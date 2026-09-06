@@ -3,7 +3,7 @@
 // Regenerate with:   node scripts/sync-feather-nodes.mjs
 //
 // Source:   https://raw.githubusercontent.com/feather-wallet/feather-nodes/master/nodes.yaml
-// Synced:   2026-09-06T18:42:01.657Z
+// Synced:   2026-09-06T19:45:02.636Z
 // Entries:  10 mainnet/clearnet nodes
 // 
 //
