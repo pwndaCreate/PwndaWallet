@@ -14,6 +14,17 @@ export default defineConfig({
     environment: "node",
     include: [
       "src/*.test.ts",
+      // Shared primitives. Added 2026-09-06 with updateBannerParity.test.ts:
+      // this directory was NOT in the include list, so a test file placed here
+      // was collected by nothing and reported as "No test files found" only
+      // because it was run explicitly. A test that never runs is worse than no
+      // test — it reads as coverage.
+      "src/components/**/*.test.ts",
+      // Release tooling. Added 2026-09-06 with scripts/lib/minisign.test.mjs --
+      // the updater-signature verifier guards the update channel of a wallet,
+      // so it must be covered by the suite that actually runs, not left as a
+      // file nothing collects (see the src/components note above).
+      "scripts/**/*.test.mjs",
       // App-level state: the account-key input map lives here, and its
       // test is the guard against a coin the deriver knows that no call
       // site feeds (the BCH `NaN` of 2026-09-05).

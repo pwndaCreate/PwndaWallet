@@ -65,8 +65,8 @@
     "tauri:dev:noswap": "node scripts/run-with-env.mjs tauri dev",
     "bundle:win": "node scripts/bundle-binaries.mjs win32",
     "bundle:linux": "node scripts/assemble-linux-grove.mjs && node scripts/bundle-binaries.mjs linux --runtime-src=.swap-sidecar-work/linux-runtime --grove-bin=.swap-sidecar-work/linux-grove/bin",
-    "check-bundle:win": "node scripts/check-bundle-payloads.mjs win32",
-    "check-bundle:linux": "node scripts/check-bundle-payloads.mjs linux",
+    "check-bundle:win": "node scripts/check-bundle-payloads.mjs win32 && node scripts/verify-bundle-deep.mjs win32",
+    "check-bundle:linux": "node scripts/check-bundle-payloads.mjs linux && node scripts/verify-bundle-deep.mjs linux",
     "check-bundle:deep": "node scripts/verify-bundle-deep.mjs win32",
     "check-bundle:deep:linux": "node scripts/verify-bundle-deep.mjs linux"
   },

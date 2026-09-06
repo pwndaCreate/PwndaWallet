@@ -26,6 +26,7 @@ import {
   type TabId,
 } from "./components/Primitives";
 import { TitleBar, Card } from "./components/PrimitivesV2";
+import { UpdateBanner } from "./components/UpdateBanner";
 import { SendModal } from "./features/send/SendModal";
 import { ZephyrSwapModal } from "./features/zephyr/ZephyrSwapModal";
 import { DeskSwapTrackerModal, type DeskTrackerState } from "./features/swap";
@@ -540,6 +541,9 @@ export function ViewRouter(props: ViewRouterProps) {
 
       {error && <div className="alert alert-error">{error}</div>}
       {success && <div className="alert alert-success">{success}</div>}
+      {/* Update notice. Shared with LandscapeShell — see UpdateBanner's header
+          for why it is one component mounted twice rather than two. */}
+      <UpdateBanner onOpenSettings={() => setView("settings")} />
 
       {/* home / login / backup / setPassword / import / derivation-picker are
           NOT rendered here. They moved to `features/auth/AuthRouter` on

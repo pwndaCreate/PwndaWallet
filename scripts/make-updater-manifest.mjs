@@ -29,6 +29,7 @@
 
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, writeFileSync, mkdirSync } from "node:fs";
+import { verifyArtifact } from "./lib/minisign.mjs";
 import { dirname, join, resolve } from "node:path";
 import { execSync } from "node:child_process";
 
@@ -87,23 +88,44 @@ const slug = repoSlug();
 
 // ── Which built file is the updater artifact for which platform ──────────────
 //
-// Windows: NSIS `-setup.exe` is preferred over MSI. Both can be signed, but an
-// MSI in-place upgrade depends on matching UpgradeCode + version rules, while
+// Windows: NSIS `-setup.exe`, and ONLY that. Both formats could be signed, but
+// an MSI in-place upgrade depends on matching UpgradeCode + version rules while
 // the NSIS installer simply overwrites the install dir — which is what "update
-// without a clean install" actually means for a user. If both exist we take
-// NSIS and say so.
+// without a clean install" actually means for a user. That preference is now
+// settled upstream: `bundle.targets` is `["nsis"]` since 2026-09-06, so there
+// is one Windows installer and it is the one the updater serves.
+//
+// The old rank-2 MSI rule is deliberately GONE rather than left as a harmless
+// fallback. `target/release/bundle/msi/` is not cleaned between builds and
+// still contains artifacts from earlier versions; a rule that scans it could
+// advertise a stale, no-longer-built installer as an update the moment the
+// NSIS one was missing for any reason. A missing artifact should fail loudly,
+// not silently resolve to a format we stopped shipping.
 //
 // Linux: AppImage only. `.deb` and `.rpm` are owned by apt/dnf and the plugin
 // refuses to self-replace them (see src/lib/updater.ts) — listing them here
 // would advertise an update path the client is right to reject.
 const RULES = [
   { platform: "windows-x86_64", dir: "target/release/bundle/nsis", ext: ".exe", rank: 1 },
-  { platform: "windows-x86_64", dir: "target/release/bundle/msi", ext: ".msi", rank: 2 },
   { platform: "linux-x86_64", dir: "target-linux/release/bundle/appimage", ext: ".AppImage", rank: 1 },
 ];
 
 // The product this manifest is for. PwndaLite builds into the same bundle dirs
 // and must never appear here.
+// The public key the SHIPPED app will check downloads against. Verification
+// here has to use this exact value, not the signing key or a key file on the
+// build machine: the only signature that matters is one the installed client
+// will accept, and this string is what got baked into it.
+const PUBKEY = conf.plugins?.updater?.pubkey;
+if (!PUBKEY) {
+  console.error(
+    `${LOG} REFUSING: tauri.conf.json has no plugins.updater.pubkey, so nothing here can be
+` +
+      `${LOG} verified -- and the shipped app would have no key to check downloads against either.`,
+  );
+  process.exit(2);
+}
+
 const productName = conf.productName;
 if (!productName) {
   console.error(`${LOG} tauri.conf.json has no productName; cannot tell this product's bundles from a sibling's`);
@@ -111,6 +133,7 @@ if (!productName) {
 }
 
 const found = new Map(); // platform -> {file, sig, rank, dir}
+const verified = [];
 const unsigned = [];
 
 // `--from <dir>` reads a FLAT directory of already-renamed, ready-to-publish
@@ -146,6 +169,7 @@ for (const rule of RULES) {
 
     const file = join(dir, name);
     const sig = `${file}.sig`;
+
     if (!existsSync(sig)) {
       // Report the dir actually scanned, not the rule's nominal one --
       // in --from mode they differ and the message would name a path the
@@ -153,6 +177,27 @@ for (const rule of RULES) {
       unsigned.push(`${dir}/${name}  (no ${name}.sig beside it)`);
       continue;
     }
+
+    // ACTUALLY VERIFY IT.
+    //
+    // This was `existsSync(sig)` and nothing else -- a question about the
+    // DIRECTORY, not about the artifact. A signature from a different build, or
+    // from a key the app does not trust, passed it. What that publishes is an
+    // update every client downloads in full (~150 MB) and then rejects at its
+    // own signature check, with the release looking perfectly healthy from here.
+    //
+    // A stale-mtime guard was added first (2026-09-06), after a bare
+    // `npm run tauri:build` with no signing key in the environment rebuilt the
+    // installer and left the previous build's .sig beside it. It caught the
+    // accident that exposed the gap and nothing else, and it is now gone: a
+    // stale signature fails verification on its merits, and keeping a proxy
+    // check beside the real one only invites trusting the proxy.
+    const v = verifyArtifact({ artifactPath: file, sigPath: sig, pubkeyConfigValue: PUBKEY });
+    if (!v.ok) {
+      unsigned.push(`${dir}/${name}  [${v.reason}] ${v.message}`);
+      continue;
+    }
+    verified.push(`${name}  (${v.algorithm}, key ${v.keyId})`);
     const prev = found.get(rule.platform);
     if (!prev || rule.rank < prev.rank) {
       found.set(rule.platform, { file, name, sig, rank: rule.rank, dir: rule.dir });
@@ -161,15 +206,35 @@ for (const rule of RULES) {
 }
 
 if (unsigned.length) {
-  console.error(`${LOG} REFUSING: ${unsigned.length} bundle(s) built WITHOUT a signature:`);
+  console.error(`${LOG} REFUSING: ${unsigned.length} bundle(s) failed signature verification:`);
   for (const u of unsigned) console.error(`${LOG}   ${u}`);
   console.error(
-    `${LOG}\n${LOG} The updater verifies every download against the pubkey in tauri.conf.json, so an\n` +
-      `${LOG} unsigned entry produces a download every client rejects AFTER transferring it.\n` +
-      `${LOG} Set "createUpdaterArtifacts": true and provide TAURI_SIGNING_PRIVATE_KEY[_PASSWORD].`,
+    `${LOG}
+${LOG} The updater verifies every download against the pubkey in tauri.conf.json, so a
+` +
+      `${LOG} bad entry produces a download every client rejects AFTER transferring it.
+` +
+      `${LOG}
+` +
+      `${LOG}   no .sig beside it  -> set "createUpdaterArtifacts": true and provide
+` +
+      `${LOG}                         TAURI_SIGNING_PRIVATE_KEY[_PASSWORD].
+` +
+      `${LOG}   key-id-mismatch    -> the signing key and the pubkey in tauri.conf.json are
+` +
+      `${LOG}                         DIFFERENT KEYS. Re-sign with the right one, or correct the
+` +
+      `${LOG}                         config -- but never rotate a shipped pubkey casually:
+` +
+      `${LOG}                         installed clients only trust the old one.
+` +
+      `${LOG}   signature-invalid  -> right key, wrong bytes. The artifact was rebuilt or
+` +
+      `${LOG}                         replaced after it was signed. Re-sign it.`,
   );
   process.exit(1);
 }
+for (const v of verified) console.log(`${LOG} signature OK  ${v}`);
 
 const WANTED = ["windows-x86_64", "linux-x86_64"];
 const missing = WANTED.filter((p) => !found.has(p));

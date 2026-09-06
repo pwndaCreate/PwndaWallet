@@ -83,8 +83,16 @@ const LOCAL = process.platform === "win32" ? ["--force-local"] : [];
 
 /** The stamp's path inside the tar. `runtime/` is the in-tar name on every
  *  platform — bundle-binaries.mjs renames the source dir at tar time precisely
- *  so this holds (see its `rename` handling). */
-const STAMP_ENTRY = "runtime/Lib/site-packages/pwnda-grove.json";
+ *  so this holds (see its `rename` handling).
+ *
+ *  The SITE-PACKAGES part is not platform-independent, and the literal
+ *  `runtime/Lib/site-packages/...` here was CPython-on-Windows only: POSIX
+ *  builds put it under `runtime/lib/python3.12/site-packages/`. Running this
+ *  against a Linux payload therefore reported "no Grove identity" for a payload
+ *  that had one — a false FAIL, and the reason this verifier could not be used
+ *  as a build gate until 2026-09-06. Matched by shape now. */
+const STAMP_RE = /^runtime\/(?:Lib|lib\/python[0-9.]+)\/site-packages\/pwnda-grove\.json$/;
+const STAMP_ENTRY = "runtime/{Lib,lib/pythonX.Y}/site-packages/pwnda-grove.json";
 
 async function main() {
   TAR_BIN = await resolveTool("tar");
@@ -203,7 +211,7 @@ async function main() {
           failures++;
           continue;
         }
-        const hit = names.find((n) => n.replace(/^\.\//, "") === STAMP_ENTRY);
+        const hit = names.find((n) => STAMP_RE.test(n.replace(/^\.\//, "")));
         if (!hit) {
           console.error(
             `${LOG} FAIL grove: ${STAMP_ENTRY} is not in the payload — the packed ` +

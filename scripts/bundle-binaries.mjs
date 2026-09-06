@@ -439,7 +439,7 @@ async function inputStamp({ name, baseDir, entries, rename }) {
   return createHash("sha256").update(parts.join("\n")).digest("hex");
 }
 
-async function buildPayload({ name, baseDir, entries, key, rename }) {
+async function buildPayload({ name, baseDir, entries, key, rename, keySha }) {
   const listFile = path.join(TMP, `${name}.list`);
   const tarFile = path.join(TMP, `${name}.tar`);
   const xzFile = `${tarFile}.xz`;
@@ -455,7 +455,10 @@ async function buildPayload({ name, baseDir, entries, key, rename }) {
     try {
       prev = JSON.parse(await readFile(stampFile, "utf8"));
     } catch {}
-    if (prev && prev.stamp === stamp && (await exists(prevEnc))) {
+    // `key_sha256` is as much a part of "is this reusable" as the inputs are:
+    // a payload encrypted under a key we are no longer shipping is not a cache
+    // hit, it is a corrupt installer. Stamps predating this field fail closed.
+    if (prev && prev.stamp === stamp && prev.key_sha256 === keySha && (await exists(prevEnc))) {
       console.log(`${LOG}   ${name.padEnd(8)} unchanged — reusing ${name}.enc (${(prev.encBytes / 1048576).toFixed(1)}MB); --force to rebuild`);
       return { name, enc_file: `${name}.enc`, tar_sha256: prev.tar_sha256 };
     }
@@ -506,7 +509,7 @@ async function buildPayload({ name, baseDir, entries, key, rename }) {
   // let a failed run mark the next one as up to date.
   await writeFile(
     path.join(OUT_DIR, `.${name}.stamp`),
-    JSON.stringify({ stamp, tar_sha256: tarSha, encBytes: enc.length }, null, 2),
+    JSON.stringify({ stamp, key_sha256: keySha, tar_sha256: tarSha, encBytes: enc.length }, null, 2),
     "utf8"
   );
 
@@ -582,18 +585,60 @@ async function main() {
   // that file permanently undecryptable -- silently: nothing fails at bundle
   // time, and the installer only breaks when a user opts into that feature.
   // Hit for real on 2026-09-04 running `--only=grove` to repack the engine.
+  //
+  // THE SAME IS TRUE OF A CACHE HIT, and that took a shipped release to learn.
+  // The input-stamp cache added 2026-09-06 reuses an existing .enc when its
+  // inputs are unchanged -- which is a payload "not rebuilt" by any other name.
+  // A full run still minted a fresh key, so a warm run wrote a NEW key beside
+  // an OLD ciphertext and reported success. v0.6.0 shipped that way: the
+  // Windows MSI's grove.enc could not be decrypted by the bundle-key.bin next
+  // to it. So the rule is not "--only reuses the key", it is:
+  //
+  //     mint a new key ONLY when nothing on disk is being kept.
+  //
+  // `reuseKey` below is decided BEFORE any payload is built, because the
+  // decision depends on what will be reused.
   const KEY_PATH = path.join(OUT_DIR, "bundle-key.bin");
-  let key;
-  if (ONLY && (await exists(KEY_PATH))) {
-    key = await readFile(KEY_PATH);
-    if (key.length !== 32) {
-      console.error(`${LOG} existing bundle-key.bin is ${key.length} bytes, expected 32 — refusing a partial rebuild against it; re-run without --only`);
-      process.exit(1);
+  let existingKey = null;
+  if (await exists(KEY_PATH)) {
+    const k = await readFile(KEY_PATH);
+    if (k.length === 32) existingKey = k;
+    else console.error(`${LOG} existing bundle-key.bin is ${k.length} bytes, expected 32 — ignoring it`);
+  }
+  const existingKeySha = existingKey ? createHash("sha256").update(existingKey).digest("hex") : null;
+
+  // Which payloads COULD be reused? A stamp match is not enough: the .enc must
+  // also have been encrypted under the key that is on disk right now, which is
+  // what `key_sha256` in the stamp records. A stamp written before this change
+  // has no key_sha256 and is therefore never reusable -- fail closed.
+  const candidates = [];
+  if (ONLY !== "grove") candidates.push("miners");
+  if (ONLY !== "miners") candidates.push("grove");
+  let anyReuse = false;
+  if (!FORCE && existingKey) {
+    for (const n of candidates) {
+      try {
+        const prev = JSON.parse(await readFile(path.join(OUT_DIR, `.${n}.stamp`), "utf8"));
+        if (prev.key_sha256 === existingKeySha && (await exists(path.join(OUT_DIR, `${n}.enc`)))) {
+          anyReuse = true;
+        }
+      } catch {}
     }
-    console.log(`${LOG} --only=${ONLY}: reusing the existing key so the payload(s) not rebuilt stay decryptable`);
+  }
+  if (ONLY && existingKey) anyReuse = true; // a partial rebuild always keeps the other payload
+
+  let key;
+  if (anyReuse) {
+    key = existingKey;
+    console.log(`${LOG} keeping the existing bundle key — at least one payload on disk stays as-is`);
   } else {
     key = randomBytes(32); // per-build, plaintext (obfuscation, not security)
   }
+  if (ONLY && !existingKey) {
+    console.error(`${LOG} --only=${ONLY} with no usable bundle-key.bin — the payload not being rebuilt would become undecryptable; re-run without --only`);
+    process.exit(1);
+  }
+  const KEY_SHA = createHash("sha256").update(key).digest("hex");
   const payloads = [];
 
   const doMiners = ONLY !== "grove";
@@ -618,7 +663,7 @@ async function main() {
       }
     }
     console.log(`${LOG} miners: ${entries.length} files from ${path.relative(REPO, MINERS_SRC)}`);
-    payloads.push(await buildPayload({ name: "miners", baseDir: MINERS_SRC, entries, key }));
+    payloads.push(await buildPayload({ keySha: KEY_SHA, name: "miners", baseDir: MINERS_SRC, entries, key }));
   }
 
   // --- grove payload: runtime/ + bin/<coin>/<binaries> -> extracted into
@@ -671,6 +716,7 @@ async function main() {
     if (binRel.split(path.sep).join("/") !== "bin") rename[binRel.split(path.sep).join("/")] = "bin";
     payloads.push(
       await buildPayload({
+        keySha: KEY_SHA,
         name: "grove",
         baseDir: groveBase,
         entries,
