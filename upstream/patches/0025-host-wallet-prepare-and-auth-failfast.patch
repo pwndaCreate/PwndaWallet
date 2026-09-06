@@ -1,0 +1,134 @@
+Grove PATCH-25: host-managed wallets are not initialised by prepare, and an
+auth rejection does not retry
+
+Two defects with one symptom -- the swap node taking ten minutes to start
+(and, because a stop must wait for it, ten minutes to stop) whenever ZEPH or
+ZANO was enabled. Observed on the live node, 2026-09-04:
+
+    WARNING : Can't connect to ZANO RPC: Wallet Zano RPC rejected the JWT
+              (401) -- secret/salt/body-hash mismatch.  Trying again in 5
+              seconds, 1/15.
+    ...  10 seconds, 2/15  ...  75 seconds, 15/15  ... exiting.
+
+That was `basicswap-prepare --addcoin=zano`. prepare's `initialise_wallets`
+waits for the new coin's wallet RPC and then calls `initialiseWallet` on it.
+For the two Grove host-wallet coins the wallet RPC is the HOST app's own
+process (zephyr-wallet-rpc; Zano's Main simplewallet), authenticated with a
+per-session secret only the supervisor knows and writes into basicswap.json
+before each engine start -- prepare's own segment deliberately carries an
+empty placeholder. So the wait can only ever fail, after the full retry
+budget, and the coin is never added; the next start repeats it.
+
+  bin/prepare.py, interface/prepare_util.py, interface/{zano,zephyr}/core.py
+      `CoinPrepareModule.host_managed_wallet` (default False; True on the
+      ZEPH and ZANO modules). `initialise_wallets` writes the chainclient
+      segment for such a coin and skips the RPC wait + initialiseWallet,
+      logging why. The supervisor fills in the live credentials at run time
+      (it already did; this removes the step that could never succeed).
+
+  basicswap.py
+      `waitForDaemonRPC` retried EVERY exception `startup_tries` times with a
+      growing delay -- 5+10+...+75 = 600 s at the defaults. A credential
+      rejection ("rejected the JWT", "(401)", "Unauthorized") is
+      deterministic: waiting cannot fix a wrong secret. It now logs the
+      reason once and stops retrying, so a misconfigured host wallet costs
+      seconds, not ten minutes. Everything else (a daemon still loading,
+      a socket not yet bound) retries exactly as before.
+
+Not an upstream candidate as written: `host_managed_wallet` is an embedder
+concept (upstream has no host-owned wallet-rpc). The fail-fast half is
+arguably upstream-worthy and is isolated in its own hunk.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -1844,6 +1844,21 @@
+                 self.coin_clients[coin_type]["interface"].testDaemonRPC(with_wallet)
+                 return
+             except Exception as ex:
++                # PWNDA-PATCH-25: an authentication rejection is deterministic.
++                # A wrong wallet-rpc secret does not become right by waiting,
++                # so retrying it `startup_tries` times with a growing delay
++                # (600 s at the defaults) only turns a misconfiguration into a
++                # ten-minute stall -- observed 2026-09-04 on a ZANO wallet-rpc
++                # answering 401 to every attempt. Fail at once with the reason.
++                if any(
++                    s in str(ex)
++                    for s in ("rejected the JWT", "(401)", "Unauthorized", "Unauthorised")
++                ):
++                    self.log.error(
++                        f"{Coins(coin_type).name} RPC rejected our credentials: {ex} -- "
++                        "not retrying (PWNDA-PATCH-25)."
++                    )
++                    break
+                 wait_for: int = startup_delay * (1 + i)
+                 if any(
+                     log in str(ex)
+diff --git a/basicswap/bin/prepare.py b/basicswap/bin/prepare.py
+--- a/basicswap/bin/prepare.py
++++ b/basicswap/bin/prepare.py
+@@ -1079,6 +1079,21 @@
+             c = swap_client.getCoinIdFromName(coin_name)
+             if module.provides_master_key:
+                 continue
++            # PWNDA-PATCH-25: host-managed wallets (zephyr, zano) are not
++            # initialised here. Their wallet-rpc belongs to the host app and
++            # authenticates with secrets only that app knows at run time, so
++            # "wait for the wallet RPC, then initialiseWallet" is a guaranteed
++            # ten-minute retry loop ending in failure -- observed 2026-09-04 on
++            # --addcoin=zano (15 tries, growing backoff, coin never added, the
++            # same ten minutes again on the next start). The chainclient
++            # segment is still written; the supervisor fills in the live
++            # credentials before every engine start.
++            if getattr(module, "host_managed_wallet", False):
++                logger.info(
++                    f"Skipping wallet initialisation for {getCoinName(c)} (host-managed "
++                    "wallet-rpc; the supervisor provides it at run time)."
++                )
++                continue
+             if coin_settings.get("connection_type") == "electrum":
+                 logger.info(
+                     f"Skipping daemon RPC wait for {getCoinName(c)} (electrum mode)."
+diff --git a/basicswap/interface/prepare_util.py b/basicswap/interface/prepare_util.py
+--- a/basicswap/interface/prepare_util.py
++++ b/basicswap/interface/prepare_util.py
+@@ -154,6 +154,12 @@
+     creates_wallet: bool = False  # Create the initial wallet through the core daemon
+     provides_master_key: bool = False  # Other coin wallets are seeded from this coin
+     reseed_note: bool = False  # Wallet can be initialised later from the ui
++    # PWNDA-PATCH-25: the coin's wallet is a HOST-managed wallet-rpc process
++    # (Grove: zephyr, zano) that prepare cannot reach -- its credentials are
++    # per-session secrets the supervisor writes into basicswap.json at run
++    # time, and the process may not be running while prepare runs. prepare
++    # writes the config segment and skips wallet initialisation for it.
++    host_managed_wallet: bool = False
+ 
+     def getConfigSegment(self, ctx: PrepareContext) -> dict:
+         raise NotImplementedError()
+diff --git a/basicswap/interface/zano/core.py b/basicswap/interface/zano/core.py
+--- a/basicswap/interface/zano/core.py
++++ b/basicswap/interface/zano/core.py
+@@ -151,4 +151,9 @@
+     version=ZANO_VERSION,
+     version_tag=ZANO_VERSION_TAG,
+     signers=zano_signers,
++    # PWNDA-PATCH-25: Main is the host app's own simplewallet (read-only for the
++    # engine, JWT it does not hold at prepare time) and Scratch is spawned by the
++    # host per swap. prepare must not try to initialise either -- see
++    # CoinPrepareModule.host_managed_wallet.
++    host_managed_wallet=True,
+ )
+\ No newline at end of file
+diff --git a/basicswap/interface/zephyr/core.py b/basicswap/interface/zephyr/core.py
+--- a/basicswap/interface/zephyr/core.py
++++ b/basicswap/interface/zephyr/core.py
+@@ -219,4 +219,9 @@
+     signers=zephyr_signers,
+     rpc_user=ZEPH_RPC_USER,
+     rpc_password=ZEPH_RPC_PWD,
++    # PWNDA-PATCH-25: the main AND swap wallets both live in the host app's own
++    # zephyr-wallet-rpc (leased to the engine, credentials written by the
++    # supervisor at run time). prepare must not try to initialise a wallet there
++    # -- see CoinPrepareModule.host_managed_wallet.
++    host_managed_wallet=True,
+ )

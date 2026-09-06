@@ -1,0 +1,160 @@
+From: PwndaWallet <pwndamining@gmail.com>
+Subject: [PATCH 11/12] bids: a narrow, gated way to restart a swap the engine
+ parked in BID_ERROR
+
+Transport for PWNDA-PATCH-10's premise, the way 0004 is transport for 0003.
+
+`BID_ERROR` is terminal for the adaptor-sig state machine. `checkXmrBidState`
+has no branch for it -- unlike its non-XMR sibling `checkBidState`, which
+carries an explicit `pass  # Wait for user input` -- so a bid that lands there
+is never re-examined by any tick. When the underlying cause was transient the
+swap itself is fine and only the TRACKING is stuck: the 2026-08-23 mainnet
+case was a chain-A redeem that had already confirmed, rejected on rebroadcast
+as a duplicate (PWNDA-PATCH-10 stops that specific cause from recurring; this
+patch is how an already-stuck bid gets out).
+
+Upstream's only exit is `manualBidUpdate`, which is reachable from the HTML
+bid page alone -- no JSON route -- and takes an arbitrary operator-chosen
+target state. An embedding host that wants to offer recovery has to either
+drive a browser form or expose arbitrary state-setting to its own renderer.
+Neither is acceptable: the second hands the renderer the ability to put any
+bid into any state, including states that would re-publish a transaction.
+
+`pwndaRecoverStalledBid` is the non-arbitrary version. It takes no target
+state. It restores the ONE pairing the engine itself uses for this step --
+`XMR_SWAP_LOCK_RELEASED` + `ActionTypes.REDEEM_XMR_SWAP_LOCK_TX_A`, exactly
+as `processADSBidReversed` sets it -- and then lets `redeemXmrBidCoinALockTx`
+decide what actually happens. That function already returns early if the
+redeem is recorded or a chain-A refund exists, and with PWNDA-PATCH-10 it is
+idempotent against an on-chain duplicate. So the worst case of calling this is
+a wasted tick, never a double spend.
+
+Three gates, all of which REFUSE rather than raise, so a caller can offer
+recovery unconditionally and explain when it was not needed:
+
+  1. the bid must actually be in `BID_ERROR` -- recovering a live bid would
+     fight the state machine that still owns it;
+  2. no chain-A refund may be in flight -- if the timelock path has taken
+     over, re-queueing a redeem against it is the one genuinely unsafe thing
+     this could do;
+  3. a chain-A spend tx must exist -- there is nothing to retry otherwise.
+
+Not an upstream-PR candidate: the endpoint exists because an embedding host
+answers "who drives recovery" differently than a standalone node with an
+operator at its web UI does. The underlying gap it works around -- no
+`BID_ERROR` branch in `checkXmrBidState` -- is arguably an upstream bug, but
+fixing that properly is a state-machine change, not an endpoint.
+
+Marker: PWNDA-PATCH-11
+---
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -7415,6 +7415,87 @@
+         self.log.info(f"Abandoning Bid {self.log.id(bid_id)}")
+         self.deactivateBidForReason(bid_id, BidStates.BID_ABANDONED)
+ 
++    def pwndaRecoverStalledBid(self, bid_id: bytes) -> dict:
++        # PWNDA-PATCH-11: re-queue the chain-A redeem for a bid the engine has
++        # already given up on.
++        #
++        # BID_ERROR is a terminal state for the adaptor-sig state machine:
++        # checkXmrBidState has no branch for it (unlike checkBidState, which
++        # carries an explicit `pass  # Wait for user input`), so a bid that
++        # lands there is never re-examined. When the cause was transient -- the
++        # 2026-08-23 mainnet case was a redeem that had ALREADY confirmed,
++        # rejected on rebroadcast as a duplicate, see PWNDA-PATCH-10 -- the
++        # swap is fine and only the tracking is stuck. Upstream's only exit is
++        # manualBidUpdate, which is reachable from the HTML bid page alone and
++        # takes an arbitrary operator-chosen state.
++        #
++        # This is the narrow, non-arbitrary version of that: it does not accept
++        # a target state, it restores the ONE pairing the engine itself uses
++        # for this step (XMR_SWAP_LOCK_RELEASED + REDEEM_XMR_SWAP_LOCK_TX_A,
++        # see processADSBidReversed) and lets redeemXmrBidCoinALockTx's own
++        # guards decide what actually happens. That function already returns
++        # early if the redeem is recorded or a refund exists, and with
++        # PWNDA-PATCH-10 it is idempotent against an on-chain duplicate -- so
++        # the worst case of calling this is a no-op tick, never a double spend.
++        #
++        # Refuses rather than raises on every gate, so a caller can offer
++        # recovery unconditionally and surface the reason it was not needed.
++        try:
++            cursor = self.openDB()
++            bid, xmr_swap = self.getXmrBidFromSession(cursor, bid_id)
++            ensure(bid, f"Bid not found: {self.log.id(bid_id)}.")
++            ensure(xmr_swap, f"Adaptor-sig swap not found: {self.log.id(bid_id)}.")
++            offer, xmr_offer = self.getXmrOfferFromSession(cursor, bid.offer_id)
++            ensure(offer, f"Offer not found: {self.log.id(bid.offer_id)}.")
++
++            state_before: str = strBidState(bid.state)
++
++            # Gate 1 -- only a bid the engine has actually parked. Recovering a
++            # LIVE bid would fight the state machine that still owns it.
++            if bid.state != BidStates.BID_ERROR:
++                return {
++                    "recovered": False,
++                    "state": state_before,
++                    "reason": "This swap is not in an error state, so there is nothing to restart.",
++                }
++            # Gate 2 -- a refund in flight means the timelock path owns the
++            # funds now. Re-queueing a redeem against it is the one genuinely
++            # unsafe thing this could do.
++            if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
++                return {
++                    "recovered": False,
++                    "state": state_before,
++                    "reason": "A refund is already in flight for this swap; the timelock path will complete it.",
++                }
++            # Gate 3 -- nothing to publish if the spend tx was never built.
++            if not xmr_swap.a_lock_spend_tx:
++                return {
++                    "recovered": False,
++                    "state": state_before,
++                    "reason": "This swap never reached the stage where funds are claimed, so there is no claim to retry.",
++                }
++
++            bid.setState(BidStates.XMR_SWAP_LOCK_RELEASED)
++            delay: int = self.get_delay_event_seconds()
++            self.createActionInSession(
++                delay, ActionTypes.REDEEM_XMR_SWAP_LOCK_TX_A, bid_id, cursor
++            )
++            self.activateBid(cursor, bid)
++            self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
++            self.commitDB()
++            self.log.info(
++                f"PWNDA-PATCH-11: re-queued chain-A redeem for stalled bid "
++                f"{self.log.id(bid_id)} (was {state_before}), retrying in {delay}s."
++            )
++            return {
++                "recovered": True,
++                "state_before": state_before,
++                "state": strBidState(bid.state),
++                "retry_in_seconds": delay,
++            }
++        finally:
++            self.closeDB(cursor, commit=False)
++
+     def timeoutBid(self, bid_id: bytes, cursor=None) -> None:
+         self.log.info(f"Bid {self.log.id(bid_id)} timed-out")
+         self.deactivateBidForReason(bid_id, BidStates.SWAP_TIMEDOUT, cursor=cursor)
+--- a/basicswap/js_server.py
++++ b/basicswap/js_server.py
+@@ -773,6 +773,16 @@
+                 swap_client.acceptBid(bid_id)
+             elif have_data_entry(post_data, "abandon"):
+                 swap_client.abandonBid(bid_id)
++            elif have_data_entry(post_data, "pwndarecover"):
++                # PWNDA-PATCH-11: restart a swap the engine parked in
++                # BID_ERROR. Read-only about funds -- it re-queues the
++                # engine's own next step and lets that step's existing
++                # guards decide. Returns {"recovered": bool, "reason": str}
++                # rather than raising, so a caller can offer recovery
++                # unconditionally and explain when it was not needed.
++                return bytes(
++                    json.dumps(swap_client.pwndaRecoverStalledBid(bid_id)), "UTF-8"
++                )
+             elif have_data_entry(post_data, "debugind") and swap_client.debug:
+                 main_debug_ind: bool = toBool(
+                     get_data_entry_or(post_data, "maindebugind", True)
+-- 
+2.43.0

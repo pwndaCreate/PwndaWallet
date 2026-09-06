@@ -1,0 +1,126 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-21
+Subject: [PATCH 4/6] basicswap: accept an account key (and its address type)
+ over the authenticated JSON API
+
+Transport for PATCH 3. The host wallet pushes one account-level extended
+private key per electrum-mode coin, with an optional addressType ("p2wpkh"
+default, "p2pkh" for wallets whose funds live on legacy base58 addresses --
+the Exodus/Atomic Litecoin case); the engine holds both in memory for the life
+of the process and initialises that coin's WalletManager from them.
+
+Why a runtime endpoint rather than an environment variable at spawn: the key
+cannot exist before the host's vault is unlocked, and the node must already be
+running by then -- coin daemons sync while the vault is still locked, and
+particl's initial sync is the long pole for the entire node.
+
+Memory only. The key is never written to the datadir or the database, so a
+restart loses it; the host pushes again on every start, and PATCH 3 fails
+closed rather than silently reverting to engine-derived keys.
+
+The response carries the resulting deposit address so the caller can assert
+the engine derived the same wallet -- in the same encoding -- it believes it
+pushed. Pushing while the wallets are locked stores the key and reports
+initialized: false rather than erroring.
+
+Custody is the engine's existing model: client auth required, loopback only,
+and the supervisor denies this path to the embedded console's proxy.
+
+Not an upstream-PR candidate: it exists to serve an embedding host.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker in patched source: PWNDA-PATCH-4
+---
+ basicswap/js_server.py |  72 ++++++++++
+ 1 files changed, 72 insertions(+), 0 deletions(-)
+
+diff --git a/basicswap/js_server.py b/basicswap/js_server.py
+index ea7adb4..7c99c84 100644
+--- a/basicswap/js_server.py
++++ b/basicswap/js_server.py
+@@ -1512,6 +1512,76 @@ def js_lock(self, url_split, post_string, is_json) -> bytes:
+     return bytes(json.dumps({"success": True}), "UTF-8")
+ 
+ 
++def js_pwnda_setaccountkey(self, url_split, post_string, is_json) -> bytes:
++    """PWNDA-PATCH-4: receive an account-level extended private key.
++
++    The engine reaches its wallets lazily and cannot be restarted to pick up a
++    key: coin daemons sync while the host vault is still locked (particl's
++    initial sync is the long pole for the whole node), so deferring the start
++    until unlock would stall it for hours. Hence a runtime push rather than an
++    environment variable at spawn.
++
++    `addressType` ("p2wpkh" default, or "p2pkh") declares how this wallet's
++    addresses are encoded -- a wallet imported from Exodus/Atomic keeps its
++    funds on legacy base58 addresses, and watching the P2WPKH encodings of the
++    same keys would show an empty wallet over real funds.
++
++    Memory only -- never written to the engine's datadir or its database. A
++    node restart therefore loses it, which is deliberate: the host pushes again
++    on every start, and PWNDA-PATCH-3 fails closed rather than silently falling
++    back to engine-derived keys for a coin the host owns.
++
++    Custody: this endpoint is reachable only with the engine's own client auth,
++    on loopback, and the supervisor adds it to its denied-endpoint list so the
++    embedded console's proxy cannot reach it.
++    """
++    swap_client = self.server.swap_client
++    post_data = getFormData(post_string, is_json)
++
++    coin = getCoinType(str(get_data_entry(post_data, "coin")))
++    account_key = bytes.fromhex(str(get_data_entry(post_data, "key")))
++    # 74 = depth(1) + fingerprint(4) + child_no(4) + chaincode(32) + 0x00 + key(32)
++    if len(account_key) != 74:
++        raise ValueError("Invalid account key length.")
++    address_type = "p2wpkh"
++    if have_data_entry(post_data, "addressType"):
++        address_type = str(get_data_entry(post_data, "addressType"))
++    if address_type not in ("p2wpkh", "p2pkh"):
++        raise ValueError("Invalid address type.")
++
++    if not hasattr(swap_client, "_pwnda_account_keys"):
++        swap_client._pwnda_account_keys = {}
++    swap_client._pwnda_account_keys[coin] = (account_key, address_type)
++
++    # Store even while locked: initialisation touches the engine DB and the
++    # lazy path re-runs after unlock. Pushing early must not be an error.
++    try:
++        _, is_locked = swap_client.getLockedState()
++    except Exception:
++        is_locked = True
++
++    deposit_address = None
++    if not is_locked:
++        wm = swap_client.getWalletManager()
++        wm.initializeFromAccountKey(coin, account_key, address_type)
++        deposit_address = wm.getDepositAddress(coin)
++
++    # The address is returned so the caller can assert the engine derived the
++    # SAME wallet it believes it pushed. A silent mismatch is the one failure
++    # this whole mechanism must not have.
++    return bytes(
++        json.dumps(
++            {
++                "success": True,
++                "coin": Coins(coin).name,
++                "initialized": not is_locked,
++                "deposit_address": deposit_address,
++            }
++        ),
++        "UTF-8",
++    )
++
++
+ def js_404(self, url_split, post_string, is_json) -> bytes:
+     return bytes(json.dumps({"Error": "path unknown"}), "UTF-8")
+ 
+@@ -2187,6 +2257,8 @@ endpoints = {
+     "electrumdiscover": js_electrum_discover,
+     "modeswitchinfo": js_modeswitchinfo,
+     "getsubfeebidtx": js_getsubfeebidtx,
++    # PWNDA-PATCH-4
++    "pwndasetaccountkey": js_pwnda_setaccountkey,
+ }
+ 
+ 

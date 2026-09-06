@@ -1,0 +1,55 @@
+Grove PATCH-28: price ZEPH as zephyr-protocol, not "zephyr"
+
+The console showed the operator's 67.266218166684 ZEPH as $1.19 while the
+wallet showed $27.08 for the same balance. Neither number was a bug in the
+balance -- both sides read 67.266218166684 from the same wallet-rpc. They
+disagreed about what a ZEPH is worth, by a factor of 22.7.
+
+getExchangeName sends chainparams[coin]["name"] to CoinGecko as an id, and
+Zephyr's chainparams name is "zephyr". That id exists on CoinGecko and is a
+DIFFERENT ASSET. Measured 2026-09-05:
+
+    /simple/price?ids=zephyr,zephyr-protocol,zano,bitcoin-cash
+    {"zephyr":{"usd":0.01772103},"zephyr-protocol":{"usd":0.402475},
+     "zano":{"usd":6.7},"bitcoin-cash":{"usd":249.6}}
+
+    67.266218166684 * 0.01772103 = $1.19   <- what the console showed
+    67.266218166684 * 0.402475   = $27.07  <- what the wallet showed
+
+So the console was not stale or rounding; it was pricing a namesake token.
+The wallet has used "zephyr-protocol" since its own price map was written
+(src/wallets/usd-prices.ts).
+
+This function already carries exactly this kind of exception -- BCH's chain
+name is "bitcoincash" but its CoinGecko id is "bitcoin-cash", and FIRO's is
+"zcoin" -- so ZEPH joins that list rather than getting a new mechanism. Every
+other Grove coin was checked against the live API the same way and resolves
+correctly on its chainparams name (bitcoin, litecoin, dash, dogecoin,
+particl, monero, wownero, zano, decred, namecoin, pivx).
+
+The wrong price is not cosmetic here: lookupFiatRates feeds the offer book's
+rate columns and the AMM page as well as the wallet cards, so a coin priced
+at 4% of its value reads as a spectacular bargain everywhere it appears.
+
+Upstream candidate: yes, if Zephyr lands upstream -- it is a one-line id
+correction of exactly the shape already present for two other coins.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -17252,6 +17252,15 @@
+     def getExchangeName(self, coin_id: int, exchange_name: str) -> str:
+         if coin_id == Coins.BCH:
+             return "bitcoin-cash"
++        # PWNDA-PATCH-28: Zephyr's chain name is "zephyr" and CoinGecko's id
++        # for Zephyr Protocol is "zephyr-protocol". The bare "zephyr" id is a
++        # different, unrelated token trading around $0.018 against ZEPH's
++        # $0.40, so the console valued a 67.27 ZEPH balance at $1.19 instead
++        # of $27.08 (measured 2026-09-05). Same shape as the BCH line above:
++        # a chain whose CoinGecko id is not its chainparams name. This one is
++        # worse than cosmetic because the same rates feed the offer book.
++        if coin_id == Coins.ZEPH:
++            return "zephyr-protocol"
+         if coin_id == Coins.FIRO:
+             return "zcoin"
+

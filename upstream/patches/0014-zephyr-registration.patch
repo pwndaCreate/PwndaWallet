@@ -1,0 +1,329 @@
+From: PwndaWallet <pwndamining@gmail.com>
+Subject: [PATCH 14/19] basicswap: register the Zephyr (ZEPH) coin module in
+ the shared engine files
+
+Wires the four new files from PWNDA-PATCH-13 (basicswap/interface/zephyr/)
+into the engine so it actually constructs a ZEPHInterface and provisions it,
+on the shared files this tree's upstream #532 refactor centralised:
+basicswap/chainparams.py (the Coins enum id + the two coin-family tuples +
+the chainparams dict), basicswap/basicswap.py (createInterface + the
+thread_func poll-loop map), basicswap/bin/prepare.py (coin_prepare_modules +
+known_coins + the chainclients config-segment dict), basicswap/bin/run.py
+(the native, non-Docker daemon/wallet-rpc start path), and
+basicswap/ui/page_settings.py (the two xmr-family coin-name tuples the
+Settings page's read/write handlers gate on).
+
+Modelled directly on the existing Coins.WOW registration at every site below
+-- WOW is the nearest sibling (also a Monero-fork xmr_based_coins member on
+this per-coin-folder layout) and every hunk here is "add ZEPH next to WOW",
+never a new pattern. Authoritative shape confirmed against
+ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md ("Phase 2 -
+central registrations") in G:\REU26 (read-only reference, not part of this
+tree), which re-ported this exact registration onto this exact per-coin-
+folder layout and validated it live (`basicswap-prepare --withcoins=zephyr
+--preparebinonly` ran the new core.py end to end; `test_other` green; CI-
+pinned lint clean). Two things follow that page's own recorded lesson rather
+than its older draft: no inline-tuple edits to basicswap.py's
+scriptless_coins/xmr_based_coins are made here, because this tree's dev base
+(post upstream #543) already centralises both tuples into chainparams.py as
+single-source-of-truth imports -- basicswap.py's own copies were dropped
+upstream, exactly the "delete our duplicate, extend dev's tuple" lesson the
+replan's 2026-07-13 entry records after hitting the equivalent conflict
+itself. Confirmed by grep against this tree: only two `Coins.WOW` sites exist
+in the entirety of basicswap.py (createInterface, thread_func) -- both
+patched below, nothing else references it.
+
+Three additions the replan's Phase 2 section does not itself enumerate,
+found by tracing this patch's own gate command through prepare.py's actual
+control flow rather than assumed from the replan text alone (the replan's
+own validation used --preparebinonly, a different code path that never
+reaches these three):
+  - bin/prepare.py's `known_coins` dict needs a "zephyr" entry, because
+    `--withcoins=zephyr` is parsed through `ensure_coin_valid()`, which
+    exits immediately with "Unknown coin Zephyr" if the name is absent from
+    `known_coins` -- before `coin_prepare_modules` is ever consulted at all.
+  - bin/prepare.py's `chainclients` dict (built once, unconditionally, right
+    where "monero"/"wownero" call their own `getConfigSegment(prepare_ctx)`)
+    needs a "zephyr" entry too: this is literally the dict this patch's own
+    gate checks for a `chainclients.zephyr` block in, and it is populated
+    independently of `coin_prepare_modules` -- omitting it would leave
+    `--withcoins=zephyr` parse successfully, `known_coins["zephyr"]` resolve
+    fine, and `settings["chainclients"]` still come up short one key,
+    silently.
+  - bin/run.py's `if c in ("monero", "wownero"):` dispatch (the ONLY place
+    that gates which coins get routed through the shared `startXmrDaemon`
+    / `startXmrWalletDaemon` functions at all -- those two functions
+    themselves have no coin gate of their own) needs "zephyr" added, so a
+    native (non-Docker) Grove install can start a local ZEPH daemon/wallet-
+    rpc exactly the way it already starts Monero's. Grove's own core.py
+    (PWNDA-PATCH-13) hardcodes manage_daemon/manage_wallet_daemon to False
+    for ZEPH -- this dispatch branch is therefore dead code in Grove's own
+    default deployment (ZEPH is always the C-RZ remote/host-leased wallet)
+    -- but it is the exact gap unit A4 (Phase A) had to build a standalone
+    regtest harness around instead of using run.py directly, and closing it
+    here, in the engine's own native-start path, is this patch's job per
+    the Grove expansion master plan's Phase B table, not a follow-up left
+    for whoever eventually needs a locally-managed ZEPH node.
+
+A real defect found and fixed WHILE building this patch, not merely
+inherited: `startXmrDaemon`'s `config_filename` ternary and
+`startXmrWalletDaemon`'s `wallet_config_filename` ternary look like the same
+pattern (both keyed on the binary name's prefix, both currently special-
+casing only "wow") but they are NOT symmetric on the provisioning side, and
+treating them as symmetric here would have shipped a second, silent
+mismatch alongside PWNDA-PATCH-13's own already-documented one. Traced by
+actually running this patch's own gate end to end (see below) and reading
+the real `basicswap.json` + datadir it produced, not by inspecting the two
+ternaries in isolation:
+  - The DAEMON conf name (`prepareDataDir`'s
+    `core_settings.get("config_filename", self.name + "d.conf")`, in
+    `basicswap/interface/prepare_util.py`'s base `CoinPrepareModule`) is
+    NAME-DERIVED by default, and ZEPHPrepare (PWNDA-PATCH-13) sets no
+    `config_filename` override, so the real file `basicswap-prepare` writes
+    to a zephyr datadir is `zephyrd.conf` -- exactly what
+    `daemon_bin.startswith("zephyr")` needed to produce. This branch is
+    correct and necessary; verified live (see gate output).
+  - The WALLET conf name is the opposite shape: `XMRPrepare.
+    getWalletConfFilename()` (`basicswap/interface/xmr/core.py`) hardcodes
+    the literal string `"monero_wallet.conf"` -- it is NOT derived from
+    `self.name` the way the daemon conf is. WOWPrepare overrides this
+    method (`basicswap/interface/wow/core.py`) to return its own name;
+    ZEPHPrepare (PWNDA-PATCH-13) does not override it at all, so it
+    inherits the literal `"monero_wallet.conf"` default -- confirmed by
+    running this patch's own gate and reading the resulting zephyr datadir,
+    which contains a real file named `monero_wallet.conf`, never
+    `zephyr-wallet-rpc.conf`. An earlier draft of this patch added a
+    "zephyr" branch to `wallet_config_filename` pointing at
+    `zephyr-wallet-rpc.conf` (mirroring the daemon-conf ternary by
+    reflex); running the gate against it would have looked identical
+    (`--nocores` never reaches `startXmrWalletDaemon` at all), so this
+    defect would have shipped invisibly -- the actual file
+    `startXmrWalletDaemon` would have gone looking for
+    `zephyr-wallet-rpc.conf`, found nothing (`os.path.exists(config_path)`
+    false), and started the wallet-rpc daemon with NO config file at all:
+    no `--rpc-bind-port`, no `--wallet-dir`, no `--rpc-login`, in a native
+    (non-Docker) install with `manage_wallet_daemon` ever flipped True by
+    hand. Caught only because this patch's gate reads the actual datadir
+    produced, not just the process exit code. FIX: `wallet_config_filename`
+    is left untouched by this patch -- "zephyr-wallet-rpc" already falls
+    through the existing `else "monero_wallet.conf"` branch unchanged,
+    which is the file that actually gets written, so no ternary edit was
+    needed there at all. Filed as a defect below and cross-referenced for
+    B-INT / a future PWNDA-PATCH-13 follow-up: ZEPHPrepare could override
+    `getWalletConfFilename()` for cosmetic self-consistency with WOW, but
+    it is not a functional bug as things stand -- each coin's conf lives in
+    its own isolated datadir, so the literal "monero_wallet.conf" name
+    never collides with an actual Monero installation's own file.
+
+Two deliberate omissions, both because Grove never manages a local ZEPH
+daemon (see the point above -- the same reasoning PWNDA-PATCH-13's core.py
+already gives for hardcoding manage_daemon/manage_wallet_daemon False), so
+neither line has anything to do at runtime for this project:
+  - bin/prepare.py's per-coin `--<name>restoreheight=N` CLI flag and its
+    `chainclients["<name>"]["restore_height"] = <name>_restore_height` /
+    `["trusted_daemon"] = extra_opts.get(...)` follow-up assignment (present
+    for "monero" and "wownero" only, not generalised to every xmr-family
+    coin already in this tree -- FIRO and DOGE get no equivalent override
+    either). ZEPHPrepare.getConfigSegment (PWNDA-PATCH-13) already sets its
+    own restore_height default; a CLI override to reach a daemon Grove never
+    manages would be unreachable code, not a real capability.
+  - bin/prepare.py's `electrum_supported_coins` dict (`{"bitcoin": "btc",
+    "litecoin": "ltc"}`) -- ZEPH is a Monero-fork RPC coin, not an
+    electrum-protocol coin; unrelated to this patch's coin family entirely
+    (that dict is BCH/BTC/LTC's concern, PWNDA-PATCH-18).
+
+Checked and confirmed NO changes needed (so not touched, per the replan's
+own 2026-07-13 finding that dev's refactor already generalised these two
+files to iterate xmr_based_coins/chainparams rather than hardcode per-coin
+tuples): basicswap/ui/page_offers.py, basicswap/ui/page_wallet.py -- grepped
+for "wownero"/"monero" tuples in both; zero matches in this tree, matching
+what the replan page itself records happened on dev after upstream #543.
+basicswap/interface/electrumx.py and basicswap/bin/prepare.py's
+`electrum_supported_coins` dict are PWNDA-PATCH-18's (BCH) files, not
+touched here.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b),
+after PWNDA-PATCH-13 (basicswap/interface/zephyr/ must exist first).
+Marker: PWNDA-PATCH-14
+---
+
+RECONSTRUCTED BODY 2026-09-03: header prose is original; the diff body was
+regenerated by `git diff` between verified p13 and p14 trees, replacing hand-
+edited hunk headers whose declared line counts no longer matched their bodies
+(unit F1 found these fail a strict `git apply`). Content is unchanged.
+
+diff --git a/basicswap/chainparams.py b/basicswap/chainparams.py
+index 4426e9d..e291690 100644
+--- a/basicswap/chainparams.py
++++ b/basicswap/chainparams.py
+@@ -15,6 +15,7 @@ from basicswap.interface.dcr.chainparams import params as dcr_params
+ from basicswap.interface.nmc.chainparams import params as nmc_params
+ from basicswap.interface.xmr.chainparams import params as xmr_params
+ from basicswap.interface.wow.chainparams import params as wow_params
++from basicswap.interface.zephyr.chainparams import params as zephyr_params
+ from basicswap.interface.pivx.chainparams import params as pivx_params
+ from basicswap.interface.dash.chainparams import params as dash_params
+ from basicswap.interface.firo.chainparams import params as firo_params
+@@ -41,6 +42,7 @@ class Coins(IntEnum):
+     # ZANO = 16
+     BCH = 17
+     DOGE = 18
++    ZEPH = 19  # PWNDA-PATCH-14: Zephyr Protocol
+ 
+ 
+ class Fiat(IntEnum):
+@@ -56,8 +58,11 @@ scriptless_coins = (
+     Coins.PART_ANON,
+     Coins.FIRO,
+     Coins.DOGE,
++    # PWNDA-PATCH-14: Zephyr is scriptless (Monero-family -- no scripts on
++    # its side of a swap at all, same as XMR/WOW).
++    Coins.ZEPH,
+ )
+-xmr_based_coins = (Coins.XMR, Coins.WOW)
++xmr_based_coins = (Coins.XMR, Coins.WOW, Coins.ZEPH)
+ 
+ chainparams = {
+     Coins.PART: part_params,
+@@ -73,6 +78,7 @@ chainparams = {
+     Coins.NAV: nav_params,
+     Coins.BCH: bch_params,
+     Coins.DOGE: doge_params,
++    Coins.ZEPH: zephyr_params,
+ }
+ 
+ name_map = {}
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 90669c1..c165129 100644
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -1262,6 +1262,13 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+             from .interface.wow.wow import WOWInterface
+ 
+             return WOWInterface(self.coin_clients[coin], self.chain, self)
++        elif coin == Coins.ZEPH:
++            # PWNDA-PATCH-14: Zephyr, modelled directly on the WOW branch
++            # immediately above -- both are xmr_based_coins members on this
++            # per-coin-folder layout.
++            from .interface.zephyr.zephyr import ZEPHInterface
++
++            return ZEPHInterface(self.coin_clients[coin], self.chain, self)
+         elif coin == Coins.PIVX:
+             from .interface.pivx.pivx import PIVXInterface
+ 
+@@ -1415,6 +1422,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+                 thread_func = {
+                     Coins.XMR: threadPollXMRChainState,
+                     Coins.WOW: threadPollXMRChainState,
++                    # PWNDA-PATCH-14: Zephyr polls chain state the same way
++                    # every other xmr-family coin does.
++                    Coins.ZEPH: threadPollXMRChainState,
+                 }.get(
+                     c, threadPollChainState
+                 )  # default case
+diff --git a/basicswap/bin/prepare.py b/basicswap/bin/prepare.py
+index 343bd1c..43eebcc 100644
+--- a/basicswap/bin/prepare.py
++++ b/basicswap/bin/prepare.py
+@@ -70,6 +70,11 @@ from basicswap.interface.wow.core import (
+     DEFAULT_WOW_RESTORE_HEIGHT,
+     prepare_module as wow_prepare,
+ )
++# PWNDA-PATCH-14: no CLI restore-height override is wired for zephyr (see
++# the patch header), so only `prepare_module` is imported -- not the
++# `DEFAULT_ZEPH_RESTORE_HEIGHT` constant every xmr-family coin's core.py
++# still exports for parity, which would otherwise be an unused import here.
++from basicswap.interface.zephyr.core import prepare_module as zephyr_prepare
+ from basicswap.interface.pivx.core import prepare_module as pivx_prepare
+ from basicswap.interface.firo.core import prepare_module as firo_prepare
+ from basicswap.interface.doge.core import prepare_module as doge_prepare
+@@ -88,6 +93,8 @@ coin_prepare_modules = {
+     "namecoin": nmc_prepare,
+     "monero": xmr_prepare,
+     "wownero": wow_prepare,
++    # PWNDA-PATCH-14: Zephyr's provisioning module (PWNDA-PATCH-13).
++    "zephyr": zephyr_prepare,
+     "pivx": pivx_prepare,
+     "firo": firo_prepare,
+ }
+@@ -128,6 +135,14 @@ known_coins = {
+         wow_prepare.version_tag,
+         wow_prepare.signers.keys(),
+     ),
++    # PWNDA-PATCH-14: required for `--withcoins=zephyr` to pass
++    # `ensure_coin_valid()` at all -- that check runs before
++    # `coin_prepare_modules` is ever consulted.
++    "zephyr": (
++        zephyr_prepare.version,
++        zephyr_prepare.version_tag,
++        zephyr_prepare.signers.keys(),
++    ),
+     "pivx": (
+         pivx_prepare.version,
+         pivx_prepare.version_tag,
+@@ -1538,6 +1553,10 @@ def main():
+         "namecoin": nmc_prepare.getConfigSegment(prepare_ctx),
+         "monero": xmr_prepare.getConfigSegment(prepare_ctx),
+         "wownero": wow_prepare.getConfigSegment(prepare_ctx),
++        # PWNDA-PATCH-14: this is the dict `basicswap-prepare` writes into
++        # `settings["chainclients"]` -- the block this patch's own gate
++        # checks for.
++        "zephyr": zephyr_prepare.getConfigSegment(prepare_ctx),
+         "pivx": pivx_prepare.getConfigSegment(prepare_ctx),
+         "dash": dash_prepare.getConfigSegment(prepare_ctx),
+         "firo": firo_prepare.getConfigSegment(prepare_ctx),
+diff --git a/basicswap/bin/run.py b/basicswap/bin/run.py
+index c013df3..a367694 100644
+--- a/basicswap/bin/run.py
++++ b/basicswap/bin/run.py
+@@ -198,7 +198,11 @@ def startXmrDaemon(node_dir, bin_dir, daemon_bin, opts=[]):
+ 
+     datadir_path = os.path.expanduser(node_dir)
+     config_filename = (
+-        "wownerod.conf" if daemon_bin.startswith("wow") else "monerod.conf"
++        # PWNDA-PATCH-14: zephyrd's own conf, not monerod's -- the third
++        # branch mirrors the "wow" branch immediately above it.
++        "wownerod.conf"
++        if daemon_bin.startswith("wow")
++        else "zephyrd.conf" if daemon_bin.startswith("zephyr") else "monerod.conf"
+     )
+     args = [
+         daemon_path,
+@@ -454,7 +458,10 @@ def runClient(
+             except Exception as e:  # noqa: F841
+                 logger.warning(f"Not starting unknown coin: {c}")
+                 continue
+-            if c in ("monero", "wownero"):
++            # PWNDA-PATCH-14: without "zephyr" here, startXmrDaemon /
++            # startXmrWalletDaemon are unreachable for it no matter what
++            # config_filename says above -- this tuple is the only gate.
++            if c in ("monero", "wownero", "zephyr"):
+                 if v["manage_daemon"] is True:
+                     swap_client.log.info(f"Starting {display_name} daemon")
+                     filename: str = getCoreBinName(coin_id, v, c + "d")
+diff --git a/basicswap/ui/page_settings.py b/basicswap/ui/page_settings.py
+index a0634b3..43ceaa9 100644
+--- a/basicswap/ui/page_settings.py
++++ b/basicswap/ui/page_settings.py
+@@ -163,7 +163,9 @@ def page_settings(self, url_split, post_string):
+             for name, c in swap_client.settings["chainclients"].items():
+                 if have_data_entry(form_data, "apply_" + name):
+                     data = {"lookups": get_data_entry(form_data, "lookups_" + name)}
+-                    if name in ("monero", "wownero"):
++                    # PWNDA-PATCH-14: zephyr takes the same settings-form
++                    # fields as monero/wownero (fee_priority, managedaemon_*).
++                    if name in ("monero", "wownero", "zephyr"):
+                         data["fee_priority"] = int(
+                             get_data_entry(form_data, "fee_priority_" + name)
+                         )
+@@ -350,7 +352,9 @@ def page_settings(self, url_split, post_string):
+                 "address_gap_limit": c.get("address_gap_limit", 50),
+             }
+         )
+-        if name in ("monero", "wownero"):
++        # PWNDA-PATCH-14: same tuple as the form-apply handler above --
++        # renders the fee_priority / rpchost / rpcport fields for zephyr too.
++        if name in ("monero", "wownero", "zephyr"):
+             chains_formatted[-1]["fee_priority"] = c.get("fee_priority", 0)
+             chains_formatted[-1]["manage_wallet_daemon"] = c.get(
+                 "manage_wallet_daemon", "Unknown"

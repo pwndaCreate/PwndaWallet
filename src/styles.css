@@ -1,0 +1,17 @@
+/* PwndaWallet styles.css barrel.
+ *
+ * Split into purpose-files under src/design/styles/ as part of Phase 2
+ * of the design-system-modularization plan. Tokens + keyframes are
+ * generated from src/design/tokens.ts by scripts/generate-tokens-css.mjs.
+ *
+ * Existing imports of "./styles.css" keep working — this barrel produces
+ * the same merged stylesheet as the legacy monolith.
+ */
+@import url('https://fonts.googleapis.com/css2?family=Press+Start+2P&family=JetBrains+Mono:wght@400;500&family=Share+Tech+Mono&display=swap');
+
+@import "./design/styles/tokens.css";
+@import "./design/styles/keyframes.css";
+@import "./design/styles/reset.css";
+@import "./design/styles/chrome.css";
+@import "./design/styles/utilities.css";
+@import "./design/styles/legacy.css";

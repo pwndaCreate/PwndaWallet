@@ -1,0 +1,125 @@
+From: PwndaWallet <pwndamining@gmail.com>
+Subject: [PATCH 10/12] redeem: treat an already-mined coin-A spend as success,
+ not a fatal action failure
+
+A completed atomic swap can present as a permanently failed one.
+
+`redeemXmrBidCoinALockTx` (the follower's chain-A redeem) calls `publishTx`
+bare. `checkQueuedActions` drives it from a periodic tick, and the bookkeeping
+that records the redeem -- `bid.xmr_a_lock_spend_tx`, written at the END of
+that function -- only lands after the publish returns. An interruption between
+the two (a wallet re-lock, a restart, a dropped RPC session) leaves a redeem
+that is genuinely confirmed on-chain and a bid that has no record of it.
+
+The next tick rebuilds the same deterministic transaction and rebroadcasts it.
+The chain correctly rejects the duplicate. Upstream treats that rejection as a
+fatal action failure and parks the bid in `BID_ERROR` -- and `checkXmrBidState`
+has no `BID_ERROR` branch, unlike its non-XMR sibling `checkBidState`, which
+carries an explicit `pass  # Wait for user input`. So the bid stops being
+tracked, while the funds it is tracking already arrived.
+
+Observed on mainnet XMR->LTC, 2026-08-23, verbatim:
+
+    checkQueuedActions failed: Electrum error: {'code': 1, 'message': 'the
+    transaction was rejected by network rules.\n\nTransaction already in block
+    chain\n'}
+
+Two independent defects, both fixed here:
+
+1. `isTxExistsError`'s electrum branch matched only "Transaction outputs
+   already in utxo set" -- the UNCONFIRMED / mempool-collision message. The
+   CONFIRMED case, which is the one this predicate exists to catch, arrives as
+   "Transaction already in block chain" (the exact wording the non-electrum
+   branch already matched). So on an electrum-mode wallet the predicate
+   answered False for its own primary case.
+
+2. The redeem path never called it at all. The coin-A *refund* path is the
+   only caller in the tree; the redeem path -- equally deterministic, equally
+   re-attemptable -- had no equivalent handling.
+
+The fix mirrors the refund path exactly: recover the txid locally via
+`getTxid` and fall through to the same bookkeeping, so an already-successful
+redeem is recorded rather than retried forever. Deliberately narrow -- every
+other publish failure still raises, because only "this exact transaction is
+already on chain" is safe to read as success.
+
+Upstream-PR candidate: this is a correctness bug in upstream's own code, not
+embedder policy. Any BasicSwap user on an electrum-mode BTC/LTC wallet can hit
+it, and both halves are wrong independent of how the node is embedded.
+
+Marker: PWNDA-PATCH-10
+---
+--- a/basicswap/interface/btc/btc.py
++++ b/basicswap/interface/btc/btc.py
+@@ -4949,8 +4949,25 @@
+         return None
+ 
+     def isTxExistsError(self, err_str: str) -> bool:
++        # PWNDA-PATCH-10: the electrum branch missed the message electrum
++        # actually returns for an already-MINED transaction.
++        #
++        # ElectrumX relays the node's own rejection verbatim, so a duplicate
++        # broadcast of a CONFIRMED transaction arrives as:
++        #     the transaction was rejected by network rules.
++        #     Transaction already in block chain
++        # which is the same "already in block chain" wording the non-electrum
++        # branch below already matches. "Transaction outputs already in utxo
++        # set" is a real electrum message too, but it is the UNCONFIRMED /
++        # mempool-collision case -- so matching only that one made this
++        # predicate answer False for the confirmed case it exists to catch,
++        # and every caller relying on it fell through to a fatal error.
++        # Observed on mainnet LTC 2026-08-23. Both messages are accepted now.
+         if self._connection_type == "electrum":
+-            return "Transaction outputs already in utxo set" in err_str
++            return (
++                "Transaction outputs already in utxo set" in err_str
++                or "Transaction already in block chain" in err_str
++            )
+         return "Transaction already in block chain" in err_str
+ 
+     def isTxNonFinalError(self, err_str: str) -> bool:
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -13007,7 +13007,39 @@
+             xmr_swap.a_lock_spend_tx = tx.serialize_without_witness()
+             xmr_swap.a_lock_spend_tx_id = ci_from.getTxid(xmr_swap.a_lock_spend_tx)
+ 
+-        txid = bytes.fromhex(ci_from.publishTx(xmr_swap.a_lock_spend_tx))
++        # PWNDA-PATCH-10: a duplicate broadcast of an already-mined redeem is
++        # a SUCCESS, not a failure.
++        #
++        # Upstream calls publishTx bare here. checkQueuedActions runs this on
++        # a periodic tick, and the bookkeeping that records the redeem
++        # (bid.xmr_a_lock_spend_tx, saved at the end of this function) only
++        # lands after the publish returns -- so an interruption between the
++        # two leaves a redeem that is genuinely on-chain and a bid that does
++        # not know it. The next tick rebuilds the SAME deterministic tx,
++        # rebroadcasts it, and the chain correctly rejects the duplicate.
++        # Upstream treats that rejection as a fatal action failure and parks
++        # the bid in BID_ERROR -- which checkXmrBidState has no branch to
++        # resume from -- so a swap that actually COMPLETED presents as "needs
++        # attention" indefinitely. Observed on mainnet XMR->LTC 2026-08-23.
++        #
++        # The coin-A refund path already handles this exact case with
++        # isTxExistsError; the redeem path simply never did. Mirror it:
++        # recover the txid locally and fall through to the SAME bookkeeping,
++        # so an already-successful redeem is recorded instead of retried
++        # forever. Deliberately narrow -- any other publish failure still
++        # raises, because only "this exact tx is already on chain" is safe to
++        # read as success.
++        try:
++            txid = bytes.fromhex(ci_from.publishTx(xmr_swap.a_lock_spend_tx))
++        except Exception as ex:
++            if not ci_from.isTxExistsError(str(ex)):
++                raise
++            txid = ci_from.getTxid(xmr_swap.a_lock_spend_tx)
++            self.log.info(
++                f"PWNDA-PATCH-10: coin A lock spend tx for bid "
++                f"{self.log.id(bid_id)} is already on chain "
++                f"({self.logIDT(txid)}); recording it rather than failing."
++            )
+         self.log.debug(
+             f"Submitted lock spend txn {self.logIDT(txid)} to {ci_from.coin_name()} chain for bid {self.log.id(bid_id)}."
+         )
+-- 
+2.43.0

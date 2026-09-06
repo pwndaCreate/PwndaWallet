@@ -1,0 +1,45 @@
+# PwndaWallet client -> pwnda-desk, INTERLEAVED transport sweep, 2026-08-13
+# Fixes the ordering confound DESK-ANSWER-v100 s2 found in the first sweep.
+# Reps OUTSIDE, sizes INSIDE, direction ALTERNATING each pass, so a slow
+# tunnel window lands on different sizes on different passes and drift
+# cannot alias onto the x-axis. 6 reps x 6 sizes, in measurement order.
+# NOTE: this session's tunnel is ~1.7x slower than the first sweep at EVERY
+# size (1000 bytes: 1699ms median here vs 999ms then). Only WITHIN-run
+# comparisons are valid - which is the same lesson as the confound itself.
+bytes,milliseconds
+1000,2057
+5000,1664
+10000,3776
+25000,2978
+50000,5371
+97786,5066
+97786,4802
+50000,2893
+25000,4000
+10000,1959
+5000,1613
+1000,1699
+1000,1970
+5000,1926
+10000,2301
+25000,3604
+50000,4527
+97786,5054
+97786,3931
+50000,2262
+25000,1839
+10000,1367
+5000,1780
+1000,1610
+1000,1675
+5000,1738
+10000,1551
+25000,1933
+50000,2519
+97786,3477
+97786,2985
+50000,2059
+25000,1800
+10000,1472
+5000,1533
+1000,1768

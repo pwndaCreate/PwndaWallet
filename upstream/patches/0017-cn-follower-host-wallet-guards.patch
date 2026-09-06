@@ -1,0 +1,244 @@
+From: PwndaWallet swap sidecar
+Date: 2026-09-03
+Subject: [PATCH 17/19] basicswap: guard ZanoInterface's main-wallet-rpc calls
+ against sending from the wrong wallet, mirroring PWNDA-PATCH-8's xmr.py
+ assertion
+
+PWNDA-PATCH-8's xmr.py hunk added a wrong-wallet assertion to
+XMRInterface.publishBLockTx, immediately before the transfer call --
+the same shape upstream commit 10ee0843 already gave findTxB and
+spendBLockTx ("guard against wrong-wallet reads made possible due to
+the preceding optimization commit"). Under Grove's host-managed-main-
+wallet deployment (PWNDA-PATCH-5 for XMR, PWNDA-PATCH-15's
+_external_main_wallet for ZANO), the host independently owns the
+wallet-rpc process this connection talks to and can switch or replace
+its account between the moment this interface last confirmed its
+identity and the moment it sends funds through it. PWNDA-PATCH-15
+(0015-zano-coin-module.patch) built the _external_main_wallet flag and
+the initialiseWallet no-op that makes host-wallet sharing possible for
+ZANO, but did not yet add a guard on the calls in ZanoInterface that
+actually move funds -- this patch is that guard.
+
+ZanoInterface cannot reuse xmr.py's exact mechanism verbatim: it does
+not inherit XMRInterface (it inherits CoinInterface directly -- see
+0015's class ZanoInterface(CoinInterface)), and Zano's wallet-rpc has
+no open_wallet/close_wallet RPC at all (ZanoInterface.openWallet is
+already a documented no-op -- Zano's wallet-rpc process always serves
+whatever account it was started with or last had generate_from_keys
+run against it). XMRInterface's _cached_main_wallet_address is
+populated by openWallet()'s fast path, which runs at the top of every
+wallet-touching call including publishBLockTx itself; ZanoInterface
+has no equivalent hook to populate it from.
+
+REVISED 2026-09-03 (Grove expansion master plan Verify phase): the
+first version of this patch guarded publishBLockTx alone. A 3-reviewer
+adversarial verify pass on unit B-X3's own output caught that
+ZanoInterface.withdrawCoin makes two of its own
+rpc_wallet("transfer", ...) calls on the SAME host-managed connection
+(the sweep-all branch and the plain-withdraw branch) with no identity
+check at all -- and withdrawCoin is reachable via the webview UI and
+the JSON-RPC `withdraw` route, not only from the swap engine. The
+patch's own header and an inline comment claimed publishBLockTx was
+"the one/single fund-moving main-wallet call in ZanoInterface", which
+was false: PWNDA-PATCH-15's own inline comment on the two-wallet-split
+rationale had already named withdrawCoin alongside publishBLockTx as a
+call that "would then silently operate on the wrong account" -- the
+pointer was sitting in the file this patch edits and was not followed
+the first time. See PwndaWalletVault/log.md's 2026-09-03 "PATCH-17
+coverage gap" entry for the full finding and this fix's verification.
+
+Four changes, all in basicswap/interface/zano/zano.py (0015's new
+file -- no shared-file conflict):
+
+1. __init__: adds self._cached_main_wallet_address, same name and
+   role as XMRInterface's field, initialised to None.
+
+2. initialiseWallet's _external_main_wallet branch (0015's Grove-only
+   no-op path): after logging, confirms and caches the live wallet's
+   address via a getaddress call. This is ZANO's analogue of
+   PWNDA-PATCH-8's basicswap.py checkWalletSeed hunk for XMR -- the
+   "host confirms its wallet's identity" moment, which for ZANO
+   happens here (bin/prepare.py's provisioning loop / reseedWallet, per
+   0015's own comment on this method) rather than in checkWalletSeed
+   (basicswap.py's xmr_based_coins branch does not special-case ZANO
+   today; when B-X2/0016 registers ZANO into that list, this cache is
+   additional defence, not required by it). A failed read leaves the
+   cache at None rather than a stale or guessed value.
+
+3. A new shared method, _confirmMainWalletIdentity: re-reads the
+   connection's live address and compares it to the cached value from
+   (2). Any mismatch -- INCLUDING "nothing was ever cached" (None) --
+   raises TemporaryError before the caller's fund-moving call is
+   reached. Fails closed deliberately: an unconfirmed wallet is not
+   treated as an acceptable one to spend from. Gated on
+   self._external_main_wallet, exactly as PATCH-8's xmr.py guard is
+   gated on the equivalent XMR flag, so a non-Grove embedder running
+   0015 with _external_main_wallet left at its default (False) sees no
+   behaviour change from this patch at all. Factored out as its own
+   method (rather than inlined per call site, as the first version of
+   this patch did) specifically so a future fund-moving call added to
+   this file only has to call it, not reimplement it.
+
+4. Three call sites, all immediately before their own
+   self.rpc_wallet("transfer", ...) call: publishBLockTx (the swap
+   settlement leg, as before), and withdrawCoin's two branches
+   (sweep-all and plain transfer, newly guarded).
+
+Deliberately NOT done here (out of scope for this unit, no shared-file
+edits): registering ZANO into basicswap.py's xmr_based_coins /
+checkWalletSeed special case (that is PWNDA-PATCH-16 / B-X2's and the
+integrator's business, and this guard does not depend on it -- the
+cache is populated locally, inside zano.py, by (2) above, independent
+of whether the shared checkWalletSeed hunk ever sees Coins.ZANO).
+
+Verification: py_compile against a scratch copy at p12+0015 (0013 also
+present as a harmless, file-disjoint extra -- new zephyr module only);
+a hand-built mutation test with a stubbed rpc_wallet confirms
+_confirmMainWalletIdentity raises TemporaryError before any of the
+three callers' "transfer" stub branch is ever reached, for a
+live-address mismatch and for an unconfirmed (None) cache, on ALL
+THREE call sites (publishBLockTx, withdrawCoin sweep-all,
+withdrawCoin plain) -- not just the one the first version tested --
+plus a positive control confirming a matching identity does not block
+a legitimate send. See PwndaWalletVault/log.md's 2026-09-03 entries
+("Unit B-X3: Zano host-wallet guard" and the same-day "PATCH-17
+coverage gap" follow-up) and
+PwndaWalletVault/wiki/synthesis/grove-expansion-master-plan.md (§ 3,
+unit B-X3) for the full writeup.
+
+---
+ basicswap/interface/zano/zano.py | 80 +++++++++++++++++++++++++++++++++++++
+ 1 file changed, 80 insertions(+)
+
+
+RECONSTRUCTED BODY 2026-09-03: the header above is the original prose,
+restored verbatim; the diff body below was regenerated from a verified tree
+pair after the file was lost, because the hand-restored body carried correct
+ADDED lines but hand-written CONTEXT lines that did not match the tree.
+
+diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
+index 9acf42c..ac81ad8 100644
+--- a/basicswap/interface/zano/zano.py
++++ b/basicswap/interface/zano/zano.py
+@@ -242,6 +242,17 @@ class ZanoInterface(CoinInterface):
+         self._have_checked_seed = False
+         self._wallet_filename = coin_settings.get("wallet_name", "swap_wallet")
+ 
++        # PWNDA-PATCH-17: last address this interface CONFIRMED the wallet-rpc
++        # connection (self.rpc_wallet) was actually serving. Same name and role
++        # as XMRInterface._cached_main_wallet_address (PWNDA-PATCH-8's xmr.py
++        # hunk), populated here by initialiseWallet's host-managed branch below
++        # instead of by an openWallet() fast path -- Zano has no open_wallet
++        # RPC to hook that into (see openWallet() a few lines down, a no-op).
++        # None until the first confirm; publishBLockTx below refuses to send
++        # while it is None, rather than treating "never confirmed" as "assume
++        # OK".
++        self._cached_main_wallet_address = None
++
+         # PWNDA-PATCH-15 (a): True when this ZANO deployment shares an externally
+         # (host-)managed main wallet rather than one BasicSwap derives from its own
+         # seed -- Grove's ONLY deployment shape for ZANO (see interface/zano/core.py's
+@@ -543,6 +554,25 @@ class ZanoInterface(CoinInterface):
+                     "own address is used as the swap destination via "
+                     "getCachedMainWalletAddress."
+                 )
++                # PWNDA-PATCH-17: this IS the "host confirms its wallet's identity"
++                # moment for ZANO (the analogue of PWNDA-PATCH-8's checkWalletSeed
++                # hunk for XMR, which runs at the same call-graph depth -- prepare's
++                # provisioning loop / reseedWallet). Cache what rpc_wallet reports
++                # NOW, before any swap has a chance to run, so the guard below has a
++                # genuine "confirmed earlier" value to re-check against rather than
++                # re-deriving "expected" from the same live read it is about to
++                # compare -- that would let a wallet swapped in BEFORE this call
++                # always pass. A failure to read it here is left uncached (stays
++                # None); every guarded call site then fails closed rather than send.
++                try:
++                    self._cached_main_wallet_address = self.rpc_wallet("getaddress")[
++                        "address"
++                    ]
++                except Exception as e:
++                    self._log.warning(
++                        f"PWNDA-PATCH-17: could not confirm ZANO main wallet address "
++                        f"at startup: {e}"
++                    )
+                 return
+ 
+             # ---- REU26's original behaviour, UNCHANGED, for any non-Grove deployment. ----
+@@ -593,6 +623,38 @@ class ZanoInterface(CoinInterface):
+                 "the payout address is then taken from the live wallet."
+             )
+ 
++    def _confirmMainWalletIdentity(self) -> None:
++        # PWNDA-PATCH-17 (revised): re-read the main wallet-rpc connection's live
++        # address and compare it to the identity confirmed earlier by
++        # initialiseWallet's _external_main_wallet branch, above. Raises
++        # TemporaryError on ANY mismatch, INCLUDING "nothing was ever cached"
++        # (None) -- fails closed, exactly as PWNDA-PATCH-8's xmr.py guard does for
++        # XMRInterface. No-op when _external_main_wallet is False: only a
++        # host-managed main wallet can be switched out from under this connection
++        # by a party other than this swap engine; a REU26-shape deployment (main
++        # wallet seed-derived, engine-exclusive) has no such actor.
++        #
++        # Call this immediately before EVERY self.rpc_wallet("transfer", ...) (or
++        # other spend) call reachable on the main wallet-rpc connection while
++        # _external_main_wallet may be set -- not just from publishBLockTx. The
++        # first version of this patch guarded publishBLockTx alone and missed
++        # that withdrawCoin's two transfer sites share the exact same connection
++        # and the exact same race, and withdrawCoin is reachable from the webview
++        # UI and the JSON-RPC API, not only from the swap engine -- see the
++        # 2026-09-03 log.md follow-up entry ("PATCH-17 coverage gap").
++        if not self._external_main_wallet:
++            return
++        try:
++            open_wallet_addr = self.rpc_wallet("getaddress")["address"]
++        except Exception:
++            open_wallet_addr = "UNKNOWN"
++        if open_wallet_addr != self._cached_main_wallet_address:
++            raise TemporaryError(
++                f"main wallet-rpc connection reports {open_wallet_addr}, expected "
++                f"confirmed identity {self._cached_main_wallet_address}; "
++                f"refusing to send"
++            )
++
+     def ensureWalletExists(self) -> None:
+         # Nothing to do, and deliberately NOT a generate_from_keys call: that RPC is
+         # destructive and one-way (quirk 4), so there is no "open the existing wallet
+@@ -823,6 +885,16 @@ class ZanoInterface(CoinInterface):
+                 "payment_id": "",
+                 "comment": "",
+             }
++
++            # PWNDA-PATCH-17: confirm the wallet-rpc connection this transfer is
++            # about to fire on really is the wallet whose identity was confirmed
++            # earlier (initialiseWallet's _external_main_wallet branch), immediately
++            # before the call that spends from it, not after. See
++            # _confirmMainWalletIdentity's own docstring for why this check is a
++            # shared method rather than inlined here -- withdrawCoin needs the
++            # identical guard on its own transfer calls, on the same connection.
++            self._confirmMainWalletIdentity()
++
+             rv = self.rpc_wallet("transfer", params)
+             self._log.info(
+                 "publishBLockTx {} to address_b58 {}".format(
+@@ -1344,6 +1416,12 @@ class ZanoInterface(CoinInterface):
+                         "sum_fee": fee,
+                         "sum_weight": 0,
+                     }
++                # PWNDA-PATCH-17: same guard as publishBLockTx, on the same
++                # main-wallet-rpc connection -- see _confirmMainWalletIdentity.
++                # A sweep-all is the single most damaging call to run against a
++                # wrong/swapped wallet (it sends the WHOLE balance), so this is
++                # not an optional extra.
++                self._confirmMainWalletIdentity()
+                 rv = self.rpc_wallet("transfer", params)
+                 return rv["tx_hash"]
+ 
+@@ -1362,6 +1440,8 @@ class ZanoInterface(CoinInterface):
+                     "sum_fee": fee,
+                     "sum_weight": 0,
+                 }
++            # PWNDA-PATCH-17: same guard, plain (non-sweep) withdraw branch.
++            self._confirmMainWalletIdentity()
+             rv = self.rpc_wallet("transfer", params)
+             return rv["tx_hash"]
+ 

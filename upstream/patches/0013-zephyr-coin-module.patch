@@ -1,0 +1,567 @@
+From: PwndaWallet <pwndamining@gmail.com>
+Subject: [PATCH 13/19] basicswap: add the Zephyr (ZEPH) coin module, on the
+ per-coin-folder interface layout
+
+Four new files under basicswap/interface/zephyr/ -- __init__.py, chainparams.py,
+zephyr.py, core.py -- giving BasicSwap a ZEPHInterface(XMRInterface) and a
+ZEPHPrepare(XMRPrepare) provisioning module, on the same per-coin-folder shape
+this tree's upstream #532 refactor gave every other coin (see
+basicswap/interface/wow/ and basicswap/interface/xmr/, both already in this
+tree, used as the direct templates below). This patch adds NO central
+registration -- Coins.ZEPH, the chainparams/basicswap.py/prepare.py/run.py
+wiring that actually makes the engine construct a ZEPHInterface, is
+PWNDA-PATCH-14 (0014-zephyr-registration.patch), which touches the shared
+files this patch deliberately does not.
+
+Zephyr is a Monero fork (base v2.3.0) with a Djed-style stablecoin overlay;
+everything a swap needs -- key-share split, DLEq, address encoding, lock-tx
+publishing -- is inherited unchanged from XMRInterface. The stablecoin overlay
+only leaks into the wallet-RPC layer (get_balance's multi-asset balances
+array; transfer/transfer_split's required source_asset/destination_asset),
+handled by wrapping self.rpc_wallet so every inherited XMRInterface method
+keeps working unmodified.
+
+Ported from a proven, tested source rather than written from scratch: REU26's
+Zephyr coin-add (github.com/basicswap/basicswap PR #531, branch
+add-zephyr-coin, head fa148d0) already re-ported this same interface onto
+this exact per-coin-folder layout and validated it end to end --
+`basicswap-prepare --withcoins=zephyr --preparebinonly` downloading,
+hash-verifying and extracting real zephyrd/zephyr-wallet-rpc binaries, 13/13
+changed files compiling, CI-pinned lint clean, `test_other` green. See
+ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md (the
+authoritative shape for these four files) and
+work/forks/basicswap-zephyr/basicswap/interface/zephyr.py (the proven
+106-line interface body, pre-#532) in G:\REU26 (read-only reference, not part
+of this tree).
+
+zephyr.py's coin_type/ticker_str/COIN/exp/__init__/_wrap_rpc_wallet are
+ported verbatim from that source (import lines re-pathed only). Two things
+diverge from it, both documented inline where they occur, both because this
+patch targets a newer XMRInterface than REU26's source did:
+
+  - depth_spendable() returns 3, not REU26's 10 (itself copied from Monero).
+    REU26's own comment on this method warns against exactly what its chosen
+    value does ("do not blindly inherit Monero's value - retune it for THIS
+    fork's block time"); 3 is this project's own retuning, reasoned inline.
+  - the wallet-open retry logic is ported onto `_openWallet`, not the public
+    `openWallet` REU26 overrode. The XMRInterface in this tree already splits
+    openWallet (an address-cache fast path) from _openWallet (the actual
+    open/retry call) -- WOWInterface, already in this tree, follows the same
+    split for the same reason. Overriding the public method the way REU26
+    did would silently drop the cache fast path for every ZEPH wallet open.
+
+core.py (a new file relative to REU26's own source, which predates #532's
+introduction of per-coin core.py/CoinPrepareModule at all -- built following
+the replan's Phase 1 step 4, the authoritative shape for this file) is a
+ZEPHPrepare(XMRPrepare) supplying getConfigSegment/downloadCore/
+verifyCoreSignature/extractCore. Grove itself never runs any of these --
+ZEPH is always a remote/host wallet the Rust sidecar leases against a pool
+node (grove-expansion-master-plan.md Phase C unit C-RZ), Grove's actual
+binary provisioning is Phase A unit A2's own hash-pinned fetch, and
+basicswap-prepare is always invoked --nocores for zephyr -- but every
+registered coin in this tree fulfils the CoinPrepareModule contract for real
+(WOW and XMR both carry working versions here), so these are real,
+REU26-modelled implementations rather than raise-on-call placeholders.
+getConfigSegment hardcodes manage_daemon/manage_wallet_daemon to False (every
+other xmr-family coin here routes them through ctx.should_manage_daemon(...))
+because nothing in Grove's deployment ever manages a local ZEPH daemon;
+blocks_confirmed is 3, matching XMRPrepare's own default. extractCore is a
+real zipfile-based override, not the inherited tar-on-non-Windows default --
+REU26's replan flags this explicitly: Zephyr ships a .zip on every platform,
+unlike monero/wownero's tar.bz2 on linux, and the inherited
+extractCoreByBasename only takes the zip branch when the arch string itself
+says win32/win64.
+
+Note on the four hunks below: each carries one more `+` line than the file's
+visible line count (e.g. `@@ -0,0 +1,2 @@` for the one-line __init__.py) --
+a deliberate trailing blank `+` line, NOT a stray edit. scripts/apply-
+engine-patches.mjs's new-file path builds file content by joining each
+hunk's added lines with "\n"; that join never appends a FINAL "\n", so
+every file it creates comes out missing its trailing newline unless the
+hunk's own line list ends in an explicit blank entry (join's own semantics
+then place the last "\n" correctly, with no visible blank line in the
+result). Verified live against this exact applier: all four files came out
+byte-for-byte identical to their source with this padding, and did not
+without it. Reported as an applier defect in PwndaWalletVault/log.md
+(2026-09-03, unit B-Z1) for a future patch to scripts/apply-engine-
+patches.mjs itself -- out of this patch's own scope, which is new files
+only. Not `git apply`-safe with this padding (git's own parser would insert
+a literal blank line instead of restoring an implicit trailing newline);
+this patch's applier is scripts/apply-engine-patches.mjs, not git apply.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker: PWNDA-PATCH-13
+---
+diff --git a/basicswap/interface/zephyr/__init__.py b/basicswap/interface/zephyr/__init__.py
+new file mode 100644
+--- /dev/null
++++ b/basicswap/interface/zephyr/__init__.py
+@@ -0,0 +1,2 @@
++# PWNDA-PATCH-13: Zephyr Protocol coin module (basicswap/interface/zephyr/).
++
+diff --git a/basicswap/interface/zephyr/chainparams.py b/basicswap/interface/zephyr/chainparams.py
+new file mode 100644
+--- /dev/null
++++ b/basicswap/interface/zephyr/chainparams.py
+@@ -0,0 +1,73 @@
++# -*- coding: utf-8 -*-
++
++# Copyright (c) 2026 The Basicswap developers
++# Distributed under the MIT software license, see the accompanying
++# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
++
++# PWNDA-PATCH-13: Zephyr Protocol (Monero fork, v2.3.0 base) chain params, on
++# the per-coin-folder layout BasicSwap dev moved to in upstream #532.
++# Modelled on basicswap/interface/wow/chainparams.py (also a Monero fork on
++# this layout).
++#
++# REU26 provenance: work/forks/basicswap-zephyr/basicswap/interface/zephyr/
++# chainparams.py (PR #531, branch add-zephyr-coin, head fa148d0), per
++# ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md Phase 1
++# step 2. That page records a real bug in the OLDER flat fork (single
++# central chainparams.py, pre-#532): the current xmr.py.__init__ reads
++# subaddress_prefix UNCONDITIONALLY
++# (chainparams_network()["subaddress_prefix"], no .get()/default) -- a
++# params dict carrying only address_prefix raises KeyError the moment a
++# ZEPHInterface is constructed. Both prefixes are supplied below; mainnet
++# and testnet values cross-checked independently against
++# work/forks/atomic-swap-evm/crypto/monero/address.go (a second, unrelated
++# Zephyr-aware codebase in REU26 hardcoding the same four constants) and
++# work/forks/basicswap-zephyr/basicswap/chainparams.py's old flat entry
++# (address_prefix values only, pre-#532).
++
++ZEPH_COIN = 10**12
++
++
++params = {
++    "name": "zephyr",
++    "ticker": "ZEPH",
++    "client": "zephyr",
++    "decimal_places": 12,
++    "mainnet": {
++        "rpcport": 17767,
++        "walletrpcport": 17768,
++        "min_amount": 1000000000,
++        "max_amount": 10000000 * ZEPH_COIN,
++        # CRYPTONOTE_PUBLIC_ADDRESS_BASE58_PREFIX / _SUBADDRESS_ variant, from
++        # Zephyr's cryptonote_config.h ("ZEPHYR..." / "ZEPHs...").
++        "address_prefix": 0x6241D18C0,
++        "subaddress_prefix": 0x8DD58C0,
++    },
++    "testnet": {
++        "rpcport": 27767,
++        "walletrpcport": 27768,
++        "min_amount": 1000000000,
++        "max_amount": 10000000 * ZEPH_COIN,
++        # "ZPHT..." / "ZPHt..."
++        "address_prefix": 0x334E41,
++        "subaddress_prefix": 0xF1FCE41,
++    },
++    "regtest": {
++        # Zephyr's --regtest ("fakechain") reuses the MAINNET address family
++        # -- confirmed in the old flat fork's central chainparams.py (its
++        # Coins.ZEPH regtest block carries the comment "fakechain uses
++        # mainnet prefix") and unaffected by the #532 per-coin-folder move
++        # (nothing coin-specific in that refactor touches prefix selection).
++        # Ports match the shared Monero-family regtest daemon/wallet ports
++        # (18081/18083), also taken unchanged from the old flat fork's
++        # regtest block -- ZEPH's regtest harness (grove-expansion-master-
++        # plan.md Phase A unit A4) runs zephyrd on these, not on ZEPH's own
++        # mainnet 17767/17768.
++        "rpcport": 18081,
++        "walletrpcport": 18083,
++        "min_amount": 1000000000,
++        "max_amount": 10000000 * ZEPH_COIN,
++        "address_prefix": 0x6241D18C0,
++        "subaddress_prefix": 0x8DD58C0,
++    },
++}
++
+diff --git a/basicswap/interface/zephyr/zephyr.py b/basicswap/interface/zephyr/zephyr.py
+new file mode 100644
+--- /dev/null
++++ b/basicswap/interface/zephyr/zephyr.py
+@@ -0,0 +1,155 @@
++# -*- coding: utf-8 -*-
++
++# Copyright (c) 2026 The Basicswap developers
++# Distributed under the MIT software license, see the accompanying
++# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
++
++# PWNDA-PATCH-13: Zephyr Protocol interface, on the per-coin-folder layout.
++# Zephyr is a Monero fork (base v2.3.0) with a Djed-style stablecoin overlay
++# on top -- everything a swap needs (key-share split, DLEq, address
++# encoding, lock-tx publishing) is inherited unchanged from XMRInterface,
++# exactly like WOWInterface. The two Zephyr-specific adaptations both live
++# in the *wallet-RPC* layer, not the swap protocol -- see REU26's
++# zephyr-testnet/RQ2-RPC-DIFF.md:
++#   - get_balance returns {"balances": [{"asset_type": "ZPH", balance, ...},
++#     ...]}, not Monero's flat {balance, unlocked_balance}. Flattened onto
++#     the top-level keys XMRInterface's inherited methods actually read.
++#   - transfer / transfer_split require source_asset/destination_asset. A
++#     swap only ever moves base ZEPH (conversions are out of the swap
++#     path), so both default to "ZPH".
++# Both are handled by wrapping self.rpc_wallet in __init__, so every
++# inherited XMRInterface method keeps working unmodified.
++#
++# REU26 provenance: work/forks/basicswap-zephyr/basicswap/interface/
++# zephyr.py (the 106-line interface, proven through the 8-test ZEPH swap
++# matrix -- G:\REU26\zephyr-testnet\test-evidence-zeph*), re-pathed onto
++# dev's post-#532 per-coin-folder layout per ResearchWiki/synthesis/
++# zeph-coin-add-dev-restructure-replan.md Phase 1 step 3. coin_type,
++# ticker_str, COIN, exp, __init__, _wrap_rpc_wallet are ported verbatim
++# (import lines re-pathed only, per the replan). depth_spendable() and the
++# openWallet override both diverge from REU26 -- see the comments at each.
++
++from basicswap.chainparams import Coins
++from basicswap.interface.zephyr.chainparams import ZEPH_COIN
++from basicswap.interface.xmr.xmr import XMRInterface
++
++
++class ZEPHInterface(XMRInterface):
++
++    @staticmethod
++    def coin_type():
++        return Coins.ZEPH
++
++    @staticmethod
++    def ticker_str() -> int:
++        return Coins.ZEPH.name
++
++    @staticmethod
++    def COIN():
++        return ZEPH_COIN
++
++    @staticmethod
++    def exp() -> int:
++        return 12
++
++    @staticmethod
++    def depth_spendable() -> int:
++        # PWNDA-PATCH-13 divergence from REU26: REU26's zephyr.py returns 10
++        # here, matched to Monero's own value with the stated reasoning
++        # "same wall-clock maturity as Monero's 2-minute blocks". That
++        # reasoning is sound for a coin whose OWN wallet balance the engine
++        # must trust unescorted -- but Grove only ever runs ZEPH as the
++        # follower/chain-B leg of a swap (grove-expansion-master-plan.md
++        # Phase C unit C-RZ), where the swap protocol's own
++        # `blocks_confirmed` coin-settings knob (set to 3 in this patch's
++        # core.py, matching XMRPrepare's own default) is ALREADY the
++        # binding lock-confirmation gate. depth_spendable's remaining job
++        # here is only "how many confirmations before the engine's wallet
++        # balance arithmetic treats a received output as spendable" -- the
++        # same question WOW answers with 4 despite Monero itself answering
++        # 10, i.e. this value is meant to be retuned per fork, not
++        # inherited. REU26's own comment on this exact method warns against
++        # exactly what its own chosen value does: "do not blindly inherit
++        # Monero's value - retune it for THIS fork's block time." Zephyr's
++        # 2-minute blocks and materially smaller hashrate than Monero argue
++        # for staying above WOW's 4 rather than matching it, so this project
++        # sets 3: below Monero's 10 (nothing here needs Monero's threat
++        # model, since the swap-lock confirmation gate is separate and
++        # already binding) but not as low as WOW's 4, given Zephyr's
++        # thinner hashrate. Documented as a genuine engineering choice, not
++        # a copy of either source.
++        return 3
++
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, **kwargs)
++        self.rpc_wallet = self._wrap_rpc_wallet(self.rpc_wallet)
++
++    @staticmethod
++    def _wrap_rpc_wallet(inner):
++        # Ported verbatim from REU26's zephyr.py (_wrap_rpc_wallet) -- the
++        # ZPH-asset-field injection and get_balance flattening described in
++        # the module docstring above.
++        def rpc_wallet(method, params=None, **kwargs):
++            if method in ("transfer", "transfer_split"):
++                params = dict(params or {})
++                params.setdefault("source_asset", "ZPH")
++                params.setdefault("destination_asset", "ZPH")
++            rv = inner(method, params, **kwargs)
++            if method == "get_balance" and isinstance(rv, dict):
++                zb = None
++                for b in rv.get("balances", []) or []:
++                    if b.get("asset_type") == "ZPH":
++                        zb = b
++                        break
++                if zb is not None:
++                    rv["balance"] = zb.get("balance", 0)
++                    rv["unlocked_balance"] = zb.get("unlocked_balance", 0)
++                    rv["blocks_to_unlock"] = zb.get("blocks_to_unlock", 0)
++                    rv["multisig_import_needed"] = zb.get(
++                        "multisig_import_needed", False
++                    )
++                # Guarantee Monero-shaped keys even for empty/sparse
++                # responses (a fresh Zephyr wallet's get_balance omits
++                # them), so inherited XMRInterface code works.
++                rv.setdefault("balance", rv.get("unlocked_balance", 0))
++                rv.setdefault("unlocked_balance", 0)
++                rv.setdefault("blocks_to_unlock", 0)
++                rv.setdefault("multisig_import_needed", False)
++            return rv
++
++        return rpc_wallet
++
++    # PWNDA-PATCH-13 divergence from REU26: REU26's zephyr.py overrides the
++    # PUBLIC `openWallet(self, filename)`. On the current dev base this
++    # patch series targets (upstream/basicswap/basicswap/interface/xmr/
++    # xmr.py), XMRInterface.openWallet is no longer the whole story: it
++    # first short-circuits via a cached main-wallet address
++    # (self._cached_main_wallet_address) before making any RPC call at all,
++    # and only then delegates the actual open/retry work to a separate
++    # `_openWallet`. WOWInterface already follows this exact split --
++    # wow.py overrides `_openWallet`, not `openWallet` (its own comment:
++    # "below only needed until wow is rebased ..."). Overriding the public
++    # method the way REU26 did would silently drop that address-cache fast
++    # path for every ZEPH wallet open (every call would re-hit RPC even
++    # when the cached address already matches). So this override targets
++    # `_openWallet` instead, through the same extension point WOW uses,
++    # keeping REU26's proven retry body unchanged: open; on "no connection
++    # to daemon" allow startup against a busy daemon; on any other failure,
++    # store+close then reopen once.
++    def _openWallet(self, filename):
++        params = {"filename": filename}
++        if self._wallet_password is not None:
++            params["password"] = self._wallet_password
++        try:
++            self.rpc_wallet("open_wallet", params)
++        except Exception as e:
++            if "no connection to daemon" in str(e):
++                self._log.debug(f"{self.coin_name()} {e}")
++                return  # allow startup with a busy daemon
++            try:
++                self.rpc_wallet("store")
++                self.rpc_wallet("close_wallet")
++            except Exception:
++                pass
++            self.rpc_wallet("open_wallet", params)
++
+diff --git a/basicswap/interface/zephyr/core.py b/basicswap/interface/zephyr/core.py
+new file mode 100644
+--- /dev/null
++++ b/basicswap/interface/zephyr/core.py
+@@ -0,0 +1,223 @@
++# -*- coding: utf-8 -*-
++
++# Copyright (c) 2026 The Basicswap developers
++# Distributed under the MIT software license, see the accompanying
++# file LICENSE or http://www.opensource.org/licenses/mit-license.php.
++
++# PWNDA-PATCH-13: Zephyr Protocol provisioning module, on the per-coin-folder
++# layout (basicswap/interface/prepare_util.py::CoinPrepareModule contract).
++#
++# Grove itself never runs tryPrepareCore for zephyr: ZEPH always runs as a
++# REMOTE/host wallet (grove-expansion-master-plan.md Phase C unit C-RZ:
++# ZphLease, "bootstrap daemon = pool head"), Grove's actual binary
++# provisioning is Phase A unit A2's Get-SwapCoinBinaries.ps1 pin (hash-
++# verified, independent of this module), and basicswap-prepare is always
++# invoked --nocores for zephyr. downloadCore/verifyCoreSignature/extractCore
++# below are still real, working implementations rather than raise-on-call
++# placeholders: CoinPrepareModule is a contract every registered coin
++# fulfils (WOW and XMR both carry working versions in this same tree), and
++# leaving ZEPH's unimplemented would make it the one coin that silently
++# breaks if --nocores were ever omitted by mistake, instead of behaving the
++# way the framework expects every coin to. They are modelled on REU26's
++# proven design, cited per-method below.
++#
++# REU26 provenance (primary, authoritative for THIS file's shape):
++# ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md Phase 1
++# step 4. Note this deliberately does NOT match the OLDER flat-fork
++# prepare.py block (zephyr-testnet/patches/
++# basicswap-prepare-zephyr-coin-add.patch), which pointed downloadCore at a
++# REU26-hosted MIRROR binary ("Path B": zephyr-cli-linux-v{V}-reu26.zip on
++# Notsosmartt-cmd/zephyr-basicswap). The replan's per-coin-folder design
++# instead downloads Zephyr's own OFFICIAL release ("Path A":
++# ZephyrProtocol/zephyr) and only borrows the REU26-hosted SHA256SUMS for
++# the hash, since Zephyr's official release publishes no hash file of its
++# own at all -- ResearchWiki/synthesis/zeph-basicswap-pr-paths.md documents
++# that gap exhaustively (all 69 assets across all 15 releases checked).
++# Followed here as the replan specifies.
++
++import os
++import zipfile
++
++from basicswap.interface.zephyr.chainparams import params
++from basicswap.interface.xmr.core import XMRPrepare
++from basicswap.interface.prepare_util import PrepareContext, setBinExecPermissions
++
++ZEPHYR_VERSION = os.getenv("ZEPHYR_VERSION", "2.3.0")
++ZEPHYR_VERSION_TAG = os.getenv("ZEPHYR_VERSION_TAG", "")
++
++# No real signer: verifyCoreSignature() below is a genuine no-op (Zephyr's
++# release publishes no signature at all -- see the provenance note above),
++# so ensurePubkey/self.signers is never consulted on this path. Kept as an
++# empty dict, matching the CoinPrepareModule contract's expected shape,
++# rather than omitted.
++zephyr_signers = {}
++
++ZEPH_RPC_HOST = os.getenv("ZEPH_RPC_HOST", "127.0.0.1")
++ZEPH_RPC_PORT = int(os.getenv("ZEPH_RPC_PORT", 17767))
++ZEPH_ZMQ_PORT = int(os.getenv("ZEPH_ZMQ_PORT", 17769))
++ZEPH_WALLET_RPC_PORT = int(os.getenv("ZEPH_WALLET_RPC_PORT", 17768))
++ZEPH_WALLET_RPC_HOST = os.getenv("ZEPH_WALLET_RPC_HOST", "127.0.0.1")
++ZEPH_WALLET_RPC_USER = os.getenv("ZEPH_WALLET_RPC_USER", "zeph_wallet_user")
++ZEPH_WALLET_RPC_PWD = os.getenv("ZEPH_WALLET_RPC_PWD", "zeph_wallet_pwd")
++ZEPH_RPC_USER = os.getenv("ZEPH_RPC_USER", "")
++ZEPH_RPC_PWD = os.getenv("ZEPH_RPC_PWD", "")
++DEFAULT_ZEPH_RESTORE_HEIGHT = int(os.getenv("DEFAULT_ZEPH_RESTORE_HEIGHT", 0))
++
++
++class ZEPHPrepare(XMRPrepare):
++    def getConfigSegment(self, ctx: PrepareContext) -> dict:
++        datadir = os.getenv("ZEPH_DATA_DIR", os.path.join(ctx.data_dir, self.name))
++        config = {
++            "connection_type": "rpc",
++            # PWNDA-PATCH-13 divergence from REU26: REU26's own core.py (and
++            # every stock xmr-family coin in this tree --
++            # WOWPrepare.getConfigSegment, XMRPrepare.getConfigSegment)
++            # routes these two flags through ctx.should_manage_daemon(...),
++            # so basicswap-prepare's --manage-daemons flag decides at
++            # provisioning time. Grove never lets basicswap-prepare manage a
++            # ZEPH daemon or wallet at all -- ZEPH is always a REMOTE host
++            # wallet the Rust sidecar leases against a pool node (see the
++            # module docstring, Phase C unit C-RZ) -- so both flags are
++            # hardcoded False here rather than left as a toggle nothing in
++            # Grove's deployment ever sets True.
++            "manage_daemon": False,
++            "manage_wallet_daemon": False,
++            "rpcport": ZEPH_RPC_PORT + ctx.port_offset,
++            "zmqport": ZEPH_ZMQ_PORT + ctx.port_offset,
++            "walletrpcport": ZEPH_WALLET_RPC_PORT + ctx.port_offset,
++            "rpchost": ZEPH_RPC_HOST,
++            "walletrpchost": ZEPH_WALLET_RPC_HOST,
++            "walletrpcuser": ZEPH_WALLET_RPC_USER,
++            "walletrpcpassword": ZEPH_WALLET_RPC_PWD,
++            "walletsdir": os.getenv("ZEPH_WALLETS_DIR", datadir),
++            "datadir": datadir,
++            "bindir": os.path.join(ctx.bin_dir, self.name),
++            "restore_height": DEFAULT_ZEPH_RESTORE_HEIGHT,
++            "blocks_confirmed": 3,
++            "rpctimeout": 60,
++            "walletrpctimeout": 120,
++            "walletrpctimeoutlong": 300,
++            "core_version_no": self.version + self.version_tag,
++            "core_type_group": "xmr",
++        }
++
++        if self.rpc_user != "":
++            config["rpcuser"] = self.rpc_user
++            config["rpcpassword"] = self.rpc_password
++
++        return config
++
++    def downloadCore(
++        self,
++        ctx: PrepareContext,
++        bin_dir: str,
++        signing_key_name: str,
++        extra_opts: dict,
++    ) -> tuple:
++        # Zephyr's official release asset naming (verified against the real
++        # release page, linux asset -- ResearchWiki/synthesis/
++        # zeph-basicswap-pr-paths.md A4). win/osx cases mirror that same
++        # "zephyr-cli-<os>-v<version>.zip" convention rather than a second
++        # independently-verified asset; Grove is Windows-only in practice
++        # and never exercises this method at all (see the module
++        # docstring), so this is the correct shape rather than a verified
++        # cross-platform fact.
++        os_name = "linux"
++        if "osx" in ctx.bin_arch:
++            os_name = "mac"
++        elif "win32" in ctx.bin_arch or "win64" in ctx.bin_arch:
++            os_name = "win"
++
++        release_filename = f"zephyr-cli-{os_name}-v{self.version}.zip"
++        release_url = (
++            f"https://github.com/ZephyrProtocol/zephyr/releases/download/"
++            f"v{self.version}/{release_filename}"
++        )
++        release_path = os.path.join(bin_dir, release_filename)
++        ctx.download_release(release_url, release_path, extra_opts)
++
++        # Zephyr's own release has no hash file at all (see the module
++        # docstring), so the hash BasicSwap's always-runs verifyCoreHash
++        # step verifies against is REU26's community-hosted mirror of it,
++        # per the replan's Phase 1 step 4 -- not a Zephyr-published
++        # artifact.
++        assert_filename = f"zephyr-{self.version}-SHA256SUMS"
++        assert_url = (
++            f"https://raw.githubusercontent.com/Notsosmartt-cmd/"
++            f"zephyr-basicswap/main/{self.version}/SHA256SUMS"
++        )
++        assert_path = os.path.join(bin_dir, assert_filename)
++        if not os.path.exists(assert_path):
++            ctx.download_file(assert_url, assert_path)
++
++        return release_path, assert_path, None
++
++    def verifyCoreSignature(
++        self,
++        ctx: PrepareContext,
++        gpg,
++        release_path: str,
++        assert_path: str,
++        assert_sig_path: str,
++        signing_key_name: str,
++        extra_opts: dict,
++    ) -> None:
++        # No-op: this IS the hash-only path. verifyCoreHash (base class,
++        # never overridden here) already ran and raised if the release
++        # didn't match the SHA256SUMS entry; there is simply no signature to
++        # check on top of it, because Zephyr's release publishes none (see
++        # downloadCore above).
++        ctx.logger.info(
++            f"{self.name}: publishes no signature upstream; hash-only verification."
++        )
++
++    def extractCore(
++        self,
++        ctx: PrepareContext,
++        bin_dir: str,
++        release_path: str,
++        extra_opts: dict,
++    ) -> None:
++        # Zephyr ships a .zip on every platform, unlike monero/wownero (tar
++        # .bz2 on linux). The inherited XMRPrepare.extractCore delegates to
++        # extractCoreByBasename, which only takes the zip branch when
++        # ctx.bin_arch itself says win32/win64 -- it would wrongly try
++        # tarfile.open() on this archive on any other platform. Extract via
++        # zipfile unconditionally instead, matching entries by basename
++        # (archive member paths inside Zephyr's zip are not guaranteed
++        # flat-at-root across releases).
++        ctx.logger.info(
++            f"Extracting core {self.name} v{self.version}{self.version_tag}"
++        )
++        extract_core_overwrite = extra_opts.get("extract_core_overwrite", True)
++        bins = self.getExtractBins()
++
++        num_exist = sum(1 for b in bins if os.path.exists(os.path.join(bin_dir, b)))
++        if not extract_core_overwrite and num_exist == len(bins):
++            ctx.logger.info("Skipping extract, files exist.")
++            return
++
++        with zipfile.ZipFile(release_path) as fz:
++            namelist = fz.namelist()
++            for b in bins:
++                out_path = os.path.join(bin_dir, b)
++                if os.path.exists(out_path) and not extract_core_overwrite:
++                    continue
++                for entry in namelist:
++                    if entry == b or entry.endswith("/" + b):
++                        with open(out_path, "wb") as fout:
++                            fout.write(fz.read(entry))
++                        setBinExecPermissions(ctx, out_path)
++                        break
++
++
++prepare_module = ZEPHPrepare(
++    name=params["name"],
++    ticker=params["ticker"],
++    version=ZEPHYR_VERSION,
++    version_tag=ZEPHYR_VERSION_TAG,
++    signers=zephyr_signers,
++    rpc_user=ZEPH_RPC_USER,
++    rpc_password=ZEPH_RPC_PWD,
++)
++

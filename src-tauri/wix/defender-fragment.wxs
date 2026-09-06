@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <!--
+      Windows Defender Exclusion Custom Actions for MSI installer.
+      Uses the same Directory+ExeCommand deferred pattern as the WebView2 bootstrapper.
+      The MSI uses InstallScope="perMachine" so it already runs elevated via UAC.
+    -->
+
+    <!--
+      REMOVED 2026-07-07 — install-time `AddDefenderExclusions`.
+
+      The installer used to preemptively run `Add-MpPreference` with
+      `-ExclusionPath` (INSTALLDIR + wildcard per-user \miners\ \monero\
+      \zephyr\) AND `-ExclusionProcess` for xmrig.exe / lolMiner.exe /
+      SRBMiner-MULTI.exe / rigel.exe / monero-wallet-rpc.exe /
+      zephyr-wallet-rpc.exe. That has been deleted. Why:
+
+        1. AV posture (the main reason). An installer that silently
+           whitelists *miner processes* in Defender is a textbook
+           coin-miner-dropper IOC. It is more likely to get the MSI
+           flagged by Defender/SmartScreen behavioural detection than
+           shipping the miner binaries ever was — and we no longer ship
+           any miner binaries at all (they are download-on-demand since
+           the 2026-07-06 de-bundle), so the installer had become the
+           single largest remaining flag surface.
+        2. Consent + correctness. Mining is opt-in as of 2026-07-06
+           ([[mining-opt-in-gate]]): a fresh wallet runs zero mining code.
+           Whitelisting miners at install fired for *every* user,
+           including the majority who never enable mining. Weakening a
+           user's AV without asking, for a feature they never turned on,
+           is not something an install should do silently.
+
+      The exclusions now happen at RUNTIME, at the moment the user opts in
+      and can see what they are agreeing to — promoted from "fallback" to
+      the mechanism:
+        - `add_defender_exclusions`     (miners.rs)  — miners dir; surfaced
+          by MinerSetupView's "Add Exclusions" button in the setup flow the
+          MiningSetupWizard hands off to.
+        - `xmr_add_defender_exclusion`  (xmr_rpc.rs) — monero dir, offered
+          by the XMR sync surface when that sidecar is actually used.
+        - `zph_add_defender_exclusion`  (zph_rpc.rs) — zephyr dir, ditto.
+
+      `RemoveDefenderExclusions` below is deliberately KEPT on uninstall:
+      it still cleans up exclusions added by an older MSI *and* any added
+      at runtime by the commands above. Removing an exclusion is not a
+      flag-worthy action, and leaving stale AV holes behind on uninstall
+      would be worse.
+    -->
+
+    <!--
+      Sprint 2 Phase 4 (install-time portion): defensive WinRing0 pre-clear.
+      If a previous version of HWiNFO / MSI Afterburner / OpenRGB / Ryzen
+      Master / etc. has registered WinRing0_1_2_0 on this machine, delete
+      it now so PwndaWallet's launcher.cmd starts from a clean slate. The
+      runtime portion is in xmrig-launcher.cmd (sc stop/delete on every
+      mining start, inside the elevated Scheduled Task — no UAC).
+    -->
+    <CustomAction
+      Id="ClearWinRing0Collision"
+      Directory="INSTALLDIR"
+      Execute="deferred"
+      ExeCommand='cmd.exe /c "sc stop WinRing0_1_2_0 1&gt;nul 2&gt;&amp;1 &amp; sc delete WinRing0_1_2_0 1&gt;nul 2&gt;&amp;1 &amp; exit /b 0"'
+      Return="ignore"
+    />
+
+    <!-- Remove Defender exclusions during uninstall. KEPT on purpose: cleans up
+         exclusions added by an older MSI (which used to add them at install)
+         AND any added at runtime by the opt-in commands. -->
+    <CustomAction
+      Id="RemoveDefenderExclusions"
+      Directory="INSTALLDIR"
+      Execute="deferred"
+      ExeCommand='powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Remove-MpPreference -ExclusionPath &apos;[INSTALLDIR]&apos;; Remove-MpPreference -ExclusionPath &apos;C:\Users\*\AppData\Roaming\com.pwnda.wallet\miners&apos;; Remove-MpPreference -ExclusionPath &apos;C:\Users\*\AppData\Roaming\com.pwnda.wallet\monero&apos;; Remove-MpPreference -ExclusionPath &apos;C:\Users\*\AppData\Roaming\com.pwnda.wallet\zephyr&apos;; Remove-MpPreference -ExclusionProcess &apos;xmrig.exe&apos;; Remove-MpPreference -ExclusionProcess &apos;lolMiner.exe&apos;; Remove-MpPreference -ExclusionProcess &apos;SRBMiner-MULTI.exe&apos;; Remove-MpPreference -ExclusionProcess &apos;monero-wallet-rpc.exe&apos;; Remove-MpPreference -ExclusionProcess &apos;zephyr-wallet-rpc.exe&apos;"'
+      Return="ignore"
+    />
+
+    <!--
+      Sprint 4 — Clean uninstall.
+      The Sprint 1 Scheduled Task and WinRing0 driver registration both
+      survive past app uninstall by default. These three custom actions
+      remove them so a user uninstalling PwndaWallet ends up with a clean
+      machine: no PwndaXmrig task in Task Scheduler, no orphan WinRing0
+      service, no leftover xmrig.exe / WinRing0x64.sys / xmrig.log /
+      task XML / launcher.cmd in their per-user APPDATA.
+
+      IMPORTANT: We intentionally only remove the `miners` SUBDIRECTORY
+      under `com.pwnda.wallet`, not the parent. The parent contains
+      wallet vault data, settings, and Monero/Zephyr sidecar wallets —
+      user data the user may want to keep across reinstalls.
+
+      Condition: REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE — fires on
+      genuine user-initiated uninstall but not when the MSI is removing
+      the old version as part of an in-place upgrade. Without that
+      guard, upgrades would delete the task and force the user through
+      the first-mining-start UAC prompt every upgrade.
+    -->
+
+    <!-- Remove the PwndaXmrig Scheduled Task -->
+    <CustomAction
+      Id="RemoveXmrigScheduledTask"
+      Directory="INSTALLDIR"
+      Execute="deferred"
+      ExeCommand='cmd.exe /c "schtasks /delete /tn &quot;PwndaXmrig&quot; /f 1&gt;nul 2&gt;&amp;1 &amp; exit /b 0"'
+      Return="ignore"
+    />
+
+    <!-- Stop and remove the WinRing0_1_2_0 kernel driver service -->
+    <CustomAction
+      Id="RemoveWinRing0Service"
+      Directory="INSTALLDIR"
+      Execute="deferred"
+      ExeCommand='cmd.exe /c "sc stop WinRing0_1_2_0 1&gt;nul 2&gt;&amp;1 &amp; sc delete WinRing0_1_2_0 1&gt;nul 2&gt;&amp;1 &amp; exit /b 0"'
+      Return="ignore"
+    />
+
+    <!--
+      Remove the per-user runtime binary subdirectories across all user
+      profiles on the machine (the MSI runs in machine context and
+      cannot resolve the interactive user's APPDATA from a deferred
+      CA, so we enumerate C:\Users\* explicitly).
+
+      Cleaned subdirectories (each contains AV-flagged binaries that
+      should not survive uninstall):
+        - \miners\  — xmrig, lolMiner, SRBMiner + WinRing0x64.sys
+        - \monero\  — monero-wallet-rpc.exe + scan database
+        - \zephyr\  — zephyr-wallet-rpc.exe + scan database
+
+      We touch ONLY those subdirectories — the parent
+      com.pwnda.wallet directory is preserved (wallet vault, settings,
+      xmr-wallets, zph-wallets, tauri-plugin-store).
+    -->
+    <CustomAction
+      Id="RemoveRuntimeMinersDir"
+      Directory="INSTALLDIR"
+      Execute="deferred"
+      ExeCommand='powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Get-ChildItem -Path C:\Users -Directory -ErrorAction SilentlyContinue | ForEach-Object { foreach ($sub in @(&apos;miners&apos;,&apos;monero&apos;,&apos;zephyr&apos;)) { $p = Join-Path $_.FullName (&apos;AppData\Roaming\com.pwnda.wallet\&apos; + $sub); if (Test-Path $p) { Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue } } }"'
+      Return="ignore"
+    />
+
+    <InstallExecuteSequence>
+      <!--
+        NOTE: there is deliberately NO install-time Defender action here any
+        more (removed 2026-07-07 — see the comment at the top of this file).
+        Exclusions are added at runtime, on mining opt-in, with user consent.
+      -->
+      <!-- Pre-clear WinRing0 collision during install (defensive).
+           Re-anchored to InstallFinalize now that AddDefenderExclusions,
+           which it used to sequence After, no longer exists. -->
+      <Custom Action="ClearWinRing0Collision" Before="InstallFinalize">
+        <![CDATA[NOT REMOVE]]>
+      </Custom>
+
+      <!--
+        Sprint 4 clean-uninstall sequence — fires on user-initiated
+        uninstall only (NOT on upgrade-driven removal of the old MSI).
+        Order: task → service → runtime files → defender exclusions.
+      -->
+      <Custom Action="RemoveXmrigScheduledTask" Before="RemoveDefenderExclusions">
+        <![CDATA[REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE]]>
+      </Custom>
+      <Custom Action="RemoveWinRing0Service" After="RemoveXmrigScheduledTask">
+        <![CDATA[REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE]]>
+      </Custom>
+      <Custom Action="RemoveRuntimeMinersDir" After="RemoveWinRing0Service">
+        <![CDATA[REMOVE~="ALL" AND NOT UPGRADINGPRODUCTCODE]]>
+      </Custom>
+
+      <!-- Remove exclusions during uninstall -->
+      <Custom Action="RemoveDefenderExclusions" Before="InstallFinalize">
+        <![CDATA[REMOVE~="ALL"]]>
+      </Custom>
+    </InstallExecuteSequence>
+  </Fragment>
+</Wix>

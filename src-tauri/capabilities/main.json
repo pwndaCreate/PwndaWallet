@@ -1,0 +1,88 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "wallet-main",
+  "description": "Main window capabilities \u2014 explicit allow-list of every Rust command the webview may invoke. Per ClientSideIntegration / Agent Brief B: signing happens in Rust core, the webview never receives raw key material, and there is NO command anywhere in this list that exports a mnemonic, seed, or raw private key.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "os:default",
+    "store:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-set-size",
+    "core:window:allow-set-resizable",
+    "core:window:allow-center",
+    "updater:default"
+  ],
+  "remote": {
+    "urls": []
+  },
+  "_documented_commands": {
+    "_comment": "This block is for human reviewers and grep-based audits. It enumerates every swap-related Tauri command. Commands NOT listed here MUST NOT be added; commands listed here MUST be sign-only or proxy-passthrough or address-derivation. There is intentionally no command for exporting mnemonic, seed, raw private key, or unencrypted vault contents.",
+    "session": [
+      "swap_set_proxy_url",
+      "swap_unlock",
+      "swap_lock"
+    ],
+    "proxy_auth_returns_public_metadata_only": [
+      "swap_proxy_get_status",
+      "swap_proxy_get_pubkey",
+      "swap_proxy_enroll",
+      "swap_proxy_test_connection",
+      "swap_proxy_health_check"
+    ],
+    "address_only_returns_public_data": [
+      "swap_get_addresses",
+      "swap_get_utxo_address",
+      "swap_get_solana_address",
+      "swap_get_near_address"
+    ],
+    "proxy_passthrough_no_key_material": [
+      "swap_get_quote",
+      "swap_build_tx",
+      "swap_track",
+      "intents_quote",
+      "intents_deposit_submit",
+      "intents_status"
+    ],
+    "sign_only_returns_signed_blob_not_key": [
+      "swap_sign_evm",
+      "swap_sign_psbt",
+      "swap_sign_near_intent",
+      "swap_sign_near_tx",
+      "swap_sign_solana"
+    ],
+    "broadcast_takes_already_signed_blob": [
+      "swap_broadcast",
+      "swap_evm_broadcast_verified"
+    ],
+    "telemetry_local_only_no_network": [
+      "swap_log_safety_incident"
+    ],
+    "socks5_proxy_pool_reputation_and_rotation": [
+      "proxy_pool_record_session_alive",
+      "proxy_pool_record_failure",
+      "proxy_pool_get_rotation_pool"
+    ],
+    "leaderboard_opt_in_telemetry_no_key_material": [
+      "leaderboard_init",
+      "leaderboard_get_status",
+      "leaderboard_set_opt_in",
+      "leaderboard_set_display_name",
+      "leaderboard_register",
+      "leaderboard_reset_identity",
+      "leaderboard_heartbeat",
+      "leaderboard_get_top",
+      "leaderboard_get_me",
+      "leaderboard_get_eligible_pools",
+      "leaderboard_get_log_path"
+    ]
+  }
+}

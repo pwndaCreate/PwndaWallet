@@ -1,0 +1,372 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-21
+Subject: [PATCH 7/7] basicswap: fund a chain-A swap lock only from
+ non-malleable inputs, and stop misrouting p2pkh wallet funds
+
+PATCH-3/4/6 let the electrum wallet hold and spend a legacy (P2PKH) BTC/LTC
+derivation. Auditing the funding and swap-lock path for the same gap turned
+up three separate hardwired-segwit assumptions in interface/btc/btc.py's
+_fundTxElectrum, plus one in electrumx.py and one in basicswap.py's own
+"needs consolidating" heuristic. All five are fixed here.
+
+1. THE PROTOCOL-SAFETY ONE. BasicSwap pre-signs the chain-A lock's refund
+   against the lock TRANSACTION'S OWN predicted txid -- createSCLockRefundTx
+   hashes the unsigned funded tx before either party has broadcast anything
+   (basicswap.py, unpatched: tx_lock.rehash(); tx_lock_id_int = tx_lock.sha256).
+   A witness input's signature lives outside that hash and can't move it; a
+   legacy P2PKH input's signature lives INSIDE it (scriptSig), so signing
+   such an input changes the txid the refund was bound to. Upstream already
+   fails closed for this -- sendXmrBidCoinALockTx raises "Coin A lock tx
+   txid changed after signing!" -- but only after the counterparty has
+   already exchanged refund signatures, with no indication that the
+   wallet's OWN address type caused it. And nothing upstream actually
+   filters which UTXOs are eligible to fund a lock tx; the RPC-mode fundTx
+   even carries the upstream comment "# TODO: Manually select only segwit
+   prevouts", unimplemented.
+
+   fundTx/_fundTxElectrum gain require_segwit_inputs (default False, so
+   ordinary withdrawals are untouched); fundSCLockTx sets it. A legacy-only
+   wallet now refuses funding a swap lock with a clear, early error --
+   before any message reaches a counterparty -- rather than silently
+   building a lock tx that either dies at broadcast or trips upstream's own
+   late guard after the other side has already committed.
+
+2. THE FEE ONE. The same function priced every selected input as a fixed
+   68 vB (P2WPKH-sized) and every change output as P2WPKH regardless of the
+   change address's real encoding. A legacy P2PKH input is ~148 vB (no
+   witness discount) -- underpriced by more than half. This was already
+   live the moment address_type shipped in PATCH-3, for every funded
+   transaction including ordinary sends, not just the swap path this patch
+   otherwise concerns. Vsize is now priced per UTXO by its own address
+   encoding (matching PATCH-6's actual per-input signing branch: a legacy
+   input's dummy witness entry is now empty too, mirroring the real signer
+   leaving no witness data for it), and legacy scriptSig bytes are costed
+   through getTxVSize's add_bytes channel rather than folded into the
+   witness-only add_witness_bytes.
+
+3. THE SILENT-MISROUTE ONE. The change output was built via
+   decodeAddress()+getScriptForPubkeyHash(), which always emits a P2WPKH
+   script -- even when change_addr is a p2pkh address string. A p2pkh
+   wallet's change would land on a script its own address table never
+   derives or subscribes to: not lost (the key is known, so it is
+   technically recoverable by hand), but invisible to the wallet's own
+   balance, history, and future coin selection. Rebuilt on
+   getDestForAddress(), which already handles bech32 / script_address /
+   script_address2 / P2PKH correctly (it is what addressToScripthash and
+   _createRawFundedTransactionElectrum already use).
+
+4. THE SCRIPTHASH ONE. electrumx.py's scripthash_from_address() checked
+   script_address but not script_address2. LTC mints P2SH under a second,
+   newer version byte after deprecating the one it shares with Bitcoin; an
+   LTC P2SH address using it fell through to the bech32-witness branch --
+   a plausible-looking but wrong scripthash, not an error. BTCInterface's
+   own getDestForAddress() already checks both bytes; this function now
+   does too.
+
+5. THE STALE-LABEL ONE. basicswap.py's _computeElectrumLegacyFundsInfo
+   flagged every non-bech32 balance as "legacy funds needing
+   consolidation". True before PATCH-3 (electrum wallets were P2WPKH-only,
+   so non-bech32 could only mean stray funds); false now, for a coin the
+   host explicitly adopted at address_type="p2pkh" -- that IS the wallet's
+   intended shape. Left unfixed, this is the exact "Fund from wallet" /
+   consolidation nudge from earlier in this integration, now firing on a
+   wallet that no longer needs it. Skipped when the coin is adopted as
+   p2pkh; unchanged otherwise.
+
+None of this enables swapping FROM a purely legacy-derivation wallet -- (1)
+is a refusal, not a workaround, because the protocol requirement is real
+(see PwndaWalletVault/wiki/synthesis/pwnda-basicswap-convergence-plan.md
+and the REU26 ResearchWiki's chain-A lock analysis). It closes the gap
+between "silently unsafe or silently wrong" and "cleanly refused or
+cleanly correct" for everything this patch touches. Swap participation
+from a legacy-only wallet remains future work, gated on giving the wallet
+a second, always-available segwit identity to fund and receive a lock
+through -- a larger design than a patch series should carry piecemeal.
+
+---
+ basicswap/interface/electrumx.py |  11 ++++++++++-
+ basicswap/interface/btc/btc.py   | 122 ++++++++++----------
+ basicswap/basicswap.py           |  22 ++++++++++----
+ 3 files changed, 136 insertions(+), 19 deletions(-)
+
+diff --git a/basicswap/interface/electrumx.py b/basicswap/interface/electrumx.py
+index b640329..c7d60a5 100644
+--- a/basicswap/interface/electrumx.py
++++ b/basicswap/interface/electrumx.py
+@@ -454,7 +454,16 @@ def scripthash_from_address(address, network_params):
+             script = CScript(
+                 [OP_DUP, OP_HASH160, addr_hash, OP_EQUALVERIFY, OP_CHECKSIG]
+             )
+-        elif addr_type == network_params.get("script_address"):
++        elif addr_type == network_params.get("script_address") or (
++            network_params.get("script_address2") is not None
++            and addr_type == network_params.get("script_address2")
++        ):
++            # PWNDA-PATCH-7: some coins (LTC) mint P2SH under a SECOND
++            # version byte -- script_address2 -- after deprecating the
++            # first one shared with Bitcoin. Falling through to the bech32
++            # branch below for that byte hashes a script the address never
++            # had (P2WPKH instead of P2SH), matching BTCInterface's own
++            # getDestForAddress(), which already checks both.
+             script = CScript([OP_HASH160, addr_hash, OP_EQUAL])
+         else:
+             script = CScript([OP_0, addr_hash])
+
+diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
+index b219b8e..781f363 100644
+--- a/basicswap/interface/btc/btc.py
++++ b/basicswap/interface/btc/btc.py
+@@ -1386,7 +1386,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+         return tx.serialize()
+ 
+     def fundSCLockTx(self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None) -> bytes:
+-        funded_tx = self.fundTx(tx_bytes, feerate, bid_id=bid_id)
++        # PWNDA-PATCH-7: the chain-A lock tx's refund is pre-signed against
++        # THIS tx's predicted (pre-signing) txid -- see basicswap.py
++        # createSCLockRefundTx / sendXmrBidCoinALockTx. That binding only
++        # holds if signing cannot change the txid, which requires every
++        # funding input to be witness-type. require_segwit_inputs=True
++        # refuses (before any counterparty message is sent) rather than
++        # building a lock tx that would fail upstream's OWN late guard.
++        funded_tx = self.fundTx(
++            tx_bytes, feerate, bid_id=bid_id, require_segwit_inputs=True
++        )
+ 
+         if self._disable_lock_tx_rbf:
+             tx = self.loadTx(funded_tx)
+@@ -2094,10 +2103,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+         lock_unspents: bool = True,
+         subfee: bool = False,
+         bid_id: bytes = None,
++        require_segwit_inputs: bool = False,
+     ) -> bytes:
+         if self.useBackend():
+             return self._fundTxElectrum(
+-                tx, feerate, lock_unspents=lock_unspents, subfee=subfee, bid_id=bid_id
++                tx,
++                feerate,
++                lock_unspents=lock_unspents,
++                subfee=subfee,
++                bid_id=bid_id,
++                require_segwit_inputs=require_segwit_inputs,
+             )
+ 
+         feerate_str = self.format_amount(feerate)
+@@ -2123,6 +2138,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+         lock_unspents: bool = True,
+         subfee: bool = False,
+         bid_id: bytes = None,
++        require_segwit_inputs: bool = False,
+     ) -> bytes:
+         wm = self.getWalletManager()
+         backend = self.getBackend()
+@@ -2176,10 +2192,58 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+                 )
+             raise ValueError("No UTXOs available")
+ 
++        if require_segwit_inputs:
++            # PWNDA-PATCH-7: chain-A lock funding. Refuse the malleable
++            # (legacy P2PKH) UTXOs outright rather than let them be
++            # selected and fail later inside the swap state machine -- see
++            # the header comment on fundSCLockTx for why they are unsafe
++            # here specifically (ordinary sends are unaffected; this
++            # parameter is never set for them).
++            bech32_prefix_guard = self.chainparams_network()["hrp"]
++            non_segwit_count = sum(
++                1
++                for u in utxos
++                if not (u.get("address") or "").startswith(
++                    bech32_prefix_guard + "1"
++                )
++            )
++            utxos = [
++                u
++                for u in utxos
++                if (u.get("address") or "").startswith(bech32_prefix_guard + "1")
++            ]
++            if not utxos:
++                raise ValueError(
++                    "No segwit-sourced funds available to fund a swap lock "
++                    "transaction. This wallet's adopted balance is entirely "
++                    "on a legacy (non-segwit) derivation, which cannot host "
++                    "the chain-A lock's pre-signed refund safely -- see "
++                    "upstream/patches/0007-electrum-funding-safety.patch. "
++                    "Legacy funds remain fully spendable for ordinary "
++                    "sends; they are excluded from swap funding only."
++                )
++            if non_segwit_count:
++                self._log.warning(
++                    f"_fundTxElectrum: excluded {non_segwit_count} legacy "
++                    "(non-segwit) UTXO(s) from swap lock funding "
++                    "(PWNDA-PATCH-7)."
++                )
++
+         utxos.sort(key=lambda x: x.get("value", 0), reverse=True)
+ 
+-        input_vsize = 68
+-        est_vsize = 10 + len(parsed_tx.vout) * 34 + input_vsize
++        # PWNDA-PATCH-7: per-UTXO vsize, not a flat P2WPKH constant. A
++        # legacy P2PKH input carries its signature in scriptSig (no witness
++        # discount, ~148 vB); a witness input keeps upstream's ~68 vB. The
++        # wallet is single-address-type-per-coin today (see PATCH-3), so in
++        # practice this sums to one type or the other -- but pricing it per
++        # UTXO costs nothing and stays correct if that ever changes.
++        bech32_prefix_est = self.chainparams_network()["hrp"]
++
++        def _input_vsize(u):
++            addr = u.get("address") or ""
++            return 68 if addr.startswith(bech32_prefix_est + "1") else 148
++
++        est_vsize = 10 + len(parsed_tx.vout) * 34 + _input_vsize(utxos[0])
+         if isinstance(feerate, int):
+             fee_per_vbyte = max(1, feerate // 1000)
+         else:
+@@ -2188,14 +2252,14 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+ 
+         selected_utxos = []
+         total_input = 0
++        selected_vsize_sum = 0
+         target = total_output if subfee else total_output + est_fee
+ 
+         for utxo in utxos:
+             selected_utxos.append(utxo)
+             total_input += utxo.get("value", 0)
+-            est_vsize = (
+-                10 + len(parsed_tx.vout) * 34 + len(selected_utxos) * input_vsize + 34
+-            )
++            selected_vsize_sum += _input_vsize(utxo)
++            est_vsize = 10 + len(parsed_tx.vout) * 34 + selected_vsize_sum + 34
+             est_fee = est_vsize * fee_per_vbyte
+             target = total_output if subfee else total_output + est_fee
+             if total_input >= target:
+@@ -2210,13 +2274,24 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+         funded_tx.nVersion = self.txVersion()
+ 
+         dummy_witness_stack = []
++        legacy_scriptsig_bytes = 0
+         for utxo in selected_utxos:
+             txid_bytes = bytes.fromhex(utxo["txid"])[::-1]
+             txid_int = int.from_bytes(txid_bytes, "little")
+             funded_tx.vin.append(
+                 CTxIn(COutPoint(txid_int, utxo["vout"]), nSequence=0xFFFFFFFD)
+             )
+-            dummy_witness_stack.append(self.getP2WPKHDummyWitness())
++            # PWNDA-PATCH-7: match PATCH-6's actual signer. A legacy input
++            # gets NO witness entry there (empty, for vin/witness alignment)
++            # and its signature lives in scriptSig instead -- estimate it
++            # the same way verifySCLockTx already prices a legacy input
++            # elsewhere in this file (add_bytes += 107 for sig+pubkey).
++            addr = utxo.get("address") or ""
++            if addr.startswith(bech32_prefix_est + "1"):
++                dummy_witness_stack.append(self.getP2WPKHDummyWitness())
++            else:
++                dummy_witness_stack.append([])
++                legacy_scriptsig_bytes += 107
+ 
+         for out in parsed_tx.vout:
+             funded_tx.vout.append(out)
+@@ -2224,13 +2299,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+         witness_bytes_len_est = self.getWitnessStackSerialisedLength(
+             dummy_witness_stack
+         )
++        # PWNDA-PATCH-7: legacy scriptSig bytes inflate BOTH the witness-
++        # serialised size and the base (non-witness) size, unlike a witness
++        # stack -- getTxVSize()'s add_bytes parameter is exactly the "add to
++        # both" channel, so route it there instead of add_witness_bytes.
+ 
+         feerate_satkb = (
+             feerate if isinstance(feerate, int) else int(feerate * 100000000)
+         )
+         min_relay_fee = 250
+ 
+-        rough_vsize = 10 + (len(funded_tx.vout) + 1) * 34 + len(selected_utxos) * 68
++        rough_vsize = (
++            10
++            + (len(funded_tx.vout) + 1) * 34
++            + selected_vsize_sum
++        )
+         rough_fee = max(round(feerate_satkb * rough_vsize / 1000), min_relay_fee)
+         rough_change = (
+             (total_input - total_output)
+@@ -2245,12 +2328,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+                 change_addr = wm.getExistingInternalAddress(self.coin_type())
+             if not change_addr:
+                 change_addr = selected_utxos[0].get("address")
+-            pkh = self.decodeAddress(change_addr)
+-            change_script = self.getScriptForPubkeyHash(pkh)
++            # PWNDA-PATCH-7: build the change script from the change
++            # address's OWN encoding via getDestForAddress() -- already
++            # correct for bech32 / script_address / script_address2 / P2PKH
++            # -- instead of decodeAddress()+getScriptForPubkeyHash(), which
++            # always produced a P2WPKH script regardless of what kind of
++            # address string change_addr actually was.
++            change_script = self.getDestForAddress(change_addr)
+             funded_tx.vout.append(self.txoType()(rough_change, change_script))
+ 
+             final_vsize = self.getTxVSize(
+-                funded_tx, add_witness_bytes=witness_bytes_len_est
++                funded_tx,
++                add_bytes=legacy_scriptsig_bytes,
++                add_witness_bytes=witness_bytes_len_est,
+             )
+             final_fee = max(round(feerate_satkb * final_vsize / 1000), min_relay_fee)
+             change = (
+@@ -2264,7 +2354,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+             else:
+                 funded_tx.vout.pop()
+                 final_vsize = self.getTxVSize(
+-                    funded_tx, add_witness_bytes=witness_bytes_len_est
++                    funded_tx,
++                    add_bytes=legacy_scriptsig_bytes,
++                    add_witness_bytes=witness_bytes_len_est,
+                 )
+                 final_fee = max(
+                     round(feerate_satkb * final_vsize / 1000), min_relay_fee
+@@ -2272,7 +2364,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+                 change = 0
+         else:
+             final_vsize = self.getTxVSize(
+-                funded_tx, add_witness_bytes=witness_bytes_len_est
++                funded_tx,
++                add_bytes=legacy_scriptsig_bytes,
++                add_witness_bytes=witness_bytes_len_est,
+             )
+             final_fee = max(round(feerate_satkb * final_vsize / 1000), min_relay_fee)
+             change = 0
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 989c1fe..7aaa4cc 100644
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -3200,13 +3200,27 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+             if not unspent_by_addr:
+                 return {"has_legacy_funds": False}
+ 
++            # PWNDA-PATCH-7: a coin explicitly adopted at address_type
++            # "p2pkh" (PATCH-3/4) is non-bech32 BY DESIGN -- that is not
++            # "legacy funds needing consolidation", it is the wallet's
++            # normal, intentional shape. Only flag non-bech32 balances for
++            # a coin that is NOT configured that way (upstream's original
++            # case: stray funds on an address type this wallet never
++            # meant to use).
++            adopted_as_p2pkh = False
++            if self._wallet_manager:
++                adopted_as_p2pkh = (
++                    self._wallet_manager._pwndaAddressType(coin_type) == "p2pkh"
++                )
++
+             legacy_balance_sats = 0
+             legacy_addresses = []
+ 
+-            for addr, balance_sats in unspent_by_addr.items():
+-                if not addr.startswith(hrp + "1"):
+-                    legacy_balance_sats += balance_sats
+-                    legacy_addresses.append(addr)
++            if not adopted_as_p2pkh:
++                for addr, balance_sats in unspent_by_addr.items():
++                    if not addr.startswith(hrp + "1"):
++                        legacy_balance_sats += balance_sats
++                        legacy_addresses.append(addr)
+ 
+             if legacy_balance_sats > 0:
+                 return {

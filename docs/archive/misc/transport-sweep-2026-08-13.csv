@@ -1,0 +1,57 @@
+# PwndaWallet client -> pwnda-desk, i2p transport sweep, 2026-08-13
+# GET /api/desk/echo?bytes=N, sigauth, measured through the production
+# signing path (swap::auth::build_headers) with a 180s client timeout so
+# the 20s production deadline cannot censor the slow tail. Nothing dropped.
+# run 1: six sizes x 5 reps, in order, cold first request retained
+bytes,milliseconds
+1000,1695
+1000,937
+1000,1002
+1000,905
+1000,999
+5000,869
+5000,872
+5000,1354
+5000,967
+5000,974
+10000,1080
+10000,1072
+10000,918
+10000,1157
+10000,1099
+25000,2264
+25000,1962
+25000,1992
+25000,1846
+25000,2239
+50000,4139
+50000,3719
+50000,15552
+50000,1700
+50000,2336
+97786,3077
+97786,1792
+97786,1748
+97786,1600
+97786,1597
+# run 2: 20 reps at the real proof size, for tail characterisation
+97786,5776
+97786,3221
+97786,2175
+97786,1809
+97786,1731
+97786,1669
+97786,1709
+97786,1592
+97786,1673
+97786,1562
+97786,1837
+97786,1874
+97786,1715
+97786,1683
+97786,1709
+97786,1665
+97786,1823
+97786,1699
+97786,1769
+97786,1699

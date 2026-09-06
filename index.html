@@ -1,0 +1,16 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Favicon points to the existing PNG icon. Without this, the
+         Tauri webview auto-requests /favicon.ico and 404s on every
+         page load (cosmetic only — caused noisy dev-console output). -->
+    <link rel="icon" type="image/png" href="/icon.png" />
+    <title>Multi-Chain Wallet</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

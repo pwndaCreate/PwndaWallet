@@ -1,0 +1,262 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-21
+Subject: [PATCH 3/6] basicswap: initialise an electrum-mode wallet from a
+ host-supplied account key, with its address type
+
+In electrum ("lean") mode the engine holds the wallet itself: WalletManager
+derives BIP84 keys, signs, and tracks UTXOs in the engine's own database, with
+public ElectrumX servers supplying only chain data. That wallet's identity is
+decided entirely by the root key handed to WalletManager.initialize(), which
+today is always the engine's own; its address ENCODING is likewise fixed to
+native SegWit.
+
+For a wallet application embedding the engine, both are wrong for a user who
+imported an existing seed: the keys may live at a different account (BIP-44,
+BIP-49, vendor-specific paths), and the funds may sit on LEGACY base58
+addresses (Exodus and Atomic derive Litecoin at m/44'/2'/0'/0/0 -> L...).
+Watching the P2WPKH encodings of the right keys still shows an empty wallet,
+because the scripthash subscriptions are sha256 of the wrong locking script.
+
+initializeFromAccountKey(coin, key, address_type) takes the account node
+directly (the serialised 74-byte ExtKeyPair) and an address_type of "p2wpkh"
+(default; upstream's only behaviour) or "p2pkh". _deriveAddress branches on
+the type: base58check with the coin's pubkey-address version byte, and a
+scripthash computed from the ACTUAL P2PKH locking script, so subscriptions,
+balance and UTXO queries all watch where the funds really are. The type
+travels with the key because it is a property of that wallet, not of the coin.
+
+_discardForeignAddresses guards the install: getAddress() reads the
+wallet_addresses table rather than deriving, so rows written by a previous key
+set (or a previous ENCODING) would keep being served after the switch --
+failing the host's verification and, worse, leaving the wallet watching
+addresses it can no longer spend. On an index-0 mismatch the coin's rows,
+wallet_state and tx cache are cleared and the migration repopulates them from
+the installed key in the installed encoding.
+
+initializeWalletManager() prefers a pushed key and FAILS CLOSED when
+BSX_PWNDA_ACCOUNT_KEY_COINS names a coin with no key pushed yet -- initialising
+from the engine seed there would hand back a wallet the user does not own.
+
+Spending legacy inputs needs PATCH 6 (the signer is witness-only upstream);
+the transport is PATCH 4. Not an upstream-PR candidate: who owns the wallet's
+keys, and in which encoding, is an embedder's question.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker in patched source: PWNDA-PATCH-3
+---
+ basicswap/wallet_manager.py | 151 ++++++++++
+ basicswap/basicswap.py      |  32 ++++++++++--
+ 2 files changed, 181 insertions(+), 2 deletions(-)
+
+diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
+index 2f51fa8..9f06bf2 100644
+--- a/basicswap/wallet_manager.py
++++ b/basicswap/wallet_manager.py
+@@ -105,6 +105,141 @@ class WalletManager:
+ 
+         self._log.debug(f"WalletManager: {Coins(coin_type).name} initialized")
+ 
++    # PWNDA-PATCH-3: base58 P2PKH version bytes, keyed like HRP above. Only
++    # the coins WalletManager itself supports.
++    PUBKEY_ADDRESS_BYTE = {
++        Coins.BTC: {"mainnet": 0x00, "testnet": 0x6F, "regtest": 0x6F},
++        Coins.LTC: {"mainnet": 0x30, "testnet": 0x6F, "regtest": 0x6F},
++    }
++
++    def _pwndaAddressType(self, coin_type: Coins) -> str:
++        """PWNDA-PATCH-3: this coin's wallet address type.
++
++        "p2wpkh" (upstream's only behaviour) unless the host pushed an
++        account key declaring "p2pkh" — the case of a wallet imported from
++        Exodus/Atomic whose funds live on legacy base58 addresses. The type
++        travels WITH the key because it is a property of where that wallet's
++        funds actually are, not of the coin.
++        """
++        return getattr(self, "_pwnda_address_types", {}).get(coin_type, "p2wpkh")
++
++    def initializeFromAccountKey(
++        self, coin_type: Coins, account_key: bytes, address_type: str = "p2wpkh"
++    ) -> None:
++        """PWNDA-PATCH-3: initialise from an ACCOUNT-level extended key.
++
++        `initialize()` takes a master seed and derives `84h/<coin>h/0h` itself.
++        This takes the account node directly -- the serialised (74 byte)
++        ExtKeyPair for the wallet's OWN account, whatever its purpose level --
++        and derives only the two chain branches beneath it.
++
++        Why: it lets the host wallet hand the engine the SAME account it
++        already uses, so the engine's electrum-mode wallet is the user's
++        wallet rather than a second one that must be funded by a deposit. The
++        derivation below is byte-identical to `initialize()`'s for the same
++        account; `address_type` additionally selects how addresses are
++        ENCODED, because a legacy-derivation wallet's funds sit on P2PKH
++        outputs and watching the P2WPKH encodings of the same keys would show
++        an empty wallet over real funds.
++
++        Account level and not the master, deliberately: the exposure is one
++        coin's branch, and no other chain's keys are reachable from it.
++        """
++        if coin_type not in self.SUPPORTED_COINS:
++            raise ValueError(f"Coin {coin_type} not supported by WalletManager")
++        if address_type not in ("p2wpkh", "p2pkh"):
++            raise ValueError(f"Unsupported address type {address_type}")
++
++        ek = ExtKeyPair()
++        ek.decode(account_key)
++        if not ek.has_key():
++            raise ValueError("Account key must carry a private key")
++
++        # Downstream helpers (_getImportKey, _getXorKey, getSeedID) key off
++        # _master_keys. Seeding it with the ACCOUNT key keeps every one of them
++        # working and self-consistent; it is not, and is not used as, a seed.
++        self._master_keys[coin_type] = ek._key
++        if self._seed is None:
++            self._seed = ek._key
++
++        if not hasattr(self, "_pwnda_address_types"):
++            self._pwnda_address_types = {}
++        self._pwnda_address_types[coin_type] = address_type
++
++        self._external_chains[coin_type] = ek.derive_path("0")
++        self._internal_chains[coin_type] = ek.derive_path("1")
++        self._initialized.add(coin_type)
++
++        # Must run BEFORE needsMigration: it clears wallet_state, which is
++        # what makes the migration below repopulate the table from THIS key
++        # (and, with address_type, in THIS encoding).
++        self._discardForeignAddresses(coin_type)
++
++        if self.needsMigration(coin_type):
++            self.runMigration(coin_type)
++
++        self._log.debug(
++            f"WalletManager: {Coins(coin_type).name} initialized from account key "
++            f"({address_type})"
++        )
++
++    def _discardForeignAddresses(self, coin_type: Coins) -> bool:
++        """PWNDA-PATCH-3: drop stored addresses these keys did not produce.
++
++        `getAddress()` READS `wallet_addresses` rather than deriving, so a
++        table populated by a PREVIOUS key set (or a previous address TYPE)
++        keeps being answered with after a new key is installed. Two
++        consequences, both silent:
++
++        * the host's verification compares its own address against a stale
++          row and refuses a push that was in fact correct;
++        * far worse, the wallet goes on WATCHING addresses whose keys it can
++          no longer derive -- a balance it cannot spend, and new deposits
++          routed to an address the user does not control.
++
++        Detected by comparing index 0 of the external branch, which is the
++        cheapest value that differs whenever the key set (or encoding) does.
++        Returns True when rows were discarded.
++        """
++        try:
++            derived, _, _ = self._deriveAddress(coin_type, 0, False)
++        except Exception:
++            return False
++
++        conn = sqlite3.connect(self._swap_client.sqlite_file)
++        try:
++            cursor = conn.cursor()
++            row = cursor.execute(
++                "SELECT address FROM wallet_addresses WHERE coin_type = ?"
++                " AND derivation_index = 0 AND is_internal = 0",
++                (int(coin_type),),
++            ).fetchone()
++            if row is None or row[0] == derived:
++                return False
++            # Clearing wallet_state too is what re-arms needsMigration, so the
++            # table is repopulated from the key that is now installed rather
++            # than simply left empty.
++            cursor.execute(
++                "DELETE FROM wallet_addresses WHERE coin_type = ?", (int(coin_type),)
++            )
++            cursor.execute(
++                "DELETE FROM wallet_state WHERE coin_type = ?", (int(coin_type),)
++            )
++            cursor.execute(
++                "DELETE FROM wallet_tx_cache WHERE coin_type = ?", (int(coin_type),)
++            )
++            conn.commit()
++            self._log.warning(
++                f"PWNDA-PATCH-3: {Coins(coin_type).name} address table belonged to a "
++                "different key set and was rebuilt from the installed key."
++            )
++            return True
++        except Exception as e:
++            self._log.warning(f"PWNDA-PATCH-3: could not clear stale addresses: {e}")
++            return False
++        finally:
++            conn.close()
++
+     def getDepositAddress(self, coin_type: Coins) -> Optional[str]:
+         return self.getAddress(coin_type, index=0, internal=False)
+ 
+@@ -128,6 +263,22 @@ class WalletManager:
+         key = self._deriveKey(coin_type, index, internal)
+         pubkey = PublicKey.from_secret(key).format()
+         pkh = hash160(pubkey)
++        # PWNDA-PATCH-3: encode per the wallet's address type. The electrum
++        # scripthash MUST match the encoding -- it is sha256 of the actual
++        # locking script, and a P2WPKH scripthash for a P2PKH wallet would
++        # subscribe to outputs the funds are not on.
++        if self._pwndaAddressType(coin_type) == "p2pkh":
++            from basicswap.util.address import b58encode
++
++            version = self.PUBKEY_ADDRESS_BYTE.get(coin_type, {}).get(
++                self._swap_client.chain, 0x00
++            )
++            data = bytes((version,)) + pkh
++            checksum = sha256(sha256(data))
++            address = b58encode(data + checksum[0:4])
++            script = bytes([0x76, 0xA9, 0x14]) + pkh + bytes([0x88, 0xAC])
++            scripthash = sha256(script)[::-1].hex()
++            return address, scripthash, pubkey
+         address = segwit_addr.encode(self._getHRP(coin_type), 0, pkh)
+         scripthash = sha256(bytes([0x00, 0x14]) + pkh)[::-1].hex()
+         return address, scripthash, pubkey
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 989c1fe..165a8fd 100644
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -3284,8 +3284,36 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+             return False
+ 
+         try:
+-            root_key = self.getWalletKey(coin_type, 1)
+-            self._wallet_manager.initialize(coin_type, root_key)
++            # PWNDA-PATCH-3: an account-level key pushed by the host wallet wins
++            # over the engine's own derivation, so the electrum-mode wallet IS
++            # the user's wallet. Absent a push this is upstream's path exactly.
++            #
++            # FAIL CLOSED: when BSX_PWNDA_ACCOUNT_KEY_COINS names this coin the
++            # host intends to own its keys, so initialising from the engine's
++            # own seed would quietly hand back a DIFFERENT wallet -- addresses
++            # the user does not hold, reported as theirs. Refuse instead; the
++            # caller retries after the push.
++            _pwnda_entry = getattr(self, "_pwnda_account_keys", {}).get(coin_type)
++            if _pwnda_entry is None:
++                _pwnda_want = [
++                    x.strip().lower()
++                    for x in os.getenv("BSX_PWNDA_ACCOUNT_KEY_COINS", "").split(",")
++                    if x.strip()
++                ]
++                if Coins(coin_type).name.lower() in _pwnda_want:
++                    self.log.warning(
++                        f"PWNDA-PATCH-3: {Coins(coin_type).name} expects a host-wallet "
++                        "account key; none pushed yet, not initialising from the "
++                        "engine seed."
++                    )
++                    return False
++                root_key = self.getWalletKey(coin_type, 1)
++                self._wallet_manager.initialize(coin_type, root_key)
++            else:
++                _pwnda_key, _pwnda_addr_type = _pwnda_entry
++                self._wallet_manager.initializeFromAccountKey(
++                    coin_type, _pwnda_key, _pwnda_addr_type
++                )
+             self.log.info(f"WalletManager initialized for {Coins(coin_type).name}")
+             return True
+         except Exception as e:

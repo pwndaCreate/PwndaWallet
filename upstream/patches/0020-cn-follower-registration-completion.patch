@@ -1,0 +1,442 @@
+Grove PATCH-20: complete the ZEPH/ZANO registration — the half-wired sites
+
+Every defect this patch fixes has one shape: a coin registered in ONE HALF of
+a paired site. Something enumerates coins in two places — a POST handler and
+its template, a coin-set registry and a launcher gate, a base class and its
+subclass — and ZEPH or ZANO was added to one of them. Each half is
+individually correct, which is why source review, the type checker and the
+invariant suites all passed over them; only asking "who is the partner site,
+and does it agree?" finds them. Found by a dedicated sweep on 2026-09-03,
+prompted by PATCH-18's own instance of the same shape (an interface built but
+never wired to its dispatch site).
+
+  interface/zano/zano.py
+      ZanoInterface extends CoinInterface directly, so unlike XMR/WOW/ZEPH
+      (which reach XMRInterface's copies) it inherited neither validateFeeRate
+      nor findConfirmedTxnByHash -- yet basicswap.py calls both unguarded, on
+      every ZANO offer creation AND on every INBOUND peer offer, where an
+      AttributeError raises inside the message handler. findConfirmedTxnByHash
+      is also reached from checkXmrBidState, i.e. coin-B refund detection, so
+      its absence was fund-relevant rather than merely a crash.
+
+      validateFeeRate is a deliberate no-op matching XMRInterface's.
+      findConfirmedTxnByHash is built on get_recent_txs_and_info3 -- the same
+      wallet-history call _getTxUnlockTimes already uses -- rather than a
+      translation of XMR's incoming_transfers, which Zano has no equivalent
+      for. It has NOT been exercised against a live Zano wallet: no patched
+      Zano binary exists on any machine here.
+
+  bin/run.py
+      zano appeared in no branch, so it fell through to the generic Bitcoin
+      launcher, which appends "-datadir=" and has no manage_wallet_daemon
+      handling at all -- aborting startup before swap_client.start(). It is
+      deliberately NOT added to the CryptoNote tuple: startXmrDaemon launches
+      a monerod-shaped process and zanod is not one. The new branch starts
+      nothing and says so if the config ever asks otherwise.
+
+  interface/zano/core.py
+      manage_daemon was ctx.should_manage_daemon("ZANO") under a comment
+      asserting Grove's supervisor forces it False at runtime "the same way it
+      already does for XMR/ZEPH". The supervisor did the opposite: it wrote
+      manage_daemon = <coin is enabled>. Now hardcoded False here as well, so
+      the engine is correct standing alone, and the supervisor was fixed
+      separately (swap_sidecar.rs, HOST_MANAGED_DAEMON_COINS).
+
+  templates/settings.html
+      page_settings.py reads fee_priority_zephyr and managedaemon_zephyr
+      unconditionally via get_data_entry -- a raw dict subscript -- while all
+      three gates in this template still said ("wownero", "monero"). Saving
+      Zephyr settings raised KeyError every single time.
+
+  templates/wallet.html
+      w.cid in "6, 9" is a SUBSTRING test on a string: "6" and "9" match,
+      "16" (ZANO) and "19" (ZEPH) do not. Both fell to branches that do not
+      serve them -- Subtract Fee, which the CryptoNote withdraw path ignores
+      (so the wallet could not be emptied), and show_utxo_groups, whose
+      handler calls ci.getUnspentsByAddr(), absent on every CryptoNote
+      interface, rendering a full-page error instead of the wallet. Replaced
+      with membership over an explicit id list.
+
+  bin/prepare.py
+      Two independent faults.
+      (a) prepareCore looped over signers and then raised if the loop had not
+          set passed -- so an EMPTY signer table raised unconditionally.
+          zephyr and zano are the only two coins that publish no signer at all
+          (deliberately: neither release is signed, and each module overrides
+          verifyCoreSignature with a documented no-op), so both modules' own
+          "clear, actionable error" paths were unreachable dead code. "No
+          signers" is a different case from "every signer failed" and is now
+          dispatched as one. Verified first that neither module dereferences
+          signing_key_name, so a None signer is safe.
+      (b) modify_tor_config gated on ("monero", "wownero"), so ZEPH and ZANO
+          fell into the Bitcoin branch and hit sys.exit(1) -- ZEPH on a
+          zephyr.conf that does not exist (the real file is zephyrd.conf),
+          ZANO on "Unknown default onion listening port". ZEPH is a Monero
+          fork and belongs in the CryptoNote branch, whose defaults already
+          resolve correctly for it; ZANO is host-managed and now refuses
+          explicitly, naming who should configure it instead.
+
+Not fixed here, recorded so it is not rediscovered: ZANO is also absent from
+page_settings.py's fee_priority handling, but CONSISTENTLY with its template,
+so it produces Bitcoin-style fields on a CryptoNote coin rather than a crash.
+
+Applies on top of PATCH-19.
+
+diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
+index ac81ad8..d0f8dec 100644
+--- a/basicswap/interface/zano/zano.py
++++ b/basicswap/interface/zano/zano.py
+@@ -815,6 +815,85 @@ class ZanoInterface(CoinInterface):
+         DEFAULT_ZANO_FEE_ATOMIC = 10000000000  # 0.01 ZANO, matches REU26 rung1/2's observed fee
+         return float(self.format_amount(DEFAULT_ZANO_FEE_ATOMIC)), "zano_default_fee"
+ 
++    def validateFeeRate(
++        self, fee_rate: int, concept_type: int, force_bypass: bool = False
++    ) -> None:
++        # PWNDA-PATCH-20: ZanoInterface extends CoinInterface directly, so unlike
++        # XMR/WOW/ZEPH (which reach XMRInterface's copy) it inherited no
++        # validateFeeRate -- yet the engine calls it unguarded on every ZANO offer
++        # creation (basicswap.py postOffer) and, worse, on every INBOUND peer offer
++        # (processOffer), where an AttributeError raises inside the message handler.
++        #
++        # Semantics match XMRInterface's: a no-op. Zano's transfer RPC takes an
++        # explicit numeric fee (see get_fee_rate above) and the scriptless leg never
++        # negotiates a rate, so there is no rate to validate. This is a deliberate
++        # no-op, not a stub -- do not "implement" it later without first establishing
++        # that a rate is actually used somewhere.
++        pass
++
++    def findConfirmedTxnByHash(self, txid: str):
++        # PWNDA-PATCH-20: second method missing for the same reason as
++        # validateFeeRate above. Called from checkXmrBidState, which is coin-B
++        # refund/recovery detection -- so its absence was fund-relevant, not just a
++        # crash on the happy path.
++        #
++        # Built on get_recent_txs_and_info3, the same wallet history call
++        # _getTxUnlockTimes already relies on, rather than a translation of XMR's
++        # incoming_transfers (Zano has no such RPC; see the get_outputs mapping note
++        # in findTxB). Returns the XMRInterface-shaped dict its callers expect, or
++        # None when the tx is absent or not yet buried deep enough.
++        #
++        # NOT YET EXERCISED against a live Zano wallet -- no patched Zano binary
++        # exists on any machine here (see [[zano-patched-wallet-build]]). It is
++        # written to the documented RPC shape and to the idiom of the neighbouring
++        # methods, and it removes a guaranteed AttributeError, but treat its first
++        # live run as unverified.
++        with self._mx_wallet:
++            try:
++                current_height: int = self.getChainHeight()
++            except Exception as e:
++                self._log.info("ZANO getChainHeight failed: %s", str(e))
++                # If the transfer is available it will be deep enough -- same
++                # fallback XMRInterface takes.
++                current_height = None
++
++            try:
++                rv = self.rpc_wallet(
++                    "get_recent_txs_and_info3",
++                    {
++                        "offset": 0,
++                        "count": 1000,
++                        "update_provision_info": False,
++                        "exclude_mining_txs": False,
++                        "exclude_unconfirmed": True,
++                        "order": "FROM_END_TO_BEGIN",
++                    },
++                )
++            except Exception as e:
++                self._log.warning(
++                    "ZANO get_recent_txs_and_info3 failed for {}: {}".format(txid, e)
++                )
++                return None
++
++            for tx in rv.get("transfers", []):
++                if tx.get("tx_hash") != txid:
++                    continue
++                height = tx.get("height", 0)
++                if height in (None, 0):
++                    # Unconfirmed: present in the wallet but not in a block.
++                    return None
++                if (
++                    current_height is not None
++                    and current_height - height <= self.blocks_confirmed
++                ):
++                    return None
++                return {
++                    "txid": tx.get("tx_hash"),
++                    "amount": tx.get("amount", 0),
++                    "height": height,
++                }
++            return None
++
+     def getNewRandomKey(self) -> bytes:
+         # Note: Returned bytes are in big endian order (same convention xmr.py uses).
+         return i2b(9 + secrets.randbelow(ed25519_l - 9))
+diff --git a/basicswap/interface/zano/core.py b/basicswap/interface/zano/core.py
+index 201d676..25d0d9b 100644
+--- a/basicswap/interface/zano/core.py
++++ b/basicswap/interface/zano/core.py
+@@ -65,12 +65,22 @@ class ZanoPrepare(CoinPrepareModule):
+     def getConfigSegment(self, ctx: PrepareContext) -> dict:
+         datadir = os.getenv("ZANO_DATA_DIR", os.path.join(ctx.data_dir, self.name))
+         config = {
+-            # Matches interface/xmr/core.py's convention for a host-wallet-managed
+-            # coin -- Grove's own supervisor (apply_local_config_policy, C-R0/C-RX;
+-            # NOT this module) is what actually forces manage_daemon False at runtime,
+-            # the same way it already does for XMR/ZEPH.
++            # PWNDA-PATCH-20: this comment used to claim that "Grove's own
++            # supervisor ... forces manage_daemon False at runtime, the same way
++            # it already does for XMR/ZEPH." That was the exact inverse of what
++            # the supervisor did: apply_coin_enablement_to_config wrote
++            # manage_daemon = <coin is enabled>, so enabling ZANO set it TRUE and
++            # startup aborted. Corrected in swap_sidecar.rs on 2026-09-03
++            # (HOST_MANAGED_DAEMON_COINS + the test that asserts the written
++            # bytes rather than reading this file).
++            #
++            # Hardcoded False here as well, deliberately, so the engine is
++            # correct standing alone: a config generated without Grove's
++            # supervisor must still not ask run.py to launch zanod, which it
++            # cannot do (PWNDA-PATCH-20 in bin/run.py refuses explicitly).
++            # Two independent guarantees, not one relying on the other.
+             "connection_type": "rpc",
+-            "manage_daemon": ctx.should_manage_daemon("ZANO"),
++            "manage_daemon": False,
+             # Unconditionally False, not merely defaulted -- see the module docstring's
+             # "why pwnda spawns the Zano scratch wallet rather than run.py" note. run.py
+             # must never attempt to spawn a Monero-family process for this coin.
+diff --git a/basicswap/bin/run.py b/basicswap/bin/run.py
+index a367694..c268946 100644
+--- a/basicswap/bin/run.py
++++ b/basicswap/bin/run.py
+@@ -520,6 +520,30 @@ def runClient(
+ 
+                 continue  # /monero
+ 
++            # PWNDA-PATCH-20: zano was in neither this list nor any other branch, so
++            # it fell through to the generic Bitcoin launcher below -- which appends
++            # "-datadir=" and has no manage_wallet_daemon handling at all, aborting
++            # startup before swap_client.start().
++            #
++            # It deliberately does NOT join the tuple above: startXmrDaemon launches
++            # a monerod-shaped process, and zanod is not one. Zano is host-managed
++            # (pwnda's supervisor owns zanod and simplewallet), so the correct
++            # behaviour here is to start nothing and say so clearly if the config
++            # ever asks run.py to do otherwise.
++            if c == "zano":
++                if v["manage_daemon"] is True or v.get("manage_wallet_daemon") is True:
++                    raise ValueError(
++                        "zano: manage_daemon/manage_wallet_daemon must both be false. "
++                        "run.py cannot launch zanod or simplewallet -- they take "
++                        "neither monerod's nor bitcoind's arguments, and the host "
++                        "supervisor owns both processes. Set them false in the zano "
++                        "chainclient settings."
++                    )
++                swap_client.log.info(
++                    f"{display_name}: host-managed, run.py starting no processes"
++                )
++                continue  # /zano
++
+             if c == "decred":
+                 appdata = v["datadir"]
+                 coin_opts = copy.deepcopy(base_coin_opts)
+diff --git a/basicswap/bin/prepare.py b/basicswap/bin/prepare.py
+index 10bf1bb..f00ac0e 100644
+--- a/basicswap/bin/prepare.py
++++ b/basicswap/bin/prepare.py
+@@ -527,6 +527,26 @@ def testOnionLink():
+ def prepareCore(coin, version_data, settings, data_dir, extra_opts={}):
+     version, version_tag, signers = version_data
+ 
++    # PWNDA-PATCH-20: an empty signer table meant zero loop iterations, so `passed`
++    # stayed False and this function raised unconditionally -- for zephyr and zano,
++    # the only two coins whose modules deliberately publish no signer (their releases
++    # carry no signature at all; each module overrides verifyCoreSignature with a
++    # documented no-op). The modules' own "clear, actionable error" paths were
++    # therefore unreachable dead code, and --upgradecores hit this on an unguarded
++    # call site.
++    #
++    # "No signers" is a distinct case from "every signer failed" and has to be
++    # dispatched, not fallen through: run the single unsigned attempt explicitly.
++    if len(signers) == 0:
++        logger.info(
++            f"Prepare core: {coin} v{version}{version_tag} - no signer published for "
++            f"this coin; the module's verifyCoreSignature governs verification."
++        )
++        tryPrepareCore(
++            coin, version_data, None, settings, data_dir, extra_opts=extra_opts
++        )
++        return
++
+     passed: bool = False
+     for signer in signers:
+         try:
+@@ -659,7 +679,27 @@ def modify_tor_config(
+     coin_settings = settings["chainclients"][coin]
+     data_dir = coin_settings["datadir"]
+ 
+-    if coin in ("monero", "wownero"):
++    # PWNDA-PATCH-20: zano is host-managed -- this app owns zanod and
++    # simplewallet, and neither takes monerod's proxy options nor bitcoind's.
++    # Before this it fell through to the Bitcoin branch below and died on
++    #     exitWithError("Unknown default onion listening port for zano")
++    # which blames a missing port table for what is really "run.py does not
++    # drive this daemon at all". Refuse explicitly, and say who should.
++    if coin == "zano":
++        exitWithError(
++            "zano: tor configuration is not handled here. zanod and "
++            "simplewallet are host-managed (see HOST_MANAGED_DAEMON_COINS in "
++            "src-tauri/src/swap_sidecar.rs); configure their proxy settings "
++            "wherever the host launches them, not through basicswap-prepare."
++        )
++
++    # PWNDA-PATCH-20: zephyr added. It IS a Monero fork, so the CryptoNote
++    # branch is correct for it: the defaults below already resolve to
++    # zephyrd.conf and zephyr-wallet-rpc.conf, and monerod_proxy_config's
++    # options are the ones zephyrd accepts. Without it zephyr took the Bitcoin
++    # branch and exited on a `zephyr.conf` that never existed -- the real file
++    # is zephyrd.conf, so the error named a filename the project does not use.
++    if coin in ("monero", "wownero", "zephyr"):
+         core_conf_name: str = coin_settings.get("config_filename", coin + "d.conf")
+         core_conf_path = os.path.join(data_dir, core_conf_name)
+         if not os.path.exists(core_conf_path):
+@@ -683,7 +723,8 @@ def modify_tor_config(
+                 # Disable tor first
+                 for line in fp_in:
+                     skip_line: bool = False
+-                    if coin in ("wownero", "monero"):
++                    # PWNDA-PATCH-20: zephyr uses monerod's proxy options too.
++                    if coin in ("wownero", "monero", "zephyr"):
+                         for opt_line in monerod_proxy_config:
+                             setting: str = opt_line[0 : opt_line.find("=") + 1]
+                             if line.startswith(setting):
+@@ -692,7 +733,8 @@ def modify_tor_config(
+                     if not skip_line:
+                         fp.write(line)
+             if enable:
+-                if coin in ("wownero", "monero"):
++                # PWNDA-PATCH-20: see above.
++                if coin in ("wownero", "monero", "zephyr"):
+                     for opt_line in monerod_proxy_config:
+                         fp.write(opt_line + "\n")
+ 
+diff --git a/basicswap/templates/settings.html b/basicswap/templates/settings.html
+index 5ce996f..d2e60b0 100644
+--- a/basicswap/templates/settings.html
++++ b/basicswap/templates/settings.html
+@@ -136,7 +136,11 @@
+            {% if c.manage_daemon is defined %}
+            <div>
+             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Manage Daemon</label>
+-            {% if c.name in ('wownero', 'monero') %}
++            {# PWNDA-PATCH-20: zephyr added. page_settings.py's POST handler reads
++               managedaemon_zephyr and fee_priority_zephyr unconditionally via
++               get_data_entry (a raw dict subscript), so without zephyr in these three
++               template gates, saving Zephyr settings raised KeyError every time. #}
++            {% if c.name in ('wownero', 'monero', 'zephyr') %}
+             <div class="relative">
+              <select class="hover:border-blue-500 bg-gray-50 text-gray-900 appearance-none dark:bg-gray-700 dark:text-white border border-gray-300 dark:border-gray-600 dark:placeholder-gray-400 text-sm rounded-lg outline-none focus:ring-blue-500 focus:border-blue-500 block w-full p-2.5 focus:ring-1 focus:outline-none" name="managedaemon_{{ c.name }}">
+               <option value="true" {% if c.manage_daemon==true %} selected{% endif %}>True</option>
+@@ -318,7 +322,8 @@
+         {% endif %}
+         {% endif %}
+ 
+-        {% if c.name in ('wownero', 'monero') %}
++        {# PWNDA-PATCH-20: zephyr added -- CryptoNote RPC configuration block. #}
++        {% if c.name in ('wownero', 'monero', 'zephyr') %}
+         <div class="mb-6">
+          <h4 class="text-sm font-medium text-gray-900 dark:text-white mb-4">
+           RPC Configuration
+@@ -395,7 +400,9 @@
+            </div>
+            {% endif %}
+ 
+-           {% if c.name in ('wownero', 'monero') %}
++           {# PWNDA-PATCH-20: zephyr added -- renders fee_priority_zephyr, which the
++              POST handler requires. #}
++           {% if c.name in ('wownero', 'monero', 'zephyr') %}
+            <div>
+             <label class="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Transaction Fee Priority</label>
+             <div class="relative">
+diff --git a/basicswap/templates/wallet.html b/basicswap/templates/wallet.html
+index b5cdc13..baa6be7 100644
+--- a/basicswap/templates/wallet.html
++++ b/basicswap/templates/wallet.html
+@@ -408,8 +408,15 @@
+                           <div class="w-full p-3">
+                             <div class="mb-2 qrcode-container flex h-60 justify-center items-center">
+                               <div class="qrcode-border flex">
+-                               {% if w.cid in '6, 9' %}
+-                               {# XMR | WOW #}
++                               {# PWNDA-PATCH-20: substring -> membership. ZEPH (19) added:
++                                  it is a Monero fork with the same main/sub address
++                                  model, so it has a main_address to render. ZANO (16)
++                                  deliberately NOT added — its address model is its own
++                                  and nothing here has verified what w.main_address
++                                  holds for it. Shape fixed for both; membership only
++                                  where it is established. #}
++                               {% if w.cid|string in ['6', '9', '19'] %}
++                               {# XMR | WOW | ZEPH #}
+                                   <div id="qrcode-monero-main" class="qrcode" data-qrcode data-address="{{ w.main_address }}"></div>
+                                 </div>
+                               </div>
+@@ -435,7 +442,15 @@
+                           </div>
+                         </div>
+                       </div>
+-                     {% if w.cid in '1, 3, 6, 9, 13' %}
++                     {# PWNDA-PATCH-20: substring -> membership, MEMBERSHIP UNCHANGED.
++                        This gate selects coins that show a second address panel;
++                        whether ZEPH/ZANO populate w.deposit_address has not been
++                        established here, so adding them would be a guess. The
++                        substring bug is fixed either way: '13' only ever matched
++                        because it is a literal substring of this string, and any
++                        future two-digit id would have silently matched or not
++                        depending on the spelling of its neighbours. #}
++                     {% if w.cid|string in ['1', '3', '6', '9', '13'] %}
+                      {# PART | LTC | XMR | WOW | FIRO #}
+                       <div class="w-full md:w-1/2 p-3 flex justify-center items-center">
+                         <div class="h-full">
+@@ -443,8 +458,9 @@
+                             <div class="w-full p-3">
+                               <div class="mb-2 qrcode-container flex h-60 justify-center items-center">
+                                 <div class="qrcode-border flex">
+-                               {% if w.cid in '6, 9' %}
+-                               {# XMR | WOW #}
++                               {# PWNDA-PATCH-20: see the main-address gate above. #}
++                               {% if w.cid|string in ['6', '9', '19'] %}
++                               {# XMR | WOW | ZEPH #}
+                                   <div id="qrcode-monero-sub" class="qrcode" data-qrcode data-address="{{ w.deposit_address }}"> </div>
+                                 </div>
+                               </div>
+@@ -691,7 +707,13 @@
+            </td>
+           </tr>
+           <tr class="opacity-100 text-gray-500 dark:text-gray-100">
+-           {% if w.cid in '6, 9' %} {# XMR | WOW #}
++           {# PWNDA-PATCH-20: was `w.cid in '6, 9'`, a SUBSTRING test on a string --
++              so "6" and "9" matched but "16" (ZANO) and "19" (ZEPH) did not, and both
++              fell to the Subtract Fee branch, which the CryptoNote withdraw path in
++              page_wallet.py ignores entirely. A Zephyr or Zano wallet could not be
++              emptied from the UI, and the checkbox it showed instead did nothing.
++              Membership over an explicit list, not a substring. #}
++           {% if w.cid|string in ['6', '9', '16', '19'] %} {# XMR | WOW | ZANO | ZEPH #}
+            <td class="hidden py-3 px-6 bold">Sweep All:</td>
+            <td class="hidden py-3 px-6">
+               <input class="hover:border-blue-500 w-5 h-5 form-check-input text-blue-600 bg-gray-50 border-gray-300 rounded focus:ring-blue-500 dark:focus:ring-blue-600 dark:ring-offset-gray-800 focus:ring-1 dark:bg-gray-500 dark:border-gray-400" type="checkbox" id="sweepall" name="sweepall_{{ w.cid }}" {% if w.wd_sweepall==true %} checked="checked"{% endif %}>
+@@ -794,8 +816,14 @@
+               <div class="py-6 bg-coolGray-100 border-t border-gray-100 dark:border-gray-400 dark:bg-gray-500 rounded-bl-xl rounded-br-xl">
+                 <div class="px-6">
+                   <div class="flex flex-wrap justify-end">
+-                    {% if w.cid in '6, 9' %}
+-                    {# XMR | WOW #}
++                    {# PWNDA-PATCH-20: same substring bug as the Sweep All gate above.
++                       ZANO (16) and ZEPH (19) fell through to the show_utxo_groups
++                       branch, whose handler calls ci.getUnspentsByAddr() -- absent on
++                       every CryptoNote interface -- raising AttributeError and
++                       rendering a full-page "BasicSwap Error" instead of the wallet.
++                       page_wallet.py's estfee handler already supports these coins. #}
++                    {% if w.cid|string in ['6', '9', '16', '19'] %}
++                    {# XMR | WOW | ZANO | ZEPH #}
+                     <div class="w-full md:w-auto p-1.5 mx-1"> <button type="submit" class="flex flex-wrap justify-center w-full px-4 py-2.5 bg-blue-500 hover:bg-blue-600 font-medium text-lg lg:text-sm text-white border border-blue-500 rounded-md shadow-button focus:ring-0 focus:outline-none" name="estfee_{{ w.cid }}" value="Estimate Fee">Estimate {{ w.ticker }} Fee </button> </div>
+                     {# / XMR | WOW #}
+                     {% elif w.show_utxo_groups %}

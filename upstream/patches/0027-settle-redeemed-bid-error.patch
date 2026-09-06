@@ -1,0 +1,160 @@
+Grove PATCH-27: settle a bid parked in BID_ERROR whose chain-A redeem is
+already confirmed
+
+BID_ERROR is terminal for the adaptor-signature state machine
+(checkXmrBidState has no branch for it), and PWNDA-PATCH-11's recovery
+re-queues the chain-A redeem so a TRANSIENT failure can be retried. It has a
+blind spot the 2026-08-23 mainnet swap fell into: the redeem was not merely
+built, it had CONFIRMED -- the engine parked the bid on a duplicate-broadcast
+rejection of a transaction that was already in a block. Re-queueing that
+redeem returns early from redeemXmrBidCoinALockTx ("already redeemed"), so
+the bid can only ever rest at LOCK_RELEASED, `in_progress`, for as long as
+the database exists. Twelve days later it was still the console's one
+"Swap in Progress" (status Error), and the wallet's tracker still said
+"Waiting for the other user".
+
+  basicswap.py  pwndaRecoverStalledBid
+      New gate between "no refund in flight" and "nothing was ever built":
+      when the engine's own record carries the chain-A spend txid AND chain A
+      reports >= 1 confirmation for it, the swap is financially complete for
+      the side that redeemed A. Settle it exactly as
+      process_XMR_SWAP_A_LOCK_tx_spend does on seeing the spend -- SCRIPT_TX_
+      REDEEMED, LOCK_TX_A_SPEND_TX_SEEN event, then SWAP_COMPLETED for the
+      redeeming side -- and deactivate it so it leaves the in-progress set.
+      The other side (was_received) completes on chain B and is NOT settled
+      here; the reply says so. Reply gains `settled: true`, `confirmations`
+      and `txid` so a caller can tell "settled" from "re-queued".
+
+  basicswap.py  pwndaTxConfirmations
+      Confirmations for a chain-A transaction: the electrum backend's verbose
+      lookup, or getrawtransaction then the wallet's gettransaction. None
+      means "unknown", and unknown never settles.
+
+Idempotent and refusal-shaped like PATCH-11: it changes no state unless the
+chain has already made the outcome a fact. The supervisor's bid janitor
+(Rust, swap_bid.rs) calls this for every "Error" row on sentbids after each
+healthy start and periodically, which is what turns the 2026-08-23 bid into
+"Completed" without anyone finding a button.
+
+Not an upstream candidate as written: upstream's exit is manualBidUpdate on
+the HTML bid page, which takes an arbitrary state. This takes none.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -7717,6 +7717,82 @@
+                     "state": state_before,
+                     "reason": "A refund is already in flight for this swap; the timelock path will complete it.",
+                 }
++            # PWNDA-PATCH-27 -- Gate 2b: the engine's own record says the
++            # chain-A redeem was PUBLISHED. When the chain agrees (>= 1
++            # confirmation) the swap is financially complete for the side that
++            # redeemed A, and BID_ERROR is a bookkeeping error, not a swap
++            # error: re-queueing the redeem (below) would return early from
++            # redeemXmrBidCoinALockTx ("already redeemed") and leave the bid
++            # resting at LOCK_RELEASED forever, still "in progress". Settle it
++            # exactly as process_XMR_SWAP_A_LOCK_tx_spend would have when it
++            # saw the spend -- same states, same event, same notification --
++            # then deactivate it so it leaves the in-progress set. The
++            # 2026-08-23 mainnet bid sat in this state for twelve days.
++            spend_txid = None
++            spend_rec = getattr(bid, "xmr_a_lock_spend_tx", None)
++            if spend_rec is not None and getattr(spend_rec, "txid", None):
++                spend_txid = spend_rec.txid
++            elif xmr_swap.a_lock_spend_tx_id:
++                spend_txid = xmr_swap.a_lock_spend_tx_id
++            if spend_txid:
++                reverse_bid: bool = self.is_reverse_ads_bid(
++                    offer.coin_from, offer.coin_to
++                )
++                was_received: bool = (
++                    bid.was_sent if reverse_bid else bid.was_received
++                )
++                coin_from = Coins(offer.coin_to if reverse_bid else offer.coin_from)
++                confirmations = self.pwndaTxConfirmations(
++                    self.ci(coin_from), spend_txid
++                )
++                if confirmations is not None and confirmations >= 1:
++                    if was_received:
++                        # The other side redeemed A; our completion is the
++                        # chain-B redeem, which the state machine owns. Not
++                        # automated here -- say so rather than guess.
++                        return {
++                            "recovered": False,
++                            "state": state_before,
++                            "reason": (
++                                "The counterparty's claim on chain A is confirmed; "
++                                "this side completes on chain B and is not settled "
++                                "automatically."
++                            ),
++                        }
++                    bid.setState(BidStates.XMR_SWAP_SCRIPT_TX_REDEEMED)
++                    if bid.xmr_a_lock_tx:
++                        bid.xmr_a_lock_tx.setState(TxStates.TX_REDEEMED)
++                    self.logBidEvent(
++                        bid.bid_id,
++                        EventLogTypes.LOCK_TX_A_SPEND_TX_SEEN,
++                        f"PWNDA-PATCH-27: chain-A redeem {spend_txid.hex()} has "
++                        f"{confirmations} confirmation(s); settling a bid parked in "
++                        f"{state_before}.",
++                        cursor,
++                    )
++                    bid.setState(BidStates.SWAP_COMPLETED)
++                    self.deactivateBid(cursor, offer, bid)
++                    self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
++                    self.commitDB()
++                    try:
++                        self.notify(NT.SWAP_COMPLETED, {"bid_id": bid_id.hex()})
++                    except Exception as ex:
++                        self.log.warning(
++                            f"Failed to send swap completion notification: {ex}"
++                        )
++                    self.log.info(
++                        f"PWNDA-PATCH-27: settled bid {self.log.id(bid_id)} "
++                        f"(was {state_before}): chain-A redeem {spend_txid.hex()} "
++                        f"confirmed x{confirmations}."
++                    )
++                    return {
++                        "recovered": True,
++                        "settled": True,
++                        "state_before": state_before,
++                        "state": strBidState(bid.state),
++                        "confirmations": confirmations,
++                        "txid": spend_txid.hex(),
++                    }
+             # Gate 3 -- nothing to publish if the spend tx was never built.
+             if not xmr_swap.a_lock_spend_tx:
+                 return {
+@@ -7746,6 +7822,32 @@
+         finally:
+             self.closeDB(cursor, commit=False)
+ 
++    def pwndaTxConfirmations(self, ci, txid: bytes) -> Optional[int]:
++        # PWNDA-PATCH-27: how many confirmations chain A gives a transaction,
++        # or None when the question cannot be answered -- and None means "do
++        # not settle", never "assume confirmed". Electrum mode asks the backend
++        # (verbose blockchain.transaction.get carries `confirmations`); RPC
++        # mode asks the node, then the wallet (the redeem is our own wallet's
++        # transaction, so gettransaction answers even without txindex).
++        try:
++            if hasattr(ci, "useBackend") and ci.useBackend():
++                backend = ci.getBackend()
++                info = backend.getTransaction(txid.hex()) if backend else None
++                if isinstance(info, dict):
++                    return int(info.get("confirmations", 0) or 0)
++                return None
++            try:
++                info = ci.rpc("getrawtransaction", [txid.hex(), True])
++            except Exception:
++                info = ci.rpc_wallet("gettransaction", [txid.hex()])
++            if isinstance(info, dict):
++                return int(info.get("confirmations", 0) or 0)
++        except Exception as e:
++            self.log.debug(
++                f"PWNDA-PATCH-27: could not read confirmations for {txid.hex()}: {e}"
++            )
++        return None
++
+     def timeoutBid(self, bid_id: bytes, cursor=None) -> None:
+         self.log.info(f"Bid {self.log.id(bid_id)} timed-out")
+         self.deactivateBidForReason(bid_id, BidStates.SWAP_TIMEDOUT, cursor=cursor)

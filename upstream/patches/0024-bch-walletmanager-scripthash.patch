@@ -1,0 +1,151 @@
+Grove PATCH-24: give WalletManager a cashaddr scripthash, so a BCH address is watched at all
+
+PATCH-18 recorded, in a comment, that WalletManager._computeScripthash cannot
+parse a cashaddr: it runs segwit_addr.decode against _getHRP, and BCH's
+chainparams "hrp" is a network-name LABEL, not a bech32 human-readable part --
+and cashaddr is not bech32 in any case. It therefore returned "" for every BCH
+address. PATCH-18 then worked around that at the one call site it needed
+(BCHInterface.importWatchOnlyAddress, which computes a scripthash and passes it
+explicitly) and left the function itself as-is.
+
+The two call sites INSIDE wallet_manager.py were not covered by that workaround:
+
+  importWatchOnlyAddress   `if not scripthash: scripthash = self._computeScripthash(...)`
+  importAddressWithKey     passes `scripthash=self._computeScripthash(...)` unconditionally
+
+Both stored "" as the watched scripthash for BCH. A watch-only row with an empty
+scripthash subscribes to nothing, so the address never reports a balance and its
+funding transactions are never observed. importAddressWithKey is how a user's
+OWN BCH address is imported, which makes the visible symptom a funded BCH
+address showing a zero balance -- and "zero" is indistinguishable from an
+address that genuinely has no funds yet, which is why nothing reported it.
+
+This is the half-wired-site shape the 0020/0021/0023 series is named for, at one
+more layer: a defect was found, documented precisely, and routed around at the
+call site that mattered at the time, leaving the shared function still broken for
+every other caller. A comment describing a trap does not disarm it.
+
+  wallet_manager.py :: _bchScripthashForAddress   (new)
+      Takes an ADDRESS, not a pubkey hash, and dispatches on the cashaddr's
+      encoded type: P2SH20 -> OP_HASH160, P2SH32 -> OP_HASH256, otherwise
+      P2PKH. Taking a pubkey hash would have reproduced PATCH-23's bug here --
+      hashing a P2PKH script for a P2SH lock address. Scripts are built with
+      the engine's own CScript and opcode constants rather than hand-written
+      byte literals, so the layout matches BCHInterface.getScriptForPubkeyHash
+      and getDestForScriptHash BY CONSTRUCTION rather than by transcription.
+
+  wallet_manager.py :: _computeScripthash
+      Branches to the helper for Coins.BCH before the bech32 decode.
+
+  wallet_manager.py :: _deriveAddress
+      Now calls the same helper instead of building the P2PKH script a second
+      time inline. Two independent implementations of one hash is precisely how
+      _computeScripthash came to disagree with _deriveAddress; leaving the
+      duplicate in place would have re-armed it.
+
+Found by porting the REU26 research repo's own BCH scripthash harness
+(zephyr-testnet/bch-electrum-evidence) into scripts/swap/. That harness compares
+FOUR independent scripthash implementations over 16 derived addresses; against
+the Grove it reported _computeScripthash returning "" for all 16 while the other
+three agreed exactly. The Grove's own offline suite could not have found it: it
+was checking the paths PATCH-18 had fixed, not the one it had documented.
+
+verify-bch-electrum.py SECTION 9 asserts the helper agrees with BCHInterface's
+own builders for P2PKH, P2SH20 and P2SH32, and that _computeScripthash is
+non-empty for BCH -- both with falsification against the pre-patch tree.
+
+Applies on top of PATCH-23. Touches basicswap/, so it counts toward the engine
+patch level (p22 -> p23).
+
+diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
+index e48dab0..23f1515 100644
+--- a/basicswap/wallet_manager.py
++++ b/basicswap/wallet_manager.py
+@@ -309,11 +309,15 @@ class WalletManager:
+             # both shapes as this unit's SECONDARY gate.
+             from basicswap.interface.bch.contrib.cashaddress import Address
+ 
+-            script = bytes([0x76, 0xA9, 0x14]) + pkh + bytes([0x88, 0xAC])
+-            scripthash = sha256(script)[::-1].hex()
+             net = self._swap_client.chain
+             version = "P2PKH" if net == "mainnet" else f"P2PKH-{net.upper()}"
+             address = Address(version, pkh).cash_address()
++            # PWNDA-PATCH-24: was a second, independent construction of the
++            # same P2PKH script here. Two implementations of one hash is
++            # exactly how _computeScripthash came to disagree with this
++            # method in the first place, so derive it from the address
++            # through the single shared helper instead.
++            scripthash = self._bchScripthashForAddress(address)
+             return address, scripthash, pubkey
+         # PWNDA-PATCH-19 (Grove-only, BCH account-key glue -- this patch's
+         # entire reason to exist): the `if coin_type == Coins.BCH:` branch
+@@ -1368,7 +1372,69 @@ class WalletManager:
+         # Legacy two-time-pad XOR format.
+         return bytes(a ^ b for a, b in zip(encrypted_key, self._getXorKey(coin_type)))
+ 
++    @staticmethod
++    def _bchScripthashForAddress(address: str) -> str:
++        """Scripthash for a cashaddr, dispatching on its encoded address TYPE.
++
++        PWNDA-PATCH-24. Two things make this necessary rather than tidy:
++
++        1. `_computeScripthash` below could not do it at all. It runs
++           segwit_addr.decode against `_getHRP`, and BCH's chainparams "hrp"
++           is a network-name label, not a bech32 human-readable part --
++           cashaddr is not bech32 to begin with. So it returned "" for every
++           BCH address, and its callers stored that empty string as the
++           watched scripthash. A watch-only row with scripthash "" subscribes
++           to nothing: the address never reports a balance and its funding
++           transactions are never seen. PATCH-18 worked around this at ONE
++           call site (BCHInterface.importWatchOnlyAddress, which passes a
++           scripthash explicitly); the two call sites INSIDE this file --
++           importWatchOnlyAddress's `if not scripthash` default and
++           importAddressWithKey -- kept getting "". The second of those is
++           how a user's own BCH address is imported, so the visible symptom
++           is a funded BCH address showing a zero balance.
++
++        2. It must branch on P2PKH vs P2SH. Hashing a P2PKH script for a P2SH
++           address yields a scripthash for a script that address does not
++           have -- the same defect PATCH-23 fixed in bch.py, and the reason
++           this helper takes an ADDRESS rather than a pubkey hash.
++
++        The scripts are built with the engine's own CScript and opcodes rather
++        than hand-written bytes, so the layout matches
++        BCHInterface.getScriptForPubkeyHash / getDestForScriptHash by
++        construction. verify-bch-electrum.py SECTION 9 asserts that agreement
++        against the interface directly, so a divergence fails rather than
++        drifts.
++        """
++        from basicswap.interface.bch.contrib.cashaddress import Address
++        from basicswap.contrib.test_framework.script import (
++            CScript,
++            OP_CHECKSIG,
++            OP_DUP,
++            OP_EQUAL,
++            OP_EQUALVERIFY,
++            OP_HASH160,
++            OP_HASH256,
++        )
++
++        parsed = Address.from_string(address)
++        payload = bytes(parsed.payload)
++        if parsed.version.startswith("P2SH"):
++            op = OP_HASH256 if len(payload) == 32 else OP_HASH160
++            script = CScript([op, payload, OP_EQUAL])
++        else:
++            script = CScript(
++                [OP_DUP, OP_HASH160, payload, OP_EQUALVERIFY, OP_CHECKSIG]
++            )
++        return sha256(bytes(script))[::-1].hex()
++
+     def _computeScripthash(self, coin_type: Coins, address: str) -> str:
++        if coin_type == Coins.BCH:
++            # PWNDA-PATCH-24: see _bchScripthashForAddress above. Without
++            # this branch the decode below returns None and this method
++            # returns "", which its callers store as the watched
++            # scripthash -- silently, and indistinguishably from an
++            # address that simply has no funds yet.
++            return self._bchScripthashForAddress(address)
+         _, data = segwit_addr.decode(self._getHRP(coin_type), address)
+         if data is None:
+             return ""

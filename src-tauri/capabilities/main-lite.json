@@ -1,0 +1,94 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "lite-main",
+  "description": "Main window capabilities for PwndaLite — the mining-only product variant. Tauri capabilities list core-permission strings; the per-command allow-list is enforced at compile time in src-tauri/src/lib.rs via `#[cfg(feature = \"full\")]` gates. Building with `--no-default-features` strips every wallet/swap/RPC command from the invoke_handler. See PwndaWalletVault/wiki/synthesis/pwnda-lite-plan.md.",
+  "windows": ["lite"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "os:default",
+    "store:default",
+    "core:event:default",
+    "core:event:allow-listen",
+    "core:event:allow-emit",
+    "core:window:allow-start-dragging",
+    "core:window:allow-minimize",
+    "core:window:allow-close",
+    "core:window:allow-set-size",
+    "core:window:allow-set-resizable",
+    "core:window:allow-center"
+  ],
+  "remote": {
+    "urls": []
+  },
+  "_documented_commands": {
+    "_comment": "PwndaLite invokes only the mining-side Tauri commands. The actual gate is `#[cfg(feature = \"full\")]` in src-tauri/src/lib.rs which strips every command listed below from the lite binary. Adding a wallet command to the unconditional block (or removing its cfg attribute) would break the lite build at `cargo check --no-default-features`.",
+    "mining": [
+      "check_miners_exist",
+      "check_defender_exclusions",
+      "add_defender_exclusions",
+      "download_miners",
+      "get_miners_dir_path",
+      "get_cpu_thread_count",
+      "start_xmrig",
+      "scan_msr_environment",
+      "get_msr_environment",
+      "msr_hard_reset",
+      "stop_xmrig",
+      "is_mining",
+      "get_xmrig_hashrate",
+      "get_gpu_miner_hashrate",
+      "get_xmrig_snapshot",
+      "get_gpu_miner_snapshot",
+      "run_xmrig_benchmark",
+      "run_gpu_miner_benchmark",
+      "start_gpu_miner",
+      "stop_gpu_miner",
+      "is_gpu_mining",
+      "delete_miners",
+      "set_miner_window_visible",
+      "get_miner_window_visible",
+      "set_dev_fee_enabled",
+      "get_dev_fee_enabled",
+      "set_dev_mode",
+      "get_dev_mode"
+    ],
+    "dev_fee": [
+      "dev_fee_get_accounting",
+      "dev_fee_get_gpu_accounting",
+      "dev_fee_get_diagnostics",
+      "dev_fee_get_session_log_path",
+      "dev_fee_list_session_logs",
+      "dev_fee_read_session_log"
+    ],
+    "device_info": [
+      "get_cpu_info",
+      "get_gpu_info"
+    ],
+    "pool_stats": [
+      "fetch_pool_stats",
+      "fetch_pool_min_payout",
+      "ping_pool",
+      "ping_pools",
+      "ping_pools_via_proxy",
+      "proxy_refresh",
+      "proxy_get_state",
+      "proxy_pool_record_session_alive",
+      "proxy_pool_record_failure",
+      "proxy_pool_get_rotation_pool"
+    ],
+    "leaderboard_opt_in_telemetry_no_key_material": [
+      "leaderboard_init",
+      "leaderboard_get_status",
+      "leaderboard_set_opt_in",
+      "leaderboard_set_display_name",
+      "leaderboard_register",
+      "leaderboard_reset_identity",
+      "leaderboard_heartbeat",
+      "leaderboard_get_top",
+      "leaderboard_get_me",
+      "leaderboard_get_eligible_pools",
+      "leaderboard_get_log_path"
+    ]
+  }
+}
