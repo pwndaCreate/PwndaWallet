@@ -1,0 +1,14 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+*.sh text eol=lf
+
+# Grove engine patches: LF in the working tree, always.
+#
+# `* text=auto` above plus core.autocrlf turns these into CRLF on checkout,
+# which mixes with the bare-LF blank context lines a unified diff contains.
+# Strict `git apply` then reports "corrupt patch at line N" on a file that
+# applied cleanly moments earlier — seen on 0008 immediately after the
+# 2026-09-03 merge checkout. apply-engine-patches.mjs is ending-tolerant and
+# stayed green throughout, so only the strict upstream-drift gate caught it.
+*.patch text eol=lf
+upstream/patches/** text eol=lf

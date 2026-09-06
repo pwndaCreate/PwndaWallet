@@ -1,0 +1,92 @@
+From: PwndaWallet <pwndamining@gmail.com>
+Subject: [PATCH 12/12] wallet: expose importAddress, so a host can repair the
+ engine's own address bookkeeping
+
+The engine can hold funds it does not report.
+
+`WalletManager.getCachedTotalBalance` sums `cached_balance` over rows already
+present in `wallet_addresses`. It is not a chain scan, and `syncBalances`
+only refreshes balances for addresses ALREADY in that table -- it never
+discovers new ones. Nothing keeps the table complete with respect to the
+chain, and the only repair command upstream ships cannot close the gap:
+`"rescan"` -> `rescanWalletAddresses` -> `runMigration` derives a fixed
+`num_addresses = 20` per chain and then forces `last_external_index` and
+`last_internal_index` to 19. It can neither find nor record anything past
+index 19.
+
+So an address beyond that is unreachable by every existing endpoint, and its
+balance is silently absent from every total the engine reports. Observed on
+mainnet LTC, 2026-08-23: 4.02888049 LTC at internal index 20 -- put there by
+the engine's own change allocation (see PWNDA-PATCH-9, which stops new change
+landing there) -- missing entirely from `/json/wallets`, while an independent
+scan of the same account over the same seed found it immediately.
+
+`WalletManager.importAddress` already does exactly the right thing: derives
+both chains to locate the index, inserts a real `wallet_addresses` row, and
+advances `last_*_index` so future allocation cannot collide with it. It had no
+caller outside internal input-signing.
+
+This exposes it as `pwndaimportaddress` and adds no new capability of its own.
+Note it must be `importAddress` and NOT the already-exposed `watchaddress`:
+`importWatchOnlyAddress` writes to `wallet_watch_only`, and
+`getCachedTotalBalance` excludes those rows unless they carry an encrypted
+private key -- so importing this way would track the address and still never
+count it, which is the more confusing failure of the two.
+
+`max_scan_index` defaults to 200 rather than the function's own 1000: a host
+that knows the address is scanning its own account, and 200 covers any
+realistic gap-limit walk at a fraction of the derivation cost.
+
+Not an upstream-PR candidate on its own -- it is a host-repair surface -- but
+the gap it exists to repair (a rescan that cannot see past its own hardcoded
+20) is upstream's, and worth reporting separately.
+
+Marker: PWNDA-PATCH-12
+---
+--- a/basicswap/js_server.py
++++ b/basicswap/js_server.py
+@@ -389,6 +389,42 @@
+                     raise ValueError("WalletManager not available")
+                 addresses = wm.getAllAddresses(coin_type)
+                 return bytes(json.dumps({"addresses": addresses}), "UTF-8")
++            elif cmd == "pwndaimportaddress":
++                # PWNDA-PATCH-12: teach the engine about an address of its
++                # OWN account that its bookkeeping never recorded.
++                #
++                # getCachedTotalBalance sums cached_balance over rows already
++                # present in wallet_addresses; it is not a chain scan. Nothing
++                # guarantees that table stays complete, and the only repair
++                # command upstream ships -- "rescan" -> rescanWalletAddresses
++                # -> runMigration -- derives a fixed num_addresses=20 per chain
++                # and then forces last_*_index to 19, so it can neither find
++                # nor record anything past index 19. An address beyond that is
++                # unreachable by every existing endpoint, and its balance is
++                # silently missing from every total the engine reports.
++                # Observed on mainnet LTC 2026-08-23: 4.02888049 LTC at
++                # internal index 20, absent from /json/wallets entirely.
++                #
++                # WalletManager.importAddress already does exactly the right
++                # thing -- derives both chains to find the index, inserts a
++                # real wallet_addresses row (so it counts, unlike
++                # importWatchOnlyAddress, whose rows are excluded from the
++                # total unless they carry a private key), and advances
++                # last_*_index so future allocation cannot collide with it.
++                # It simply had no caller outside internal input-signing.
++                # This exposes it; it adds no new capability of its own.
++                post_data = getFormData(post_string, is_json)
++                address = get_data_entry(post_data, "address")
++                max_scan_index = int(
++                    get_data_entry_or(post_data, "max_scan_index", 200)
++                )
++                wm = swap_client.getWalletManager()
++                if wm is None:
++                    raise ValueError("WalletManager not available")
++                imported = wm.importAddress(coin_type, address, max_scan_index)
++                return bytes(
++                    json.dumps({"success": imported, "address": address}), "UTF-8"
++                )
+             elif cmd == "fixseedid":
+                 root_key = swap_client.getWalletKey(coin_type, 1)
+                 swap_client.storeSeedIDForCoin(root_key, coin_type)
+-- 
+2.43.0

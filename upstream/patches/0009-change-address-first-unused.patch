@@ -1,0 +1,75 @@
+From: PwndaWallet <pwndamining@gmail.com>
+Subject: [PATCH 9/9] wallet_manager: allocate change at the lowest UNUSED
+ internal index, not MAX+1
+
+`getNewInternalAddress` picked `MAX(derivation_index) + 1` for every change
+address. After a lookahead pool of internal addresses has been derived but
+never used -- the normal state -- that skips the entire pool and lands change
+at its far end.
+
+Observed on mainnet LTC, 2026-08-22: an internal pool of 20 (indices 0-19,
+none ever used) put 4.02888049 LTC of real change at index 20. BIP-44 fixes
+the address gap limit at 20, so a wallet restoring the same seed walks the
+chain, sees 20 consecutive unused addresses, stops at index 19, and reports a
+zero balance over funds that are demonstrably on-chain. The coins are not
+lost and the seed is not wrong -- the seed backup simply stops being
+sufficient to find them without a raised gap limit.
+
+`_findReusableAddress` already encodes the correct rule ("lowest index with
+ever_used = 0 and is_funded = 0") and `getNewAddress` already calls it. This
+path never did. Prefer it, marking the reused row used rather than inserting
+a duplicate at the same index, and fall back to MAX+1 only when nothing is
+reusable -- at which point the trailing unused run is zero by construction,
+so a fresh index at the end cannot strand anything.
+
+Marker: PWNDA-PATCH-9
+---
+--- a/basicswap/wallet_manager.py
++++ b/basicswap/wallet_manager.py
+@@ -519,6 +519,44 @@
+         try:
+             cursor = self._swap_client.openDB()
+ 
++            # PWNDA-PATCH-9: allocate the LOWEST unused internal index rather
++            # than MAX(derivation_index) + 1.
++            #
++            # Upstream takes MAX + 1. After a lookahead pool of internal
++            # addresses has been derived but never used -- the normal state --
++            # that skips every address in the pool and lands change at its far
++            # end. Observed 2026-08-22 on mainnet LTC: a pool of 20 (indices
++            # 0-19, none ever used) put real change at index 20, which is
++            # exactly one past BIP-44's standard address gap limit of 20. A
++            # stock wallet restoring the same seed walks the chain, stops after
++            # 20 consecutive unused addresses, and reports zero over funds that
++            # are demonstrably on-chain. The money is not lost, but the seed
++            # backup silently stops being sufficient to find it.
++            #
++            # _findReusableAddress already expresses the correct rule and
++            # getNewAddress already uses it; this path simply never called it.
++            # Reuse marks the existing row used instead of inserting a second
++            # row at the same index.
++            reuse_index, reuse_address = self._findReusableAddress(
++                coin_type, True, cursor
++            )
++            if reuse_address is not None:
++                cursor.execute(
++                    "UPDATE wallet_addresses SET ever_used = 1"
++                    " WHERE coin_type = ? AND derivation_index = ? AND is_internal = ?",
++                    (int(coin_type), reuse_index, True),
++                )
++                self._swap_client.commitDB()
++                self._log.debug(
++                    f"PWNDA-PATCH-9: reusing unused internal address for "
++                    f"{coin_type.name} at index {reuse_index}: "
++                    f"{reuse_address[:16]}..."
++                )
++                return reuse_address
++
++            # Nothing reusable means every derived internal address is already
++            # used, so the trailing unused run is zero and a fresh index at the
++            # end of the chain cannot strand anything.
+             cursor.execute(
+                 "SELECT MAX(derivation_index) FROM wallet_addresses WHERE coin_type = ? AND is_internal = 1",
+                 (int(coin_type),),
+-- 
+2.43.0

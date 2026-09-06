@@ -1,0 +1,26 @@
+﻿# Build output
+/dist
+/dist-lite
+/node_modules
+/src-tauri/target
+/src-tauri/gen
+
+# Bundled binaries are produced by the release pipeline, never committed
+/src-tauri/binaries
+/src-tauri/resources/miners-linux
+/src/mining
+
+# Local environment
+.env
+.env.local
+.env.*.local
+!.env.example
+!.env.local.example
+!.env.development.local.example
+!.env.sandbox.local.example
+
+# Editors / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db

@@ -1,0 +1,111 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-21
+Subject: [PATCH 6/6] basicswap: sign legacy P2PKH wallet inputs in electrum
+ mode
+
+_signTxWithWalletElectrum assumed every wallet input is P2WPKH: it computed
+the BIP-143 segwit sighash and placed the signature in the witness stack,
+unconditionally. A wallet running with a legacy address type (PATCH 3's
+"p2pkh" -- the Exodus/Atomic import case) holds P2PKH outputs, whose spend
+requires the ORIGINAL sighash algorithm and a scriptSig of <sig> <pubkey>,
+with no witness entry. A witness signature over a P2PKH prevout is simply
+invalid; every spend from such a wallet -- withdrawals and swap funding alike
+-- would fail at broadcast.
+
+signTxLegacy mirrors signTx exactly (same low-R grinding, same SIGHASH_ALL
+tail byte) over LegacySignatureHash, which commits to the previous
+scriptPubKey but not the input amount. The signing loop branches per INPUT on
+the address string reconstructed from the previous output's actual
+scriptPubKey -- authoritative regardless of how the wallet usually encodes --
+and appends an empty witness entry for legacy inputs so mixed transactions
+serialise correctly.
+
+Fee estimation is deliberately untouched: legacy inputs are ~2.2x the vbytes,
+so the estimator's segwit-based figure underpays on a legacy-heavy
+transaction. On Litecoin, where this path is used, absolute fees are far
+below relay-fee floors either way; a Bitcoin legacy wallet would want the
+estimator revisited before heavy use. Recorded rather than hidden.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker in patched source: PWNDA-PATCH-6
+---
+ basicswap/interface/btc/btc.py |  52 ++++++++++----
+ 1 files changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
+index b219b8e..0a3a0db 100644
+--- a/basicswap/interface/btc/btc.py
++++ b/basicswap/interface/btc/btc.py
+@@ -98,6 +98,7 @@ from basicswap.contrib.test_framework.script import (
+     OP_RETURN,
+     SIGHASH_ALL,
+     SegwitV0SignatureHash,
++    LegacySignatureHash,
+ )
+ from basicswap.basicswap_util import (
+     ADAPTOR_SIG_LOCK_SPEND_FEE_BUFFER,
+@@ -2024,6 +2025,38 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+                 return sig + bytes((SIGHASH_ALL,))
+         raise RuntimeError("sign failed.")
+ 
++    def signTxLegacy(
++        self,
++        key_bytes: bytes,
++        tx_bytes: bytes,
++        input_n: int,
++        prevout_script: bytes,
++    ) -> bytes:
++        """PWNDA-PATCH-6: sign one input with the ORIGINAL (pre-segwit)
++        sighash. The legacy algorithm commits to the previous scriptPubKey but
++        not to the input amount, and the signature lands in scriptSig rather
++        than the witness -- both required to spend a P2PKH wallet input, which
++        a wallet imported from Exodus/Atomic consists of entirely.
++
++        Same low-R grinding as `signTx` so signature size stays uniform.
++        """
++        tx = self.loadTx(tx_bytes)
++        sig_hash, err = LegacySignatureHash(prevout_script, tx, input_n, SIGHASH_ALL)
++        if err is not None:
++            raise ValueError(f"LegacySignatureHash failed: {err}")
++
++        eck = PrivateKey(key_bytes)
++        for i in range(10000):
++            if i == 0:
++                nonce = (ffi.NULL, ffi.NULL)
++            else:
++                extra_entropy = i.to_bytes(4, "little") + (b"\0" * 28)
++                nonce = (ffi.NULL, ffi.new("unsigned char [32]", extra_entropy))
++            sig = eck.sign(sig_hash, hasher=None, custom_nonce=nonce)
++            if len(sig) < 71:
++                return sig + bytes((SIGHASH_ALL,))
++        raise RuntimeError("sign failed.")
++
+     def signTxOtVES(
+         self,
+         key_sign: bytes,
+@@ -2601,10 +2634,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+             )
+             value = utxo.get("value", 0)
+ 
+-            sig = self.signTx(priv_key, tx, i, script_code, value)
+-
+-            parsed_tx.wit.vtxinwit.append(CTxInWitness())
+-            parsed_tx.wit.vtxinwit[i].scriptWitness.stack = [sig, pubkey]
++            # PWNDA-PATCH-6: sign per the INPUT's actual script type. The
++            # address string is authoritative -- it was reconstructed from the
++            # previous output's scriptPubKey above, so a base58 address means
++            # a P2PKH prevout regardless of how the wallet usually encodes.
++            bech32_prefix = self.chainparams_network()["hrp"]
++            if address.startswith(bech32_prefix + "1"):
++                sig = self.signTx(priv_key, tx, i, script_code, value)
++                parsed_tx.wit.vtxinwit.append(CTxInWitness())
++                parsed_tx.wit.vtxinwit[i].scriptWitness.stack = [sig, pubkey]
++            else:
++                sig = self.signTxLegacy(priv_key, tx, i, script_code)
++                parsed_tx.vin[i].scriptSig = CScript([sig, pubkey])
++                # Witness stays aligned: an empty entry for a legacy input so
++                # mixed transactions serialise correctly.
++                parsed_tx.wit.vtxinwit.append(CTxInWitness())
+ 
+         self._log.debug(
+             f"_signTxWithWalletElectrum: signed {len(utxos)} inputs "

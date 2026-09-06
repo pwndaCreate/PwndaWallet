@@ -1,0 +1,40 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-18
+Subject: [PATCH 1/2] bin/run: guard the SIGHUP registration on Windows
+
+signal.SIGHUP does not exist on Windows, so `signal.signal(signal.SIGHUP, ...)`
+raises AttributeError before the handler is installed. The call site sits inside
+runClient()'s broad `except Exception` startup path, so the exception is
+swallowed and the node exits immediately AFTER its coin daemons have already
+been spawned -- leaving orphaned particld / litecoind / monerod processes and no
+BasicSwap parent to reap them. On Windows the node "starts and then vanishes".
+
+Gate the registration on `os.name != "nt"`. SIGINT and SIGTERM exist on Windows
+and stay unconditional, so Ctrl-C / terminate handling is unchanged.
+
+No-op on every POSIX platform. Upstream-PR candidate; the operator elected to
+submit this one.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker in patched source: PWNDA-PATCH-1
+---
+ basicswap/bin/run.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/basicswap/bin/run.py b/basicswap/bin/run.py
+index 696b533..c013df3 100755
+--- a/basicswap/bin/run.py
++++ b/basicswap/bin/run.py
+@@ -603,7 +603,11 @@ def runClient(
+ 
+         signal.signal(signal.SIGINT, signal_handler)
+         signal.signal(signal.SIGTERM, signal_handler)
+-        signal.signal(signal.SIGHUP, signal_handler)
++        # PWNDA-PATCH-1: SIGHUP does not exist on Windows; the bare registration
++        # raises AttributeError, which the broad except below swallows, killing the
++        # node immediately after its daemons start. Upstream-PR candidate.
++        if os.name != "nt":
++            signal.signal(signal.SIGHUP, signal_handler)
+ 
+         if len(start_only_coins) > 0:
+             logger.info(

@@ -1,0 +1,52 @@
+PwndaWallet
+Copyright 2026 PwndaWallet
+
+This product includes software developed by third parties, listed below with
+their own licenses. Nothing here modifies the Apache License, Version 2.0 that
+governs PwndaWallet itself; this file exists to satisfy the attribution those
+licenses require and to make the provenance of every shipped component legible.
+
+--------------------------------------------------------------------------------
+BasicSwap  (https://github.com/tecnovert/basicswap)
+The MIT License (MIT) — Copyright (c) 2019-2024 tecnovert
+
+PwndaWallet embeds a MODIFIED copy of BasicSwap as its atomic-swap engine. The
+modifications are kept as a numbered, append-only patch series under
+`upstream/patches/`, applied to a pinned upstream tag rather than merged into a
+fork, so exactly what was changed and why is readable in isolation. The
+distribution is identified at runtime as `pwnda-grove <upstream version>+p<N>`.
+
+Per the MIT license, the upstream copyright notice and permission notice are
+retained in `upstream/basicswap/LICENSE` (fetched with the pinned source) and
+reproduced with any distribution. Modified files carry `PWNDA-PATCH-<n>`
+markers naming the change.
+
+--------------------------------------------------------------------------------
+coincurve  (https://github.com/tecnovert/coincurve, BasicSwap fork)
+Licensed under the terms in that repository.
+
+Vendored as a build-time dependency of the swap engine, pinned by tag and
+commit in `scripts/fetch-swap-runtime.mjs`.
+
+--------------------------------------------------------------------------------
+Bundled third-party binaries
+
+The installer embeds, or downloads on demand, unmodified upstream binaries from
+the projects below. Each is pinned by version and verified by SHA256 (and, where
+the publisher signs releases, by GPG) before use. None is modified; each remains
+under its own license.
+
+  Mining          xmrig, lolMiner, SRBMiner-MULTI
+  Coin daemons    Particl, Bitcoin, Litecoin, Bitcoin Cash Node, Monero, Zephyr
+  Wallet RPC      monero-wallet-rpc, zephyr-wallet-rpc
+  Runtime         CPython (python-build-standalone)
+
+The full inventory — every binary, its source URL, its pin, and whether it is
+embedded or fetched at runtime — is maintained in the project documentation
+under `shipped-binary-inventory`.
+
+--------------------------------------------------------------------------------
+Application dependencies
+
+Node and Rust dependencies are declared in `package.json`, `package-lock.json`,
+`src-tauri/Cargo.toml` and `src-tauri/Cargo.lock`, each under its own license.

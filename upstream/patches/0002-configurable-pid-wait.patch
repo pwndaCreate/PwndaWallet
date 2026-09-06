@@ -1,0 +1,46 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-18
+Subject: [PATCH 2/2] basicswap: make the per-coin pid wait configurable
+
+initialiseDaemon()'s post-start handshake polls for the daemon's pid file 20
+times at 0.5s intervals -- a hard 10 second budget -- and raises if the pid is
+still unreadable. On Windows, with three coin daemons (particld, litecoind,
+monerod) coming up concurrently against Defender's on-access scanner and a cold
+page cache, the pid file routinely lands later than that, and the run aborts
+with a spurious "Failed to get daemon pid" even though every daemon is healthy
+and finishes starting seconds later.
+
+Read the iteration count from the BSX_PID_WAIT_ITERS environment variable,
+defaulting to the existing literal 20. With the variable unset the behaviour is
+byte-for-byte upstream's, so this is a no-op for every current deployment; the
+Windows supervisor sets BSX_PID_WAIT_ITERS=40 (20s) or higher.
+
+Deliberately NOT a raised constant: the right budget is a property of the host
+(disk speed, AV, how many daemons start at once), not of the software, so it
+belongs in the environment rather than in a new upstream default.
+
+Upstream-PR candidate (not yet submitted).
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker in patched source: PWNDA-PATCH-2
+---
+ basicswap/basicswap.py | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 989c1fe..eed04a8 100644
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -1273,7 +1273,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+             # Wait for daemon to start
+             # Test pids to ensure authcookie is read for the correct process
+             datadir_pid = -1
+-            for i in range(20):
++            # PWNDA-PATCH-2: Windows daemons write pid files slower under multi-daemon
++            # startup contention; make the 10s (20*0.5s) wait configurable. Absent env
++            # var == upstream default of 20, so this is a no-op for upstream.
++            _pwnda_pid_iters = int(os.getenv("BSX_PID_WAIT_ITERS", "20"))
++            for i in range(_pwnda_pid_iters):
+                 try:
+                     if os.name == "nt" and cc["core_version_group"] <= 17:
+                         # Older core versions don't write a pid file on windows

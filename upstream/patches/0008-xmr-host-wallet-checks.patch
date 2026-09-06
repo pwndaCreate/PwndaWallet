@@ -1,0 +1,273 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-21
+Subject: [PATCH 8/19] basicswap: accept a host-managed XMR main wallet's
+ identity, receive its config, and guard its fund-moving calls
+
+C9 points the engine's MAIN Monero wallet at the host's own monero-wallet-rpc
+(PWNDA-PATCH-5). Three upstream places assumed the main wallet is always the
+engine's own; this wallet is DELIBERATELY not derived from the swap seed, on
+purpose, verified by the host on its own side before mainwalletrpc* is ever
+written.
+
+1. initialiseWallet (basicswap.py) builds self.coin_clients[coin] -- what
+   XMRInterface.__init__ actually receives -- as an explicit ALLOWLIST copy
+   from the raw config, one key at a time. mainwalletrpcport/mainwalletrpchost/
+   mainwalletrpcauth are not upstream keys, so without this hunk they are
+   silently dropped between a correctly-written basicswap.json and the
+   coin_settings dict PWNDA-PATCH-5's __init__ reads --
+   coin_settings.get("mainwalletrpcport") always sees nothing, no matter what
+   is actually on disk. Caught live, 2026-08-21: the operator's config had
+   every key right, and the running engine still tried to open its own local
+   wallet file. This is the fix -- it belongs next to the ALREADY-CURATED
+   walletrpc*/rpcuser/rpcpassword copies a few lines above it in the same
+   xmr_based_coins block, which is exactly where the equivalent upstream keys
+   already get this treatment.
+
+2. checkWalletSeed (basicswap.py) compares the live main-wallet address
+   against a persisted KV, main_wallet_addr_<coin>, that on an existing
+   install holds the address of the ENGINE'S OWN former wallet. Under C9 the
+   addresses differ by design, so this check would return False --
+   and restrict_unknown_seed_wallets defaults TRUE (basicswap.py:605), so
+   checkCoinsReady would then raise and refuse EVERY XMR swap, with a
+   message about seeds that never names the real cause. Fixed: when
+   ci._external_main_wallet is set (the PWNDA-PATCH-5 flag), the check
+   refreshes the KV to the wallet's actual (host-owned) address and passes,
+   instead of comparing against a KV this configuration was never meant to
+   match.
+
+3. publishBLockTx and withdrawCoin (interface/xmr/xmr.py) -- the
+   fund-moving calls on the main wallet -- carried no wrong-wallet assertion
+   before their transfer/sweep_all calls. publishBLockTx's siblings, findTxB
+   and spendBLockTx, got one in upstream commit 10ee0843 ("guard against
+   wrong-wallet reads made possible due to the preceding optimization
+   commit") right after 740360dc introduced the address-confirm-and-cache
+   fast path these calls also depend on -- the fund-moving calls were
+   missed. Under upstream's single-owner model that gap is nearly
+   unreachable; under C9 it is a live race, because PWNDA-PATCH-5
+   deliberately makes openWallet() CONFIRM an external main wallet's address
+   rather than re-opening it, while the host independently owns
+   open_wallet/close_wallet on that same process. Confirm at T, host
+   switches wallets at T+1, spend at T+2 sends FROM the wrong wallet. Fixed
+   with the same assertion shape findTxB/spendBLockTx already carry,
+   immediately before each fund-moving call.
+
+REVISED 2026-09-03 (Grove expansion master plan, Phase D unit D-Z2): the
+original version of this patch guarded publishBLockTx alone. D-Z2, while
+verifying (not assuming) that "PATCH-8/PATCH-17's wrong-wallet guard pattern
+fails closed for ZEPH the same way it does for XMR/ZANO" -- the exact
+inheritance claim this coin's whole design rests on -- built a real
+XMRInterface, cached the host wallet's address via one openWallet() call,
+then changed the connection's live address (simulating the host switching
+wallets after the cache was set) and called withdrawCoin: it sent, in both
+branches, no exception. openWallet()'s own _external_main_wallet branch
+(PWNDA-PATCH-5, above) confirms and caches ONLY the first time it is called
+and returns unconditionally on every call after that -- it never re-verifies
+once cached. withdrawCoin calls openWallet() at its own top expecting that
+to mean "verified" and gets nothing of the sort past the first call ever
+made. This is the SAME gap ZanoInterface's PATCH-17 guard had, and was fixed
+for, the same day (see PwndaWalletVault/log.md's "PATCH-17 coverage gap"
+entry) -- except PATCH-17's guard was explicitly modeled on THIS patch's
+original, publishBLockTx-only shape, so fixing Zano without checking whether
+the interface it was copied from had the identical hole left the hole open
+on the coin PATCH-17 was modeled on, and (by inheritance, since
+ZEPHInterface(XMRInterface) overrides neither openWallet nor withdrawCoin)
+on ZEPH too. See PwndaWalletVault/log.md's "xmr.py::withdrawCoin has no
+PATCH-8 drift guard" entry (2026-09-03) for the full detection writeup.
+
+Four changes now, all in basicswap/interface/xmr/xmr.py (basicswap.py's two
+hunks are unchanged from the original patch):
+
+1. (unchanged) initialiseWallet's mainwalletrpc* allowlist copy, basicswap.py.
+2. (unchanged) checkWalletSeed's host-managed-wallet branch, basicswap.py.
+3. A new shared method, _confirmMainWalletIdentity: re-reads the connection's
+   live address and compares it to self._cached_main_wallet_address (the
+   value openWallet's _external_main_wallet branch populates). Any mismatch
+   -- INCLUDING "nothing was ever cached" -- raises TemporaryError before the
+   caller's fund-moving call is reached. Fails closed. Gated on
+   self._external_main_wallet, so a non-Grove embedder with that flag left
+   at its default (False) sees no behaviour change from this patch at all.
+   Factored out as its own method (rather than inlined per call site, as the
+   original version of this patch did) specifically so a future fund-moving
+   call added to this file only has to call it, not reimplement it.
+4. Three call sites, all immediately before their own
+   self.rpc_wallet("transfer"/"sweep_all", ...) call: publishBLockTx (the
+   swap settlement leg, as before), and withdrawCoin's two branches
+   (sweep-all and plain transfer, newly guarded).
+
+All guarded on ci._external_main_wallet / self._external_main_wallet
+(fix 1 on its presence in the raw config, which IS what sets that flag), so
+every path is byte-for-byte upstream's when PWNDA-PATCH-5 is inert (no
+mainwalletrpcport configured) -- a no-op for every install that hasn't
+opted into C9. Refuses on an engine that does not carry PWNDA-PATCH-5 (see
+engine_has_patch's XMR_SPLIT_PATCH_FILE gate, unchanged by this patch) --
+without it, _external_main_wallet never exists on the interface at all.
+
+Also fixed in the same incident, on the pwnda side and not part of this
+diff: mainwalletrpcauth is now written as a 2-element JSON array
+[user, pass], not a "user:pass" string -- callrpc_xmr (rpc_xmr.py) does
+auth[0]/auth[1], the same tuple shape upstream's own walletrpcauth already
+uses, and a joined string would have silently indexed by CHARACTER instead
+of by field once fix 1 above let the key through at all. See
+src-tauri/src/swap_sidecar.rs's apply_host_xmr_wallet_to_config.
+
+See PwndaWalletVault/wiki/synthesis/c9-xmr-lifecycle-design.md, blockers 2
+and 6, and PwndaWalletVault/log.md's 2026-08-21 entries for the original
+incident writeup, and the 2026-09-03 entries above for this revision.
+
+---
+ basicswap/basicswap.py           | 42 +++++++++++++++++++++++++++++++++++++
+ basicswap/interface/xmr/xmr.py   | 61 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 103 insertions(+)
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -981,6 +981,25 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+                     "rpcpassword", ""
+                 )
+
++                # PWNDA-PATCH-8: pass through the host-managed main-wallet
++                # settings PWNDA-PATCH-5's XMRInterface.__init__ reads
++                # (coin_settings.get("mainwalletrpcport") etc.). Absent for
++                # every install before C9 -- the .get() below then adds
++                # nothing, and _external_main_wallet's own check in xmr.py
++                # evaluates the same False it always has, so this is a no-op
++                # everywhere this key was never written.
++                if "mainwalletrpcport" in chain_client_settings:
++                    self.coin_clients[coin]["mainwalletrpcport"] = (
++                        chain_client_settings["mainwalletrpcport"]
++                    )
++                    self.coin_clients[coin]["mainwalletrpchost"] = (
++                        chain_client_settings.get("mainwalletrpchost", "127.0.0.1")
++                    )
++                    if "mainwalletrpcauth" in chain_client_settings:
++                        self.coin_clients[coin]["mainwalletrpcauth"] = (
++                            chain_client_settings["mainwalletrpcauth"]
++                        )
++
+     def getXMRTrustedDaemon(self, coin, node_host: str) -> bool:
+         coin = Coins(coin)  # Errors for invalid coin value
+         chain_client_settings = self.getChainClientSettings(coin)
+@@ -5119,6 +5138,29 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+             )  # All keys should be be derived from the Particl mnemonic
+             return True  # TODO
+         if c in self.xmr_based_coins:
++            if getattr(ci, "_external_main_wallet", False):
++                # PWNDA-PATCH-8: this main wallet is deliberately host-managed
++                # (PWNDA-PATCH-5) -- the "derived from OUR swap seed" invariant
++                # this check exists to enforce has been intentionally replaced
++                # by the host's own identity verification, done on the host's
++                # side before it ever writes mainwalletrpc* into this config.
++                # Comparing against main_wallet_addr_<coin> here would compare
++                # a host-owned wallet against a KV holding the ENGINE'S OWN
++                # former wallet -- refresh it to the truth instead of refusing
++                # every swap on a check that no longer applies.
++                ci._have_checked_seed = True
++                ci.setWalletSeedWarning(False)
++                try:
++                    wallet_address: str = ci.getMainWalletAddress()
++                    self.setStringKV(
++                        "main_wallet_addr_" + ci.coin_name().lower(), wallet_address
++                    )
++                except Exception as e:
++                    self.log.warning(
++                        f"PWNDA-PATCH-8: could not refresh cached main wallet "
++                        f"address for {ci.coin_name()}: {e}"
++                    )
++                return True
+             expect_address = self.getCachedMainWalletAddress(ci)
+             if expect_address is None:
+                 self.log.warning(
+diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
+--- a/basicswap/interface/xmr/xmr.py
++++ b/basicswap/interface/xmr/xmr.py
+@@ -324,6 +324,48 @@ class XMRInterface(CoinInterface):
+             except Exception:
+                 pass
+
++    def _confirmMainWalletIdentity(self) -> None:
++        # PWNDA-PATCH-8 (revised): re-read the main wallet-rpc connection's live
++        # address and compare it to the identity confirmed earlier by openWallet's
++        # _external_main_wallet branch, above. Raises TemporaryError on ANY
++        # mismatch, INCLUDING "nothing was ever cached" -- fails closed. A no-op
++        # when _external_main_wallet is False: only a host-managed main wallet
++        # can be switched out from under this connection by a party other than
++        # this swap engine (the host); an upstream-shape deployment (main wallet
++        # seed-derived, engine-exclusive) has no such actor.
++        #
++        # WHY THIS EXISTS SEPARATELY FROM openWallet's OWN cache check, above:
++        # openWallet's _external_main_wallet branch confirms and caches ONLY the
++        # FIRST time it is called (self._cached_main_wallet_address is None) and
++        # returns unconditionally on every call after that -- it never re-reads
++        # or re-compares once cached (see the comment there: "the engine only
++        # CONFIRMS... and caches it", once). So a caller like withdrawCoin, which
++        # calls openWallet() at its own top expecting that to mean "verified",
++        # gets nothing of the sort on the second and every later call. Call this
++        # method immediately before EVERY self.rpc_wallet("transfer"/"sweep_all",
++        # ...) call reachable on the main wallet-rpc connection while
++        # _external_main_wallet may be set -- not just from publishBLockTx. The
++        # original PWNDA-PATCH-8 guarded publishBLockTx alone and missed that
++        # withdrawCoin's two fund-moving calls share the exact same connection
++        # and the exact same race -- see the 2026-09-03 log.md entry
++        # ("xmr.py::withdrawCoin has no PATCH-8 drift guard") this revision
++        # closes. ZanoInterface's own PATCH-17 guard (interface/zano/zano.py)
++        # was modeled on this method's original, publishBLockTx-only form, and
++        # had the identical withdrawCoin gap found and fixed first, the same day
++        # -- this revision brings the interface it was copied from back in line.
++        if not self._external_main_wallet:
++            return
++        try:
++            open_wallet_addr = self.rpc_wallet("get_address")["address"]
++        except Exception:
++            open_wallet_addr = "UNKNOWN"
++        if open_wallet_addr != self._cached_main_wallet_address:
++            raise TemporaryError(
++                f"main wallet-rpc connection reports {open_wallet_addr}, expected "
++                f"confirmed identity {self._cached_main_wallet_address}; "
++                f"refusing to send"
++            )
++
+     def _openWallet(self, filename):
+         # PWNDA-PATCH-5: reachable without going through `openWallet`, so it
+         # selects too rather than trusting the caller to have done it.
+@@ -601,6 +643,17 @@ class XMRInterface(CoinInterface):
+             self.rpc_wallet("refresh")
+             self._log.debug(f"Refreshing {self.coin_name()} wallet")
+
++            # PWNDA-PATCH-8: openWallet() for an external main wallet only
++            # CONFIRMS the address and caches it (PWNDA-PATCH-5) rather than
++            # issuing open_wallet -- the host owns the process too and may
++            # switch or close the wallet between that confirmation and a
++            # fund-moving call below. Assert again, immediately before the
++            # call that spends -- the same defence findTxB/spendBLockTx
++            # already carry for the per-swap wallets (upstream 10ee0843),
++            # applied here for main. See _confirmMainWalletIdentity's own
++            # docstring for why this is a shared method, not inlined here.
++            self._confirmMainWalletIdentity()
++
+             Kbv = self.getPubkey(kbv)
+             shared_addr: str = xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
+
+@@ -881,6 +934,12 @@ class XMRInterface(CoinInterface):
+                 }
+                 if self._fee_priority > 0:
+                     params["priority"] = self._fee_priority
++                # PWNDA-PATCH-8: same guard as publishBLockTx, on the same
++                # main-wallet-rpc connection -- see _confirmMainWalletIdentity.
++                # A sweep-all is the single most damaging call to run against a
++                # wrong/swapped wallet (it sends the WHOLE balance), so this is
++                # not an optional extra.
++                self._confirmMainWalletIdentity()
+                 rv = self.rpc_wallet("sweep_all", params)
+                 if estimate_fee:
+                     return {
+@@ -898,6 +957,8 @@ class XMRInterface(CoinInterface):
+             }
+             if self._fee_priority > 0:
+                 params["priority"] = self._fee_priority
++            # PWNDA-PATCH-8: same guard, plain (non-sweep) withdraw branch.
++            self._confirmMainWalletIdentity()
+             rv = self.rpc_wallet("transfer", params)
+             if estimate_fee:
+                 return {
+

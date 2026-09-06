@@ -1,0 +1,273 @@
+Grove PATCH-22: the ADS test helpers must check the SCRIPTLESS coin's balance
+
+Defect D-7. The shared ADS helpers in tests/basicswap/extended/test_dcr.py --
+which every Grove regtest matrix calls, ZEPH's and ZANO's included -- verified
+settlement only through the SCRIPTED coin's `gettransaction`. For the
+scriptless coin they ran `pass`, twice. For every reverse bid they returned
+before reaching any verification at all:
+
+    if reverse_bid:
+        return  # TODO
+
+That is half the matrix asserting nothing about where the coins ended up, and
+the other half asserting it only for the leg that has a script to fall back
+on. A partial settlement, or coins stranded in the wrong wallet, read as a
+FULLY GREEN matrix run.
+
+This matters more than the blocked matrices themselves. Every one of ZEPH's
+and ZANO's acceptance rows is gated on a green matrix; unblocking the daemons
+without fixing this would have produced green results that meant considerably
+less than they appeared to -- on precisely the leg (scriptless, no script to
+reclaim from) where being wrong is least recoverable.
+
+The fix takes a per-node balance snapshot of every scriptless leg before the
+swap, and asserts after settlement that the coins are no longer where they
+started. It is deliberately weak in form and strong in placement: it does not
+predict WHICH node receives (that differs between forward and reverse bids,
+and between the success and refund paths), only that the scriptless leg moved
+at all. A stranded or partially-settled leg fails it; a completed one cannot.
+
+Three further properties, each there because its absence is how D-7 survived:
+
+  * a missing baseline is a FAILURE, not a skip -- otherwise the check
+    silently degrades back into the `pass` it replaces;
+  * the reverse-bid path now runs the balance check BEFORE returning, and the
+    return is narrowed to the scripted-side checks that genuinely are
+    leader-side only;
+  * the two former `pass` branches now assert the baseline was taken, so a
+    future edit that removes the snapshot fails loudly at the exact sites that
+    used to be silent.
+
+"An xmr-family coin has no gettransaction" was upstream's reason for the
+`pass`. It is a good reason not to check it THAT way, and not a reason not to
+check it.
+
+Applies on top of PATCH-21.
+
+diff --git a/tests/basicswap/extended/test_dcr.py b/tests/basicswap/extended/test_dcr.py
+index 485776f..32bbe65 100644
+--- a/tests/basicswap/extended/test_dcr.py
++++ b/tests/basicswap/extended/test_dcr.py
+@@ -352,6 +352,118 @@ def run_test_itx_refund(self, coin_from: Coins, coin_to: Coins):
+     )
+ 
+ 
++def _pwnda_scriptless_balances(self, coin_from: Coins, coin_to: Coins):
++    """PWNDA-PATCH-22 (defect D-7): balances of every scriptless leg, per node.
++
++    Returns {(node_id, coin): int} in the coin's smallest unit, or None when no
++    leg of this swap is scriptless (a scripted<->scripted pair, where the
++    existing `gettransaction` checks already cover both sides).
++
++    The shared ADS helpers verified settlement ONLY through the SCRIPTED coin's
++    `gettransaction`. For the scriptless coin they ran `pass`; for every
++    reverse bid they returned before reaching any check; and the swipe-refund
++    path had no verification block at all. So a partial settlement, or coins
++    stranded in the wrong wallet, read as a fully green matrix run -- on the
++    exact leg that has no script to reclaim from.
++    """
++    swap_clients = self.swap_clients
++    scriptless = swap_clients[0].scriptless_coins
++    out = {}
++    for coin in (coin_from, coin_to):
++        if coin not in scriptless:
++            continue
++        for node_id in (0, 1):
++            try:
++                ci = swap_clients[node_id].ci(coin)
++                out[(node_id, coin)] = ci.make_int(
++                    ci.getWalletInfo().get("balance", 0)
++                )
++            except Exception as e:  # a node that does not hold this coin
++                logging.info(f"D-7 baseline: {coin.name} node {node_id}: {e}")
++    return out or None
++
++
++def _pwnda_assert_scriptless_settled(self, coin_from, coin_to, before):
++    """PWNDA-PATCH-22 (defect D-7), success side: the scriptless leg moved.
++
++    Deliberately weak in form and strong in placement: it does not predict
++    WHICH node receives (that differs between forward and reverse bids), only
++    that the coins are no longer where they started. A stranded or partially
++    settled leg fails it; a completed one cannot. A missing baseline is a
++    FAILURE, not a skip -- otherwise this degrades into the `pass` it replaces.
++    """
++    if before is None:
++        return  # genuinely no scriptless leg in this pair
++    swap_clients = self.swap_clients
++    moved = set()
++    for (node_id, coin), was in before.items():
++        try:
++            ci = swap_clients[node_id].ci(coin)
++            now = ci.make_int(ci.getWalletInfo().get("balance", 0))
++        except Exception as e:
++            logging.info(f"D-7 settle read: {coin.name} node {node_id}: {e}")
++            continue
++        if now != was:
++            moved.add(coin)
++        logging.info(
++            f"D-7 {coin.name} node {node_id}: {was} -> {now} (delta {now - was})"
++        )
++    for coin in {c for (_n, c) in before}:
++        assert coin in moved, (
++            f"{coin.name} is the SCRIPTLESS leg of this swap and no node's "
++            f"balance changed at all. The bid reached its terminal state, so "
++            f"the state machine believes it settled -- but the coins did not "
++            f"move. This is exactly the stranded/partial settlement that read "
++            f"as a green run before defect D-7 was fixed."
++        )
++
++
++def _pwnda_assert_scriptless_refunded(self, coin_from, coin_to, before):
++    """PWNDA-PATCH-22 (defect D-7), refund side: the coins came BACK.
++
++    The success-path assertion is WRONG here: on a refund the coins return to
++    whoever locked them, so "some balance changed" would be satisfied by the
++    very failure that matters -- coins locked and never reclaimed.
++
++    So this asserts recovery instead: the TOTAL held across both nodes must be
++    within a fee of the pre-swap total. It does not care which node ends up
++    holding them, because a refund and a swipe-refund put them in different
++    places and both are legitimate outcomes of the paths that call this.
++    """
++    if before is None:
++        return
++    swap_clients = self.swap_clients
++    for coin in {c for (_n, c) in before}:
++        was_total = sum(v for (n, c), v in before.items() if c == coin)
++        now_total = 0
++        read_any = False
++        for (node_id, c) in before:
++            if c != coin:
++                continue
++            try:
++                ci = swap_clients[node_id].ci(coin)
++                now_total += ci.make_int(ci.getWalletInfo().get("balance", 0))
++                read_any = True
++            except Exception as e:
++                logging.info(f"D-7 refund read: {coin.name} node {node_id}: {e}")
++        assert read_any, (
++            f"could not read {coin.name} balances after the refund, so this "
++            f"check answered nothing"
++        )
++        logging.info(
++            f"D-7 refund {coin.name}: total {was_total} -> {now_total} "
++            f"(delta {now_total - was_total}, tolerance {self.max_fee})"
++        )
++        assert was_total - now_total <= self.max_fee, (
++            f"{coin.name} is the SCRIPTLESS leg and {was_total - now_total} "
++            f"(more than one fee) went missing across BOTH wallets during a "
++            f"refund. The bid reached its terminal refunded state, so the "
++            f"state machine believes the coins came back -- they did not. "
++            f"Stranded scriptless funds are the failure this path exists to "
++            f"catch, and it could not see them before defect D-7 was fixed."
++        )
++
++
+ def run_test_ads_success_path(self, coin_from: Coins, coin_to: Coins):
+     logging.info(f"---------- Test ADS swap {coin_from.name} to {coin_to.name}")
+ 
+@@ -367,6 +479,8 @@ def run_test_ads_success_path(self, coin_from: Coins, coin_to: Coins):
+ 
+     self.prepare_balance(coin_to, 100.0, 1801, 1800)
+     self.prepare_balance(coin_from, 100.0, 1800, 1801)
++    # PWNDA-PATCH-22 (defect D-7): baseline for the scriptless-leg check.
++    _scriptless_before = _pwnda_scriptless_balances(self, coin_from, coin_to)
+ 
+     # Leader sends the initial (chain a) lock tx.
+     # Follower sends the participate (chain b) lock tx.
+@@ -406,15 +520,29 @@ def run_test_ads_success_path(self, coin_from: Coins, coin_to: Coins):
+         wait_for=(30),
+     )
+ 
++    # PWNDA-PATCH-22 (defect D-7): upstream returned here for every reverse
++    # bid -- HALF the matrix -- so a reverse-direction swap asserted nothing
++    # about where the coins ended up. The scripted-side `gettransaction`
++    # checks below genuinely are leader-side only, but the balance check is
++    # not, and it is the one that notices a partial settlement.
++    _pwnda_assert_scriptless_settled(self, coin_from, coin_to, _scriptless_before)
++
+     if reverse_bid:
+-        return  # TODO
++        return  # scripted-side gettransaction checks below are leader-side only
+ 
+     # Verify lock tx spends are found in the expected wallets
+     bid, xmr_swap = swap_clients[id_offerer].getXmrBid(bid_id)
+ 
+     node_from_ci_to = swap_clients[0].ci(coin_to)
+     if node_from_ci_to.coin_type() in swap_clients[0].xmr_based_coins:
+-        pass
++        # PWNDA-PATCH-22 (defect D-7): was `pass`. An xmr-family coin has no
++        # `gettransaction`, which is why upstream skipped it -- but "cannot
++        # check it THIS way" is not "cannot check it". The balance assertion
++        # above covers this side; this asserts it was not skipped.
++        assert _scriptless_before is not None, (
++            "the scriptless baseline was never taken, so the settlement check "
++            "above was vacuous"
++        )
+     else:
+         wtx = node_from_ci_to.rpc_wallet(
+             "gettransaction",
+@@ -429,7 +557,14 @@ def run_test_ads_success_path(self, coin_from: Coins, coin_to: Coins):
+ 
+     node_to_ci_from = swap_clients[1].ci(coin_from)
+     if node_to_ci_from.coin_type() in swap_clients[1].xmr_based_coins:
+-        pass
++        # PWNDA-PATCH-22 (defect D-7): was `pass`. An xmr-family coin has no
++        # `gettransaction`, which is why upstream skipped it -- but "cannot
++        # check it THIS way" is not "cannot check it". The balance assertion
++        # above covers this side; this asserts it was not skipped.
++        assert _scriptless_before is not None, (
++            "the scriptless baseline was never taken, so the settlement check "
++            "above was vacuous"
++        )
+     else:
+         wtx = node_to_ci_from.rpc_wallet(
+             "gettransaction",
+@@ -470,6 +605,8 @@ def run_test_ads_both_refund(
+ 
+     self.prepare_balance(coin_to, 100.0, 1801, 1800)
+     self.prepare_balance(coin_from, 100.0, 1800, 1801)
++    # PWNDA-PATCH-22 (defect D-7): baseline for the scriptless-leg check.
++    _scriptless_before = _pwnda_scriptless_balances(self, coin_from, coin_to)
+ 
+     id_leader: int = id_bidder if reverse_bid else id_offerer
+     id_follower: int = id_offerer if reverse_bid else id_bidder
+@@ -528,8 +665,14 @@ def run_test_ads_both_refund(
+         wait_for=(self.extra_wait_time + 40),
+     )
+ 
++    # PWNDA-PATCH-22 (defect D-7): the refund path returned here for every
++    # reverse bid and verified nothing about the scriptless leg in either
++    # direction. Coins locked and never reclaimed looked exactly like a clean
++    # refund.
++    _pwnda_assert_scriptless_refunded(self, coin_from, coin_to, _scriptless_before)
++
+     if reverse_bid:
+-        return  # TODO
++        return  # scripted-side txid checks below are leader-side only
+ 
+     # Verify lock tx spends are found in the expected wallets
+     bid, xmr_swap = swap_clients[id_offerer].getXmrBid(bid_id)
+@@ -602,6 +745,8 @@ def run_test_ads_swipe_refund(
+     if reverse_bid:
+         self.prepare_balance(coin_to, 100.0, 1801, 1800)
+         self.prepare_balance(coin_from, 100.0, 1800, 1801)
++        # PWNDA-PATCH-22 (defect D-7): baseline for the scriptless-leg check.
++        _scriptless_before = _pwnda_scriptless_balances(self, coin_from, coin_to)
+ 
+     amt_swap = ci_from.make_int(random.uniform(0.1, 2.0), r=1)
+     rate_swap = ci_to.make_int(random.uniform(0.2, 20.0), r=1)
+@@ -650,6 +795,12 @@ def run_test_ads_swipe_refund(
+         sent=(not leader_sent_bid),
+     )
+ 
++    # PWNDA-PATCH-22 (defect D-7): the swipe-refund path had no
++    # verification block AT ALL -- it asserted bid states and stopped.
++    # A swipe that leaves the scriptless leg stranded reaches the same
++    # terminal state as one that returns the coins.
++    _pwnda_assert_scriptless_refunded(self, coin_from, coin_to, _scriptless_before)
++
+ 
+ def prepareDCDDataDir(datadir, node_id, conf_file, dir_prefix, num_nodes=3):
+     node_dir = os.path.join(datadir, dir_prefix + str(node_id))

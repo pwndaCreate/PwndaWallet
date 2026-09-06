@@ -1,0 +1,177 @@
+/* App chrome — titlebar, scrollbar, header. Sourced during Phase 2 split. */
+
+/* ── Titlebar ── */
+.titlebar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 36px;
+  min-height: 36px;
+  padding: 0 12px;
+  background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+  z-index: 1000;
+}
+
+
+.titlebar-title {
+  font-family: var(--pixel);
+  font-size: 10px;
+  letter-spacing: 1px;
+  color: var(--white);
+}
+
+
+.titlebar-accent {
+  color: var(--accent);
+}
+
+
+.titlebar-controls { display: flex; gap: 4px; }
+
+
+.titlebar-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 20px;
+  background: transparent;
+  border: 1px solid var(--border);
+  cursor: pointer;
+  color: var(--text-muted);
+  transition: all 0.12s ease;
+}
+
+
+.titlebar-btn:hover {
+  color: var(--accent);
+  border-color: var(--border-hi);
+}
+
+
+.titlebar-close:hover {
+  background: var(--danger-dim) !important;
+  border-color: var(--danger) !important;
+  color: var(--danger) !important;
+}
+
+
+/* ── App content ── */
+.app {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 16px 16px 32px;
+  position: relative;
+  z-index: 1;
+}
+
+/* Auth splash (Home / Login): make `.app` a flex column so AuthSplash fills the
+   available height below the header instead of overflowing into a scrollbar. */
+.app-auth {
+  display: flex;
+  flex-direction: column;
+}
+
+
+/* Themed scrollbar — applies globally so every scroll surface picks up
+   the 6 px `--border` thumb on transparent track. Was previously scoped
+   to `.app` only, which meant landscape view containers (Settings, Swap
+   RIGHT rail, etc.) showed the default Windows scrollbar. Promoted to
+   global per landscape-mode-fixes-plan L4 on 2026-05-25. */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+
+::-webkit-scrollbar-track { background: transparent; }
+
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 0; }
+
+::-webkit-scrollbar-thumb:hover { background: var(--border-hi); }
+
+/* Firefox / Edge non-WebKit fallback */
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+
+
+/* Scrollable element that should hide its scrollbar track/thumb entirely.
+   Content still scrolls via wheel / touchpad / keyboard — only the bar is hidden.
+   .no-scroll-bar is the canonical class; .no-scrollbar kept for back-compat. */
+.no-scrollbar,
+.no-scroll-bar { scrollbar-width: none; -ms-overflow-style: none; }
+
+.no-scrollbar::-webkit-scrollbar,
+.no-scroll-bar::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+
+/* ── Header ── */
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+  padding-bottom: 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+
+header h1 {
+  font-family: var(--pixel);
+  font-size: 14px;
+  letter-spacing: 2px;
+  color: #f2f2f2;
+  /* Small glitch wordmark · titlebar variant — chromatic split + soft glow
+     (Pwnda Wallet design system · preview/logo-brand.html). */
+  text-shadow:
+    1px 0 0 rgba(255, 60, 60, 0.9),
+    -1px 0 0 rgba(0, 220, 255, 0.85),
+    0 0 5px rgba(242, 242, 242, 0.35);
+}
+
+
+.header-actions { display: flex; align-items: center; gap: 8px; }
+
+
+.btn-setup {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+  background: var(--surface);
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  cursor: pointer;
+  transition: all 0.12s ease;
+}
+
+
+.btn-setup:hover {
+  color: var(--accent);
+  border-color: var(--border-hi);
+}
+
+
+.btn-setup-alert {
+  color: var(--warn) !important;
+  border-color: var(--warn) !important;
+  animation: alert-pulse 2s ease-in-out infinite;
+}
+
+
+.card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+
+.secret-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+
+.mining-header { display: flex; align-items: center; gap: 10px; }

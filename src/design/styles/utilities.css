@@ -1,0 +1,374 @@
+/* Utility classes — .type-*, .color-*, .bg-*, .border-*, .qbtn, .field, .tnum, etc.
+ * Used by the v2 primitives + many legacy views.
+ */
+
+/* ============================================================
+   DESIGN-SYSTEM UTILITY CLASSES (mirrors colors_and_type.css)
+   Terminal / hacker aesthetic — no rounded corners, no gradients.
+   ============================================================ */
+
+/* Display heading — pixel font, app title / section names */
+.type-display {
+  font-family: var(--font-pixel);
+  font-size: var(--text-lg);
+  letter-spacing: var(--tracking-widest);
+  color: var(--white);
+  line-height: var(--leading-tight);
+}
+
+
+/* Hero number — balances, hashrates */
+.type-hero {
+  font-family: var(--font-pixel);
+  font-size: var(--text-2xl);
+  letter-spacing: var(--tracking-tight);
+  color: var(--white);
+  line-height: 1;
+}
+
+
+.type-hero-accent {
+  font-family: var(--font-pixel);
+  font-size: var(--text-2xl);
+  letter-spacing: var(--tracking-widest);
+  color: var(--accent);
+  line-height: 1;
+}
+
+
+/* Section label — bracketed via ::before / ::after */
+.type-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  letter-spacing: var(--tracking-wider);
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+
+
+/* Micro label — smallest readable size */
+.type-micro {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  letter-spacing: var(--tracking-wider);
+  color: var(--text-dim);
+  text-transform: uppercase;
+}
+
+
+/* Body / status copy */
+.type-body {
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  color: var(--text-muted);
+  line-height: var(--leading-normal);
+}
+
+
+.type-input {
+  font-family: var(--font-mono);
+  font-size: var(--text-input);
+  color: var(--text);
+  line-height: var(--leading-normal);
+}
+
+
+.type-code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  word-break: break-all;
+  line-height: var(--leading-normal);
+}
+
+
+.type-btn {
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+
+/* Semantic color utilities */
+.color-accent   { color: var(--accent); }
+
+.color-success  { color: var(--success); }
+
+.color-danger   { color: var(--danger); }
+
+.color-warn     { color: var(--warn); }
+
+.color-muted    { color: var(--text-muted); }
+
+.color-dim      { color: var(--text-dim); }
+
+.color-white    { color: var(--white); }
+
+
+.bg-surface     { background: var(--surface); }
+
+.bg-surface-2   { background: var(--surface-2); }
+
+.bg-accent-dim  { background: var(--accent-dim); }
+
+.bg-danger-dim  { background: var(--danger-dim); }
+
+.bg-success-dim { background: var(--success-dim); }
+
+.bg-warn-dim    { background: var(--warn-dim); }
+
+
+.border-default { border: 1px solid var(--border); }
+
+.border-hi      { border: 1px solid var(--border-hi); }
+
+.border-accent  { border: 1px solid var(--accent); }
+
+.border-danger  { border: 1px solid var(--danger); }
+
+.border-warn    { border: 1px solid var(--warn); }
+
+.border-success { border: 1px solid var(--success); }
+
+
+/* ── Design-system pulse (mirrors Components.jsx StatusDot) ── */
+
+
+/* ── fade-in used by Box on mount (BEHAVIORS.md §5) ── */
+
+
+/* ── syncbar — XMR sync progress stripe ── */
+
+
+/* ── Status dot ── */
+.status-dot {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  background: var(--accent);
+  animation: pulse 1.2s ease-in-out infinite;
+}
+
+.status-dot.danger  { background: var(--danger); }
+
+.status-dot.warn    { background: var(--warn); }
+
+.status-dot.success { background: var(--success); }
+
+
+/* ── Chain selector chip strip ── */
+.chain-chip-strip {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 14px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+
+.chain-chip {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-wide);
+  padding: 6px 12px;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  cursor: pointer;
+  flex-shrink: 0;
+  text-transform: uppercase;
+  transition: var(--transition-fast);
+}
+
+
+.chain-chip:hover {
+  color: var(--accent);
+  border-color: var(--border-hi);
+}
+
+
+.chain-chip.active {
+  border-color: var(--border-hi);
+  color: var(--accent);
+}
+
+
+.chain-chip:disabled {
+  cursor: default;
+}
+
+
+.chain-chip:disabled:hover {
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+
+
+.chain-chip.more {
+  border: 1px dashed rgba(255,255,255,0.15);
+  color: #444;
+}
+
+
+/* ============================================================
+   v2 UTILITY CLASSES — drop-in helpers used by new primitives.
+   ============================================================ */
+
+/* Tabular nums everywhere numbers matter */
+.tnum { font-variant-numeric: tabular-nums; }
+
+
+/* Hide scrollbar but keep scroll */
+.no-scroll-bar { scrollbar-width: none; -ms-overflow-style: none; }
+
+.no-scroll-bar::-webkit-scrollbar { width: 0; height: 0; display: none; }
+
+
+/* fade-in utility — paired with @keyframes fade-in already in the sheet */
+.fade-in { animation: fade-in .25s ease both; }
+
+
+/* CRT scanline overlay for arbitrary container (pairs with --scan-opacity) */
+.scanlines { position: relative; }
+
+.scanlines::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 999;
+  background: repeating-linear-gradient(
+    0deg, transparent 0 2px, rgba(0,0,0,0.18) 2px 3px
+  );
+  opacity: var(--scan-opacity, 0.5);
+  mix-blend-mode: multiply;
+}
+
+
+/* Soft center vignette to focus attention */
+.vignette { position: relative; }
+
+.vignette::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 998;
+  background: radial-gradient(ellipse at center, transparent 55%, rgba(0,0,0,0.45) 100%);
+}
+
+
+/* 32×32px subtle grid backdrop (login splash) */
+.grid-bg {
+  background-image:
+    linear-gradient(rgba(255,255,255,0.025) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,0.025) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+
+/* Quiet button — used for tile actions, address copy/qr, filter chips */
+.qbtn {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  padding: 6px 10px;
+  cursor: pointer;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.5px;
+  transition: all .12s ease;
+}
+
+.qbtn:hover { color: var(--text); border-color: var(--border-hi); }
+
+.qbtn:focus-visible { outline: 1px solid var(--border-hi); outline-offset: 2px; }
+
+.qbtn.primary {
+  background: var(--white); color: #050505; border-color: var(--white);
+}
+
+.qbtn.primary:hover { background: rgba(242,242,242,0.82); }
+
+.qbtn.accent { color: var(--accent); border-color: var(--accent-mid); }
+
+.qbtn.accent:hover { background: var(--accent-soft); border-color: var(--accent); }
+
+.qbtn.danger { color: var(--danger); border-color: rgba(255,59,59,0.4); }
+
+.qbtn.danger:hover { background: rgba(255,59,59,0.10); border-color: var(--danger); }
+
+
+/* Field input — flat, monospace, terminal-feel */
+.field {
+  background: #060606;
+  border: 1px solid var(--border);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 10px 12px;
+  width: 100%;
+  outline: none;
+  transition: border-color .12s ease;
+}
+
+.field:focus { border-color: var(--border-hi); }
+
+.field:focus-visible { outline: 1px solid var(--border-hi); outline-offset: 2px; }
+
+
+/* Universal focus ring for keyboard users (a11y).
+   Bumped from 1px → 2px (and accent color) per UXS-20260516-118:
+   the 1px treatment against the dark `#0a0a0a` panel background
+   failed WCAG 2.4.7 (focus visible) on the assets list, which is
+   by far the longest interactive region on the wallet panel.
+   2px + accent is consistent with the design system's accent
+   focus token and stays subtle enough not to dominate the
+   terminal aesthetic on small controls. */
+button:focus-visible,
+a:focus-visible,
+[role="button"]:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Skip-to-content link — invisible until focused, then jumps the
+   keyboard user past the title-bar window-chrome buttons (Minimize /
+   Close / Settings / Lock) into the app's main content. Without this,
+   P4 keyboard users had to Tab through 4 chrome controls every time
+   they entered the app. See UXS-20260516-118 acceptance criterion #1. */
+.skip-to-content {
+  position: absolute;
+  top: -100px;
+  left: 8px;
+  z-index: 10000;
+  padding: 8px 14px;
+  background: var(--accent);
+  color: #000;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  text-decoration: none;
+  border: 2px solid var(--accent);
+  transition: top 0.12s ease;
+}
+.skip-to-content:focus-visible {
+  top: 8px;
+  outline: 2px solid #000;
+  outline-offset: 2px;
+}
+
+
+/* Hero number — class form of the inline text-shadow used on big USD readouts */
+.hero-num {
+  font-family: var(--font-mono);
+  font-weight: 600;
+  color: var(--white);
+  letter-spacing: -0.5px;
+  text-shadow: 0 0 18px rgba(242,242,242,0.18);
+  font-variant-numeric: tabular-nums;
+}

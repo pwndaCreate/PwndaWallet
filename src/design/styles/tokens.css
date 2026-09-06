@@ -1,0 +1,110 @@
+/* AUTO-GENERATED from src/design/tokens.ts. Do not hand-edit. */
+
+:root {
+  --bg:           #000000;
+  --bg-2:         #0a0a0a;
+  --surface:      #0d0d0d;
+  --surface-2:    #111111;
+
+  --border:       rgba(255,255,255,0.14);
+  --border-hi:    rgba(255,255,255,0.32);
+  --border-soft:  rgba(255,255,255,0.06);
+
+  --text:         #e8e8e8;
+  --text-muted:   #909090;
+  --text-dim:     #555555;
+  --white:        #f2f2f2;
+
+  --accent:       #00ff66;
+  --accent-soft:  rgba(0,255,102,0.10);
+  --accent-mid:   rgba(0,255,102,0.25);
+  --accent-glow:  rgba(0,255,102,0.06);
+  --accent-dim:   var(--accent-soft);
+
+  --success:      #00cc66;
+  --success-dim:  rgba(0,204,102,0.15);
+  --danger:       #ff3b3b;
+  --danger-dim:   rgba(255,59,59,0.15);
+  --warn:         #ffaa00;
+  --warn-dim:     rgba(255,170,0,0.15);
+  --positive:     #00cc66;
+  --negative:     #ff3b3b;
+
+  --scan-opacity: 0.5;
+
+  --radius:         0px;
+  --radius-sm:      0px;
+  --radius-xs:      0px;
+  --radius-window:  0px;
+
+  --font-pixel:   'Press Start 2P', cursive;
+  --font-mono:    'JetBrains Mono', 'Share Tech Mono', 'Consolas', monospace;
+  --font-sans:    'Share Tech Mono', 'JetBrains Mono', monospace;
+  --pixel:        var(--font-pixel);
+  --mono:         var(--font-mono);
+  --sans:         var(--font-sans);
+
+  --text-2xs:    9px;
+  --text-xs:     10px;
+  --text-sm:     11px;
+  --text-base:   12px;
+  --text-input:  13px;
+  --text-lg:     14px;
+  --text-xl:     24px;
+  --text-2xl:    28px;
+
+  --tracking-tight:   0px;
+  --tracking-normal:  0.5px;
+  --tracking-wide:    1px;
+  --tracking-wider:   1.5px;
+  --tracking-widest:  2px;
+  --tracking-hero:    4px;
+
+  --leading-tight:    1.4;
+  --leading-normal:   1.5;
+  --leading-relaxed:  1.6;
+
+  --space-1:   4px;
+  --space-2:   6px;
+  --space-3:   8px;
+  --space-4:   10px;
+  --space-5:   12px;
+  --space-6:   14px;
+  --space-7:   16px;
+  --space-8:   20px;
+  --space-9:   24px;
+  --space-10:  32px;
+
+  --transition-fast:   all 120ms ease;
+  --transition-medium: all 150ms ease;
+  --transition-slow:   all 200ms ease;
+
+  /* Motion durations (see src/design/BEHAVIORS.md) */
+  --motion-pulse-duration:    1400ms;
+  --motion-blink-duration:    1000ms;
+  --motion-fadein-duration:   250ms;
+  --motion-fadein-translate:  6px;
+  --motion-scan-duration:     6000ms;
+  --motion-syncbar-duration:  1200ms;
+  --motion-syncbar-step:      40px;
+  --motion-alert-duration:    2000ms;
+  --motion-progress-duration: 1500ms;
+  --motion-mining-duration:   1200ms;
+  --motion-loading-duration:  1500ms;
+  --motion-hover-duration:    120ms;
+  --motion-hover-easing:      ease;
+
+  --disabled-opacity: 0.4;
+
+  /* Short aliases — match the prototype names */
+  --bg2:        var(--bg-2);
+  --surf:       var(--surface);
+  --surf2:      var(--surface-2);
+  --bdr:        var(--border);
+  --bdr-hi:     var(--border-hi);
+  --muted:      var(--text-muted);
+  --dim:        var(--text-dim);
+  --green:      var(--accent);
+  --green-dim:  var(--accent-soft);
+  --green-glow: var(--accent-glow);
+}

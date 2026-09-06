@@ -1,0 +1,217 @@
+From: PwndaWallet swap sidecar
+Date: 2026-08-20
+Subject: [PATCH 5/5] basicswap: split the Monero wallet-rpc clients so a host
+ wallet can be the main wallet
+
+The XMR interface multiplexes ONE monero-wallet-rpc between the main wallet and
+the per-swap 2-of-2 b-lock wallets, serialised behind `_mx_wallet`. That is
+sound while the engine owns the process, and unsound the moment anything else
+does: monero-wallet-rpc serves one open wallet at a time, so an outside client
+issuing `transfer` during the window a swap wallet is open would spend from the
+SWAP's wallet, not the user's. Upstream already ships defensive
+wrong-wallet-open checks in findTxB and spendBLockTx for the same reason.
+
+So an embedding host that already runs the user's Monero wallet cannot share
+this client. It can share a dedicated one. This patch adds a second wallet-rpc
+client, selected per operation by WHICH WALLET FILE the operation opens:
+
+  * main wallet  -> `mainwalletrpc{host,port,auth}`, the host's process, which
+    only ever holds the user's wallet open;
+  * every per-swap wallet -> the existing client, the engine's own process,
+    with keys derived per swap and no overlap with the user's key set.
+
+Two processes, disjoint wallet files, and no multiplexing across the boundary —
+which is what makes the arrangement safe rather than merely convenient.
+
+The routing rule is upstream's own structure, not a new convention: every
+main-wallet operation in this file opens `self._wallet_filename` first, and
+every per-swap operation opens a wallet named for the swap's shared address. The
+filename is therefore not a proxy for the decision, it IS the decision, so
+`_selectWallet` is driven from it and all ~40 call sites keep their exact shape.
+
+Three consequences are handled explicitly rather than left to luck:
+
+  * `openWallet` never issues open_wallet/close_wallet for a host-managed main
+    wallet. It confirms the address instead and caches it — the confirmation is
+    deliberately not skippable, because it is what turns a misconfigured port
+    into a loud failure rather than silent operation on a stranger's wallet.
+  * `createWallet` and `changeWalletPassword` refuse to act on a host-managed
+    main wallet. Neither is the engine's to do, and the second would lock the
+    host out of its own wallet.
+  * `testDaemonRPC` and `getDaemonVersion` touch no wallet and would otherwise
+    inherit whichever client the previous operation left selected. They pin to
+    the main client, which also makes the health check exercise the connection a
+    user is most likely to have broken.
+
+With `mainwalletrpcport` absent both names bind to the same client and every
+path is byte-for-byte upstream's, so this is a no-op for every existing
+deployment and for the WOW interface that subclasses this one.
+
+Not an upstream-PR candidate: it exists to serve an embedding host.
+
+Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Marker in patched source: PWNDA-PATCH-5
+---
+ basicswap/interface/xmr/xmr.py | 105 ++++++++++++---
+ 1 file changed, 102 insertions(+), 3 deletions(-)
+
+diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
+index 6cd0680..f8a044d 100644
+--- a/basicswap/interface/xmr/xmr.py
++++ b/basicswap/interface/xmr/xmr.py
+@@ -188,19 +188,88 @@ class XMRInterface(CoinInterface):
+             default_timeout=self._rpctimeout,
+             tag="Node ",
+         )  # non-json endpoint
+-        self.rpc_wallet = make_xmr_rpc_func(
++        # PWNDA-PATCH-5: two wallet-rpc clients, not one.
++        #
++        # This interface multiplexes ONE monero-wallet-rpc between the main
++        # wallet and the per-swap 2-of-2 b-lock wallets, serialised behind
++        # `_mx_wallet`. That is safe while the engine owns the process, and
++        # unsafe the moment anything else does: monero-wallet-rpc serves one
++        # open wallet at a time, so an outside client issuing `transfer` during
++        # the window a swap wallet is open would spend from the SWAP's wallet.
++        #
++        # An embedding host that already runs the user's own wallet therefore
++        # cannot simply share this client. It can share a *dedicated* one:
++        # `mainwalletrpc*` points main-wallet traffic at the host's process
++        # (which only ever holds the user's wallet open), while every per-swap
++        # wallet stays here, on the engine's own process, with keys derived per
++        # swap and no overlap with the user's. Two processes, disjoint wallet
++        # files, no multiplexing across the boundary.
++        #
++        # Absent `mainwalletrpcport` both names bind to the same client and
++        # every call path is byte-for-byte upstream's.
++        self._rpc_wallet_swap = make_xmr_rpc_func(
+             coin_settings["walletrpcport"],
+             coin_settings["walletrpcauth"],
+             host=coin_settings.get("walletrpchost", "127.0.0.1"),
+             default_timeout=self._walletrpctimeout,
+             tag="Wallet ",
+         )
++        self._external_main_wallet = coin_settings.get("mainwalletrpcport") is not None
++        if self._external_main_wallet:
++            self._rpc_wallet_main = make_xmr_rpc_func(
++                coin_settings["mainwalletrpcport"],
++                coin_settings.get("mainwalletrpcauth"),
++                host=coin_settings.get("mainwalletrpchost", "127.0.0.1"),
++                default_timeout=self._walletrpctimeout,
++                tag="HostWallet ",
++            )
++        else:
++            self._rpc_wallet_main = self._rpc_wallet_swap
++        # Which client `rpc_wallet` currently dispatches to. Every switch goes
++        # through `_selectWallet`, driven by the filename being opened, and all
++        # of it happens under `_mx_wallet`.
++        self._wallet_is_main = True
++
++    def rpc_wallet(self, method, params=None, wallet=None, timeout=None):
++        """PWNDA-PATCH-5: dispatch to the main or the swap wallet-rpc.
++
++        A method rather than the attribute it replaces, so that all ~40 call
++        sites in this file keep their exact shape and the routing decision
++        lives in ONE place. A subclass that assigns `self.rpc_wallet` (as the
++        WOW interface's ancestors may) shadows this and falls back to
++        single-client behaviour, which is the pre-patch semantics.
++        """
++        rpc = self._rpc_wallet_main if self._wallet_is_main else self._rpc_wallet_swap
++        if timeout is None:
++            return rpc(method, params, wallet)
++        return rpc(method, params, wallet, timeout)
++
++    def _selectWallet(self, filename) -> None:
++        """Route by WHICH WALLET FILE is being opened.
++
++        The split is exactly upstream's own structure: every main-wallet
++        operation opens `self._wallet_filename` first, and every per-swap
++        operation opens a wallet named for the swap's shared address. So the
++        filename is not a proxy for the routing decision — it IS the decision.
++        """
++        self._wallet_is_main = filename == self._wallet_filename
+ 
+     def setFeePriority(self, new_priority):
+         ensure(new_priority >= 0 and new_priority < 4, "Invalid fee_priority value")
+         self._fee_priority = new_priority
+ 
+     def createWallet(self, params):
++        # PWNDA-PATCH-5
++        self._selectWallet(params.get("filename"))
++        if self._wallet_is_main and self._external_main_wallet:
++            # The host's wallet already exists and is open; creating over it
++            # would be destructive, and it is not this process's wallet to
++            # create. `initialiseWallet` never reaches here in that
++            # configuration (its openWallet succeeds), so this is a guard
++            # against a future path, not a live branch.
++            raise ValueError(
++                "PWNDA-PATCH-5: refusing to create the host-managed main wallet"
++            )
+         if self._wallet_password is not None:
+             params["password"] = self._wallet_password
+         rv = self.rpc_wallet("generate_from_keys", params)
+@@ -220,6 +289,21 @@ class XMRInterface(CoinInterface):
+ 
+     def openWallet(self, filename):
+         is_default: bool = filename == self._wallet_filename
++        # PWNDA-PATCH-5
++        self._selectWallet(filename)
++        if is_default and self._external_main_wallet:
++            # The host holds this wallet open for its own use. Issuing
++            # `open_wallet` here would at best be redundant and at worst close
++            # and reopen a wallet mid-scan under the host's feet, so the engine
++            # only CONFIRMS which wallet it is talking to, and caches it. The
++            # confirmation is not optional: it is what makes a misconfigured
++            # port fail loudly instead of silently operating on a stranger's
++            # wallet.
++            if self._cached_main_wallet_address is None:
++                self._cached_main_wallet_address = self.rpc_wallet("get_address")[
++                    "address"
++                ]
++            return
+         if is_default and self._cached_main_wallet_address is not None:
+             try:
+                 if (
+@@ -241,6 +325,9 @@ class XMRInterface(CoinInterface):
+                 pass
+ 
+     def _openWallet(self, filename):
++        # PWNDA-PATCH-5: reachable without going through `openWallet`, so it
++        # selects too rather than trusting the caller to have done it.
++        self._selectWallet(filename)
+         params = {"filename": filename}
+         if self._wallet_password is not None:
+             params["password"] = self._wallet_password
+@@ -330,12 +417,17 @@ class XMRInterface(CoinInterface):
+             self.openWallet(self._wallet_filename)
+ 
+     def testDaemonRPC(self, with_wallet=True) -> None:
+-        self.rpc_wallet("get_languages")
++        # PWNDA-PATCH-5: these two touch no wallet, so they would otherwise
++        # inherit whichever client the previous operation happened to leave
++        # selected. Pinning them to the main client makes the health check
++        # deterministic AND makes it check the connection that matters — a
++        # host wallet-rpc that is down is the failure a user will hit.
++        self._rpc_wallet_main("get_languages")
+ 
+     def getDaemonVersion(self):
+         # Returns wallet version
+         if self._core_version is None:
+-            self._core_version = self.rpc_wallet("get_version")["version"]
++            self._core_version = self._rpc_wallet_main("get_version")["version"]
+         return self._core_version
+ 
+     def getBlockchainInfo(self):
+@@ -870,6 +962,13 @@ class XMRInterface(CoinInterface):
+         self, old_password, new_password, check_seed_if_encrypt: bool = True
+     ):
+         self._log.info(f"changeWalletPassword - {self.ticker()}")
++        if self._external_main_wallet:
++            # PWNDA-PATCH-5: the main wallet belongs to the host. Rotating its
++            # password from in here would lock the host out of its own wallet.
++            raise ValueError(
++                "PWNDA-PATCH-5: the main Monero wallet is host-managed; "
++                "change its password in the host wallet"
++            )
+         orig_password = self._wallet_password
+         if old_password != "":
+             self._wallet_password = old_password

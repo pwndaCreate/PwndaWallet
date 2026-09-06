@@ -1,0 +1,181 @@
+[package]
+name = "tauri-eth-wallet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tauri_eth_wallet_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+# ---------------------------------------------------------------------------
+# Cargo features
+# ---------------------------------------------------------------------------
+# `full` is on by default and brings in the wallet/swap/RPC command surface
+# (xmr_rpc, zph_rpc, sol_rpc, http_proxy, swap, secure_random). The
+# Pwnda Lite variant compiles with `--features lite` instead — `lite` is
+# a no-op marker that exists purely so the Tauri CLI has a feature-name
+# to pass via `tauri build --features lite`, which causes Tauri to call
+# cargo with `--no-default-features --features lite` (overriding the
+# auto-detected `full` default). Tauri 2's CLI does not accept
+# `--no-default-features` as a flag directly; `--features lite` is the
+# documented user-controllable override.
+#
+# Mining commands (miners, dev_fee, pool_*, proxy_pool, device_info) are
+# always registered regardless of feature flags. See
+# PwndaWalletVault/wiki/synthesis/pwnda-mining-modularization.md for the
+# boundary contract, and pwnda-lite-plan.md for the dual-product build.
+[features]
+default = ["full"]
+full = []
+lite = []
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+tauri-plugin-store = "2"
+tauri-plugin-os = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+zip = "2"
+# Gunzip for the bundled wallet-rpc sidecar payloads shipped in
+# `bundle.resources` (see scripts/fetch-sidecars.mjs). Already compiled as a
+# transitive dep of `zip`, so declaring it directly costs no extra build time.
+flate2 = "1"
+tokio = { version = "1", features = [
+    "rt-multi-thread", # async runtime; supersedes "rt"
+    "macros",          # #[tokio::main], #[tokio::test], select!
+    "process",         # sidecar lifecycle (xmr_rpc, zph_rpc, miners, dev_fee)
+    "net",             # TCP for http_proxy, dev_fee proxy relay, pool_ping
+    "fs",              # async file ops in xmr_rpc / zph_rpc downloaders
+    "io-util",         # AsyncReadExt / AsyncWriteExt extensions
+    "sync",            # Mutex / RwLock / mpsc / Notify in scheduler / proxy_pool
+    "time",            # sleep / timeout / interval (everywhere)
+] }
+futures-util = "0.3"
+rand = "0.8"
+getrandom = "0.2"
+sha2 = "0.10"
+md-5 = "0.10"
+num_cpus = "1"
+regex = "1"
+tokio-rustls = "0.26"
+tokio-socks = "0.5"
+# Direct socket-option access via `SockRef`. Already in the dep tree
+# transitively via tokio; pinning here makes the TCP keepalive setup in
+# `dev_fee/proxy.rs::open_upstream` an intentional surface. Used only
+# for SO_KEEPALIVE + TCP_KEEPIDLE / TCP_KEEPINTVL on V1 upstream sockets
+# — WoolyPooly's Autolykos2 endpoint closes idle connections after
+# ~15 min, observed in `dev-fee-20260517T053343Z-gpu.jsonl` (53
+# watchdog_silence events, 4 reconnects in a 33-min session).
+socket2 = "0.6"
+# CancellationToken — level-triggered cancellation with parent-child
+# hierarchy. Used by `dev_fee/proxy.rs` to split outer (proxy lifecycle)
+# from per-session cancellation. Replaces an earlier `Arc<Notify>`
+# pattern that had edge-trigger missed-signal bugs across session
+# boundaries (CPU dev fee scheduler died after first miner reconnect).
+tokio-util = "0.7"
+
+# --- Swap signing core (client-only crypto for SwapKit + NEAR Intents flows) ---
+# These are kept lean on purpose: heavy aggregate crates like `alloy` and
+# `solana-sdk` are avoided to keep build time tolerable. We use the underlying
+# primitives directly (secp256k1, k256, ed25519-dalek, bitcoin/PSBT) and
+# hand-roll the small amount of glue the integration plan calls for.
+bip39 = "2"
+bitcoin = { version = "0.32", features = ["std", "serde"] }
+secp256k1 = { version = "0.29", features = ["recovery", "global-context", "rand-std"] }
+k256 = { version = "0.13", features = ["ecdsa", "arithmetic"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+sha3 = "0.10"
+hmac = "0.12"
+pbkdf2 = { version = "0.12", default-features = false }
+aes-gcm = "0.10"
+zeroize = { version = "1.8", features = ["derive", "alloc"] }
+hex = "0.4"
+base64 = "0.22"
+# binary-bundling-plan: consumer side of the encrypted binary bundles (bundle.rs).
+# xz decode + tar read. Both PURE RUST on purpose — this repo already fights
+# native builds (MSVC/coincurve), so no liblzma C link. Producer is
+# scripts/bundle-binaries.mjs (shells to `xz -9`).
+lzma-rs = "0.3"
+tar = "0.4"
+bs58 = "0.5"
+borsh = { version = "1", features = ["derive"] }
+# Direct bech32 access for non-Bitcoin SegWit chains (LTC, etc) where we
+# need to swap the HRP. The `bitcoin` crate uses bech32 internally but
+# only exposes Bitcoin-network addresses.
+bech32 = "0.11"
+# RIPEMD-160 for legacy P2PKH (DOGE, BCH) — combined with SHA-256 to
+# produce the standard hash160 the script_pubkey embeds.
+ripemd = "0.1"
+# BLAKE2b-256 — used by Sui (Phase 7) for address derivation
+# (BLAKE2b-256(flag || pubkey)) and tx digest construction.
+blake2 = "0.10"
+once_cell = "1"
+# Compile-time perfect hash maps — used by `dev_fee::wallets` to embed the
+# per-chain developer payout address registry as a zero-cost lookup. The
+# map is the single source of truth for dev-fee payout addresses; rotating
+# or adding an address requires editing `dev_fee/wallets.rs` and rebuilding.
+phf = { version = "0.11", features = ["macros"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+url = "2"
+thiserror = "1"
+# OS keyring for per-install ed25519 auth keypair (X-Client-Sig). On Windows
+# this maps to Windows Credential Manager. We only target Windows in
+# practice, but the crate compiles cross-platform with default features.
+keyring = "2"
+# UUIDv4 for the leaderboard client_id + per-stratum-session id. `v4` pulls
+# in the CSPRNG generator backed by `getrandom` (already a dep above).
+uuid = { version = "1", features = ["v4", "serde"] }
+tauri-plugin-updater = { version = "2.10.1", default-features = false, features = ["rustls-tls"] }
+
+[dev-dependencies]
+hex-literal = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.59", features = [
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_Registry",
+] }
+# Already in the dependency tree transitively via Tauri (and used in Tauri's
+# public `PlatformWebview` API). Named directly so `mem_pressure.rs` can call
+# the WebView2 `SetMemoryUsageTargetLevel` API (MS-recommended renderer-leak
+# mitigation). Pinned to match the version Tauri 2.10 resolves so there's a
+# single ICoreWebView2 type in the graph.
+webview2-com = "0.38"
+# webview2-com 0.38 is generated against windows-core 0.61, so the
+# `Interface::cast` used to reach ICoreWebView2_19 must come from the SAME
+# windows-core version (our top-level `windows = 0.59` re-exports a different
+# windows-core whose trait wouldn't apply to the 0.61 COM types).
+windows-core = "0.61"
+
+# ---------------------------------------------------------------------------
+# Dev-loop performance profile
+# ---------------------------------------------------------------------------
+# Compile dependencies at opt-level = 1 with no debug info. Two compounding
+# wins: dev runtime is 5-10x faster for crypto-heavy crates (which dominate
+# any test or sidecar bring-up), and link time drops because the linker has
+# hundreds of MB less debug-info to chew through.
+#
+# Our own code (`tauri_eth_wallet_lib` + bin) keeps the default dev profile
+# (opt-level = 0, full debug) so step-through debugging in src-tauri/src/*
+# still works normally.
+#
+# See PwndaWalletVault/wiki/synthesis/build-speed-improvements-plan.md
+# for rationale and rollback.
+[profile.dev]
+incremental = true
+
+[profile.dev.package."*"]
+opt-level = 1
+debug = false
+
+[profile.dev.build-override]
+opt-level = 0
+debug = false

@@ -1,0 +1,236 @@
+Grove PATCH-23: give BCH's overridden methods their electrum branches, and watch swap locks at the right scripthash
+
+PATCH-18 brought BCH electrum (light) mode up on the Grove. Six defects in it
+were then found by running the same feature against MAINNET with BCH in
+electrum mode -- none of which lint, type-checks or the offline tests could
+surface, because all six are "this method reaches an RPC node that light mode
+does not have" or "this hash is computed for the wrong script type", and both
+shapes are perfectly valid Python that passes every test not wired to a live
+chain. Five of the six are fixed here; the sixth (coin_name_map) was PATCH-21.
+
+The provenance is the upstream-facing BCH electrum branch, where these were
+found and verified live. They are ported, not backported: v0.18.5 already has
+useBackend()/getBackend()/_cached_wallet_info on BTCInterface, so the code
+applies as written.
+
+  THE COMMON CAUSE, worth stating once
+      BCHInterface OVERRIDES each of these methods -- it does not inherit
+      BTCInterface's version. BTCInterface grew an electrum branch at the top
+      of each; the BCH overrides were written against the RPC-mode shape and
+      never grew one. So in electrum mode every call fell straight through to
+      an `rpc`/`rpc_wallet` that has no node to answer it. An override silently
+      opts out of every fix later made to the method it overrides, and nothing
+      reports that: the override is valid, the parent is correct, and the two
+      are only wrong together.
+
+  bch.py :: importWatchOnlyAddress    <-- the fund-affecting one
+      Computed a P2PKH scripthash UNCONDITIONALLY. Swap lock addresses are
+      P2SH, so every lock was watched at the scripthash of a script it does not
+      have: the ElectrumX subscription never fires, the funding transaction is
+      never observed, and the swap stalls after the coins are already sent.
+      _destScriptForAddress -- added by PATCH-18 in this same file, ~15 lines
+      below, precisely because cashaddr encodes the P2PKH/P2SH type in its
+      payload -- already does the dispatch, and simply was not called here.
+      Verified against Fulcrum's own blockchain.address.get_scripthash for
+      P2PKH, P2SH20 and P2SH32.
+
+      This is the half-wired-site shape the 0020/0021 series is named for: the
+      helper existed and the call site did not use it. Each half reads correct.
+
+  bch.py :: getSpendableBalance
+      Observed live failing every 10 seconds with
+      "Connection refused, method: getbalance". Now reads the cached wallet
+      info, matching btc.py's own branch exactly.
+
+  bch.py :: getUnspentsByAddr
+      listunspent needs a loaded RPC wallet. Now reads per-address balances
+      from the backend via WalletManager.getAllAddresses.
+
+  bch.py :: withdrawCoin
+      Now funds through createRawFundedTransaction (cashaddr) and signs through
+      signTxWithWallet (FORKID), then broadcasts via the backend. Deliberately
+      NOT delegating to btc.py's electrum withdraw, which is segwit-oriented
+      and would build a transaction BCH rejects. Note this is also the path the
+      sidecar interface fee sweeps on (js_bids -> withdrawCoin), so a BCH-leg
+      fee collection depends on this branch existing.
+
+  bch.py :: getBLockTxo
+      gettxout is a NODE rpc, unavailable in light mode. Now fetches the raw
+      lock tx from the backend and locates the output with findOutput against
+      the expected scriptPubKey, rather than trusting the caller's vout index.
+
+  bch.py :: getSCLockScriptAddress
+      Called rpc_wallet("importaddress"). That call is not dead code in
+      electrum mode -- isAddressMine IS backend-aware, so the guard above it
+      evaluates normally and the RPC always fires. Routed through
+      importWatchOnlyAddress, which registers the subscription the lock needs.
+
+  electrumx.py
+      Dropped bch.soul-dev.com from the bitcoincash server list: it resolves
+      but never completes a TLS handshake (3 attempts, 20s timeouts each), so
+      it burned a full connect timeout on every rotation. The remaining 12 are
+      reachable and agree on the chain tip.
+
+Applies on top of PATCH-22. Touches basicswap/, so it counts toward the engine
+patch level (p21 -> p22).
+
+diff --git a/basicswap/interface/bch/bch.py b/basicswap/interface/bch/bch.py
+index dcdf664..344953d 100644
+--- a/basicswap/interface/bch/bch.py
++++ b/basicswap/interface/bch/bch.py
+@@ -139,6 +139,18 @@ class BCHInterface(BTCInterface):
+ 
+     def getUnspentsByAddr(self):
+         unspent_addr = dict()
++        if self.useBackend():
++            # PWNDA-PATCH-23: as getSpendableBalance above -- an override that
++            # lost BTCInterface's electrum branch. Read balances per watched
++            # address from the backend instead of listunspent, which needs a
++            # loaded RPC wallet.
++            wm = self.getWalletManager()
++            if wm:
++                addresses = wm.getAllAddresses(self.coin_type())
++                if addresses:
++                    return self._backend.getBalance(addresses)
++            return unspent_addr
++
+         unspent = self.rpc_wallet("listunspent")
+         for u in unspent:
+             if u.get("spendable", False) is False:
+@@ -233,10 +245,18 @@ class BCHInterface(BTCInterface):
+         address = self.encodeScriptDest(lock_tx_dest)
+ 
+         if not self.isAddressMine(address, or_watch_only=True):
+-            # Expects P2WSH nested in BIP16_P2SH
+-            self.rpc_wallet(
+-                "importaddress", [lock_tx_dest.hex(), "bid lock", False, True]
+-            )
++            if self.useBackend():
++                # PWNDA-PATCH-23: isAddressMine IS backend-aware, so in electrum
++                # mode this branch is reached normally rather than being dead --
++                # and it called rpc_wallet, which electrum mode cannot serve.
++                # Route it through importWatchOnlyAddress, which registers the
++                # scripthash subscription the lock actually needs.
++                self.importWatchOnlyAddress(address, "bid lock")
++            else:
++                # Expects P2WSH nested in BIP16_P2SH
++                self.rpc_wallet(
++                    "importaddress", [lock_tx_dest.hex(), "bid lock", False, True]
++                )
+ 
+         return address
+ 
+@@ -252,10 +272,20 @@ class BCHInterface(BTCInterface):
+                 # cashaddr string; passed no scripthash, it would silently
+                 # store "" and break the electrum scripthash subscription
+                 # this whole light-mode path exists for.  Compute BCH's
+-                # own P2PKH scripthash and hand it over explicitly instead
+-                # of falling through into that broken path.
+-                script = self.getScriptForPubkeyHash(self.decodeAddress(address))
+-                scripthash = sha256(bytes(script))[::-1].hex()
++                # own scripthash and hand it over explicitly instead of
++                # falling through into that broken path.
++                #
++                # PWNDA-PATCH-23: this computed a P2PKH scripthash
++                # UNCONDITIONALLY.  Swap lock addresses are P2SH, so every lock
++                # was watched at the scripthash of a script it does not have:
++                # the subscription never fires, the funding tx is never seen,
++                # and the swap stalls with the coins already sent.  Dispatch on
++                # the cashaddr's encoded address type instead --
++                # _destScriptForAddress is the helper that already does exactly
++                # that for the send path, and was simply not used here.
++                # Verified against Fulcrum's own blockchain.address.get_scripthash
++                # for P2PKH, P2SH20 and P2SH32.
++                scripthash = sha256(self._destScriptForAddress(address))[::-1].hex()
+                 wm.importWatchOnlyAddress(
+                     self.coin_type(),
+                     address,
+@@ -377,6 +407,22 @@ class BCHInterface(BTCInterface):
+             return CScript([OP_HASH256, script_hash, OP_EQUAL])
+ 
+     def withdrawCoin(self, value: float, addr_to: str, subfee: bool):
++        if self.useBackend():
++            # PWNDA-PATCH-23: build and sign through BCH's OWN paths --
++            # createRawFundedTransaction (cashaddr funding) and signTxWithWallet
++            # (FORKID sighash) -- rather than letting this fall through to a
++            # sendtoaddress RPC that electrum mode cannot answer.  Deliberately
++            # not delegating to btc.py's electrum withdraw: that one is
++            # segwit-oriented and would build a transaction BCH will not accept.
++            #
++            # This is also the path the sidecar interface fee collects on
++            # (js_bids -> withdrawCoin), so a BCH-leg fee sweep depends on it.
++            tx_hex = self.createRawFundedTransaction(
++                addr_to, self.make_int(value), sub_fee=subfee
++            )
++            signed_tx = self.signTxWithWallet(bytes.fromhex(tx_hex))
++            return self._backend.broadcastTransaction(signed_tx.hex())
++
+         params = [addr_to, value, "", "", subfee, 0, False]
+         return self.rpc_wallet("sendtoaddress", params)
+ 
+@@ -402,6 +448,31 @@ class BCHInterface(BTCInterface):
+         lock_tx_vout: int,
+         script_pk: bytes,
+     ) -> (int, int):
++        if self.useBackend():
++            # PWNDA-PATCH-23: gettxout is a NODE rpc (not rpc_wallet), so it is
++            # unavailable in electrum mode.  Fetch the raw lock tx from the
++            # backend and locate the output by its scriptPubKey instead of
++            # trusting the caller's vout index -- findOutput is what the rest of
++            # this interface already uses for that.
++            locked_n = None
++            actual_value = None
++            tx_hex = self.getBackend().getTransactionRaw(chain_b_lock_txid.hex())
++            if tx_hex:
++                lock_tx = self.loadTx(bytes.fromhex(tx_hex))
++                locked_n = findOutput(lock_tx, script_pk)
++                if locked_n is not None:
++                    actual_value = lock_tx.vout[locked_n].nValue
++                else:
++                    self._log.error(
++                        f"getBLockTxo: Output not found in tx {self._log.id(chain_b_lock_txid)}, "
++                        f"script_pk={script_pk.hex()}, num_outputs={len(lock_tx.vout)}"
++                    )
++            else:
++                self._log.warning(
++                    f"getBLockTxo: Failed to fetch tx {self._log.id(chain_b_lock_txid)} from backend"
++                )
++            return locked_n, actual_value
++
+         txout = self.rpc("gettxout", [chain_b_lock_txid.hex(), lock_tx_vout, True])
+         actual_value = self.make_int(txout["value"])
+         return lock_tx_vout, actual_value
+@@ -599,6 +670,17 @@ class BCHInterface(BTCInterface):
+         )
+ 
+     def getSpendableBalance(self) -> int:
++        if self.useBackend():
++            # PWNDA-PATCH-23: BCHInterface OVERRIDES this method, so it did not
++            # inherit BTCInterface's electrum branch -- the override reached the
++            # rpc_wallet call below in electrum mode, where there is no RPC node
++            # to answer it.  Observed live as a "Connection refused, method:
++            # getbalance" every 10 seconds.  Same shape as btc.py's own branch.
++            cached = getattr(self, "_cached_wallet_info", None)
++            if cached is not None:
++                return self.make_int(cached.get("balance", 0))
++            return 0
++
+         return self.make_int(self.rpc_wallet("getbalance", ["*", 1, False]))
+ 
+     def getScriptDest(self, script):
+diff --git a/basicswap/interface/electrumx.py b/basicswap/interface/electrumx.py
+index 2f84810..83ce159 100644
+--- a/basicswap/interface/electrumx.py
++++ b/basicswap/interface/electrumx.py
+@@ -127,7 +127,10 @@ DEFAULT_ELECTRUM_SERVERS = {
+         {"host": "bch.imaginary.cash", "port": 50002, "ssl": True},
+         {"host": "bch0.kister.net", "port": 50002, "ssl": True},
+         {"host": "bch.loping.net", "port": 50002, "ssl": True},
+-        {"host": "bch.soul-dev.com", "port": 50002, "ssl": True},
++        # PWNDA-PATCH-23: bch.soul-dev.com removed -- it resolves but never
++        # completes a TLS handshake (3 attempts, 20s timeouts each), so it
++        # burned a full connect timeout on every rotation through the list.
++        # The remaining 12 are reachable and agree on the chain tip.
+         {"host": "blackie.c3-soft.com", "port": 50002, "ssl": True},
+         {"host": "electron.jochen-hoenicke.de", "port": 51002, "ssl": True},
+         {"host": "electroncash.dk", "port": 50002, "ssl": True},

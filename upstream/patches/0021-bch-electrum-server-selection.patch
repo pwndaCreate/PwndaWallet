@@ -1,0 +1,138 @@
+Grove PATCH-21: make BCH electrum select BitcoinCash servers, and configurable
+
+PATCH-18 added thirteen live-verified "bitcoincash" entries to
+DEFAULT_ELECTRUM_SERVERS and wired BCHInterface to _initElectrumBackend. It
+did not add BCH to the one map that decides WHICH server set a backend uses,
+so those entries were dead data that nothing ever selected.
+
+  wallet_backend.py
+      ElectrumBackend.__init__'s coin_name_map held only BTC and LTC and fell
+      through to "bitcoin" for anything else. coin_name is the sole input to
+      ElectrumServer's DEFAULT_ELECTRUM_SERVERS lookup, so a BCH client built
+      on the default path -- basicswap-prepare --light or --bch-mode=electrum,
+      neither of which writes electrum_clearnet_servers -- connected to
+      BITCOIN's servers and answered every balance, UTXO, height and fee query
+      from the wrong chain, with broadcasts rejected. Silently: the .get()
+      default never warned, and the log line reads
+      "ElectrumServer bitcoin: 6 clearnet servers", which looks entirely
+      normal.
+
+      Proven by construction, not inferred -- building the object with exactly
+      the arguments _initElectrumBackend passes gives
+          BTC -> bitcoin | LTC -> litecoin | BCH -> bitcoin
+      An unmapped coin now RAISES instead of defaulting. A wrong-chain default
+      is strictly worse than a startup failure: it is silent, and it presents
+      as an empty wallet. Note line 174 of the same constructor already used a
+      generic chainparams.get(coin_type, ...) -- one lookup in this function
+      was generic and the one immediately below it was hardcoded.
+
+      Why every earlier gate missed it: the one live run used a regtest
+      Fulcrum via an explicit --bch-electrum-server, i.e. the single
+      configuration where user-supplied servers are set and coin_name is
+      irrelevant. The server-list check verified the bitcoincash entries'
+      CONTENTS and REACHABILITY, never that anything SELECTS them.
+
+  ui/page_settings.py, js_server.py
+      Three more copies of the same allowlist -- the settings POST handler,
+      the settings render path, and the JSON endpoint -- each listing only
+      bitcoin and litecoin. BCH could run in electrum mode but could not be
+      configured from the UI, and the endpoint refused to return servers for a
+      coin the backend genuinely supports.
+
+This is why the missing map mattered so much for BCH specifically: Fulcrum is
+deliberately NOT bundled (it is harness-only), so for BCH light mode the
+public bitcoincash server list IS the backend, and coin_name_map was the only
+thing standing between the user and it.
+
+Kept separate from PATCH-20 so it stays exportable as an upstream-facing
+change alongside PATCH-18 -- see scripts/swap/export-upstream-pr.mjs.
+
+Applies on top of PATCH-20.
+
+diff --git a/basicswap/wallet_backend.py b/basicswap/wallet_backend.py
+index 89c6103..a6863e6 100644
+--- a/basicswap/wallet_backend.py
++++ b/basicswap/wallet_backend.py
+@@ -174,11 +174,31 @@ class ElectrumBackend(WalletBackend):
+         coin_params = chainparams.get(coin_type, chainparams.get(Coins.BTC))
+         self._network_params = coin_params.get(chain, coin_params.get("mainnet", {}))
+ 
++        # PWNDA-PATCH-21: BCH was missing here, and the default silently made it
++        # Bitcoin. coin_name is the ONLY thing that selects a server set --
++        # ElectrumServer looks it up in DEFAULT_ELECTRUM_SERVERS -- so a BCH client
++        # built on the default path (no --bch-electrum-server, hence
++        # clearnet_servers=None) connected to Bitcoin's servers and answered every
++        # balance, UTXO, height and fee query from the wrong chain, with broadcasts
++        # rejected and nothing logged out of the ordinary.
++        #
++        # Raise on an unmapped coin rather than defaulting. A wrong-chain default is
++        # strictly worse than a startup failure: it is silent, and it looks like an
++        # empty wallet. Note line 174 above already uses a generic
++        # chainparams.get(coin_type, ...) -- one lookup in this constructor was
++        # generic and the one immediately below it was hardcoded.
+         coin_name_map = {
+             Coins.BTC: "bitcoin",
+             Coins.LTC: "litecoin",
++            Coins.BCH: "bitcoincash",
+         }
+-        coin_name = coin_name_map.get(coin_type, "bitcoin")
++        if coin_type not in coin_name_map:
++            raise ValueError(
++                f"ElectrumBackend has no server set for {coin_type}; add it to "
++                f"coin_name_map and to DEFAULT_ELECTRUM_SERVERS before enabling "
++                f"electrum mode for this coin"
++            )
++        coin_name = coin_name_map[coin_type]
+ 
+         self._host = "localhost"
+         self._port = 50002
+diff --git a/basicswap/ui/page_settings.py b/basicswap/ui/page_settings.py
+index 43ceaa9..276ee35 100644
+--- a/basicswap/ui/page_settings.py
++++ b/basicswap/ui/page_settings.py
+@@ -156,9 +156,15 @@ def page_settings(self, url_split, post_string):
+                     "TODO: If running in docker see doc/tor.md to enable/disable tor."
+                 )
+ 
++            # PWNDA-PATCH-21: bitcoincash added. This is the POST-handling half of
++            # the pair; the render half is the identical tuple at ~line 320 and the
++            # third copy is js_server.py::electrum_supported. All three must list the
++            # same coins or the feature is half-wired -- BCH could run in electrum
++            # mode but could not be configured from the UI.
+             electrum_supported_coins = (
+                 "bitcoin",
+                 "litecoin",
++                "bitcoincash",
+             )
+             for name, c in swap_client.settings["chainclients"].items():
+                 if have_data_entry(form_data, "apply_" + name):
+@@ -302,9 +308,13 @@ def page_settings(self, url_split, post_string):
+         except Exception as e:
+             err_messages.append(str(e))
+     chains_formatted = []
++    # PWNDA-PATCH-21: the render half of the pair above -- drives
++    # "supports_electrum" in the template. Keep in sync with the POST handler and
++    # with js_server.py::electrum_supported.
+     electrum_supported_coins = (
+         "bitcoin",
+         "litecoin",
++        "bitcoincash",
+     )
+ 
+     sorted_names = sorted(swap_client.settings["chainclients"].keys())
+diff --git a/basicswap/js_server.py b/basicswap/js_server.py
+index 1314867..4766985 100644
+--- a/basicswap/js_server.py
++++ b/basicswap/js_server.py
+@@ -2164,7 +2164,10 @@ def js_electrum_discover(self, url_split, post_string, is_json) -> bytes:
+         except ValueError:
+             coin_type = getCoinType(coin_str)
+ 
+-    electrum_supported = ["bitcoin", "litecoin"]
++    # PWNDA-PATCH-21: third copy of the electrum coin allowlist (the other two are
++    # in ui/page_settings.py). bitcoincash added -- without it the JSON endpoint
++    # refused to return servers for a coin the backend can genuinely run.
++    electrum_supported = ["bitcoin", "litecoin", "bitcoincash"]
+     coin_name = chainparams.get(coin_type, {}).get("name", "").lower()
+     if coin_name not in electrum_supported:
+         return bytes(

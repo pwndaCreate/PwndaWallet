@@ -1,0 +1,41 @@
+# PwndaWallet Cargo configuration overrides.
+#
+# See PwndaWalletVault/wiki/synthesis/build-speed-improvements-plan.md for
+# the rationale; rollback by deleting this file.
+
+# Use rust-lld (LLVM's linker, bundled with the stable-x86_64-pc-windows-msvc
+# toolchain) instead of MSVC's link.exe. rust-lld is internally multi-threaded
+# and produces byte-compatible COFF output, halving the incremental link step
+# on this codebase.
+#
+# Path is toolchain-relative — if you change toolchains, run
+#   rustup which rustc
+# and update the prefix accordingly. Forward slashes are accepted on Windows.
+#
+# NOTE: this path embeds the Windows username (`user`). It only applies to the
+# MSVC target, so non-Windows hosts ignore it entirely — but a second Windows
+# machine with a different profile name needs this line updated (or removed,
+# which just falls back to link.exe and builds slightly slower).
+[target.x86_64-pc-windows-msvc]
+linker = "C:/Users/user/.rustup/toolchains/stable-x86_64-pc-windows-msvc/lib/rustlib/x86_64-pc-windows-msvc/bin/rust-lld.exe"
+
+# sccache wrapper — content-addressed compile cache. Survives `cargo clean`
+# and branch switches. Install once via `cargo install sccache --locked`.
+# See the build-speed plan for verification commands and rollback. If a build
+# fails with a stale-cache symptom, run `sccache --zap`.
+#
+# 2026-08-12: this is deliberately NOT set repo-wide anymore. A hard
+# `rustc-wrapper = "sccache"` makes the workspace unbuildable on any machine
+# without sccache on PATH — cargo dies with a bare "could not execute process
+# sccache", which reads like a broken toolchain rather than a missing optional
+# cache. It blocked the first native Linux build, and it is why
+# `scripts/build-linux-inner.sh` has to defensively `export RUSTC_WRAPPER=""`.
+#
+# Opt in per-machine instead, so the cache is used where installed and simply
+# absent (not fatal) where it isn't:
+#
+#   Windows (PowerShell, persists):   setx RUSTC_WRAPPER sccache
+#   Linux / macOS (~/.bashrc etc.):   export RUSTC_WRAPPER=sccache
+#
+# [build]
+# rustc-wrapper = "sccache"
