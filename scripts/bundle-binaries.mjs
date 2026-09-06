@@ -86,6 +86,7 @@ const argVal = (flag, dflt) => {
   return a ? a.slice(a.indexOf("=") + 1) : dflt;
 };
 const ONLY = argVal("--only", null); // "miners" | "grove" | null(both)
+const FORCE = argv.includes("--force"); // rebuild even when the input stamp matches
 const EXE = TARGET === "win32" ? ".exe" : "";
 const OUT_DIR = path.resolve(argVal("--out", path.join(REPO, "src-tauri", "binaries")));
 const MINERS_SRC = path.resolve(
@@ -402,10 +403,64 @@ function escapeForTransform(seg) {
  * consumer needs to find after extraction. The canonical names are enforced
  * at packaging time now, not inherited from the filesystem.
  */
+/**
+ * A stamp describing this payload's INPUTS, cheaply.
+ *
+ * Path + size + mtime of every entry, plus the rename map and the target. Not a
+ * content hash: the miners payload is 418 MB and Grove is 565 MB, so hashing to
+ * decide whether to compress would cost most of what compressing costs.
+ * Size+mtime is the same staleness test `make` has used for fifty years, and
+ * these inputs are FETCHED artifacts — `fetch-miners` and `fetch-sidecars`
+ * rewrite them whenever a version moves, which moves the mtime.
+ *
+ * Measured 2026-09-06: `bundle:win` is 94 s, and the Linux side repeats the
+ * same work on a larger tree. That is ~4 minutes per release spent producing
+ * bytes identical to the ones already on disk.
+ */
+async function inputStamp({ name, baseDir, entries, rename }) {
+  const parts = [`target=${TARGET}`, `name=${name}`, `rename=${JSON.stringify(rename ?? null)}`];
+  const walk = async (rel) => {
+    const full = path.join(baseDir, rel);
+    let st;
+    try {
+      st = await stat(full);
+    } catch {
+      parts.push(`${rel}\tMISSING`);
+      return;
+    }
+    if (st.isDirectory()) {
+      const kids = (await readdir(full)).sort();
+      for (const k of kids) await walk(path.join(rel, k));
+      return;
+    }
+    parts.push(`${rel}\t${st.size}\t${Math.floor(st.mtimeMs)}`);
+  };
+  for (const e of [...entries].sort()) await walk(e);
+  return createHash("sha256").update(parts.join("\n")).digest("hex");
+}
+
 async function buildPayload({ name, baseDir, entries, key, rename }) {
   const listFile = path.join(TMP, `${name}.list`);
   const tarFile = path.join(TMP, `${name}.tar`);
   const xzFile = `${tarFile}.xz`;
+
+  // Unchanged inputs produce byte-identical output, so do not spend 90 s
+  // proving it. `--force` bypasses; a changed stamp rebuilds; a missing .enc
+  // or a missing previous entry rebuilds.
+  const stampFile = path.join(OUT_DIR, `.${name}.stamp`);
+  const stamp = await inputStamp({ name, baseDir, entries, rename });
+  if (!FORCE) {
+    const prevEnc = path.join(OUT_DIR, `${name}.enc`);
+    let prev = null;
+    try {
+      prev = JSON.parse(await readFile(stampFile, "utf8"));
+    } catch {}
+    if (prev && prev.stamp === stamp && (await exists(prevEnc))) {
+      console.log(`${LOG}   ${name.padEnd(8)} unchanged — reusing ${name}.enc (${(prev.encBytes / 1048576).toFixed(1)}MB); --force to rebuild`);
+      return { name, enc_file: `${name}.enc`, tar_sha256: prev.tar_sha256 };
+    }
+  }
+
   await writeFile(listFile, entries.join("\n") + "\n", "utf8");
 
   const tarArgs = ["--force-local", "-C", baseDir];
@@ -447,6 +502,13 @@ async function buildPayload({ name, baseDir, entries, key, rename }) {
   const enc = Buffer.concat([nonce, ct, tag]);
   const encName = `${name}.enc`;
   await writeFile(path.join(OUT_DIR, encName), enc);
+  // Only after the payload is on disk: a stamp written before the write would
+  // let a failed run mark the next one as up to date.
+  await writeFile(
+    path.join(OUT_DIR, `.${name}.stamp`),
+    JSON.stringify({ stamp, tar_sha256: tarSha, encBytes: enc.length }, null, 2),
+    "utf8"
+  );
 
   await rm(listFile, { force: true });
   await rm(tarFile, { force: true });
