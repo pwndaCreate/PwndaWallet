@@ -63,16 +63,20 @@ ALLOW_LINES = [
     ("<REDACTED>", "already redacted"),
 ]
 
-SKIP_DIRS = {".git", "node_modules", "target", "target-linux", "target-sandbox",
-             "dist", "dist-lite", ".cache", ".swap-sidecar-work", "__pycache__",
-             ".playwright-mcp", ".obsidian"}
+# Any directory named target* is a cargo build tree (target, target-linux,
+# target-sandbox, target-claude-lite, …). Scanning them is slow and produces
+# nothing but PEM strings vendored inside .rlib files by pkcs8/native-tls.
+SKIP_DIR_PREFIXES = ("target",)
+SKIP_DIRS = {".git", "node_modules", "dist", "dist-lite", ".cache",
+             ".swap-sidecar-work", "__pycache__", ".playwright-mcp", ".obsidian"}
 SKIP_EXT = {".png", ".jpg", ".jpeg", ".gif", ".ico", ".icns", ".zip", ".gz", ".xz",
             ".enc", ".wasm", ".exe", ".dll", ".so", ".pdf", ".keys", ".bin", ".woff",
             ".woff2", ".ttf", ".mp4", ".lock"}
 
 hits, scanned = [], 0
 for dirpath, dirnames, filenames in os.walk(ROOT):
-    dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+    dirnames[:] = [d for d in dirnames
+                   if d not in SKIP_DIRS and not d.startswith(SKIP_DIR_PREFIXES)]
     for fn in filenames:
         full = os.path.join(dirpath, fn)
         rel = os.path.relpath(full, ROOT).replace("\\", "/")
@@ -88,6 +92,22 @@ for dirpath, dirnames, filenames in os.walk(ROOT):
         except OSError:
             continue
         scanned += 1
+
+        # A RAW KEY FILE: the whole file is one hex blob with no `key=` around
+        # it, so every line-level rule above is blind to it. This is exactly the
+        # shape of `ada-funding.preprod.skey` — 64 bytes of Ed25519 secret and
+        # nothing else — which the first version of this scanner missed while
+        # correctly flagging the same key's hex inside an env file (2026-09-06).
+        # Digest files are the obvious false positive, so they are excluded by
+        # extension and by the "hash plus a filename" shape.
+        stripped = text.strip()
+        if (32 <= len(stripped) <= 256
+                and re.fullmatch(r"[0-9a-fA-F]+", stripped)
+                and len(stripped) % 2 == 0
+                and not fn.lower().endswith((".sha256", ".sha512", ".md5", ".sum", ".txt"))
+                and "SUMS" not in fn.upper()):
+            hits.append(("raw key file (whole file is hex)", f"{rel}:1"))
+
         for i, line in enumerate(text.splitlines(), 1):
             if len(line) > 4000:
                 continue
