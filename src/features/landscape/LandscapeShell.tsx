@@ -3,6 +3,7 @@ import { Dot } from "../../components/Primitives";
 import { useAppState } from "../../state/AppStateContext";
 import { shouldShowSwitcher, contextForWallet } from "../../vault-schema";
 import { WalletSwitcher } from "./WalletSwitcher";
+import { UpdateBanner } from "../../components/UpdateBanner";
 
 /* ══════ Types ═════════════════════════════════════════════════ */
 export type LandscapeTab =
@@ -229,6 +230,12 @@ export function LandscapeShell({
           </button>
         </div>
       </div>
+
+      {/* Update notice — the SAME component portrait mounts in ViewRouter, not
+          a landscape copy of it. Landscape had no update path at all before
+          2026-09-06: the only caller of checkForUpdate() was a portrait
+          Settings button. See UpdateBanner's header. */}
+      <UpdateBanner onOpenSettings={() => setTab("settings")} />
 
       {/* ── Body row: Sidebar + Content ─────────────────────────── */}
       <div style={{ flex: 1, display: "flex", minHeight: 0, overflow: "hidden" }}>

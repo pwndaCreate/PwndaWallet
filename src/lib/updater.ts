@@ -89,6 +89,24 @@ export async function isUpdaterSupported(): Promise<boolean> {
  * would be a worse bug than a missed update. The error is logged, not thrown.
  */
 export async function checkForUpdate(): Promise<UpdateInfo | null> {
+  // Sandbox-only: let the browser sandbox exercise the update UI.
+  //
+  // The real check needs the Tauri runtime, so `dev:sandbox` can never produce
+  // an update and the banner could not be looked at — which is how the app
+  // ended up with an updater nobody had ever SEEN fire. Same shape as
+  // VITE_MOCK_STATE / VITE_MOCK_DEVICE; set VITE_MOCK_UPDATE=<version> in
+  // .env.sandbox.local. `import.meta.env.DEV` is statically false in
+  // `vite build`, so this whole branch is dead-code-eliminated from shipped
+  // binaries.
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_UPDATE) {
+    const version = String(import.meta.env.VITE_MOCK_UPDATE);
+    console.log(`[updater] VITE_MOCK_UPDATE active — pretending v${version} is available`);
+    return {
+      version,
+      currentVersion: "0.0.0-sandbox",
+      notes: "Synthetic update from VITE_MOCK_UPDATE. Nothing is downloadable.",
+    };
+  }
   if (!inTauri()) return null;
   try {
     const { check } = await import("@tauri-apps/plugin-updater");

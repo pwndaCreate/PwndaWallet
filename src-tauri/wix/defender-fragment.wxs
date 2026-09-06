@@ -2,6 +2,28 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
     <!--
+      ============================================================
+      NOT BUILT as of 2026-09-06. `bundle.targets` is ["nsis"]:
+      Windows ships ONE installer, and it is the NSIS .exe, because
+      that is the only format the in-app updater can apply.
+
+      The uninstall cleanup below has been PORTED to
+      `src-tauri/nsis/cleanup-uninstall.ps1`, invoked from
+      `src-tauri/nsis/hooks.nsh` (NSIS_HOOK_PREUNINSTALL). That is
+      the live implementation; this file is kept, and its `wix`
+      config entry with it, so that re-adding "msi" to
+      bundle.targets restores the same behaviour instead of
+      silently producing an MSI with no cleanup at all.
+
+      Read the port's header before changing anything here: it
+      documents two places where this MSI version was WRONG (it
+      removed Defender exclusions by bare filename while the
+      runtime adds them by full path, so it never removed the
+      runtime-added ones; and it deleted AppData across every user
+      profile on the machine).
+      ============================================================
+    -->
+    <!--
       Windows Defender Exclusion Custom Actions for MSI installer.
       Uses the same Directory+ExeCommand deferred pattern as the WebView2 bootstrapper.
       The MSI uses InstallScope="perMachine" so it already runs elevated via UAC.

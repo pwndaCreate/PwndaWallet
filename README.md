@@ -17,7 +17,7 @@ Built on Tauri 2 (Rust) + React 19 + Vite 6 + TypeScript.
 ## Install
 
 Download the installer for your platform from the
-[Releases](https://github.com/pwndaCreate/PwndaWalletDevelopment/releases) page. The
+[Releases](https://github.com/pwndaCreate/PwndaWallet/releases) page. The
 installer carries everything the swap engine needs; nothing is downloaded at first run
 unless you opt into a coin whose chain daemon is not bundled.
 
