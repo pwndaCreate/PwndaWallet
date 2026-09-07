@@ -1,7 +1,7 @@
 {
-  "_comment": "Pinned miner releases per platform. SHA256 hashes lock downloads against silent upstream tampering. Update both 'version' and 'sha256' together — the runtime downloader refuses to extract on mismatch. xmrig hashes come from the official SHA256SUMS file in the same release; the others are computed locally after download.",
+  "_comment": "Pinned miner releases per platform. SHA256 hashes lock downloads against silent upstream tampering. Update both 'version' and 'sha256' together \u2014 the runtime downloader refuses to extract on mismatch. xmrig hashes come from the official SHA256SUMS file in the same release; the others are computed locally after download.",
   "_updated": "2026-08-28",
-  "_note_2026_08_28": "rigel dropped (binary-bundling-plan T2) — no advertised GPU algo was rigel-exclusive. Bundled+shipped miners are now xmrig/lolMiner/SRBMiner-MULTI only.",
+  "_note_2026_08_28": "rigel dropped (binary-bundling-plan T2) \u2014 no advertised GPU algo was rigel-exclusive. Bundled+shipped miners are now xmrig/lolMiner/SRBMiner-MULTI only.",
   "miners": {
     "xmrig": {
       "version": "6.26.0",
@@ -30,18 +30,18 @@
       }
     },
     "SRBMiner-MULTI": {
-      "version": "3.2.8",
+      "version": "3.6.2",
       "win32": {
-        "url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.2.8/SRBMiner-Multi-3-2-8-win64.zip",
-        "sha256": "55d897a3b756c0f657640d84c930d6b97e659a999bfd10dd028e8df815b9dd75",
+        "url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.6.2/SRBMiner-Multi-3-6-2-win64.zip",
+        "sha256": "73ff202fba65d95f1e4d487c6610f9d931bc7b5e70fed1c34a3abc7311f120a7",
         "extract_all": true,
-        "subdir": "SRBMiner-Multi-3-2-8"
+        "subdir": "SRBMiner-Multi-3-6-2"
       },
       "linux": {
-        "url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.2.8/SRBMiner-Multi-3-2-8-Linux.tar.gz",
-        "sha256": "810ccec8935d217aad2547d6f4435b190a992dea8077a69dc6de763ff6fb0059",
+        "url": "https://github.com/doktor83/SRBMiner-Multi/releases/download/3.6.2/SRBMiner-Multi-3-6-2-Linux.tar.gz",
+        "sha256": "5513eda1a69871bc4f668ee056f8a12875ed0c340f66cbad73cb5547d9cb5278",
         "extract_all": true,
-        "subdir": "SRBMiner-Multi-3-2-8"
+        "subdir": "SRBMiner-Multi-3-6-2"
       }
     }
   }

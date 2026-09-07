@@ -103,13 +103,66 @@ const WORK = join(ROOT, ".swap-sidecar-work");
  * `Lib/site-packages/basicswap/basicswap.py`, and results are keyed by
  * `realpathSync` so a junction and its target count once.
  */
-function discoverRuntimes(dir, depth = 0, seen = new Map()) {
-  if (depth > 3 || !existsSync(dir)) return seen;
+/**
+ * The `site-packages` directory of an embedded runtime rooted at `dir`, or null.
+ *
+ * # Why this is not just `Lib/site-packages` (2026-09-06)
+ *
+ * It was, and that is why the Linux release shipped Grove p19 while Windows
+ * shipped p27. Both markers this used to require —
+ *
+ *     python.exe                              (root)
+ *     Lib/site-packages/basicswap/basicswap.py
+ *
+ * — are CPython-on-WINDOWS shapes. A POSIX runtime has `bin/python3` and
+ * `lib/python3.12/site-packages`. So `.swap-sidecar-work/linux-runtime` was
+ * structurally invisible to this script: every run patched only the Windows
+ * runtime, printed success, and left Linux eight patch levels behind. `--check`
+ * inherited the same blindness, which is worse — the tool used to CONFIRM a
+ * runtime's patch level could not see the runtime that was wrong.
+ *
+ * The identical Windows-only assumption existed in `verify-bundle-deep.mjs`
+ * (`runtime/Lib/site-packages/pwnda-grove.json`) and was fixed the same day;
+ * fixing it there is what made this drift visible at all.
+ *
+ * Windows is checked first and the POSIX glob cannot match a Windows runtime
+ * (which has no `lib/pythonX.Y` level), so a case-insensitive filesystem does
+ * not confuse the two.
+ */
+function sitePackagesFor(dir) {
+  const win = join(dir, "Lib", "site-packages");
   if (
     existsSync(join(dir, "python.exe")) &&
-    existsSync(join(dir, "Lib", "site-packages", "basicswap", "basicswap.py"))
+    existsSync(join(win, "basicswap", "basicswap.py"))
   ) {
-    const sp = join(dir, "Lib", "site-packages");
+    return win;
+  }
+  // POSIX: bin/python3* at the root, lib/python<X.Y>/site-packages beneath.
+  const bin = join(dir, "bin");
+  let hasPython = false;
+  try {
+    hasPython = readdirSync(bin).some((f) => /^python3(\.\d+)?$/.test(f));
+  } catch {
+    hasPython = false;
+  }
+  if (!hasPython) return null;
+  let libs;
+  try {
+    libs = readdirSync(join(dir, "lib")).filter((f) => /^python3(\.\d+)?$/.test(f));
+  } catch {
+    return null;
+  }
+  for (const l of libs.sort()) {
+    const sp = join(dir, "lib", l, "site-packages");
+    if (existsSync(join(sp, "basicswap", "basicswap.py"))) return sp;
+  }
+  return null;
+}
+
+function discoverRuntimes(dir, depth = 0, seen = new Map()) {
+  if (depth > 3 || !existsSync(dir)) return seen;
+  const sp = sitePackagesFor(dir);
+  if (sp) {
     // Key AND report on the resolved path, so a junction and its target are one
     // entry and the name printed is the real one. Reporting the first-seen alias
     // instead is actively misleading here: several junctions point at the single
@@ -128,7 +181,7 @@ function discoverRuntimes(dir, depth = 0, seen = new Map()) {
     // isDirectory() is false for a junction — check isSymbolicLink() too, or
     // the live runtime is invisible (trap 2 above).
     if (!e.isDirectory() && !e.isSymbolicLink()) continue;
-    if (e.name === "Lib" || e.name.startsWith("runtime-backup-")) continue;
+    if (e.name === "Lib" || e.name === "lib" || e.name.startsWith("runtime-backup-")) continue;
     discoverRuntimes(join(dir, e.name), depth + 1, seen);
   }
   return seen;
@@ -165,11 +218,8 @@ function discoverRuntimes(dir, depth = 0, seen = new Map()) {
 function resolveTarget(raw) {
   const literal = resolve(raw);
   if (existsSync(join(literal, "basicswap", "basicswap.py"))) return literal;
-  const asRoot = join(literal, "Lib", "site-packages");
-  if (
-    existsSync(join(literal, "python.exe")) &&
-    existsSync(join(asRoot, "basicswap", "basicswap.py"))
-  ) {
+  const asRoot = sitePackagesFor(literal);
+  if (asRoot) {
     console.log(
       `[patches] --target ${literal} is a runtime root, not a site-packages ` +
         `dir — using ${asRoot}`,
