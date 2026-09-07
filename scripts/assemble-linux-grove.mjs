@@ -117,6 +117,76 @@ async function main() {
     process.exit(1);
   }
 
+  // ── Patch-level parity with Windows ────────────────────────────────────
+  //
+  // Linux shipped Grove p19 for ten days while Windows shipped p27, and three
+  // Linux bundles were advertised on the download page carrying the older
+  // engine. The cause was that `apply-engine-patches.mjs` identified a runtime
+  // by `python.exe` + `Lib/site-packages`, so the POSIX tree was invisible to
+  // it and every "patched, success" run had simply never looked at Linux.
+  //
+  // That predicate is fixed. This is the gate that makes the fix hold: the two
+  // runtimes' patch levels are COMPARED at build time, and a difference stops
+  // the build. Fixing the enumerator prevents the accident; only a comparison
+  // prevents it silently recurring for some other reason.
+  //
+  // A deliberate divergence is DECLARED here with a reason, the same shape as
+  // NOT_BUNDLED_FOR in bundle-binaries.mjs — because "declare it or remove it"
+  // is the only version of this that stays true.
+  const ALLOWED_PATCH_LEVEL_GAP = null; // e.g. { linux: 27, win: 28, why: "..." }
+
+  const grovePath = (root, ...rest) => path.join(root, ...rest, "pwnda-grove.json");
+  const readLevel = async (p) => {
+    try {
+      const { readFile } = await import("node:fs/promises");
+      return JSON.parse(await readFile(p, "utf8"));
+    } catch {
+      return null;
+    }
+  };
+  const linuxGrove = await readLevel(
+    grovePath(LINUX_RUNTIME_SRC, "lib", "python3.12", "site-packages")
+  );
+  const winGrove = await readLevel(
+    grovePath(path.join(REPO, ".swap-sidecar-work", "runtime"), "Lib", "site-packages")
+  );
+
+  if (!linuxGrove) {
+    console.error(
+      `${LOG} FATAL: the Linux runtime carries no pwnda-grove.json, so which patch ` +
+        `level it holds cannot be established from the tree that is about to ship.`
+    );
+    process.exit(1);
+  }
+  if (!winGrove) {
+    // Not fatal: a Linux-only build machine legitimately has no Windows runtime.
+    console.log(`${LOG} no Windows runtime present to compare against — skipping parity check`);
+  } else if (linuxGrove.patchLevel !== winGrove.patchLevel) {
+    const ok =
+      ALLOWED_PATCH_LEVEL_GAP &&
+      ALLOWED_PATCH_LEVEL_GAP.linux === linuxGrove.patchLevel &&
+      ALLOWED_PATCH_LEVEL_GAP.win === winGrove.patchLevel;
+    if (!ok) {
+      console.error(
+        `${LOG} FATAL: engine patch levels differ — linux ${linuxGrove.id} vs windows ${winGrove.id}.
+` +
+          `${LOG} Linux users would get a different swap engine from Windows users, which is
+` +
+          `${LOG} how p19 shipped against p27 for ten days.
+` +
+          `${LOG} Fix:     node scripts/apply-engine-patches.mjs --target .swap-sidecar-work/linux-runtime
+` +
+          `${LOG} Declare: set ALLOWED_PATCH_LEVEL_GAP in this file, with the reason.`
+      );
+      process.exit(1);
+    }
+    console.log(
+      `${LOG} patch levels differ by declaration: linux ${linuxGrove.id} vs windows ${winGrove.id} — ${ALLOWED_PATCH_LEVEL_GAP.why}`
+    );
+  } else {
+    console.log(`${LOG} engine parity ok: ${linuxGrove.id} on both platforms`);
+  }
+
   let missing = 0;
   for (const [coin, files] of Object.entries(COIN_BINARIES)) {
     for (const f of files) {

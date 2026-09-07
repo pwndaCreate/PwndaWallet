@@ -112,6 +112,45 @@ async function extractTarGz(tarPath, outDir) {
   }
 }
 
+/**
+ * Copy one staged file, and explain the ONE failure that is not about the copy.
+ *
+ * `copyFile` onto a running executable fails with `EBUSY: resource busy or
+ * locked` on Windows, and the raw error names two absolute paths and no cause,
+ * which reads like a corrupt download. It is not: a miner is RUNNING out of the
+ * staging directory and holding its own binary open. That is an ordinary state
+ * -- mining active during a dev rebuild, or a release cut while the app mines --
+ * so it should say so rather than send the next person hunting a cache problem
+ * they do not have. Hit for real on 2026-09-06, killing a release after both
+ * platform builds had already passed.
+ */
+async function copyStagedFile(src, dest, minerName) {
+  try {
+    await copyFile(src, dest);
+  } catch (err) {
+    if (err && (err.code === "EBUSY" || err.code === "EPERM" || err.code === "EACCES")) {
+      throw new Error(
+        `cannot write ${path.relative(REPO_ROOT, dest)} -- it is IN USE (${err.code}).
+` +
+          `    A miner is almost certainly running from the staging directory and holding
+` +
+          `    its own binary open. Nothing is wrong with the download; the copy has
+` +
+          `    nowhere to land.
+` +
+          `    Stop that one and re-run. On Windows, match on PATH, not on name:
+` +
+          `      Get-Process ${minerName}* | Where-Object { $_.Path -like '*PwndaWalletDevelopment*' } | Stop-Process
+` +
+          `    A miner running from somewhere else on this machine is NOT holding this
+` +
+          `    file and must not be stopped -- that would be someone's live mining.`
+      );
+    }
+    throw err;
+  }
+}
+
 async function processOne(name, spec) {
   const platformSpec = spec[TARGET];
   if (!platformSpec) {
@@ -162,7 +201,7 @@ async function processOne(name, spec) {
     for await (const file of walkFiles(src)) {
       const dest = path.join(STAGING_DIR, file.relName);
       await mkdir(path.dirname(dest), { recursive: true });
-      await copyFile(file.absPath, dest);
+      await copyStagedFile(file.absPath, dest, name);
       copiedCount++;
     }
     if (TARGET === "linux") {
@@ -184,7 +223,7 @@ async function processOne(name, spec) {
     const destName = path.basename(srcRel);
     const dest = path.join(STAGING_DIR, destName);
     await rm(dest, { force: true });
-    await copyFile(src, dest);
+    await copyStagedFile(src, dest, name);
     if (TARGET === "linux") {
       await chmod(dest, 0o755);
     }
