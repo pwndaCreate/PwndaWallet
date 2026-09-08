@@ -3,13 +3,19 @@
 A desktop multi-chain wallet with built-in mining and peer-to-peer atomic swaps.
 Windows first; Linux bundles are produced by the same release pipeline.
 
-- **Wallet** — one seed, many chains (Bitcoin, Litecoin, Bitcoin Cash, Ethereum and
+**The first wallet to ship BasicSwap natively.** The peer-to-peer atomic-swap engine
+runs inside the app, bundled in the installer and supervised by the wallet, rather than
+installed beside it. No Docker, no second program, no account: you take an offer from
+the Swap tab and the engine trades from your own wallet's accounts.
+
+- **Wallet.** One seed, many chains (Bitcoin, Litecoin, Bitcoin Cash, Ethereum and
   EVM networks, Solana, Cardano, Monero, Zephyr, Zano and more). Keys never leave the
   machine; the vault is PBKDF2 + AES-GCM.
-- **Swap** — three routes behind one form: an aggregator route (NEAR Intents), a
-  peer-to-peer route (**Pwnda Grove**, a bundled BasicSwap engine — no counterparty
-  but the other user, no custody, refund by timelock), and the in-protocol Zephyr swaps.
-- **Mine** — XMRig, SRBMiner and lolMiner managed in-app, with a mining-only sibling
+- **Swap.** Three routes behind one form: an aggregator route (NEAR Intents), a
+  peer-to-peer route (**Pwnda Grove**, a bundled BasicSwap engine with no
+  counterparty but the other user, no custody, and refund by timelock), and
+  the in-protocol Zephyr swaps.
+- **Mine.** XMRig, SRBMiner and lolMiner managed in-app, with a mining-only sibling
   build (**PwndaLite**).
 
 Built on Tauri 2 (Rust) + React 19 + Vite 6 + TypeScript.
@@ -67,14 +73,14 @@ network, is the engine's own wallet.
 
 | Path | What |
 |---|---|
-| `src/` | Frontend — wallet adapters, views, the swap form and trackers |
-| `src-tauri/` | Rust backend — process supervision, the swap-node sidecar, mining |
+| `src/` | Frontend: wallet adapters, views, the swap form and trackers |
+| `src-tauri/` | Rust backend: process supervision, the swap-node sidecar, mining |
 | `src-lite/` | PwndaLite (mining-only) entry |
 | `upstream/patches/` | The Grove patch series over BasicSwap |
 | `scripts/` | Build, bundling, release, and swap-runtime tooling |
-| `PwndaWalletVault/` | The project wiki (Obsidian) — architecture, entities, the incident log |
+| `PwndaWalletVault/` | The project wiki (Obsidian): architecture, entities, the incident log |
 | `BOUNDARIES.md` | Per-feature import policy, enforced for the mining/lite slices |
 
 ## License
 
-Apache-2.0 — see `LICENSE`.
+Apache-2.0. See `LICENSE`.
