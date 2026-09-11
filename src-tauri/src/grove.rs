@@ -58,7 +58,7 @@ pub const DISTRO_SLUG: &str = "pwnda-grove";
 /// `PIN_BASICSWAP_TAG`. Kept honest by [`tests::expected_version_matches_the_pin`]
 /// — the constant cannot drift from the pin without a test going red, which is the
 /// whole point: a *restated* version in a comment is what went stale before.
-pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.5";
+pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.6";
 
 /// How many patches the series carries. Kept honest by
 /// [`tests::expected_patch_level_matches_the_series`], which counts
@@ -92,7 +92,28 @@ pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.5";
 /// valued a 67.27 ZEPH balance at $1.19 against the wallet's $27.08, and the
 /// same rates feed the offer book. (0027 landed with the p27 runtime, which
 /// stamps p26: the level is a COUNT of engine patches, and 0022 is exempt.)
-pub const EXPECTED_PATCH_LEVEL: u32 = 27;
+/// 27 -> 29 on 2026-09-08: 0029 (lock-tx-B RPC errors counted CONSECUTIVELY,
+/// and never escalating a PREREFUND bid whose remedy is chain-A only -- a
+/// transient Monero outage had been parking live swaps in BID_ERROR, which
+/// is terminal for the adaptor-sig machine) and 0030 (pwndaRecoverStalledBid
+/// returns such a bid to the timelock path instead of refusing it on the
+/// grounds that the timelock path -- the thing BID_ERROR stops -- will
+/// handle it). Both touch `basicswap/`, so both count.
+/// 29 -> 30 on 2026-09-09: 0031 (`PART_PRUNE` makes upstream's Particl conf
+/// writer emit `prune=` and omit `spentindex`/`txindex`). It touches
+/// `basicswap/`, so it counts. The patch has to exist at all because `prepare`
+/// starts particld itself, so the supervisor cannot fix the conf afterwards --
+/// particld aborts with "You need to rebuild the database using -reindex to
+/// change -spentindex". Off by default; absent the env var upstream behaviour
+/// is byte-identical.
+/// 30 -> 31 on 2026-09-09: 0032 (`PART_WALLET_SCAN_FROM` skips or bounds the
+/// `extkeyimportmaster` birthday scan). It touches `basicswap/`, so it counts.
+/// Needed because a restored snapshot cannot be started at all without it: a
+/// scan-everything wallet either blows the 10 s RPC timeout (151 s rescan) or,
+/// created against an empty chain first, ends up below `pruneheight` and
+/// particld refuses to start. Off by default; absent the env var the call is
+/// upstream's own single-argument form.
+pub const EXPECTED_PATCH_LEVEL: u32 = 31;
 
 /// The identifier this build expects a correctly-patched runtime to carry,
 /// e.g. `pwnda-grove 0.18.5+p26`.
@@ -119,6 +140,12 @@ pub enum EngineIdentity {
     /// Stamped, and the stamp equals what this build expects.
     Ok { id: String },
     /// Stamped, and the stamp disagrees with this build. The 2026-08-25 shape.
+    ///
+    /// Whether this is anyone's PROBLEM is not carried here: it depends on
+    /// whether the build ships an engine payload to self-heal from, which is
+    /// already reported as `SidecarStatus::bundle_available` (the same
+    /// `bundle_has(.., "grove")` check `reconcile_bundled_engine` gates on).
+    /// The UI pairs the two rather than duplicating the answer.
     Drift { stamped: String, expected: String },
 }
 

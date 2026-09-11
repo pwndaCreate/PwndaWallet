@@ -40,6 +40,7 @@ import {
 import { useSwapQuote, type NormalizedQuote } from "./useSwapQuote";
 import { DeskConfirmModal } from "./DeskConfirmModal";
 import type { DeskSwapSummary } from "../../api/desk-rust";
+import { sourceSecretFor } from "./asset-capabilities";
 import { SwapConfirmModal } from "./SwapConfirmModal";
 import {
   loadSwapHistory,
@@ -717,13 +718,7 @@ export function SwapView({
           fromBlockchain={fromBlockchain}
           quote={liveQuoteState.quote}
           sourceAddress={sourceAddress}
-          sourceMnemonic={
-            // ADA is the one TS-signed swap source — it needs the mnemonic
-            // (same value ADA Send uses). undefined for every other source.
-            fromCoin.toUpperCase() === "ADA"
-              ? walletsByChain.cardano?.mnemonic
-              : undefined
-          }
+          sourceSecret={sourceSecretFor(fromCoin, walletsByChain)}
           destinationAddress={destinationAddress}
           onClose={() => setConfirmOpen(false)}
         />
@@ -1248,6 +1243,12 @@ export function ActiveSidecarSwapsPanel({
           const elapsed = elapsedSeconds(s.createdAt, now);
           const window = etaWindow(s.sendCoin, s.receiveCoin);
           const standing = etaStanding(elapsed, window);
+          // The pair estimate describes the HAPPY arc and nothing else. Once a
+          // swap is on a timelock its duration is a CSV lock, so "usually only
+          // 20 to 40 min" beside 51 hours elapsed compares two unrelated
+          // things — which is what this card showed for two days on the live
+          // 2026-09-08 bid. Off the arc, the tracker owns the deadline.
+          const showWindow = window != null && progress != null;
           return (
             <button
               key={s.bidId}
@@ -1333,7 +1334,7 @@ export function ActiveSidecarSwapsPanel({
                 {s.lastPolledAt
                   ? ` · checked ${Math.max(1, Math.floor((now - s.lastPolledAt) / 1000))}s ago`
                   : " · waiting for the first check"}
-                {window
+                {showWindow
                   ? ` · ${standing === "onTrack" ? "usually" : "usually only"} ${formatEtaRange(window)}`
                   : ""}
                 {" · keeps running if you leave · "}

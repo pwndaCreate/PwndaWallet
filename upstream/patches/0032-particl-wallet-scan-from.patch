@@ -1,0 +1,128 @@
+Grove PATCH-32: let the Particl wallet be born at the tip (PART_WALLET_SCAN_FROM)
+
+PATCH-31 made the Particl conf generatable as pruned, which is what a snapshot
+restore needs on the CHAIN side. This is the WALLET side of the same feature, and
+without it a restored snapshot cannot be started at all.
+
+`extkeyimportmaster`'s sixth positional argument is scan_chain_from -- "scan for
+transactions in blocks after timestamp, negative number to skip" -- and
+particl-core acts on it as `if (nScanFrom >= 0) { RescanFromTime(...) }`
+(rpchdwallet.cpp:1850). Upstream never passes it, so it takes its default of 1:
+scan from the beginning of time, i.e. the entire chain.
+
+On an empty datadir that costs nothing, which is why it has never mattered. On a
+datadir that already holds a chain it is fatal, and in both possible orderings.
+Measured 2026-09-09 against a real prepare and a real engine:
+
+  restore snapshot, then prepare
+      The new wallet rescans the whole retained window. Measured
+      "Rescan completed in 151741ms" for 475,213 blocks, against the engine's
+      10-second RPC client timeout (basicswap/rpc.py:33), so prepare dies with
+
+          ValueError: RPC server error: timed out, method: extkeyimportmaster
+
+      The rescan itself SUCCEEDS and the wallet is correct; only prepare's exit
+      is wrong. That is worse than a clean failure, not better -- it leaves a
+      usable datadir behind a reported error.
+
+  prepare, then restore snapshot
+      The wallet is created against an empty chain, so its last-synced height is
+      0. Dropping in a chain pruned to height 1,764,346 puts that below
+      pruneheight and particld refuses to start:
+
+          Error: Prune: last wallet synchronisation goes beyond pruned data.
+          You need to -reindex (download the whole blockchain again in case of
+          pruned node)
+
+There is no third ordering. The wallet must be created while the chain is
+already at the tip, AND it must not try to walk back through it.
+
+A freshly derived wallet has no history to find -- it is a BIP-85 child minted
+seconds earlier -- so the scan is pure waste in exactly the case that breaks.
+Passing -1 skips it and the wallet is born at whatever tip the node is on.
+
+    PART_WALLET_SCAN_FROM=<unix ts>   scan for transactions after that time
+                          =-1        skip the scan; wallet starts at the tip
+                          unset      upstream behaviour, byte-identical
+
+Absent the variable the original single-argument call is used unchanged, so a
+runtime carrying this patch behaves exactly as upstream until something asks
+otherwise. The other five arguments appear only because the parameter is
+positional, and each is upstream's own default restated: passphrase "",
+save_bip44_root false, master_label "Master Key", account_label "Default
+Account" (rpchdwallet.cpp:1652-1668). None of them changes.
+
+Deliberately NOT defaulted to -1 inside the engine. Skipping the scan is right
+for a wallet this process just derived and wrong for a wallet being RESTORED
+from a user's own phrase with history to recover -- and prepare cannot tell those
+apart from in here. The caller knows which it is doing, so the caller decides.
+On a pruned node the restore case cannot be served by a scan anyway: the blocks
+below pruneheight are gone, so a full recovery needs an unpruned node regardless.
+
+diff --git a/basicswap/interface/part/core.py b/basicswap/interface/part/core.py
+index e101b86a..8d23dd49 100644
+--- a/basicswap/interface/part/core.py
++++ b/basicswap/interface/part/core.py
+@@ -148,7 +148,61 @@ class PARTPrepare(CoinPrepareModule):
+                 "mnemonic"
+             ]
+             generated = True
+-        swap_client.callcoinrpc(coin_id, "extkeyimportmaster", [mnemonic_in])
++        # PWNDA-PATCH-32: PART_WALLET_SCAN_FROM controls the birthday scan.
++        #
++        # `extkeyimportmaster`'s 6th positional argument is "scan for
++        # transactions in blocks after timestamp, negative number to skip"
++        # (rpchdwallet.cpp: `if (nScanFrom >= 0) RescanFromTime(...)`).
++        # Upstream never passes it, so it defaults to 1 -- scan from the
++        # beginning of time, i.e. the whole chain.
++        #
++        # On an EMPTY chain that costs nothing, which is why it has never
++        # mattered. On a datadir that already holds a chain -- a restored
++        # snapshot -- it is fatal in both directions, measured 2026-09-09:
++        #
++        #   restore then prepare : the new wallet rescans the whole retained
++        #     window (151,741 ms for 475,213 blocks) while the caller's RPC
++        #     client times out at 10 s -> `RPC server error: timed out,
++        #     method: extkeyimportmaster`. The rescan itself SUCCEEDS; only
++        #     prepare's exit is wrong.
++        #   prepare then restore : the wallet is created against an empty
++        #     chain, so its last-synced height is 0, below the restored
++        #     snapshot's pruneheight -> particld refuses to start with
++        #     `Prune: last wallet synchronisation goes beyond pruned data`.
++        #
++        # A freshly derived wallet has no history to find, so the scan is
++        # pure waste in the case that matters. Passing -1 skips it and the
++        # wallet is born at the tip the node is already on.
++        #
++        # The other five arguments are upstream's own defaults, restated
++        # only because the parameter is positional: passphrase "",
++        # save_bip44_root false, master_label "Master Key", account_label
++        # "Default Account" (rpchdwallet.cpp:1652-1668). Absent the env var
++        # the single-argument call is used unchanged, so upstream behaviour
++        # is byte-identical.
++        scan_from = os.getenv("PART_WALLET_SCAN_FROM", "")
++        if scan_from.strip():
++            try:
++                scan_from_i = int(scan_from)
++            except ValueError:
++                raise ValueError(
++                    "PART_WALLET_SCAN_FROM must be an integer unix timestamp, "
++                    f"or negative to skip the scan; got {scan_from!r}"
++                )
++            swap_client.callcoinrpc(
++                coin_id,
++                "extkeyimportmaster",
++                [
++                    mnemonic_in,
++                    "",
++                    False,
++                    "Master Key",
++                    "Default Account",
++                    scan_from_i,
++                ],
++            )
++        else:
++            swap_client.callcoinrpc(coin_id, "extkeyimportmaster", [mnemonic_in])
+         return mnemonic_in, generated
+ 
+     def createWallet(

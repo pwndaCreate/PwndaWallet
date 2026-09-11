@@ -36,6 +36,34 @@
  * {@link classifyBidState} accepts all three, so callers pass whatever field
  * they happen to hold. **Prefer `bid_state_ind`**: the human strings are
  * upstream display text and can be reworded in any release without notice.
+ *
+ * ## A bid state does NOT determine the story on its own
+ *
+ * Four of these states mean opposite things to the two sides of the same swap,
+ * because the adaptor-signature protocol is not symmetric. The engine names the
+ * asymmetry `was_sent` after adjusting for `reverse_bid`
+ * (`basicswap.py::checkXmrBidState`); this module calls it {@link SwapLeg}.
+ *
+ * The one that bit us, live on bid `000000006a9c9d96…` for 28 hours:
+ * `XMR_SWAP_SCRIPT_TX_PREREFUND` (14) was rendered as "the refund is on chain
+ * now", which is true for the party who locked the SCRIPTED coin — it is their
+ * lock moving into the refund script. For the party on the SCRIPTLESS leg it
+ * is the counterparty's money moving; their own coin has not moved at all and
+ * is not coming back yet. The operator read "the refund is on chain now",
+ * reasonably concluded they had been refunded a day earlier, and asked why a
+ * finished swap would not leave the screen. It had not finished.
+ *
+ * `XMR_SWAP_FAILED_SWIPED` (18) is worse, because it is exactly inverted: the
+ * scriptless leg is the side that publishes the swipe
+ * (`basicswap.py:8880` guards it with `if was_sent:`, and
+ * `createCoinALockRefundSwipeTx` pays to `getReceiveAddressForCoin` — this
+ * node's own address). Telling that side "recovered by the other user" reports
+ * a loss at the moment they are paid.
+ *
+ * So {@link classifyBidState} takes an optional leg. Omitting it keeps the
+ * neutral mapping, which is what a caller that cannot compute the leg — the
+ * `/json/active` rows carry `was_sent` but no `reverse_bid` — must use. A
+ * guess would be a coin flip on which of two opposite stories to tell.
  */
 
 // =========================================================================
@@ -213,13 +241,70 @@ export type BidStage =
   | "waiting-counterparty"
   | "finalising"
   | "done"
+  | "refunding"
   | "refunded"
+  | "timelock-unwinding"
+  | "swiped-settling"
+  | "swiped"
   | "counterparty-recovered"
   | "recovering"
   | "cancelled"
   | "needs-attention"
   | "internal"
   | "unknown";
+
+// =========================================================================
+// Which leg of the swap this node is on
+// =========================================================================
+
+/**
+ * Which coin THIS node locked, in the on-chain frame.
+ *
+ * - `"scriptless"` — this node locked the coin with no script (XMR, ZEPH,
+ *   ZANO). It is the side that publishes the **swipe** if the counterparty
+ *   goes quiet, and the side whose own coin is *not* what the chain-A
+ *   pre-refund tx moves.
+ * - `"scripted"` — this node locked the coin with the script (BTC, LTC, BCH,
+ *   PART). It is the side that publishes the **refund spend**, and the side
+ *   the pre-refund tx returns money to.
+ * - `"unknown"` — the caller could not compute it. Copy stays neutral.
+ *
+ * Mirrors the engine exactly. `basicswap.py::checkXmrBidState` opens with
+ * `was_sent = bid.was_received if reverse_bid else bid.was_sent`, and every
+ * asymmetric branch below it keys on that variable, not on `bid.was_sent`.
+ */
+export type SwapLeg = "scriptless" | "scripted" | "unknown";
+
+/** The fields {@link swapLegOf} needs. A subset of `BasicSwapBidDetail`. */
+export interface SwapLegSource {
+  was_sent?: boolean | null;
+  was_received?: boolean | null;
+  reverse_bid?: boolean | null;
+}
+
+/**
+ * Work out which leg this node is on, or `"unknown"` when the payload cannot
+ * say.
+ *
+ * **`reverse_bid` is required.** It is absent from `/json/active` rows, and
+ * without it `was_sent: true` is ambiguous — on a reverse ADS bid the roles
+ * are mirrored and the sender is on the scripted leg. Returning `"unknown"`
+ * costs a neutral sentence for one poll cycle; guessing costs a user being
+ * told the opposite of what happened to their money.
+ */
+export function swapLegOf(detail: SwapLegSource | null | undefined): SwapLeg {
+  if (!detail) return "unknown";
+  const reverse = detail.reverse_bid;
+  if (typeof reverse !== "boolean") return "unknown";
+  const mine = reverse ? detail.was_received : detail.was_sent;
+  // `was_received` comes back as `null` (not `false`) on a bid this node sent,
+  // so only an explicit `true` is evidence. A `null` on the side the reverse
+  // flag selects means we cannot tell.
+  if (mine === true) return "scriptless";
+  const other = reverse ? detail.was_sent : detail.was_received;
+  if (other === true) return "scripted";
+  return "unknown";
+}
 
 /**
  * How loudly a stage should read.
@@ -305,13 +390,63 @@ export const BID_STAGES: Readonly<Record<BidStage, BidStageInfo>> = {
     terminal: true,
     surface: true,
   },
+  // The refund STARTING is not the refund having finished.
+  //
+  // XMR_SWAP_SCRIPT_TX_PREREFUND (14) used to map to `refunded` — terminal,
+  // past tense — while the pre-refund tx was still confirming on chain. The
+  // user was told "Refunded ... returned your funds" at the moment the refund
+  // had merely been published. Observed on the live 2026-09-06 bid.
+  refunding: {
+    stage: "refunding",
+    label: "Refunding",
+    description:
+      "The other user stopped responding. The refund is on chain now. Leave the app open until it settles.",
+    severity: "normal",
+    terminal: false,
+    surface: true,
+  },
   refunded: {
     stage: "refunded",
     label: "Refunded",
     description:
-      "The swap did not go through, so the timelock returned your funds. This is a normal outcome, not an error — no coins were lost.",
+      "The timelock returned your funds. A normal outcome, not an error. No coins were lost.",
     severity: "normal",
     terminal: true,
+    surface: true,
+  },
+  // ── the scriptless leg's view of the same three protocol states ──────
+  //
+  // `refunding` above is the SCRIPTED leg's story: its own lock moved into the
+  // refund script and its own coin is on the way back. On the scriptless leg
+  // none of that is true, so it gets its own stage rather than a shared one
+  // with a hedged sentence.
+  "timelock-unwinding": {
+    stage: "timelock-unwinding",
+    label: "Waiting on the timelock",
+    description:
+      "The other user stopped responding with both sides locked. The protocol is unwinding the swap on its own. Your coin has not moved yet and nothing is lost.",
+    severity: "normal",
+    terminal: false,
+    surface: true,
+  },
+  swiped: {
+    stage: "swiped",
+    label: "Settled by the timelock",
+    description:
+      "The other user never finished, so the timelock paid you the coin you were buying instead. It is in your wallet.",
+    severity: "normal",
+    terminal: true,
+    surface: true,
+  },
+  // Not terminal on purpose, same reasoning as `recovering`: the bid is still
+  // moving, so nothing downstream should settle against it yet.
+  "swiped-settling": {
+    stage: "swiped-settling",
+    label: "Settled by the timelock",
+    description:
+      "The timelock paid you the coin you were buying. Your node is handing back the key share so the other user can recover their side.",
+    severity: "normal",
+    terminal: false,
     surface: true,
   },
   "counterparty-recovered": {
@@ -327,7 +462,7 @@ export const BID_STAGES: Readonly<Record<BidStage, BidStageInfo>> = {
     stage: "recovering",
     label: "Recovering your funds",
     description:
-      "The other user took the recovery path, but they have released the key share that lets your side be recovered too. This is in progress — it is not finished, and nothing is lost yet.",
+      "The other user took the recovery path but released the key share that lets your side recover too. In progress, not finished.",
     severity: "progress",
     terminal: false,
     surface: true,
@@ -336,7 +471,7 @@ export const BID_STAGES: Readonly<Record<BidStage, BidStageInfo>> = {
     stage: "cancelled",
     label: "Cancelled",
     description:
-      "The swap ended before any funds were committed — it was abandoned, rejected, or it expired.",
+      "The swap ended before any funds were committed. It was abandoned, rejected, or it expired.",
     severity: "normal",
     terminal: true,
     surface: true,
@@ -402,7 +537,7 @@ export const BID_STATE_STAGES: Readonly<Record<BidStateName, BidStage>> = {
   // Refunded — NORMAL outcomes, see the module header
   XMR_SWAP_FAILED_REFUNDED: "refunded",
   XMR_SWAP_NOSCRIPT_TX_RECOVERED: "refunded",
-  XMR_SWAP_SCRIPT_TX_PREREFUND: "refunded",
+  XMR_SWAP_SCRIPT_TX_PREREFUND: "refunding",
   // Counterparty recovered
   XMR_SWAP_FAILED_SWIPED: "counterparty-recovered",
   // ...and the mercy keyshare was there but never used, so it stays that way.
@@ -434,6 +569,34 @@ export const BID_STATE_STAGES: Readonly<Record<BidStateName, BidStage>> = {
   CONNECT_REQ_SENT: "internal",
   SWAP_DELAYING: "internal",
   BID_RECEIVING_ACC: "internal",
+};
+
+/**
+ * THE OVERRIDES. What the four asymmetric states mean to the **scriptless**
+ * leg, which is the side the table above does not describe.
+ *
+ * Every entry is pinned to the engine line that makes it true:
+ *
+ * | state | why the scriptless leg reads it differently |
+ * |---|---|
+ * | `SCRIPT_TX_PREREFUND` | the pre-refund moves the *counterparty's* chain-A lock. This side's coin is untouched, so "the refund is on chain now" is somebody else's refund. |
+ * | `FAILED_SWIPED` | `basicswap.py:8880` publishes the swipe under `if was_sent:`, and `createCoinALockRefundSwipeTx` pays `getReceiveAddressForCoin` — this node took the coin. |
+ * | `FAILED_SWIPED_SENDING_MERCY` | set at `basicswap.py:10583`, on the swiper, once its own mercy tx is queued. Nothing of this side's is being recovered. |
+ *
+ * `USING_MERCY`, `USED_MERCY` and `MERCY_UNUSED` are deliberately absent: all
+ * three are set on the *victim* (`basicswap.py:10557`, `:9501`, `:10545`), so
+ * the base table is already their correct reading and the scriptless leg does
+ * not reach them.
+ *
+ * The scripted leg needs no overrides — the base table was written from its
+ * point of view, which is precisely how the asymmetry went unnoticed.
+ */
+export const SCRIPTLESS_LEG_STAGES: Readonly<
+  Partial<Record<BidStateName, BidStage>>
+> = {
+  XMR_SWAP_SCRIPT_TX_PREREFUND: "timelock-unwinding",
+  XMR_SWAP_FAILED_SWIPED: "swiped",
+  XMR_SWAP_FAILED_SWIPED_SENDING_MERCY: "swiped-settling",
 };
 
 // =========================================================================
@@ -471,6 +634,8 @@ export interface BidStateClassification extends BidStageInfo {
   stateId: number | null;
   /** Exactly what was passed in, kept so an unknown value can be reported. */
   raw: string | number | null;
+  /** The leg this reading was made from. `"unknown"` means neutral copy. */
+  leg: SwapLeg;
 }
 
 /**
@@ -492,22 +657,39 @@ export function bidStateNameOf(state: BidStateInput): BidStateName | null {
   return WIRE_LABEL_TO_NAME[upper] ?? null;
 }
 
-/** The full stage record for a bid state. */
-export function classifyBidState(state: BidStateInput): BidStateClassification {
+/**
+ * The full stage record for a bid state, as seen from `leg`.
+ *
+ * `leg` defaults to `"unknown"`, which reproduces the neutral mapping exactly.
+ * Pass a real leg wherever the payload can produce one ({@link swapLegOf}) —
+ * without it, four states tell the scriptless side the counterparty's story.
+ */
+export function classifyBidState(
+  state: BidStateInput,
+  leg: SwapLeg = "unknown",
+): BidStateClassification {
   const name = bidStateNameOf(state);
-  const stage = name ? BID_STATE_STAGES[name] : "unknown";
+  const base = name ? BID_STATE_STAGES[name] : "unknown";
+  const stage =
+    leg === "scriptless" && name
+      ? (SCRIPTLESS_LEG_STAGES[name] ?? base)
+      : base;
   const info = BID_STAGES[stage];
   return {
     ...info,
     state: name,
     stateId: name ? BID_STATE_IDS[name] : null,
     raw: typeof state === "string" || typeof state === "number" ? state : null,
+    leg,
   };
 }
 
 /** Just the stage. */
-export function stageForBidState(state: BidStateInput): BidStage {
-  return classifyBidState(state).stage;
+export function stageForBidState(
+  state: BidStateInput,
+  leg: SwapLeg = "unknown",
+): BidStage {
+  return classifyBidState(state, leg).stage;
 }
 
 /** Just the label. Empty string for internal states — check {@link shouldSurface} first. */
@@ -532,11 +714,74 @@ export function isTerminal(state: BidStateInput): boolean {
 export const isTerminalBidState = isTerminal;
 
 /**
- * True for the three timelock-return states. Call this to pick refund copy —
- * never to pick error copy.
+ * True for the timelock-return states — refund IN PROGRESS as well as finished.
+ * Call this to pick refund copy, never to pick error copy.
+ *
+ * `refunding` is included deliberately: a refund that is confirming is still a
+ * refund, and the whole point of this predicate is to keep failure language away
+ * from it. Splitting PREREFUND into its own stage on 2026-09-06 silently dropped
+ * it out of here until the test caught it.
+ *
+ * `timelock-unwinding` is included for the same reason — it is PREREFUND read
+ * from the scriptless leg, so a caller passing a leg would otherwise fall out
+ * of the refund vocabulary and into whatever the `else` branch says.
+ * `swiped` is NOT: nothing was returned there, the timelock paid out the coin
+ * being bought, and calling that a refund is the mirror image of the mistake
+ * this whole leg split exists to fix.
  */
-export function isRefundOutcome(state: BidStateInput): boolean {
-  return stageForBidState(state) === "refunded";
+export function isRefundOutcome(
+  state: BidStateInput,
+  leg: SwapLeg = "unknown",
+): boolean {
+  const s = stageForBidState(state, leg);
+  return s === "refunded" || s === "refunding" || s === "timelock-unwinding";
+}
+
+/**
+ * Is the node's own `state_description` for this state written from the OTHER
+ * leg's point of view?
+ *
+ * True for exactly the states {@link SCRIPTLESS_LEG_STAGES} overrides, and
+ * only on the scriptless leg. Callers use it to suppress upstream prose that
+ * would contradict the stage copy on the same screen.
+ *
+ * Observed live on 2026-09-08, on the bid this whole leg split came from, at
+ * the moment it settled in the user's favour. `state_description` read,
+ * verbatim:
+ *
+ * ```text
+ * Swap failed, the other party claimed the refund
+ * ```
+ *
+ * That is upstream's `strBidState` prose written from the scripted leg's view,
+ * handed to the side that had just been paid 0.09992346 LTC by the swipe. The
+ * tracker renders it under "Swap node detail:", so without this the corrected
+ * label and the inverted raw line sit four lines apart in the same panel.
+ *
+ * Suppressing rather than relabelling matches the policy already stated for
+ * {@link BID_STATE_WIRE_LABELS}: upstream display text is kept because two
+ * endpoints report only it, NOT because it should be shown.
+ */
+export function nodeProseIsOtherLegsStory(
+  state: BidStateInput,
+  leg: SwapLeg = "unknown",
+): boolean {
+  if (leg !== "scriptless") return false;
+  const name = bidStateNameOf(state);
+  return name != null && name in SCRIPTLESS_LEG_STAGES;
+}
+
+/**
+ * True once the timelock has paid this side the coin it was buying, because
+ * the counterparty stalled. Only ever true on the scriptless leg — see
+ * {@link SCRIPTLESS_LEG_STAGES}.
+ */
+export function isSwipeOutcome(
+  state: BidStateInput,
+  leg: SwapLeg = "unknown",
+): boolean {
+  const s = stageForBidState(state, leg);
+  return s === "swiped" || s === "swiped-settling";
 }
 
 /**

@@ -30,8 +30,11 @@
  *  - **PART must be synced before ANY swap works**, including swaps between two
  *    coins that are not Particl. A user watching a Bitcoin sync bar has no
  *    reason to guess that.
- *  - **A small PART balance is required to post offers** (SMSG fees), so an
- *    empty PART wallet is a real blocker with a non-obvious remedy.
+ *  - **No PART balance is needed.** Offers and bids are sent as UNPAID SMSG
+ *    (`bsx_network.py` calls `smsgsend` with `paid_msg=False`), which costs
+ *    per-message proof-of-work, not coin. An earlier version of this comment
+ *    claimed a small PART balance was required for "SMSG fees"; that was
+ *    wrong, and the rendered copy never made the claim. Corrected 2026-09-08.
  */
 import type { CSSProperties } from "react";
 import { Card, Dot } from "../../design/primitives";
@@ -214,9 +217,9 @@ export function DexParticlCard({
 
           {sync?.kind === "not-started" && (
             <div style={{ ...mono, fontSize: 10, color: "var(--text-muted)" }}>
-              Particl keeps a full index and cannot be pruned, so the first sync
-              is about 8 GB and takes a while. Nothing can trade until it
-              finishes.
+              The node is pruned, so it settles at about 1.3 GB — but the first
+              sync still downloads and checks the whole chain, which takes a few
+              hours. Nothing can trade until it finishes.
             </div>
           )}
 

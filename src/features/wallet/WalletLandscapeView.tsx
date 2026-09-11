@@ -35,7 +35,6 @@ import { AdaLegacyPanel } from "./AdaLegacyPanel";
 import { CardanoDerivationPanel } from "./CardanoDerivationPanel";
 import { SolanaDerivationPanel } from "./SolanaDerivationPanel";
 import { DerivationInfoCard } from "./DerivationInfoCard";
-import { SourceAddressesCard } from "../swap/SourceAddressesCard";
 import { LitecoinDerivationPanel } from "./LitecoinDerivationPanel";
 import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { placeholderSparkFor } from "./spark-fallback";
@@ -1436,11 +1435,6 @@ export function WalletLandscapeView({
                 as a detached footer below this view. Content built by
                 LandscapeRoot from the shared Zano components. */}
             {activeChain === "zano" && zanoCenterSlot}
-            {/* Funding addresses for chains that can act as a NEAR Intents
-                source but lack a first-party wallet view (LTC/DOGE/BCH/SOL/
-                NEAR). Takes no props — sealed until the user unlocks it.
-                Was portrait-only until the parity test caught it. */}
-            {activeWallet && <SourceAddressesCard />}
 
             {/* Derivation, for EVERY chain. Mounted here as well as in the
                 portrait dashboard — landscape is the DEFAULT layout, so a
@@ -1582,7 +1576,20 @@ export function WalletLandscapeView({
                   />
                 )
               ) : genericRecent.length === 0 ? (
-                <EmptyMsg text="No recent transactions." />
+                /* Zephyr and Zano read history from their own wallet-rpc and
+                   return an EMPTY page when no session is open
+                   (zph-wallet.ts:688). Rendering the same "No recent
+                   transactions." as a genuinely empty chain told the user they
+                   had none, when the truth was that nothing had been asked.
+                   Monero already distinguished the two; these now do too. */
+                <EmptyMsg
+                  text={
+                    (activeChain === "zephyr" || activeChain === "zano") &&
+                    zphSession?.syncState !== "synced"
+                      ? "Transaction history available after sync."
+                      : "No recent transactions."
+                  }
+                />
               ) : (
                 <ActivityList
                   chain={activeChain}

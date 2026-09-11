@@ -102,13 +102,51 @@ const slug = repoSlug();
 // NSIS one was missing for any reason. A missing artifact should fail loudly,
 // not silently resolve to a format we stopped shipping.
 //
-// Linux: AppImage only. `.deb` and `.rpm` are owned by apt/dnf and the plugin
-// refuses to self-replace them (see src/lib/updater.ts) — listing them here
-// would advertise an update path the client is right to reject.
+// Linux ships THREE updatable formats, not one.
+//
+// `tauri-plugin-updater` implements an installer for each (AppImage replaces
+// itself; `.deb` and `.rpm` go through `pkexec dpkg -i` / `rpm -U`, which is
+// what apt runs underneath). Until 2026-09-10 only the AppImage was listed
+// here, with a comment claiming the plugin "refuses to self-replace" the other
+// two — it does not. What actually blocked them was that their signatures were
+// built and never uploaded (`scripts/releaseArtifactParity.test.mjs`).
+//
+// # Why one manifest cannot serve all three
+//
+// A client looks itself up by `{os}-{arch}`, so every Linux build — AppImage,
+// deb and rpm alike — reads the SAME `linux-x86_64` key. One key, one URL:
+// serving all three from `latest.json` is not possible, and serving the wrong
+// one is worse than serving none (the plugin would hand AppImage bytes to
+// `install_deb`, which rejects them as `InvalidUpdaterFormat` after a ~180 MB
+// download).
+//
+// The way out is `{{bundle_type}}` in the endpoint URL. The bundler stamps
+// `__TAURI_BUNDLE_TYPE` into each artifact as it builds it, so a binary
+// installed from the .deb asks for `latest-deb.json` and one running from the
+// AppImage asks for `latest-appimage.json` — each of which carries a single
+// `linux-x86_64` entry pointing at the right file.
+//
+// `latest.json` is still written, unchanged, and still lists the AppImage for
+// Linux: clients built before this change have the old endpoint compiled in
+// and must keep resolving. See `writeManifest` at the bottom.
 const RULES = [
-  { platform: "windows-x86_64", dir: "target/release/bundle/nsis", ext: ".exe", rank: 1 },
-  { platform: "linux-x86_64", dir: "target-linux/release/bundle/appimage", ext: ".AppImage", rank: 1 },
+  { platform: "windows-x86_64", bundleType: "nsis", dir: "target/release/bundle/nsis", ext: ".exe" },
+  { platform: "linux-x86_64", bundleType: "appimage", dir: "target-linux/release/bundle/appimage", ext: ".AppImage" },
+  { platform: "linux-x86_64", bundleType: "deb", dir: "target-linux/release/bundle/deb", ext: ".deb" },
+  { platform: "linux-x86_64", bundleType: "rpm", dir: "target-linux/release/bundle/rpm", ext: ".rpm" },
 ];
+
+/**
+ * Which bundle type `latest.json` serves for each platform.
+ *
+ * Pinned as data rather than inferred, because this is a compatibility
+ * commitment to already-installed clients and not something a future edit
+ * should be able to change by reordering a list. An old client asking for
+ * `latest.json` is an
+ * AppImage or an NSIS install — those were the only two formats the endpoint
+ * ever served — so those are the two it must keep getting.
+ */
+const LEGACY_MANIFEST_TYPES = { "windows-x86_64": "nsis", "linux-x86_64": "appimage" };
 
 // The product this manifest is for. PwndaLite builds into the same bundle dirs
 // and must never appear here.
@@ -132,7 +170,19 @@ if (!productName) {
   process.exit(2);
 }
 
-const found = new Map(); // platform -> {file, sig, rank, dir}
+/**
+ * bundleType -> the one verified artifact of that format.
+ *
+ * The single source of truth for everything below. There used to be a second
+ * map keyed by PLATFORM, with a `rank` field breaking ties for the shared
+ * `linux-x86_64` key — that made sense when Linux had one updatable format and
+ * the only contest was msi-vs-nsis. Now three Linux formats share that key and
+ * every one of them needs its own manifest, so "which artifact is the deb" is
+ * the only question worth indexing. Which format `latest.json` serves is a
+ * separate, pinned decision (`LEGACY_MANIFEST_TYPES`), not a race a rank
+ * number wins.
+ */
+const byType = new Map();
 const verified = [];
 const unsigned = [];
 
@@ -161,10 +211,10 @@ for (const rule of RULES) {
     // advertised to PwndaWallet clients as their update.
     if (!name.includes(bare)) continue;
     if (!name.startsWith(productName)) continue;
-    // In --from mode every rule sees the same flat dir, so a .exe could be
-    // matched by both the nsis and msi rules. Extension is the discriminator
-    // and both rules already carry one; nothing further is needed, but the
-    // rank still decides which wins for a platform.
+    // In --from mode every rule sees the same flat dir, so each rule must be
+    // able to recognise its own artifact by extension alone. Every rule has a
+    // distinct one (.exe / .AppImage / .deb / .rpm), and `.deb.sig` does not
+    // end with `.deb`, so signatures are never mistaken for artifacts.
 
 
     const file = join(dir, name);
@@ -198,10 +248,19 @@ for (const rule of RULES) {
       continue;
     }
     verified.push(`${name}  (${v.algorithm}, key ${v.keyId})`);
-    const prev = found.get(rule.platform);
-    if (!prev || rule.rank < prev.rank) {
-      found.set(rule.platform, { file, name, sig, rank: rule.rank, dir: rule.dir });
+    const hit = { file, name, sig, dir: rule.dir, platform: rule.platform };
+    // Two artifacts of the SAME bundle type is not a tie to break, it is an
+    // ambiguity: both passed the version+product filter, so there is no
+    // principled way to pick, and silently taking one could publish the wrong
+    // binary. Refuse instead.
+    const clash = byType.get(rule.bundleType);
+    if (clash && clash.name !== name) {
+      console.error(
+        `${LOG} REFUSING: two ${rule.bundleType} artifacts for ${bare}: ${clash.name} and ${name}.`,
+      );
+      process.exit(1);
     }
+    byType.set(rule.bundleType, hit);
   }
 }
 
@@ -236,8 +295,18 @@ ${LOG} The updater verifies every download against the pubkey in tauri.conf.json
 }
 for (const v of verified) console.log(`${LOG} signature OK  ${v}`);
 
+// What `latest.json` will contain. Which format the LEGACY endpoint serves is
+// a compatibility commitment to already-installed clients, so it is read from
+// LEGACY_MANIFEST_TYPES and from nowhere else.
+const platforms = {};
+for (const [platform, type] of Object.entries(LEGACY_MANIFEST_TYPES)) {
+  const hit = byType.get(type);
+  if (!hit) continue;
+  platforms[platform] = entryForVerbose(hit, platform);
+}
+
 const WANTED = ["windows-x86_64", "linux-x86_64"];
-const missing = WANTED.filter((p) => !found.has(p));
+const missing = WANTED.filter((p) => !(p in platforms));
 if (missing.length && !flag("allow-partial")) {
   console.error(`${LOG} REFUSING: no signed updater artifact for ${missing.join(", ")}.`);
   console.error(
@@ -250,34 +319,75 @@ if (missing.length) {
   console.warn(`${LOG} PARTIAL RELEASE: no update will be offered to ${missing.join(", ")}.`);
 }
 
-const platforms = {};
-for (const [platform, hit] of found) {
+const notes = arg("notes", `PWNDA Wallet ${version}`);
+// Fixed-format UTC. `new Date().toISOString()` is what Tauri's own examples
+// use and what the client parses. Computed ONCE so every manifest this run
+// writes carries the same timestamp — they describe one release.
+const pubDate = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
+
+const out = arg("out", join(REPO_ROOT, "src-tauri", "target", "release", "bundle", "latest.json"));
+mkdirSync(dirname(out), { recursive: true });
+
+/**
+ * Build one manifest entry from a verified hit.
+ *
+ * Declared as a `function` (not a `const`) deliberately: it is called from the
+ * `latest.json` assembly further UP the file, and hoisting is what lets the
+ * helpers live next to the writer that is their main consumer.
+ */
+function entryFor(hit) {
   const signature = readFileSync(hit.sig, "utf8").trim();
   if (!signature) {
     console.error(`${LOG} REFUSING: ${hit.name}.sig is empty`);
     process.exit(1);
   }
-  platforms[platform] = {
+  return {
     signature,
     url: `https://github.com/${slug}/releases/download/${version}/${encodeURIComponent(hit.name)}`,
   };
+}
+
+/**
+ * As [`entryFor`], and print the artifact + its sha256.
+ *
+ * The hash is logged, never published: `latest.json` has no field for it (the
+ * signature is what the client verifies). It is here so a release operator can
+ * match what was published against what is on disk without re-deriving it.
+ */
+function entryForVerbose(hit, platform) {
+  const entry = entryFor(hit);
   const sha = createHash("sha256").update(readFileSync(hit.file)).digest("hex");
   console.log(`${LOG} ${platform.padEnd(16)} ${hit.name}`);
   console.log(`${LOG} ${"".padEnd(16)} sha256 ${sha}`);
+  return entry;
 }
 
-const manifest = {
-  version: bare,
-  notes: arg("notes", `PWNDA Wallet ${version}`),
-  // Fixed-format UTC. `new Date().toISOString()` is what Tauri's own examples
-  // use and what the client parses.
-  pub_date: new Date().toISOString().replace(/\.\d{3}Z$/, "Z"),
-  platforms,
-};
+function writeManifest(path, platformMap) {
+  writeFileSync(
+    path,
+    `${JSON.stringify({ version: bare, notes, pub_date: pubDate, platforms: platformMap }, null, 2)}\n`,
+    "utf8",
+  );
+  console.log(`${LOG} wrote ${path}  (${Object.keys(platformMap).join(", ")})`);
+}
 
-const out = arg("out", join(REPO_ROOT, "src-tauri", "target", "release", "bundle", "latest.json"));
-mkdirSync(dirname(out), { recursive: true });
-writeFileSync(out, `${JSON.stringify(manifest, null, 2)}\n`, "utf8");
+// 1. `latest.json` — the endpoint compiled into every client built before the
+//    `{{bundle_type}}` change. Its contents must not drift: those clients are
+//    AppImage and NSIS installs, and that is what it has always served.
+writeManifest(out, platforms);
 
-console.log(`${LOG} wrote ${out}`);
-console.log(`${LOG} version ${bare}, ${Object.keys(platforms).length} platform(s), repo ${slug}`);
+// 2. One manifest per bundle type, for the `{{bundle_type}}` endpoint. Each
+//    carries exactly ONE platform entry, because a client that resolves
+//    `latest-deb.json` is by construction a deb install and there is nothing
+//    else in that file for it to pick up by mistake.
+const perType = [];
+for (const [type, hit] of byType) {
+  const path = join(dirname(out), `latest-${type}.json`);
+  writeManifest(path, { [hit.platform]: entryFor(hit) });
+  perType.push(type);
+}
+
+console.log(
+  `${LOG} version ${bare}, ${Object.keys(platforms).length} platform(s) in latest.json, ` +
+    `per-type: ${perType.join(", ") || "none"}, repo ${slug}`,
+);

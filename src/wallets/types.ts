@@ -1,3 +1,5 @@
+import type { EvmGasToken } from "./evm-gas";
+
 export type ChainType =
   | "ethereum"
   | "avalanche"
@@ -161,6 +163,50 @@ export interface FeeEstimate {
   fetchedAt: number;
   /** Free-form raw payload from the source — never required by callers. */
   raw?: unknown;
+}
+
+/**
+ * Whether an address can pay the fee for a send, in the coin that fee is
+ * charged in.
+ *
+ * Every amount here is a decimal string in the FEE COIN's units, never the
+ * sent token's. The comparison itself is made in wei by the adapter, so the
+ * UI never re-derives it from these strings and cannot disagree with it.
+ */
+export interface GasBudget {
+  /** The fee coin, and which chain's. See `evm-gas.ts`. */
+  ticker: string;
+  chainName: string;
+  /** Native-coin balance at this address. Decimal string. */
+  available: string;
+  /**
+   * Does {@link required} include the amount being sent, or only the fee?
+   *
+   * `true` on a NATIVE send: amount and fee come out of the same balance, so
+   * the requirement is their sum. `false` on an ERC-20 send, where the amount
+   * is drawn from the token balance and only gas touches this one.
+   *
+   * The UI cannot word the warning correctly without it — "you need 0.5 ETH
+   * to send ETH" and "you need 0.00003 ETH to send USDC" are different
+   * sentences about different quantities.
+   */
+  includesAmount: boolean;
+  /**
+   * Estimated native-coin cost of the send, or `null` when the node would not
+   * estimate one — an empty recipient field, or a node declining to simulate
+   * a transfer the account cannot fund (which is the very case being tested).
+   */
+  required: string | null;
+  /**
+   * `true` / `false` when known; `null` when genuinely undecidable.
+   *
+   * `false` is reported on a zero balance EVEN WHEN `required` is `null`,
+   * because no positive fee is payable from nothing and that needs no
+   * estimate — which matters, since a zero-gas account is exactly where
+   * `estimateGas` tends to refuse. Any other unestimable case stays `null`:
+   * the UI warns on `false` and must not block on a guess.
+   */
+  sufficient: boolean | null;
 }
 
 /**
@@ -365,6 +411,40 @@ export interface ChainAdapter {
    * is unreachable; never returns a stale or guessed value.
    */
   getFeeEstimate(): Promise<FeeEstimate>;
+
+  /**
+   * The coin that pays this adapter's fees, when it is NOT the coin being
+   * sent.
+   *
+   * Present only on ERC-20 adapters (`usdc-arb`, `usdt-op`, …), because they
+   * are the only ones where holding the full send amount still leaves you
+   * unable to send. On a native adapter the fee comes out of the same balance
+   * the amount does, the modal already shows it, and there is no second asset
+   * to warn about — so this stays `undefined` and callers skip the check.
+   *
+   * Absent on every non-EVM adapter too. `undefined` means "no separate fee
+   * asset to reason about", never "unknown".
+   */
+  gasToken?: EvmGasToken;
+
+  /**
+   * Can this address actually pay the fee for the send it is about to make?
+   *
+   * Only implemented alongside {@link gasToken}. Added 2026-09-09 after the
+   * ERC-20 branch of `evm-factory.ts::sendTransaction` was found calling
+   * `contract.transfer(...)` with no balance check in front of it: a wallet
+   * holding USDC on Arbitrum and zero ETH showed an enabled Send button and
+   * reported the shortfall only as a raw RPC string, after the press.
+   *
+   * `opts.to` / `opts.amount` are the send being contemplated. They are
+   * optional because the most valuable moment to answer is when the modal
+   * opens and neither has been typed yet — see {@link GasBudget.sufficient}
+   * for what is still decidable then.
+   */
+  getGasBudget?(
+    address: string,
+    opts?: { to?: string; amount?: string },
+  ): Promise<GasBudget>;
 
   /**
    * True when the NETWORK computes the fee at broadcast time, so the estimate

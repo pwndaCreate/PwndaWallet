@@ -109,11 +109,12 @@ export const STABLECOINS: StablecoinFamily[] = [
       { chain: "usdt-sol",  parent: "solana",    network: "Solana",          contract: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB", decimals: 6, nearIntents: true },
       // TRC-20, verified symbol() = "USDT" / decimals() = 6. One of the most
       // widely held stablecoin legs anywhere, and the wallet could not read it
-      // at all before 2026-09-02. `nearIntents: false` — NEAR Intents carries
-      // USDT on Tron, but this wallet has no Tron SOURCE signer registered in
-      // `intents-source-capability.ts`, so offering the route would offer a
-      // swap the wallet cannot execute.
-      { chain: "usdt-tron", parent: "tron",      network: "Tron",            contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", decimals: 6, nearIntents: false },
+      // at all before 2026-09-02. Flipped to `nearIntents: true` on
+      // 2026-09-09: `tron` is now in `intents-source-capability.ts`, so the
+      // route the flag was withholding is one the wallet can actually execute
+      // (`trc20-wallet.ts` builds and signs the `transfer(address,uint256)`
+      // call, the same path the Send button uses).
+      { chain: "usdt-tron", parent: "tron",      network: "Tron",            contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", decimals: 6, nearIntents: true },
     ],
   },
   {

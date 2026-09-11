@@ -42,7 +42,14 @@ describe("getDropdownTickers — canonical market-cap order", () => {
   it("places ADA (a native) before the stablecoins", () => {
     const list = getDropdownTickers({ sourceOnly: true });
     expect(list.indexOf("ADA")).toBeGreaterThanOrEqual(0);
-    expect(list.indexOf("ADA")).toBeLessThan(list.indexOf("USDC"));
+    // Since 2026-09-09 there is no bare "USDC" in the roster — stablecoins
+    // are per-(symbol, network) legs (`USDC-ARB`), so the assertion is about
+    // the first stablecoin leg rather than a symbol that no longer appears.
+    // `indexOf("USDC")` returned -1 and the old comparison passed vacuously
+    // in the wrong direction until it was corrected.
+    const firstStable = list.findIndex((x) => /^USDC|^USDT/.test(x));
+    expect(firstStable).toBeGreaterThanOrEqual(0);
+    expect(list.indexOf("ADA")).toBeLessThan(firstStable);
   });
 });
 
@@ -83,5 +90,26 @@ describe("getDropdownTickers — pwnda-desk roster contribution", () => {
     for (const t of ["ZEPHUSD", "ZEPHRSV", "ZEPHYRS"]) {
       expect(list).not.toContain(t);
     }
+  });
+});
+
+describe("leg keys rank as their symbol, not as unknowns", () => {
+  it("ranks USDC-ARB exactly where USDC ranks", () => {
+    // They used to sort last only because `assetRank` did not recognise them
+    // and returned MAX_SAFE_INTEGER — the right position for the wrong
+    // reason, and indistinguishable from a typo'd ticker.
+    expect(assetRank("USDC-ARB")).toBe(assetRank("USDC"));
+    expect(assetRank("USDC-BASE")).toBe(assetRank("USDC"));
+  });
+
+  it("resolves USDT0 legs through USDT", () => {
+    // `USDT0` has no row of its own in the canonical order; it is USD₮0,
+    // the same money, and must not sort as an unknown.
+    expect(assetRank("USDT0-ARB")).toBe(assetRank("USDT"));
+  });
+
+  it("still sorts a genuinely unknown ticker last", () => {
+    expect(assetRank("NOTACOIN")).toBe(Number.MAX_SAFE_INTEGER);
+    expect(assetRank("NOPE-CHAIN")).toBe(Number.MAX_SAFE_INTEGER);
   });
 });

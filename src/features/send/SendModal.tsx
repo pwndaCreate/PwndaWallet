@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
-import type { ChainAdapter, FeeEstimate } from "../../wallets/types";
+import type { ChainAdapter, FeeEstimate, GasBudget } from "../../wallets/types";
 
 type Tier = "slow" | "normal" | "fast";
 
 export function SendModal({
   adapter,
+  fromAddress,
   sendTo,
   setSendTo,
   sendAmount,
@@ -15,6 +16,13 @@ export function SendModal({
   assetLabel,
 }: {
   adapter: ChainAdapter;
+  /**
+   * The address the send leaves FROM. Needed to answer whether it can pay the
+   * fee, which on an ERC-20 send is a different balance from the one shown as
+   * "Available". Optional so a caller that has no address yet still renders;
+   * the gas check simply stays quiet.
+   */
+  fromAddress?: string;
   sendTo: string;
   setSendTo: (v: string) => void;
   sendAmount: string;
@@ -32,6 +40,49 @@ export function SendModal({
   const [feeError, setFeeError] = useState<string | null>(null);
   const [feeLoading, setFeeLoading] = useState(false);
   const [tier, setTier] = useState<Tier>("normal");
+
+  // ── can this address pay the fee at all? ────────────────────────────────
+  //
+  // Only ERC-20 adapters answer this: they are the ones where the fee is paid
+  // in a coin the modal is NOT otherwise showing. `adapter.gasToken` is
+  // present exactly on those, so its absence is the whole feature flag.
+  //
+  // Before 2026-09-09 nothing asked. `evm-factory.ts`'s ERC-20 branch called
+  // `contract.transfer(...)` directly, so a wallet holding USDC on Arbitrum
+  // and zero ETH rendered "Available: 500 USDC", a network fee, and an
+  // enabled Send button — then surfaced the shortfall as a raw
+  // `insufficient funds for intrinsic transaction cost` from `useSend`'s
+  // catch-all, AFTER the press. Bridging a stablecoin to an L2 moves the
+  // token and nothing else, so a zero-gas wallet holding real value is the
+  // ordinary first state on Arbitrum and Base, not an edge case.
+  const [gas, setGas] = useState<GasBudget | null>(null);
+
+  const loadGas = useCallback(async () => {
+    if (!adapter.getGasBudget || !fromAddress) return;
+    try {
+      // `to`/`amount` are passed when present so the estimate is of the REAL
+      // transfer; without them the adapter falls back to a per-chain gas
+      // limit and can still settle the zero-balance case.
+      const r = await adapter.getGasBudget(fromAddress, {
+        to: sendTo || undefined,
+        amount: sendAmount || undefined,
+      });
+      setGas(r);
+    } catch (e) {
+      // The adapter is documented not to throw; if a future one does, a
+      // missing warning must not take the modal down with it.
+      console.warn("[SendModal] gas budget failed:", e);
+      setGas(null);
+    }
+  }, [adapter, fromAddress, sendTo, sendAmount]);
+
+  useEffect(() => {
+    void loadGas();
+  }, [loadGas]);
+
+  /** A definite "cannot pay the fee". Never true on an unestimable answer. */
+  const gasShort = gas?.sufficient === false;
+
 
   // Fetch fee estimate on mount and refresh every 30 s while open. Adapters
   // throw `not initialized` for sidecar chains until the wallet is open;
@@ -233,6 +284,53 @@ export function SendModal({
           )}
         </div>
 
+        {/* The second balance. Rendered only when the adapter has told us the
+            fee is paid in a different coin (`gasToken`), and only when the
+            answer is a definite no — `sufficient: null` means the node would
+            not estimate and the balance is non-zero, which is not grounds to
+            stop anybody. */}
+        {gas && gas.sufficient === false && (
+          <div
+            data-gas-shortfall
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              lineHeight: 1.6,
+              color: "var(--warn)",
+              border: "1px solid rgba(255,170,0,0.4)",
+              background: "rgba(255,170,0,0.06)",
+              padding: "8px 10px",
+              marginBottom: 12,
+            }}
+          >
+            {gas.includesAmount ? (
+              // NATIVE send: the amount and the fee come out of one balance,
+              // so the shortfall is about the total, and naming a second coin
+              // would be nonsense ("you need ETH to send ETH").
+              <>
+                {gas.required
+                  ? `This send needs about ${gas.required} ${gas.ticker} in total — the amount plus the network fee. This address has ${gas.available}.`
+                  : `This address has no ${gas.ticker} on ${gas.chainName}, so it cannot cover the amount and the network fee.`}
+                <div style={{ marginTop: 4, opacity: 0.85 }}>
+                  {`The fee comes out of the same balance as the amount, so sending the full balance always leaves it slightly short. Lower the amount by at least the fee shown above.`}
+                </div>
+              </>
+            ) : (
+              // ERC-20 send: the amount is drawn from the TOKEN balance and
+              // only gas touches the native one, so the sentence is about a
+              // different coin entirely — and must name which chain's.
+              <>
+                {gas.required
+                  ? `You need about ${gas.required} ${gas.ticker} on ${gas.chainName} to send ${sendTicker}. This address has ${gas.available}.`
+                  : `You need ${gas.ticker} on ${gas.chainName} to pay the network fee for a ${sendTicker} send. This address has none.`}
+                <div style={{ marginTop: 4, opacity: 0.85 }}>
+                  {`Fees on ${gas.chainName} are paid in ${gas.ticker}, not in ${sendTicker}. Add ${gas.ticker} to this address and the send will go through.`}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
         <div className="button-row">
           <button className="btn-secondary" onClick={onClose}>
             Cancel
@@ -244,11 +342,22 @@ export function SendModal({
             // have a fee number to charge against. Title attribute
             // gives keyboard / screen-reader users an explanation
             // when the button is greyed out.
-            disabled={sending || !sendTo || !sendAmount || !feeReady}
+            // Blocked on a DEFINITE shortfall only. `gas.sufficient === false`
+            // is either a priced estimate the balance cannot cover, or a zero
+            // balance (where no positive fee is payable whatever the limit).
+            // `null` — unestimable, non-zero balance — deliberately does not
+            // block: refusing a send on a guess is its own bug.
+            disabled={
+              sending || !sendTo || !sendAmount || !feeReady || gasShort
+            }
             title={
-              !feeReady
-                ? "Network fee isn't available yet — Send is disabled until the fee fetch succeeds."
-                : undefined
+              gasShort
+                ? gas?.includesAmount
+                  ? `This address does not hold enough ${gas?.ticker ?? "funds"} to cover the amount plus the network fee.`
+                  : `This address has no ${gas?.ticker ?? "gas"} on ${gas?.chainName ?? "this network"} to pay the fee with.`
+                : !feeReady
+                  ? "Network fee isn't available yet — Send is disabled until the fee fetch succeeds."
+                  : undefined
             }
           >
             {sending ? "Sending…" : "► Send"}

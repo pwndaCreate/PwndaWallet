@@ -252,10 +252,14 @@ export {
   bidStageLabel,
   isTerminal,
   isRefundOutcome,
+  isSwipeOutcome,
+  nodeProseIsOtherLegsStory,
   shouldSurface,
+  swapLegOf,
   type BidStage,
   type BidSeverity,
   type BidStateName,
+  type SwapLeg,
 } from "./bidStates";
 
 // ── Offer ranking + validation (price-only, never maker-preferential) ─

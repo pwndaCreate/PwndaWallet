@@ -442,12 +442,24 @@ pub fn probe_randomx_prereqs() -> RandomxPrereqs {
 /// Whether this process is running from an AppImage.
 ///
 /// The AppImage runtime exports `APPIMAGE` (absolute path to the .AppImage
-/// file) and `APPDIR` into the child environment; nothing else sets them. This
-/// is the only reliable way to tell an AppImage apart from a `.deb`/`.rpm`
-/// install from inside the process, and the distinction matters for the
-/// updater: Tauri can self-replace an AppImage, but must NOT overwrite files
-/// owned by apt/dnf — doing so behind the package manager's back corrupts its
-/// database. Always false on non-Linux, where packaging is unambiguous.
+/// file) and `APPDIR` into the child environment; nothing else sets them, so
+/// this is a reliable positive test for "launched from an AppImage".
+///
+/// # Not the updater's question any more
+///
+/// This used to back `updater_can_self_install`, on the reasoning that Tauri
+/// could self-replace an AppImage but must never overwrite apt/dnf-owned files
+/// because doing so "corrupts the package database". That reasoning was wrong
+/// — `tauri-plugin-updater` installs `.deb`/`.rpm` with `pkexec dpkg -i` /
+/// `rpm -U`, which is exactly what apt runs underneath and is recorded in the
+/// package database normally — and it is no longer used for that. The updater
+/// now asks `tauri::utils::platform::bundle_type()`, which reads a marker the
+/// BUNDLER stamps into each artifact rather than inferring from the
+/// environment, and so answers for every format instead of one.
+///
+/// Kept because "am I an AppImage" is still a meaningful question with a
+/// correct answer here; it simply is not the question the updater asks.
+/// Always false on non-Linux.
 pub fn is_appimage() -> bool {
     cfg!(target_os = "linux") && std::env::var_os("APPIMAGE").is_some()
 }

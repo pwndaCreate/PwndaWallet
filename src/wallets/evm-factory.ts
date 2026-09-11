@@ -8,7 +8,14 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  GasBudget,
 } from "./types";
+import {
+  decideGasSufficiency,
+  fallbackGasLimit,
+  gasTokenFor,
+  totalNativeRequired,
+} from "./evm-gas";
 import { proxyGetJson } from "./_proxy";
 import { withFallback as withUrlFallback } from "./_fallback";
 
@@ -309,6 +316,131 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
           ? String(Math.min(...items.map((i) => i.height ?? Number.MAX_SAFE_INTEGER)) - 1)
           : undefined;
       return { items, cursor: cursorOut };
+    },
+
+    /**
+     * The coin that pays this adapter's fees, when that is a DIFFERENT coin
+     * from the one being sent. Native adapters leave it undefined: their fee
+     * comes out of the balance the modal already shows.
+     */
+    gasToken: tokenContract ? (gasTokenFor(chainId) ?? undefined) : undefined,
+
+    /**
+     * Can this address pay the fee for the send it is about to make?
+     *
+     * Two independent reads, in this order, because the second is allowed to
+     * fail and the first is not:
+     *
+     *  1. the native balance — always obtainable, and on its own enough to
+     *     settle the dominant real case (a bridged wallet holding tokens and
+     *     exactly zero gas);
+     *  2. an `estimateGas` on the ACTUAL transfer, priced with current fee
+     *     data. This is what turns "you have no ETH" into "you need
+     *     0.000060756 ETH", and it is also the read a node may refuse.
+     *
+     * `estimateGas` rather than a gas-limit constant is deliberate: on
+     * Arbitrum the returned limit folds in the L1 calldata cost, so the same
+     * ERC-20 transfer that costs ~60k gas on Optimism reports several hundred
+     * thousand there. A constant would understate Arbitrum by an order of
+     * magnitude, and Arbitrum is where the reported failure happened.
+     *
+     * Never throws. The caller is a modal that must still render.
+     */
+    async getGasBudget(
+      address: string,
+      opts?: { to?: string; amount?: string },
+    ): Promise<GasBudget> {
+      const token = gasTokenFor(chainId);
+      const base = {
+        ticker: token?.ticker ?? ticker,
+        chainName: token?.chainName ?? displayName,
+        // A token send needs GAS out of the native balance; a native send
+        // needs gas AND the amount out of it. The UI cannot word the warning
+        // correctly without knowing which number it was handed.
+        includesAmount: !tokenContract,
+      };
+
+      let availableWei: bigint;
+      try {
+        availableWei = await withFallback((provider) => provider.getBalance(address));
+      } catch (e) {
+        // Could not read the balance at all. Report nothing rather than a
+        // zero: "you have no gas" is a claim, and an unreachable RPC is not
+        // evidence for it. Same rule as `getBalance`'s own contract.
+        console.warn("[evm] gas-budget balance read failed:", e);
+        return { ...base, available: "0", required: null, sufficient: null };
+      }
+
+      const available = ethers.formatEther(availableWei);
+
+      let requiredWei: bigint | null = null;
+      try {
+        requiredWei = await withFallback(async (provider) => {
+          const feeData = await provider.getFeeData();
+          const price = feeData.maxFeePerGas ?? feeData.gasPrice;
+          if (!price) throw new Error("no fee data");
+
+          let gasLimit: bigint;
+          if (opts?.to && opts.to.trim() && opts?.amount) {
+            // Simulate the real call, from this address, so the estimate is
+            // the one the chain would actually charge.
+            const parsed = ethers.parseUnits(opts.amount, tokenDecimals);
+            if (tokenContract) {
+              const c = new ethers.Contract(tokenContract, ERC20_ABI, provider);
+              gasLimit = await c.transfer.estimateGas(opts.to, parsed, {
+                from: address,
+              });
+            } else {
+              gasLimit = await provider.estimateGas({
+                from: address,
+                to: opts.to,
+                value: parsed,
+              });
+            }
+          } else {
+            gasLimit = fallbackGasLimit(chainId, Boolean(tokenContract));
+          }
+
+          // `parseUnits(amount, tokenDecimals)` is correct for the native
+          // leg too: `tokenDecimals` defaults to 18 and is overridden only on
+          // token adapters, where the amount is not added anyway.
+          const amountWei =
+            opts?.amount && opts.amount.trim()
+              ? ethers.parseUnits(opts.amount, tokenDecimals)
+              : 0n;
+          return totalNativeRequired(
+            gasLimit * price,
+            amountWei,
+            Boolean(tokenContract),
+          );
+        });
+      } catch {
+        // Expected, and not an error worth a console line: an empty or
+        // malformed recipient, or a node declining to simulate a transfer the
+        // account cannot fund — which is the very condition being tested.
+        requiredWei = null;
+      }
+
+      if (requiredWei != null) {
+        return {
+          ...base,
+          available,
+          required: ethers.formatEther(requiredWei),
+          // Decided in wei. The decimal strings above are for display only
+          // and are never what the comparison reads.
+          sufficient: decideGasSufficiency(availableWei, requiredWei),
+        };
+      }
+
+      // No estimate. A zero balance still settles it: no positive fee is
+      // payable from nothing, whatever the limit would have been. Anything
+      // else stays undecided rather than blocking a send on a guess.
+      return {
+        ...base,
+        available,
+        required: null,
+        sufficient: decideGasSufficiency(availableWei, null),
+      };
     },
 
     async getFeeEstimate(): Promise<FeeEstimate> {

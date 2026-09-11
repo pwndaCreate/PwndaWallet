@@ -67,6 +67,10 @@ mod desk;
 // describes the BasicSwap sidecar, which the lite build does not carry.
 #[cfg(feature = "full")]
 mod grove;
+// The opt-in Particl chain snapshot — the difference between a ~4.5 hour first
+// sync and about two minutes. Full-only for the same reason as `grove`.
+#[cfg(feature = "full")]
+mod snapshot;
 #[cfg(feature = "full")]
 mod http_proxy;
 #[cfg(feature = "full")]
@@ -453,6 +457,14 @@ pub fn run() {
             // those can never be reachable from the webview.
             #[cfg(feature = "full")]
             swap_sidecar::swap_sidecar_status,
+            // The Particl chain snapshot. Gated individually — `#[cfg]` binds to
+            // the next item only, and two unguarded lines here is precisely what
+            // BOUNDARIES.md's backend rule forbids. Caught by
+            // `cargo check --no-default-features`, which is why that gate exists.
+            #[cfg(feature = "full")]
+            snapshot::swap_snapshot_offer,
+            #[cfg(feature = "full")]
+            snapshot::swap_snapshot_restore,
             #[cfg(feature = "full")]
             swap_sidecar::swap_sidecar_opt_in,
             #[cfg(feature = "full")]

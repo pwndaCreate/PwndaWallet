@@ -36,18 +36,38 @@ pub struct DataLocations {
 
 /// Whether an in-place self-update can be applied to this install.
 ///
-/// True on Windows (MSI/NSIS own their install tree) and for Linux AppImages
-/// (a single self-contained file we can replace). False for `.deb`/`.rpm`,
-/// which are owned by apt/dnf — the Settings card uses this to point those
-/// users at their package manager rather than offering a button that would
-/// either silently no-op or corrupt the package database.
+/// Answered by asking what this build IS, not by guessing from the
+/// environment. `bundle_type()` reads `__TAURI_BUNDLE_TYPE`, a marker the
+/// bundler bakes into each artifact as it produces it, so a binary installed
+/// from the .deb reports `Deb` and one running from the AppImage reports
+/// `AppImage` — no heuristics, no env var that a launcher might not set.
+///
+/// Every variant it can return is a format `tauri-plugin-updater` implements
+/// an installer for (`install_deb` / `install_rpm` / AppImage replacement /
+/// msiexec / NSIS), so the mapping is "did the bundler stamp this build" and
+/// the only `false` is `None` — an unstamped binary, which in practice means a
+/// `cargo run` dev build or a tarball someone extracted by hand. Neither can
+/// be self-updated, and neither should be offered the button.
+///
+/// # This used to say `.deb`/`.rpm` were impossible
+///
+/// Until 2026-09-10 it returned `is_appimage()` on Linux, with a comment
+/// saying apt/dnf-owned formats would "silently no-op or corrupt the package
+/// database". That was wrong on both counts: the plugin runs
+/// `pkexec dpkg -i` / `pkexec rpm -U`, which is what apt itself runs
+/// underneath and is recorded in the package database exactly as a normal
+/// install is. What actually blocked those formats was that their signatures
+/// were never uploaded, so no manifest could list them — see
+/// `scripts/releaseArtifactParity.test.mjs`.
+///
+/// The remaining caveat is real but different: `dpkg -i` does not resolve
+/// dependencies, so a release that ADDS one can fail on a machine that lacks
+/// it. That is guarded at build time instead, by the dependency-drift check in
+/// `scripts/check-linux-deps.mjs`, because it is a property of the release
+/// rather than of the machine.
 #[tauri::command]
 pub fn updater_can_self_install() -> bool {
-    if cfg!(target_os = "linux") {
-        crate::platform::is_appimage()
-    } else {
-        true
-    }
+    tauri::utils::platform::bundle_type().is_some()
 }
 
 /// Return the on-disk paths the Settings card shows.

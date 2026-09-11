@@ -76,7 +76,9 @@ export type SwapChainKind =
   | "XMR"
   | "ZEPH"
   | "ZANO"
-  | "CARDANO";
+  | "CARDANO"
+  | "XRP"
+  | "TRON";
 
 /**
  * Per-asset capability record. Subsumes the legacy `SwapCoinMeta`
@@ -127,17 +129,31 @@ export interface AssetCapability {
 
   /**
    * Set when the SOURCE-chain deposit tx is built, signed, and submitted
-   * in the TypeScript layer rather than the Rust core. Today only ADA:
-   * Cardano's BIP-32-Ed25519 (Icarus) + CBOR signing lives in
-   * `cardano-tx.ts` / `cardano-cip1852.ts` (the same code the dashboard
-   * Send flow uses), so there is no Rust `swap_sign_cardano`. An asset is
+   * in the TypeScript layer rather than the Rust core. An asset is
    * source-capable when EITHER `signerInRustCore` is true OR this is set —
    * see `isSourceCapable` / `capabilityToLegacyMeta` in `swap-data.ts`.
    * `signerInRustCore` stays the honest "is there a Rust signer" flag
-   * (false for ADA) so the `signerInRustCore → rpcsAvailable` invariant
-   * test doesn't trip (ADA broadcasts via Koios, not a chain RPC).
+   * (false for all three below) so the `signerInRustCore → rpcsAvailable`
+   * invariant test doesn't trip.
+   *
+   * The three, and why each signs in TypeScript:
+   *
+   *  - `cardano` — BIP-32-Ed25519 (Icarus) + CBOR in `cardano-tx.ts` /
+   *    `cardano-cip1852.ts`, broadcast via Koios. No `swap_sign_cardano`.
+   *  - `xrp` — the `xrpl` library owns both signing and submission inside
+   *    `xrp-wallet.ts`; there is no separate unsigned-tx step a Rust signer
+   *    could slot into.
+   *  - `tron` — secp256k1 over the node-assigned `txID`, in `trx-wallet.ts`
+   *    (native TRX) and `trc20-wallet.ts` (TRC-20 `transfer`). Tron builds
+   *    the transaction node-side, so the signer only ever sees a hash.
+   *
+   * Each names the SIGNER, not the chain: `TRX` and `USDT-TRON` are both
+   * `chainKind: "TRON"` and share `tsSourceSigner: "tron"`, but they are
+   * different assets with different transaction shapes (a native transfer
+   * versus a contract call). The executor tells them apart by
+   * `walletsByChainKey`, which resolves each to its own adapter.
    */
-  tsSourceSigner?: "cardano";
+  tsSourceSigner?: "cardano" | "xrp" | "tron";
 
   /**
    * True when `defaultRpcUrl` is set OR `rpcFallbacks` is non-empty.
@@ -227,9 +243,13 @@ export interface AssetCapability {
 // `ASSET_CAPABILITIES` below references these helpers.
 
 import {
+  ARB_RPCS,
   AVAX_RPCS,
+  BASE_RPCS,
+  BSC_RPCS,
   ETH_RPCS,
   FLR_RPCS,
+  OP_RPCS,
   POL_RPCS,
 } from "../../wallets/chain-rpcs";
 
@@ -707,7 +727,437 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
     explorerTxUrl: (h) => `https://cardanoscan.io/transaction/${h}`,
     explorerAddressUrl: (a) => `https://cardanoscan.io/address/${a}`,
   },
+
+  // ─── XRP + Tron (2026-09-09) ─────────────────────────────────────
+  //
+  // Both were listed in `PWNDA_INTENTS_DESTINATION_TICKERS` and reached the
+  // user as NEITHER source nor destination, because `getDropdownTickers`
+  // filters the roster through `ASSET_CAPABILITIES[t].nearIntentsAsset` and
+  // neither had an entry here at all. The same hole the stablecoin legs sat
+  // in until earlier today: the roster is a wish, this registry is the fact.
+  //
+  // Both sign in TypeScript (`tsSourceSigner`), for the same reason Cardano
+  // does: the signing already exists in the adapter the Send button uses, and
+  // there is no unsigned-transaction seam a Rust signer could take over.
+  // `signerInRustCore` stays false and honest.
+  XRP: {
+    ticker: "XRP",
+    network: "XRP Ledger",
+    chainKind: "XRP",
+    decimals: 6,
+    walletsByChainKey: "xrp",
+    signerInRustCore: false,
+    tsSourceSigner: "xrp",
+    // `xrpl` opens its own websocket to a public cluster rather than going
+    // through `chain-rpcs`, so there is no RPC url to advertise here.
+    rpcsAvailable: false,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:xrp.omft.near",
+    // No `atomicDesk` and no BasicSwap leg. Both omissions are deliberate:
+    // the desk's leaders are the timelock-capable chains it can actually lead
+    // (LTC, ADA, AVAX), and `basicswapLegsFor` pairs scripted UTXO chains with
+    // the scriptless followers — XRP is neither. Writing `role: "leader",
+    // engine: null` here would read as "vendoring pending" rather than "not a
+    // desk leg", which is a different and untrue claim; the desk-roster test
+    // caught exactly that when this entry was first drafted.
+    explorerTxUrl: (h) => `https://xrpscan.com/tx/${h}`,
+    explorerAddressUrl: (a) => `https://xrpscan.com/account/${a}`,
+  },
+  TRX: {
+    ticker: "TRX",
+    network: "Tron",
+    chainKind: "TRON",
+    decimals: 6,
+    walletsByChainKey: "tron",
+    signerInRustCore: false,
+    tsSourceSigner: "tron",
+    // Tron builds the transaction node-side via TronGrid; `trx-wallet.ts`
+    // talks to it through the http proxy, not `chain-rpcs`.
+    rpcsAvailable: false,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:tron.omft.near",
+    // No `atomicDesk` — see the XRP entry above for why that omission is the
+    // honest encoding rather than a null engine.
+    explorerTxUrl: (h) => `https://tronscan.org/#/transaction/${h}`,
+    explorerAddressUrl: (a) => `https://tronscan.org/#/address/${a}`,
+  },
+
+  // ─── Stablecoin legs (2026-09-09) ────────────────────────────────
+  //
+  // ONE ENTRY PER (symbol, network), keyed to match the wallet's own
+  // ChainType: `USDC-ARB` here is `usdc-arb` there. That is not a stylistic
+  // choice — `AssetCapability` carries a single `chainId`,
+  // `walletsByChainKey` and `nearIntentsAsset`, so a bare `USDC` key cannot
+  // describe eight networks, and the wallet already settled this question
+  // the same way ("Each (symbol, network) pair is its own chain … the ASSETS
+  // RAIL groups them back into one row per symbol", `wallets/types.ts`).
+  //
+  // Why they were missing until now: the roster arrays in `swap-data.ts`
+  // have listed "USDC"/"USDT"/"DAI" since 2026-05-08, but the NEAR tab
+  // filters the roster through `ASSET_CAPABILITIES[t].nearIntentsAsset` —
+  // and no stablecoin had an entry, so all three were silently dropped from
+  // the picker. Sixteen wallet legs, every one of them present in the
+  // 1Click catalog, none reachable. Same shape as the LTC regression the
+  // filter comment describes, at a larger scale.
+  //
+  // Every `nearIntentsAsset` below was matched to the catalog by CONTRACT
+  // ADDRESS, never by symbol — see the USDT0 rows for why that matters.
+  // DAI is deliberately absent: the roster lists it, but the wallet has no
+  // DAI adapter at all, so it was a phantom entry and is removed there.
+  "USDC-ETH": {
+    ticker: "USDC",
+    network: "Ethereum",
+    chainKind: "EVM",
+    chainId: 1,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-eth",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:eth-0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48.omft.near",
+    defaultRpcUrl: ETH_RPCS()[0],
+    rpcFallbacks: ETH_RPCS(),
+    explorerTxUrl: (h) => `https://etherscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://etherscan.io/address/${a}`,
+  },
+  "USDC-OP": {
+    ticker: "USDC",
+    network: "Optimism",
+    chainKind: "EVM",
+    chainId: 10,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-op",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:10_A2ewyUyDp6qsue1jqZsGypkCxRJ",
+    defaultRpcUrl: OP_RPCS()[0],
+    rpcFallbacks: OP_RPCS(),
+    explorerTxUrl: (h) => `https://optimistic.etherscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://optimistic.etherscan.io/address/${a}`,
+  },
+  "USDC-BSC": {
+    ticker: "USDC",
+    network: "BNB Smart Chain",
+    chainKind: "EVM",
+    chainId: 56,
+    decimals: 18,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-bsc",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:56_2w93GqMcEmQFDru84j3HZZWt557r",
+    defaultRpcUrl: BSC_RPCS()[0],
+    rpcFallbacks: BSC_RPCS(),
+    explorerTxUrl: (h) => `https://bscscan.com/tx/${h}`,
+    explorerAddressUrl: (a) => `https://bscscan.com/address/${a}`,
+  },
+  "USDC-POL": {
+    ticker: "USDC",
+    network: "Polygon",
+    chainKind: "EVM",
+    chainId: 137,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-pol",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:137_qiStmoQJDQPTebaPjgx5VBxZv6L",
+    defaultRpcUrl: POL_RPCS()[0],
+    rpcFallbacks: POL_RPCS(),
+    explorerTxUrl: (h) => `https://polygonscan.com/tx/${h}`,
+    explorerAddressUrl: (a) => `https://polygonscan.com/address/${a}`,
+  },
+  "USDC-BASE": {
+    ticker: "USDC",
+    network: "Base",
+    chainKind: "EVM",
+    chainId: 8453,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-base",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:base-0x833589fcd6edb6e08f4c7c32d4f71b54bda02913.omft.near",
+    defaultRpcUrl: BASE_RPCS()[0],
+    rpcFallbacks: BASE_RPCS(),
+    explorerTxUrl: (h) => `https://basescan.org/tx/${h}`,
+    explorerAddressUrl: (a) => `https://basescan.org/address/${a}`,
+  },
+  "USDC-ARB": {
+    ticker: "USDC",
+    network: "Arbitrum",
+    chainKind: "EVM",
+    chainId: 42161,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-arb",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:arb-0xaf88d065e77c8cc2239327c5edb3a432268e5831.omft.near",
+    defaultRpcUrl: ARB_RPCS()[0],
+    rpcFallbacks: ARB_RPCS(),
+    explorerTxUrl: (h) => `https://arbiscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://arbiscan.io/address/${a}`,
+  },
+  "USDC-AVAX": {
+    ticker: "USDC",
+    network: "Avalanche",
+    chainKind: "EVM",
+    chainId: 43114,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdc-avax",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:43114_3atVJH3r5c4GqiSYmg9fECvjc47o",
+    defaultRpcUrl: AVAX_RPCS()[0],
+    rpcFallbacks: AVAX_RPCS(),
+    explorerTxUrl: (h) => `https://snowtrace.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://snowtrace.io/address/${a}`,
+  },
+  "USDT-ETH": {
+    ticker: "USDT",
+    network: "Ethereum",
+    chainKind: "EVM",
+    chainId: 1,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdt-eth",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:eth-0xdac17f958d2ee523a2206206994597c13d831ec7.omft.near",
+    defaultRpcUrl: ETH_RPCS()[0],
+    rpcFallbacks: ETH_RPCS(),
+    explorerTxUrl: (h) => `https://etherscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://etherscan.io/address/${a}`,
+  },
+  "USDT-OP": {
+    ticker: "USDT",
+    network: "Optimism",
+    chainKind: "EVM",
+    chainId: 10,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdt-op",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:10_359RPSJVdTxwTJT9TyGssr2rFoWo",
+    defaultRpcUrl: OP_RPCS()[0],
+    rpcFallbacks: OP_RPCS(),
+    explorerTxUrl: (h) => `https://optimistic.etherscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://optimistic.etherscan.io/address/${a}`,
+  },
+  "USDT-BSC": {
+    ticker: "USDT",
+    network: "BNB Smart Chain",
+    chainKind: "EVM",
+    chainId: 56,
+    decimals: 18,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdt-bsc",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:56_2CMMyVTGZkeyNZTSvS5sarzfir6g",
+    defaultRpcUrl: BSC_RPCS()[0],
+    rpcFallbacks: BSC_RPCS(),
+    explorerTxUrl: (h) => `https://bscscan.com/tx/${h}`,
+    explorerAddressUrl: (a) => `https://bscscan.com/address/${a}`,
+  },
+  "USDT-AVAX": {
+    ticker: "USDT",
+    network: "Avalanche",
+    chainKind: "EVM",
+    chainId: 43114,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdt-avax",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:43114_372BeH7ENZieCaabwkbWkBiTTgXp",
+    defaultRpcUrl: AVAX_RPCS()[0],
+    rpcFallbacks: AVAX_RPCS(),
+    explorerTxUrl: (h) => `https://snowtrace.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://snowtrace.io/address/${a}`,
+  },
+  "USDT0-POL": {
+    ticker: "USDT0",
+    network: "Polygon",
+    chainKind: "EVM",
+    chainId: 137,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdt0-pol",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    // 1Click lists this contract under `USDT`, the wallet under
+    // `USDT0`. Same token: matched on CONTRACT, not symbol. Routing
+    // uses the catalog's id below; the UI keeps the wallet's label.
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:137_3hpYoaLtt8MP1Z2GH1U473DMRKgr",
+    defaultRpcUrl: POL_RPCS()[0],
+    rpcFallbacks: POL_RPCS(),
+    explorerTxUrl: (h) => `https://polygonscan.com/tx/${h}`,
+    explorerAddressUrl: (a) => `https://polygonscan.com/address/${a}`,
+  },
+  "USDT0-ARB": {
+    ticker: "USDT0",
+    network: "Arbitrum",
+    chainKind: "EVM",
+    chainId: 42161,
+    decimals: 6,
+    // Token legs keep their OWN wallet key — the address is the shared EVM
+    // one, but balance / history / send all resolve per leg.
+    walletsByChainKey: "usdt0-arb",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    // 1Click lists this contract under `USDT`, the wallet under
+    // `USDT0`. Same token: matched on CONTRACT, not symbol. Routing
+    // uses the catalog's id below; the UI keeps the wallet's label.
+    nearIntentsAsset: "nep141:arb-0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9.omft.near",
+    defaultRpcUrl: ARB_RPCS()[0],
+    rpcFallbacks: ARB_RPCS(),
+    explorerTxUrl: (h) => `https://arbiscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://arbiscan.io/address/${a}`,
+  },
+
+  // Solana SPL legs. `chainKind: "SOLANA"` routes them through the same
+  // signer the native SOL leg uses; the mint lives in `wallets/stablecoins.ts`
+  // and was verified on chain when those adapters landed (2026-09-02).
+  "USDC-SOL": {
+    ticker: "USDC",
+    network: "Solana",
+    chainKind: "SOLANA",
+    decimals: 6,
+    walletsByChainKey: "usdc-sol",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:sol-5ce3bf3a31af18be40ba30f721101b4341690186.omft.near",
+    defaultRpcUrl: rpcEnv("VITE_SOL_RPC", "https://api.mainnet-beta.solana.com"),
+    explorerTxUrl: (h) => `https://solscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://solscan.io/account/${a}`,
+  },
+  "USDT-SOL": {
+    ticker: "USDT",
+    network: "Solana",
+    chainKind: "SOLANA",
+    decimals: 6,
+    walletsByChainKey: "usdt-sol",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:sol-c800a4bd850783ccb82c2b2c7e84175443606352.omft.near",
+    defaultRpcUrl: rpcEnv("VITE_SOL_RPC", "https://api.mainnet-beta.solana.com"),
+    explorerTxUrl: (h) => `https://solscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://solscan.io/account/${a}`,
+  },
+  // TRC-20 USDT — `TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t`, the same contract
+  // `stablecoins.ts` carries, matched by CONTRACT against 1Click's catalog
+  // rather than by symbol (the rule that saved USDT0 on Arbitrum from being
+  // dropped as "not USDT").
+  //
+  // NOTE: there is deliberately no `USDC-TRON` sibling. USDC is a real TRC-20
+  // token on Tron, and 1Click does not carry it: its catalog lists USDC on
+  // sixteen chains and Tron is not among them, while USDT on Tron IS there.
+  // An entry would be a row the picker offers and no venue can route.
+  "USDT-TRON": {
+    ticker: "USDT",
+    network: "Tron",
+    chainKind: "TRON",
+    decimals: 6,
+    walletsByChainKey: "usdt-tron",
+    signerInRustCore: false,
+    // Same signer as native TRX; a different adapter builds the transaction
+    // (`triggersmartcontract` with `transfer(address,uint256)` rather than a
+    // native `TransferContract`), which `walletsByChainKey` selects.
+    tsSourceSigner: "tron",
+    rpcsAvailable: false,
+    swapKitAsset: null,
+    nearIntentsAsset:
+      "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near",
+    explorerTxUrl: (h) => `https://tronscan.org/#/transaction/${h}`,
+    explorerAddressUrl: (a) => `https://tronscan.org/#/address/${a}`,
+  },
 };
+
+/**
+ * The secret a TS-signed source chain needs, tagged with which kind it is.
+ *
+ * Cardano needs the seed phrase (its Icarus derivation rebuilds a key set);
+ * XRP and Tron need a single chain private key. A tagged union rather than
+ * one optional field per chain, so adding a fourth TS-signed chain does not
+ * widen the executor's input again, and so passing the wrong kind is a type
+ * error at the call site instead of a failure inside a signer.
+ */
+export type SourceSecret =
+  | { kind: "mnemonic"; value: string }
+  | { kind: "privateKey"; value: string };
+
+/**
+ * Which secret (if any) a source asset needs, and where to read it from.
+ *
+ * The mapping lives here, once, because it is the kind of decision that
+ * otherwise gets re-derived at each call site and then drifts. Both swap
+ * surfaces mount the same confirm modal, and portrait had been the only one
+ * threading ADA's mnemonic; the landscape copy repeating the same ternary is
+ * a second place to forget XRP. It is also the exact shape of the
+ * `SwapChainKind` duplication that broke the build earlier today.
+ *
+ * Returns `undefined` for every Rust-signed chain — they sign inside the swap
+ * session and need nothing here — and for a TS-signed chain whose wallet has
+ * not been derived yet, so the executor raises the actionable "open the chain
+ * in the dashboard" error rather than this returning a half-built secret.
+ *
+ * Exported so a test can pin the mapping without rendering a modal.
+ */
+export function sourceSecretFor(
+  fromAsset: string,
+  walletsByChain: Partial<
+    Record<string, { mnemonic?: string; privateKey?: string } | undefined>
+  >,
+): SourceSecret | undefined {
+  const cap = ASSET_CAPABILITIES[fromAsset.toUpperCase()];
+  const signer = cap?.tsSourceSigner;
+  // `walletsByChainKey` is required on every registry entry, but the lookup
+  // above can miss, so both are checked together rather than asserted.
+  if (!signer || !cap?.walletsByChainKey) return undefined;
+  if (signer === "cardano") {
+    // Cardano rebuilds a whole key set from the seed; a single private key
+    // cannot express its Icarus derivation.
+    const m = walletsByChain[cap.walletsByChainKey]?.mnemonic;
+    return m ? { kind: "mnemonic", value: m } : undefined;
+  }
+  // xrp / tron — one chain key, which is what those adapters take. Read
+  // through `walletsByChainKey` rather than the signer name, because TRX and
+  // USDT-TRON share the signer and hold separate wallet entries.
+  const pk = walletsByChain[cap.walletsByChainKey]?.privateKey;
+  return pk ? { kind: "privateKey", value: pk } : undefined;
+}
 
 // ─── Helpers ──────────────────────────────────────────────────────────
 //

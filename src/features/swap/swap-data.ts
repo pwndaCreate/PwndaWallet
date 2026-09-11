@@ -24,6 +24,7 @@ import {
   isIntentsRoutableFromRegistry,
   isSwapKitRoutableFromRegistry,
   type AssetCapability,
+  type SwapChainKind,
 } from "./asset-capabilities";
 
 /**
@@ -109,25 +110,22 @@ export const SWAP_COINS = [
 ] as const;
 export type SwapCoin = (typeof SWAP_COINS)[number];
 
-/** Where the swap orchestration sends a coin's signed tx for broadcast. */
-export type SwapChainKind =
-  | "EVM"
-  | "BTC"
-  | "LTC"
-  | "DOGE"
-  | "BCH"
-  | "DASH"
-  | "SOLANA"
-  | "NEAR"
-  | "STELLAR"
-  | "SUI"
-  | "XMR"
-  | "ZEPH"
-  | "ZANO"
-  // Source + destination as of 2026-06-21. ADA source signs in the TS
-  // Cardano stack (cardano-tx.ts), not Rust — see `tsSourceSigner` in
-  // asset-capabilities.ts.
-  | "CARDANO";
+/**
+ * Where the swap orchestration sends a coin's signed tx for broadcast.
+ *
+ * RE-EXPORTED, not redeclared. Until 2026-09-09 this was a second literal
+ * union that `asset-capabilities.ts` described as "mirrored verbatim" from
+ * here, with a comment in that file explaining the copy existed only to avoid
+ * an import cycle. Two hand-kept copies of one union do exactly what you would
+ * expect: adding `"XRP"` and `"TRON"` to one of them made
+ * `capabilityToLegacyMeta` stop compiling, because a registry entry's
+ * `chainKind` was no longer assignable to the alias it is supposed to BE.
+ *
+ * There was never a cycle to avoid in this direction: `swap-data` already
+ * imports `ASSET_CAPABILITIES` from that module, so taking the type from the
+ * same place costs nothing and removes the drift permanently.
+ */
+export type { SwapChainKind } from "./asset-capabilities";
 
 /**
  * Legacy SwapCoinMeta shape. Pre-2026-05-25 this was the per-asset
@@ -383,7 +381,19 @@ export function tickerToChain(ticker: string): ChainType | null {
     XLM: "stellar",
     SUI: "sui",
   };
-  return map[ticker.toUpperCase()] ?? null;
+  const key = ticker.toUpperCase();
+  const mapped = map[key];
+  if (mapped) return mapped;
+
+  // Per-leg keys (`USDC-ARB`, `USDT0-POL`, …) are NOT in the map above and
+  // deliberately never will be: the registry already names the wallet key
+  // for each one, so a second hand-kept copy here would be one more thing to
+  // forget. Falling back to it means a stablecoin leg added to
+  // `ASSET_CAPABILITIES` gets its balance row for free — which is the
+  // difference between the picker showing "USDC 260.5" and showing nothing
+  // beside a coin the user definitely holds.
+  const viaRegistry = ASSET_CAPABILITIES[key]?.walletsByChainKey;
+  return (viaRegistry as ChainType | undefined) ?? null;
 }
 
 /** Detect whether a (from, to) pair is one the existing
@@ -824,11 +834,31 @@ const PWNDA_INTENTS_SOURCE_TICKERS: readonly string[] = [
   "LTC",
   "DOGE", // Promoted source-capable 2026-05-08 (Phase 1, bch-doge plan)
   "BCH",  // Promoted source-capable 2026-05-08 (Phase 2, bch-doge plan)
-  // ── multi-chain-token-integration-plan (2026-05-08) ───────────────
-  // Phase 1 (ERC-20): USDC / USDT / DAI on every EVM chain.
-  "USDC",
-  "USDT",
-  "DAI",
+  // ── stablecoin legs, one per (symbol, network) (2026-09-09) ───────
+  // Bare "USDC"/"USDT" used to sit here and were filtered straight back out
+  // by `getDropdownTickers`, which gates the NEAR tab on
+  // `ASSET_CAPABILITIES[t].nearIntentsAsset` — and no stablecoin had a
+  // registry entry. The keys below match the wallet's own ChainType
+  // (`usdc-arb` -> `USDC-ARB`); the picker groups them back into one row per
+  // symbol with a network sub-selector, the way the assets rail already does.
+  "USDC-ETH",
+  "USDC-ARB",
+  "USDC-BASE",
+  "USDC-OP",
+  "USDC-POL",
+  "USDC-AVAX",
+  "USDC-BSC",
+  "USDC-SOL",
+  "USDT-ETH",
+  "USDT-OP",
+  "USDT-BSC",
+  "USDT-AVAX",
+  "USDT-SOL",
+  // USD₮0 — Tether's LayerZero OFT, which is what Arbitrum's and Polygon's
+  // USDT actually are now. 1Click carries them under the symbol `USDT`; the
+  // ids below were matched by contract.
+  "USDT0-ARB",
+  "USDT0-POL",
   // Phase 3 (Monad): MON native + EVM-compatible signer (chainId 143).
   "MON",
   // Phase 4 (BSC + L2 surface): BNB native + ETH on Arbitrum/Base/Optimism.
@@ -849,14 +879,28 @@ const PWNDA_INTENTS_SOURCE_TICKERS: readonly string[] = [
   // via executeCardanoTransfer), not a Rust swap_sign_* command. See
   // [[ada-swap-source]].
   "ADA",
+  // 2026-09-09 — XRP and Tron promoted source-capable, joining ADA as the
+  // TS-signed sources (`executeAdapterTransfer` in swap-sources.ts). Both
+  // were already in the DESTINATION list below and reached the user as
+  // neither, because that list is filtered through `ASSET_CAPABILITIES` and
+  // neither had an entry there. `USDT-TRON` rides the same Tron signer as
+  // `TRX`; a different adapter builds the transaction.
+  "XRP",
+  "TRX",
+  "USDT-TRON",
 ];
 
 /**
- * Pwnda × NEAR Intents destination intersection. Superset of the source
- * list — XRP and TRX are still destination-only because their signing
- * schemes (XRP ed25519 + sequence numbers, TRX TRON-specific tx
- * encoding) are separate modules from the UTXO PSBT signer and haven't
- * been wired to the swap pipeline yet.
+ * Pwnda × NEAR Intents destination intersection. A superset of the source
+ * list: receiving needs only a derived address, sending needs a signer.
+ *
+ * Corrected 2026-09-09. This header used to say XRP and TRX were
+ * "destination-only ... haven't been wired to the swap pipeline yet". They
+ * were listed here and were not destinations either: `getDropdownTickers`
+ * filters every roster entry through `ASSET_CAPABILITIES[t].nearIntentsAsset`
+ * and neither ticker had a registry entry, so both were dropped in BOTH
+ * directions. A roster line is a wish; the registry is the fact. Both are now
+ * source and destination capable, so the caveat is gone rather than reworded.
  */
 const PWNDA_INTENTS_DESTINATION_TICKERS: readonly string[] = [
   "BTC",
@@ -867,11 +911,34 @@ const PWNDA_INTENTS_DESTINATION_TICKERS: readonly string[] = [
   "DOGE",
   "XRP",
   "TRX",
+  "USDT-TRON",
   // 2026-05-08 multi-chain expansion (mirrors PWNDA_INTENTS_SOURCE_TICKERS
   // since destination receive works for every chain we have an adapter for).
-  "USDC",
-  "USDT",
-  "DAI",
+  // ── stablecoin legs, one per (symbol, network) (2026-09-09) ───────
+  // Bare "USDC"/"USDT" used to sit here and were filtered straight back out
+  // by `getDropdownTickers`, which gates the NEAR tab on
+  // `ASSET_CAPABILITIES[t].nearIntentsAsset` — and no stablecoin had a
+  // registry entry. The keys below match the wallet's own ChainType
+  // (`usdc-arb` -> `USDC-ARB`); the picker groups them back into one row per
+  // symbol with a network sub-selector, the way the assets rail already does.
+  "USDC-ETH",
+  "USDC-ARB",
+  "USDC-BASE",
+  "USDC-OP",
+  "USDC-POL",
+  "USDC-AVAX",
+  "USDC-BSC",
+  "USDC-SOL",
+  "USDT-ETH",
+  "USDT-OP",
+  "USDT-BSC",
+  "USDT-AVAX",
+  "USDT-SOL",
+  // USD₮0 — Tether's LayerZero OFT, which is what Arbitrum's and Polygon's
+  // USDT actually are now. 1Click carries them under the symbol `USDT`; the
+  // ids below were matched by contract.
+  "USDT0-ARB",
+  "USDT0-POL",
   "MON",
   "BNB",
   "DASH",

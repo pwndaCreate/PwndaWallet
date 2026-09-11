@@ -32,6 +32,12 @@ import { formatAmount } from "../swap-sidecar/types";
 import { sidecarFeesReserve } from "../../api/basicswap";
 import { feeAppliesToSend, spendableAfterReserve } from "./feeReserve";
 import { minPresetTitle, planMinPreset } from "./minPreset";
+import {
+  isGrouped,
+  networkLabelFor,
+  pickerRows,
+  symbolFor,
+} from "./picker-rows";
 import { NetworkPill } from "./NetworkPill";
 import {
   AmountCard,
@@ -156,8 +162,12 @@ export function SwapForm({
   intentsMinimum?: {
     displayAmount: string;
     ticker: string;
-    source: "probe" | "upstream-error" | "loading";
+    source: "probe" | "upstream-error" | "loading" | "usd-limit";
     expectedAmountOutUsd?: string;
+    /** The floor as upstream stated it, in dollars. `source === "usd-limit"`
+     *  only, where `displayAmount` is a price conversion of ours rather than
+     *  a number the bridge ever gave. */
+    usdFloor?: string;
     /** USD-equivalent of `displayAmount` itself (not the destination-
      *  anchor USD below) — rendered as "(~$X)" right next to the
      *  minimum's scalar amount. */
@@ -383,6 +393,18 @@ export function SwapForm({
   // price isn't cached yet.
   const minimumUsdSuffix = intentsMinimum?.minimumUsd
     ? ` (~$${formatUsdSubLine(intentsMinimum.minimumUsd)})`
+    : "";
+  // A dollar denominated limit is a different sentence. The bridge named a
+  // price, not an amount of the coin, so the coin figure is our conversion
+  // and is marked approximate, and the bridge's own number leads. Writing it
+  // the other way round would put a number in the user's mouth that upstream
+  // never said, and it drifts with the market besides.
+  const usdLimit =
+    intentsMinimum?.source === "usd-limit" && intentsMinimum.usdFloor
+      ? `$${Number(intentsMinimum.usdFloor).toLocaleString("en-US")}`
+      : null;
+  const usdLimitAmount = intentsMinimum
+    ? `about ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}`
     : "";
   // Form-level warning: even MAX of the user's balance is below the
   // minimum. balanceFor returns a number; convert to atomic for the
@@ -890,10 +912,32 @@ export function SwapForm({
             </span>
             {intentsMinimum.source === "loading"
               ? `Finding minimum for ${fromCoin} → ${toCoin}…`
-              : belowMinimum
-                ? `Below NEAR Intents minimum: ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}${minimumUsdSuffix}`
-                : `Min: ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}${minimumUsdSuffix} for ${fromCoin} → ${intentsMinimum.destinationDisplayName ?? toCoin}`}
+              : usdLimit
+                ? belowMinimum
+                  ? `Below NEAR Intents temporary limit: ${usdLimit} per swap (${usdLimitAmount})`
+                  : `Temporary NEAR Intents limit: ${usdLimit} per swap (${usdLimitAmount})`
+                : belowMinimum
+                  ? `Below NEAR Intents minimum: ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}${minimumUsdSuffix}`
+                  : `Min: ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}${minimumUsdSuffix} for ${fromCoin} → ${intentsMinimum.destinationDisplayName ?? toCoin}`}
           </div>
+          {/* Why the floor is this large, and why changing the amount is the
+              only lever. Without it the hint reads as a wallet rule, and the
+              obvious next move is to try the other direction, which fails the
+              same way because the limit follows the asset onto either leg. */}
+          {usdLimit && (
+            <div
+              data-usd-limit-note
+              style={{
+                color: "var(--text-dim)",
+                fontSize: 9,
+                paddingLeft: 14,
+              }}
+            >
+              (set by the bridge these assets use, not by the wallet. It counts
+              the swap's dollar value on either side, so flipping the pair does
+              not avoid it.)
+            </div>
+          )}
           {/* USD-anchor sub-line — probe entries only, where the
               minimum was learned by asking "what's the input for
               ~$X of destination?" Shows the user that the displayed
@@ -1478,6 +1522,9 @@ function CoinPickerButton({
   basicswapEnabledTickers?: ReadonlySet<string> | null;
 }) {
   const [open, setOpen] = useState(false);
+  /** Which multi-network symbol is expanded, if any. Reset on close so
+   *  reopening the picker always starts from the symbol list. */
+  const [expandedSymbol, setExpandedSymbol] = useState<string | null>(null);
   const wrapperRef = useRef<HTMLDivElement | null>(null);
 
   // Close on outside click or escape — standard click-away pattern.
@@ -1492,7 +1539,10 @@ function CoinPickerButton({
       }
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setOpen(false);
+      if (e.key === "Escape") {
+        setOpen(false);
+        setExpandedSymbol(null);
+      }
     };
     window.addEventListener("mousedown", onMouseDown);
     window.addEventListener("keydown", onKey);
@@ -1532,8 +1582,26 @@ function CoinPickerButton({
           borderColor: open ? "var(--accent-mid)" : "var(--border)",
         }}
       >
-        <CoinIcon sym={ticker} size={18} glow={false} />
-        <span style={{ color: "var(--text)" }}>{ticker}</span>
+        <CoinIcon sym={symbolFor(ticker)} size={18} glow={false} />
+        <span style={{ color: "var(--text)" }}>{symbolFor(ticker)}</span>
+        {/* The network is part of the asset's identity, not decoration.
+            USDC on Arbitrum and USDC on Base are different tokens at
+            different contracts, so the CLOSED button has to say which one is
+            selected or the form claims to swap "USDC" from nowhere. */}
+        {networkLabelFor(ticker) && (
+          <span
+            data-network-chip
+            style={{
+              fontSize: 8,
+              letterSpacing: 0.4,
+              padding: "1px 4px",
+              border: "1px solid var(--border)",
+              color: "var(--text-dim)",
+            }}
+          >
+            {networkLabelFor(ticker)}
+          </span>
+        )}
         <span
           style={{
             color: "var(--text-dim)",
@@ -1577,97 +1645,205 @@ function CoinPickerButton({
               the pair. Zephyr ecosystem swaps live in their own
               `<ZephyrEcosystemSwapCard>` — in-protocol routing, not a
               cross-chain route, so it never enters this list. */}
-          {(preferredRouter === "basicswap"
-            ? basicswapPickerTickers(
-                getDropdownTickers({ sourceOnly: onlySourceCapable }),
-                otherTicker,
-                basicswapEnabledTickers,
-              )
-            : getDropdownTickers({
-                sourceOnly: onlySourceCapable,
-                router: preferredRouter,
-              })
-          ).map((sym) => {
-            const isSelected = sym === ticker;
-            const isDisabled = sym === otherTicker;
-            const bal = balanceFor(sym);
+          {pickerRows(
+            preferredRouter === "basicswap"
+              ? basicswapPickerTickers(
+                  getDropdownTickers({ sourceOnly: onlySourceCapable }),
+                  otherTicker,
+                  basicswapEnabledTickers,
+                )
+              : getDropdownTickers({
+                  sourceOnly: onlySourceCapable,
+                  router: preferredRouter,
+                }),
+          ).map((row) => {
+            // A symbol carried on more than one network is ONE row that
+            // expands, not N rows. The roster gained fifteen stablecoin legs
+            // on 2026-09-09 (`USDC-ARB`, `USDT0-POL`, …) because the
+            // capability registry holds one chain per entry; rendering them
+            // flat would triple the dropdown and ask the user to decode
+            // `USDC-BSC`. The assets rail groups the same money the same way.
+            const grouped = isGrouped(row);
+            const expanded = expandedSymbol === row.symbol;
+            const soleKey = row.legs[0];
+            const isSelected = row.legs.includes(ticker);
+            // Only an ungrouped row can BE the other side; a grouped row is
+            // disabled per-network below, because USDC-ARB opposite USDC-BASE
+            // is a legitimate pair.
+            const isDisabled = !grouped && soleKey === otherTicker;
+            const bal = grouped ? null : balanceFor(soleKey);
+
             return (
-              <button
-                key={sym}
-                role="option"
-                aria-selected={isSelected}
-                disabled={isDisabled}
-                onClick={() => {
-                  if (isDisabled) return;
-                  onPick(sym);
-                  setOpen(false);
-                }}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 10,
-                  padding: "8px 10px",
-                  background: isSelected
-                    ? "rgba(0,255,102,0.06)"
-                    : "transparent",
-                  border: "none",
-                  borderLeft: isSelected
-                    ? "2px solid var(--accent)"
-                    : "2px solid transparent",
-                  color: isSelected ? "var(--accent)" : "var(--text)",
-                  cursor: isDisabled ? "not-allowed" : "pointer",
-                  opacity: isDisabled ? 0.35 : 1,
-                  textAlign: "left",
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 11,
-                  letterSpacing: 0.4,
-                  transition: "background .1s ease",
-                }}
-                onMouseEnter={(e) => {
-                  if (isDisabled || isSelected) return;
-                  e.currentTarget.style.background = "rgba(255,255,255,0.04)";
-                }}
-                onMouseLeave={(e) => {
-                  if (isDisabled || isSelected) return;
-                  e.currentTarget.style.background = "transparent";
-                }}
-              >
-                <CoinIcon sym={sym} size={20} glow={false} />
-                <span style={{ flex: 1 }}>{sym}</span>
-                {bal != null ? (
-                  <span
-                    className="tnum"
-                    style={{
-                      fontSize: 10,
-                      color: "var(--text-dim)",
-                    }}
-                  >
-                    {fmtBal(bal)}
-                  </span>
-                ) : (
-                  <span
-                    style={{
-                      fontSize: 9,
-                      color: "var(--text-dim)",
-                      opacity: 0.6,
-                    }}
-                  >
-                    —
-                  </span>
-                )}
-                {isDisabled && (
-                  <span
-                    style={{
-                      fontSize: 8,
-                      color: "var(--text-dim)",
-                      letterSpacing: 0.5,
-                      textTransform: "uppercase",
-                    }}
-                  >
-                    other side
-                  </span>
-                )}
-              </button>
+              <div key={row.symbol} style={{ display: "contents" }}>
+                <button
+                  role="option"
+                  aria-selected={isSelected}
+                  aria-expanded={grouped ? expanded : undefined}
+                  disabled={isDisabled}
+                  onClick={() => {
+                    if (isDisabled) return;
+                    if (grouped) {
+                      // Expand. There is no bare "USDC" to select — every
+                      // choice resolves to exactly one network's leg.
+                      setExpandedSymbol(expanded ? null : row.symbol);
+                      return;
+                    }
+                    onPick(soleKey);
+                    setOpen(false);
+                  }}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 10,
+                    padding: "8px 10px",
+                    background: isSelected
+                      ? "rgba(0,255,102,0.06)"
+                      : "transparent",
+                    border: "none",
+                    borderLeft: isSelected
+                      ? "2px solid var(--accent)"
+                      : "2px solid transparent",
+                    color: isSelected ? "var(--accent)" : "var(--text)",
+                    cursor: isDisabled ? "not-allowed" : "pointer",
+                    opacity: isDisabled ? 0.35 : 1,
+                    textAlign: "left",
+                    fontFamily: "var(--font-mono)",
+                    fontSize: 11,
+                    letterSpacing: 0.4,
+                    transition: "background .1s ease",
+                    width: "100%",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (isDisabled || isSelected) return;
+                    e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                  }}
+                  onMouseLeave={(e) => {
+                    if (isDisabled || isSelected) return;
+                    e.currentTarget.style.background = "transparent";
+                  }}
+                >
+                  <CoinIcon sym={row.symbol} size={20} glow={false} />
+                  <span style={{ flex: 1 }}>{row.symbol}</span>
+
+                  {grouped ? (
+                    <span
+                      data-network-count
+                      style={{ fontSize: 9, color: "var(--text-dim)" }}
+                    >
+                      {row.legs.length} networks {expanded ? "\u25be" : "\u25b8"}
+                    </span>
+                  ) : bal != null ? (
+                    <span
+                      className="tnum"
+                      style={{ fontSize: 10, color: "var(--text-dim)" }}
+                    >
+                      {fmtBal(bal)}
+                    </span>
+                  ) : (
+                    <span
+                      style={{
+                        fontSize: 9,
+                        color: "var(--text-dim)",
+                        opacity: 0.6,
+                      }}
+                    >
+                      —
+                    </span>
+                  )}
+
+                  {isDisabled && (
+                    <span
+                      style={{
+                        fontSize: 8,
+                        color: "var(--text-dim)",
+                        letterSpacing: 0.5,
+                        textTransform: "uppercase",
+                      }}
+                    >
+                      other side
+                    </span>
+                  )}
+                </button>
+
+                {/* The network choice. Indented under its symbol so the
+                    relationship is visible, and every entry names the chain
+                    in full — "Arbitrum", not "ARB" — because picking the
+                    wrong network is how funds end up somewhere the user
+                    cannot easily reach them. */}
+                {grouped &&
+                  expanded &&
+                  row.networks.map((n) => {
+                    const legSelected = n.key === ticker;
+                    const legDisabled = n.key === otherTicker;
+                    const legBal = balanceFor(n.key);
+                    return (
+                      <button
+                        key={n.key}
+                        role="option"
+                        aria-selected={legSelected}
+                        disabled={legDisabled}
+                        onClick={() => {
+                          if (legDisabled) return;
+                          onPick(n.key);
+                          setExpandedSymbol(null);
+                          setOpen(false);
+                        }}
+                        style={{
+                          display: "flex",
+                          alignItems: "center",
+                          gap: 8,
+                          padding: "6px 10px 6px 30px",
+                          background: legSelected
+                            ? "rgba(0,255,102,0.06)"
+                            : "transparent",
+                          border: "none",
+                          borderLeft: legSelected
+                            ? "2px solid var(--accent)"
+                            : "2px solid transparent",
+                          color: legSelected ? "var(--accent)" : "var(--text)",
+                          cursor: legDisabled ? "not-allowed" : "pointer",
+                          opacity: legDisabled ? 0.35 : 1,
+                          textAlign: "left",
+                          fontFamily: "var(--font-mono)",
+                          fontSize: 10,
+                          letterSpacing: 0.3,
+                          width: "100%",
+                        }}
+                        onMouseEnter={(e) => {
+                          if (legDisabled || legSelected) return;
+                          e.currentTarget.style.background =
+                            "rgba(255,255,255,0.04)";
+                        }}
+                        onMouseLeave={(e) => {
+                          if (legDisabled || legSelected) return;
+                          e.currentTarget.style.background = "transparent";
+                        }}
+                      >
+                        <span style={{ flex: 1 }}>{n.network}</span>
+                        {legBal != null ? (
+                          <span
+                            className="tnum"
+                            style={{ fontSize: 9, color: "var(--text-dim)" }}
+                          >
+                            {fmtBal(legBal)}
+                          </span>
+                        ) : null}
+                        {legDisabled && (
+                          <span
+                            style={{
+                              fontSize: 8,
+                              color: "var(--text-dim)",
+                              letterSpacing: 0.5,
+                              textTransform: "uppercase",
+                            }}
+                          >
+                            other side
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+              </div>
             );
           })}
         </div>

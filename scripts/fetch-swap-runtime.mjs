@@ -95,8 +95,8 @@ const LOG = "[swap-runtime]";
 
 // Upstream source pins. These MUST match upstream/README.md's pin table — that
 // file is the human-readable copy of the same contract.
-const PIN_BASICSWAP_TAG = "v0.18.5";
-const PIN_BASICSWAP_COMMIT = "3859612035f8c4476b5cadedf36b875d2f2def5b";
+const PIN_BASICSWAP_TAG = "v0.18.6";
+const PIN_BASICSWAP_COMMIT = "ea39faddbcaffd51a34d6bbd72fb9607654227f5";
 const PIN_COINCURVE_TAG = "basicswap_v0.4";
 const PIN_COINCURVE_COMMIT = "ff375ce4ac551afc99f359da784ffceeda03203f";
 
@@ -350,10 +350,14 @@ const LOCAL_WHEELS = [
   },
   {
     name: "basicswap",
-    version: "0.18.5",
-    file: "basicswap-0.18.5-py3-none-any.whl",
-    sha256: "d7f43ec8b472795228be50f6d6a8a92f46f93bd4e9c9a09cad9730dd33dc0014",
-    bytes: 5215710,
+    version: "0.18.6",
+    file: "basicswap-0.18.6-py3-none-any.whl",
+    // Rebuilt 2026-09-08 from upstream/basicswap @ v0.18.6 with the buildCmd
+    // below; hash computed from the produced file, not taken from pip's log.
+    // `reproducible: false` (below) is why this is "what we built and
+    // verified" rather than a value anyone else can rederive byte-for-byte.
+    sha256: "206971cfb959bfe8523ae4dbae00e555fc33cb5c63d01cd02e2d4fbc2280428e",
+    bytes: 5215510,
     buildFrom: `upstream/basicswap @ ${PIN_BASICSWAP_TAG} (${PIN_BASICSWAP_COMMIT})`,
     buildBackend: "hatchling",
     buildCmd: "python -m pip wheel . --no-deps -w <wheelhouse>",

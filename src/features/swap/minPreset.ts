@@ -34,12 +34,18 @@ export interface MinPresetInput {
   preferredRouter: RouterPreference;
   /** `isBasicswapRoutable(from, to)`. */
   basicswapRoutable: boolean;
-  /** The quote hook's NEAR minimum for the current pair, if any. */
+  /** The quote hook's NEAR minimum for the current pair, if any.
+   *
+   *  `"usd-limit"` is a floor upstream stated in dollars rather than in
+   *  atomic units (the HOT Omni Bridge family, 2026-09-09); `displayAmount`
+   *  on those is the hook's price conversion. MIN fills from it like any
+   *  other known floor, which is the point of converting at all: the button
+   *  has to offer a size that actually quotes. */
   intentsMinimum:
     | {
         displayAmount: string;
         ticker: string;
-        source: "probe" | "upstream-error" | "loading";
+        source: "probe" | "upstream-error" | "loading" | "usd-limit";
       }
     | null
     | undefined;

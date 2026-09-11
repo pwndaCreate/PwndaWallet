@@ -790,6 +790,7 @@ export function LandscapeRoot(props: {
       {showSendModal && walletsByChain[activeChain] && (
         <SendModal
           adapter={getAdapter(activeChain)}
+          fromAddress={walletsByChain[activeChain]?.address}
           sendTo={sendTo}
           setSendTo={setSendTo}
           sendAmount={sendAmount}

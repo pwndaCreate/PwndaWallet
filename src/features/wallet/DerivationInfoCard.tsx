@@ -16,7 +16,11 @@ import { GenericDerivationFinder } from "./GenericDerivationFinder";
  *
  * Three states, driven by the declaration rather than by a per-chain branch:
  *
- *   independent-seed  Monero / Zephyr. No BIP-39 path exists; show why.
+ *   independent-seed  Monero / Zephyr / Zano. NOTHING IS RENDERED. There is
+ *                     no path to show and no choice to make, so the card only
+ *                     ever explained why it was empty — which is a paragraph
+ *                     of prose on a wallet screen earning nothing. Removed
+ *                     2026-09-07 at the operator's request.
  *   hasAlternatives   A mismatch is plausible. Show the path and point at the
  *                     chain's switcher if one is mounted below.
  *   otherwise         Every major wallet agrees (all EVM chains). Show the
@@ -36,6 +40,11 @@ export function DerivationInfoCard(props: {
   const adapter = getAdapter(chain);
   const d = adapter.derivation;
 
+  // Monero-lineage chains derive from their own seed, so there is no path to
+  // display and no alternative to offer. Keyed on the adapter's declaration
+  // rather than a chain list, so a future CN-family chain inherits this.
+  if (d.kind === "independent-seed") return null;
+
   return (
     <Card style={{ marginTop: 10 }}>
       <div className="secret-row">
@@ -45,11 +54,7 @@ export function DerivationInfoCard(props: {
           </span>
         </div>
 
-        {d.kind === "independent-seed" ? (
-          <div style={{ fontSize: 10, color: "var(--text-dim)", lineHeight: 1.6 }}>
-            {d.note}
-          </div>
-        ) : (
+        {(
           <>
             <div
               className="tnum"

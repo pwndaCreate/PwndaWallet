@@ -8,7 +8,6 @@ import {
   swapSidecarConsoleTrace,
   swapSidecarSupervisorLog,
   swapSidecarJanitorRun,
-  swapSidecarUpdateEngine,
   type EngineIdentity,
   type JanitorReport,
 } from "../../api/basicswap";
@@ -72,10 +71,30 @@ type SidecarPhase =
   | { phase: "stopping" }
   | { phase: "failed"; reason: string };
 
-/** Rust `SidecarStatus`. Carries no credential field, by construction. */
+/**
+ * Rust `SidecarStatus`. Carries no credential field, by construction.
+ *
+ * NOTE: this is a LOCAL re-declaration of the canonical `SidecarStatus` in
+ * `src/api/basicswap.ts`, and it drifts. On 2026-09-08 the card could not see
+ * `bundleAvailable` at all — a field the backend had been sending for weeks —
+ * because this copy had never grown it. `SidecarSetupWizard.tsx` keeps a
+ * third copy. Worth collapsing to one import; a type-only refactor is its own
+ * change, so it is recorded here rather than done in passing.
+ */
 interface SidecarStatus {
-  /** Which engine is on disk, and whether it is the one this build expects
-   *  (`grove::identify`). Rendered by `EngineDriftNote` since 2026-09-04. */
+  /**
+   * Which engine is on disk, and whether it is the one this build expects
+   * (`grove::identify`).
+   *
+   * Deliberately NOT rendered. `EngineDriftNote` showed it from 2026-09-04
+   * until 2026-09-08, when it was removed outright: a Grove bump is a patch
+   * rebase plus the invariant suites plus a runtime deploy, so no UI can
+   * honestly offer it, and on a user's machine it is not their job at all
+   * (`reconcile_bundled_engine` installs the bundled engine at the next node
+   * start). Drift belongs in the supervisor log via `grove::describe`, and in
+   * `apply-engine-patches.mjs --check`. Kept on the type because the payload
+   * still carries it and a future DEVELOPER surface may want it.
+   */
   engine?: EngineIdentity;
   phase: SidecarPhase;
   running: boolean;
@@ -89,9 +108,55 @@ interface SidecarStatus {
   autostart: boolean;
   coins: string[];
   coinsUnavailable: string[];
+  /**
+   * A3 (Option A): this datadir's Particl chain predates pruning, so it keeps
+   * ~2.9 GB where a new setup uses ~1.3 GB. Optional because a status from an
+   * older backend does not carry it, and `undefined` must read as "no claim"
+   * rather than as `false` — the drift this type's own note warns about.
+   */
+  particlUnpruned?: boolean;
 }
 
 const POLL_MS = 5000;
+
+/**
+ * A3 (Option A): this node's Particl chain predates pruning.
+ *
+ * New setups run Particl at `prune=550` (~1.3 GB). A chain synced before that
+ * keeps ~2.9 GB, and particl-core cannot drop `txindex`/`spentindex` from a
+ * chain that already has them — so this is a fact about the datadir, not a
+ * setting this card could flip. Reclaiming the space needs a fresh sync.
+ *
+ * Rendered rather than left silent because the setup wizard now quotes "about
+ * 1.5 GB" for the whole node: an existing install showing three times that,
+ * with nothing to explain the gap, reads as a wrong number rather than as an
+ * older layout. Deliberately NOT a warning colour and NOT an action — nothing
+ * is broken, and every swap behaves identically either way.
+ *
+ * A separate pure component so the branch is unit-testable. The card itself
+ * holds `useState`/`useEffect` and cannot be invoked directly in a test, and
+ * the opted-in card is unreachable in the browser-only sandbox (the wizard's
+ * Tauri event listener has no mock — see `SidecarSetupWizard.tsx:86`), so
+ * without this split the copy would ship on nothing but a type-check.
+ */
+export function ParticlFootprintNote({ unpruned }: { unpruned: boolean }) {
+  if (!unpruned) return null;
+  return (
+    <div
+      style={{
+        marginTop: 12,
+        fontFamily: "var(--font-mono)",
+        fontSize: 10.5,
+        lineHeight: 1.6,
+        color: "var(--text-muted)",
+      }}
+    >
+      This node's Particl chain predates pruning and keeps about 2.9 GB. New
+      setups use about 1.3 GB. Reclaiming the difference needs a fresh Particl
+      sync, so nothing changes on its own.
+    </div>
+  );
+}
 
 
 /**
@@ -124,73 +189,6 @@ const POLL_MS = 5000;
  * rather than pretending. The `p…` ids stay visible in small print because
  * they are what a bug report needs.
  */
-function EngineDriftNote({
-  engine,
-  running,
-  onUpdate,
-  busy,
-  result,
-}: {
-  engine?: EngineIdentity;
-  /** The engine cannot be replaced under a live node — the button says why. */
-  running: boolean;
-  onUpdate: () => void;
-  busy: boolean;
-  result: string | null;
-}) {
-  if (!engine || engine.state !== "drift") return null;
-  return (
-    <div
-      data-engine-drift
-      style={{
-        marginTop: 8,
-        padding: "8px 10px",
-        fontSize: 10,
-        lineHeight: 1.6,
-        fontFamily: "var(--mono)",
-        color: "var(--warn, #ffaa00)",
-        border: "1px solid rgba(255,170,0,0.4)",
-        background: "rgba(255,170,0,0.06)",
-      }}
-    >
-      The swap engine on disk is older than the one this wallet ships. It will
-      be replaced automatically the next time the node starts — fixes waiting
-      in the newer engine do not apply until then.
-      {/* The data hook lives on the wrapper, not the Btn: `Btn` takes an
-          explicit prop list and drops unknown props, so `data-*` on it never
-          reaches the DOM. Found while verifying this note in the sandbox. */}
-      <div
-        data-engine-update
-        style={{ marginTop: 6, display: "flex", gap: 8, alignItems: "center" }}
-      >
-        <Btn
-          onClick={onUpdate}
-          disabled={busy || running}
-          title={
-            running
-              ? "Stop the swap node first — replacing the engine under a running node would drop a process that may be watching a swap's timelocks"
-              : "Install the engine this build ships"
-          }
-        >
-          {busy ? "Updating…" : "Update engine now"}
-        </Btn>
-        {running && (
-          <span style={{ opacity: 0.85 }}>stop the node first, or just restart it</span>
-        )}
-      </div>
-      {result && (
-        <div data-engine-update-result style={{ marginTop: 6, opacity: 0.9 }}>
-          {result}
-        </div>
-      )}
-      <div style={{ marginTop: 6, opacity: 0.65 }}>
-        on disk <b>{engine.stamped}</b>, this build expects <b>{engine.expected}</b> —
-        the number counts PwndaWallet's own patches on BasicSwap, not a version.
-      </div>
-    </div>
-  );
-}
-
 function errMsg(e: unknown): string {
   if (typeof e === "string") return e;
   if (e && typeof e === "object" && "message" in e) {
@@ -325,23 +323,6 @@ export function SidecarStatusCard({
    */
   const [shareReport, setShareReport] = useState(lastSharePass);
   useEffect(() => subscribeSharePass(setShareReport), []);
-  /** The drift note's "Update engine now" — installs the engine this build
-   *  ships. The automatic path runs on the next start; this is for doing it
-   *  without waiting. See `reconcile_bundled_engine` (Rust). */
-  const [engineBusy, setEngineBusy] = useState(false);
-  const [engineResult, setEngineResult] = useState<string | null>(null);
-  const updateEngine = useCallback(async () => {
-    setEngineBusy(true);
-    setEngineResult(null);
-    try {
-      setEngineResult(await swapSidecarUpdateEngine());
-      await refresh();
-    } catch (e) {
-      setEngineResult(errMsg(e));
-    } finally {
-      if (alive.current) setEngineBusy(false);
-    }
-  }, []);
   const [error, setError] = useState("");
   const alive = useRef(true);
 
@@ -597,13 +578,39 @@ export function SidecarStatusCard({
     }
   };
 
-  // ── Not enabled (canvas frame 1h, OFF state) ──────────────────────────
+  // ── Not enabled, OR enabled but never set up ──────────────────────────
   //
   // The paragraph that used to live here ("…is not installed until you turn
   // it on. Nothing has been downloaded or started.") is now the rail plus two
   // chips: the rail shows what enabling will DO, and `NOTHING RUNS UNTIL YOU
   // CLICK` carries the claim the sentence made. Same promise, one glance.
-  if (optedIn !== true) {
+  //
+  // `configured !== true` belongs in this condition, and leaving it out was a
+  // real defect (2026-09-10). Opt-in and first-prepare are separate facts:
+  // the wizard normally does both in one flow, so "opted in" implied
+  // "configured" — until something recorded consent WITHOUT creating a node.
+  // `scripts/swap/dev-sidecar-env.mjs` does exactly that (it seeds
+  // `opt-in.json` so a dev run needs no click), and a fresh
+  // `PWNDA_SWAP_SIDECAR_HOME` then landed here opted-in with no
+  // `basicswap.json`.
+  //
+  // The card rendered its normal running state with a "Start node" button, and
+  // that button CANNOT work in this state: its handler deliberately withholds
+  // the mnemonic ("this is an existing install", R1), while a datadir with no
+  // config needs a FIRST prepare, which `check_first_prepare_gate` refuses
+  // without one — "the vault must be unlocked to create the swap wallet",
+  // reported to the user as `the start was aborted before the node launched`.
+  // The backend gate is right (R3: never mint a Particl wallet the vault
+  // cannot restore); the card was offering a door that only leads into it.
+  //
+  // So: no config, no Start. Route to setup, which is the path that derives
+  // the BIP85 child and does a proper keyed first prepare — and which is also
+  // where the Particl chain choice lives.
+  // `status != null` matters: while the first read is in flight `status` is
+  // null, and treating "unknown" as "not configured" would flash the OFF state
+  // on every EXISTING install before flipping to the real card. Absent beats a
+  // wrong claim — the same rule the offers cell and the coin tiles follow.
+  if (optedIn !== true || (status != null && status.configured !== true)) {
     return (
       <Card
         title="SWAP NODE (XMR / ZEPH / ZANO)"
@@ -778,13 +785,6 @@ export function SidecarStatusCard({
           Rendered only while the node is actually up. The operational
           controls below stay for the opted-in-but-stopped case, so this
           never duplicates a Start/Stop the user can already see. */}
-      <EngineDriftNote
-            engine={status?.engine}
-            running={running}
-            onUpdate={updateEngine}
-            busy={engineBusy}
-            result={engineResult}
-          />
       {running && (
         <SwapNodeRunningState
           statusCells={runningCells}
@@ -796,7 +796,7 @@ export function SidecarStatusCard({
           footer={
             nodeBalanceLabel === "—"
               ? "swaps run from your own wallet · the node holds nothing to sweep"
-              : "the node is holding these · recover them from Swap ▸ sweep back"
+              : "the node is holding these · recover them from Settings ▸ sweep back"
           }
         />
       )}
@@ -823,13 +823,6 @@ export function SidecarStatusCard({
           representation of one fact, in both states. */}
       {!running && dexCoinTiles.length > 0 && (
         <>
-          <EngineDriftNote
-            engine={status?.engine}
-            running={running}
-            onUpdate={updateEngine}
-            busy={engineBusy}
-            result={engineResult}
-          />
           <DexCoinTiles coins={dexCoinTiles} />
         </>
       )}
@@ -843,6 +836,8 @@ export function SidecarStatusCard({
           />
         </div>
       )}
+
+      <ParticlFootprintNote unpruned={status?.particlUnpruned === true} />
 
       <label
         style={{

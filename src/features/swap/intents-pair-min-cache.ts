@@ -18,6 +18,22 @@
  * starts uncached — the first below-minimum attempt populates it. This
  * matches 1Click's solver liquidity which can shift over time; we don't
  * want stale pair-mins persisting across days.
+ *
+ * ## Two kinds of floor
+ *
+ * Everything above describes a floor stated in ATOMIC UNITS of one asset
+ * ("try at least 2655163748239372"). Since 2026-09-09 upstream also states
+ * floors in DOLLARS ("Temporary swap limits: minimum swap amount is
+ * $1,000"), which is a claim about the size of the swap, not about an
+ * amount of any one coin. Those arrive from the HOT Omni Bridge and apply
+ * to every pair carrying a `nep245:v2_1.omni.hot.tg:*` asset on either leg.
+ *
+ * They are parsed by `parseMinUsdFromUpstreamError` and stored as
+ * `source: "usd-limit"` entries whose `atomic` is OUR conversion at a live
+ * price, with the bridge's own dollar figure kept beside it in `usdFloor`.
+ * Keeping both is the point: the conversion is what the form compares
+ * against, and the dollar figure is what the copy quotes, so the wallet
+ * never attributes a coin amount to a bridge that only ever said a price.
  */
 
 /**
@@ -26,13 +42,16 @@
  * (a probe-derived minimum is anchored to a known output level — the
  * hint can show the USD anchor).
  */
-export type PairMinSource = "probe" | "upstream-error";
+export type PairMinSource = "probe" | "upstream-error" | "usd-limit";
 
 export interface PairMinEntry {
   /** Atomic-units string of the SOURCE asset (what the user must send). */
   atomic: string;
   /** Where this entry came from. Probe = dry EXACT_OUTPUT response;
-   *  upstream-error = parsed from a rejected real quote. */
+   *  upstream-error = parsed from a rejected real quote; usd-limit =
+   *  converted from a FIAT floor the upstream stated in dollars, where
+   *  `atomic` is our own price-derived equivalent rather than a number
+   *  the bridge ever said. */
   source: PairMinSource;
   /** When this entry was learned. ms epoch. */
   learnedAt: number;
@@ -40,6 +59,19 @@ export interface PairMinEntry {
    *  From `quote.amountOutUsd` when the entry came from a probe. Lets
    *  the UI render "(receives ~$X of TICKER)" without re-doing math. */
   expectedAmountOutUsd?: string;
+  /**
+   * The floor as the UPSTREAM stated it, in dollars, when it stated one
+   * — `"1000"` for *"minimum swap amount is $1,000"*. Present only on
+   * `source: "usd-limit"` entries.
+   *
+   * It is kept alongside `atomic` because the two are not the same claim.
+   * `atomic` is ours: dollars divided by a price that moves, so it is an
+   * estimate that goes stale. `usdFloor` is the bridge's own sentence and
+   * stays true while the limit stands. The hint copy leads with this one
+   * and marks the converted amount approximate, so the wallet never
+   * attributes a number to upstream that upstream did not say.
+   */
+  usdFloor?: string;
 }
 
 /** TTL per source type. Probe entries are anchored to a specific output
@@ -48,6 +80,12 @@ export interface PairMinEntry {
  *  change. */
 const PROBE_TTL_MS = 5 * 60 * 1000; // 5 min
 const UPSTREAM_ERROR_TTL_MS = 30 * 60 * 1000; // 30 min
+/** A USD limit is stated by upstream as TEMPORARY, and `atomic` on such an
+ *  entry is a price conversion that drifts with the market. Both reasons
+ *  point the same way: expire it soon enough that the wallet notices when
+ *  the limit lifts, rather than blocking swaps against a floor that is no
+ *  longer there. */
+const USD_LIMIT_TTL_MS = 10 * 60 * 1000; // 10 min
 
 /** Keyed by `${fromAssetId}|${toAssetId}` so a single Map covers every
  *  routable pair. */
@@ -68,6 +106,7 @@ export function setPairMinimum(
   opts: {
     source?: PairMinSource;
     expectedAmountOutUsd?: string;
+    usdFloor?: string;
   } = {},
 ): void {
   if (!atomicStr) return;
@@ -78,6 +117,9 @@ export function setPairMinimum(
   };
   if (opts.expectedAmountOutUsd) {
     entry.expectedAmountOutUsd = opts.expectedAmountOutUsd;
+  }
+  if (opts.usdFloor) {
+    entry.usdFloor = opts.usdFloor;
   }
   cache.set(key(fromAssetId, toAssetId), entry);
 }
@@ -102,7 +144,11 @@ export function getPairMinimumEntry(
   const entry = cache.get(key(fromAssetId, toAssetId));
   if (!entry) return null;
   const ttl =
-    entry.source === "probe" ? PROBE_TTL_MS : UPSTREAM_ERROR_TTL_MS;
+    entry.source === "probe"
+      ? PROBE_TTL_MS
+      : entry.source === "usd-limit"
+        ? USD_LIMIT_TTL_MS
+        : UPSTREAM_ERROR_TTL_MS;
   if (Date.now() - entry.learnedAt > ttl) {
     cache.delete(key(fromAssetId, toAssetId));
     return null;
@@ -118,6 +164,53 @@ export function getPairMinimumEntry(
  * digits it happens to carry.
  */
 const MINIMUM_CUES = /at least|minimum|too low|too small|below the/i;
+
+/**
+ * An amount denominated in MONEY rather than in atomic units.
+ *
+ * Matches `$1,000`, `$ 1000`, `1000 USD`, `1,000.50 dollars`. Two callers
+ * want it and they want opposite things: `parseMinUsdFromUpstreamError`
+ * reads it, and `parseMinAtomicFromUpstreamError` deletes it before looking
+ * for integers, because a dollar figure that reaches the atomic parser
+ * becomes a fabricated on chain floor.
+ */
+const CURRENCY_AMOUNT =
+  /\$\s*\d[\d,]*(?:\.\d+)?|\b\d[\d,]*(?:\.\d+)?\s*(?:USD|dollars?)\b/gi;
+
+/**
+ * Parse a FIAT floor out of an upstream rejection.
+ *
+ * The shape this exists for, captured live 2026-09-09 on AVAX to BTC:
+ *
+ *   "Temporary swap limits: minimum swap amount is $1,000"
+ *
+ * It is a different KIND of claim from everything
+ * `parseMinAtomicFromUpstreamError` handles. Those messages name an on chain
+ * amount of one specific asset, so the number can be cached and compared
+ * against what the user typed. This one names a dollar value of the whole
+ * swap, applies to every pair carrying a HOT Omni Bridge
+ * (`nep245:v2_1.omni.hot.tg:*`) asset on EITHER leg, and has to be turned
+ * into an asset amount by us, at a price that moves.
+ *
+ * Returns the dollar figure as a plain numeric string (`"1000"`), commas
+ * stripped, or null when the message is not about a minimum or names no
+ * money. The caller converts.
+ */
+export function parseMinUsdFromUpstreamError(message: string): string | null {
+  if (!MINIMUM_CUES.test(message)) return null;
+  // Fresh non global regex per call: CURRENCY_AMOUNT is /g, and a shared /g
+  // regex carries `lastIndex` between calls, so reusing it here would make
+  // the second call on the same string miss.
+  const m = message.match(new RegExp(CURRENCY_AMOUNT.source, "i"));
+  if (!m) return null;
+  const raw = m[0]
+    .replace(/[$,]/g, "")
+    .replace(/\s*(USD|dollars?)\s*$/i, "")
+    .trim();
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  return raw;
+}
 
 /**
  * Parse an upstream `minimum amount` error message into an atomic-units
@@ -147,7 +240,20 @@ export function parseMinAtomicFromUpstreamError(message: string): string | null 
   if (!MINIMUM_CUES.test(message)) return null;
   // Match all unbroken digit-only runs of length ≥4. Strict — won't
   // match "1.5" or "1,500" (the comma form is rare in upstream JSON).
-  const matches = message.match(/\b\d{4,}\b/g);
+  // Delete money before counting digits. Added 2026-09-09, after 1Click began
+  // answering HOT Omni Bridge pairs with "Temporary swap limits: minimum swap
+  // amount is $1,000": the cue gate passes on "minimum", and the ONLY thing
+  // that stopped "1,000" reaching the cache as a floor of 1000 wei was the
+  // comma. Written "$1000" it parses, and the form would then have told the
+  // user that 0.000000000000001 AVAX cleared the floor. That is the same
+  // fabricated floor failure as the "CIP-1852 path" message which yielded a
+  // minimum of 1852 on 2026-09-05, one message shape further along.
+  //
+  // A dollar figure is not atomic units of anything. It belongs to
+  // `parseMinUsdFromUpstreamError`, which converts it at a live price and
+  // labels the result as ours rather than the bridge's.
+  const scrubbed = message.replace(CURRENCY_AMOUNT, " ");
+  const matches = scrubbed.match(/\b\d{4,}\b/g);
   if (!matches || matches.length === 0) return null;
   // Pick the largest by lexicographic length (since they're integers,
   // longer = larger). Ties: take the last one — typically the wei-shape
@@ -167,35 +273,13 @@ export function clearPairMinimumCache(): void {
 }
 
 /** Read the cache out for diagnostic purposes. */
-export function _snapshotForTests(): Array<{
-  from: string;
-  to: string;
-  atomic: string;
-  source: PairMinSource;
-  learnedAt: number;
-  expectedAmountOutUsd?: string;
-}> {
-  const out: Array<{
-    from: string;
-    to: string;
-    atomic: string;
-    source: PairMinSource;
-    learnedAt: number;
-    expectedAmountOutUsd?: string;
-  }> = [];
+export function _snapshotForTests(): Array<
+  PairMinEntry & { from: string; to: string }
+> {
+  const out: Array<PairMinEntry & { from: string; to: string }> = [];
   for (const [k, v] of cache.entries()) {
     const [from, to] = k.split("|");
-    const row = {
-      from,
-      to,
-      atomic: v.atomic,
-      source: v.source,
-      learnedAt: v.learnedAt,
-      ...(v.expectedAmountOutUsd
-        ? { expectedAmountOutUsd: v.expectedAmountOutUsd }
-        : {}),
-    };
-    out.push(row);
+    out.push({ ...v, from, to });
   }
   return out;
 }

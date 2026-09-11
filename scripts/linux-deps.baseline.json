@@ -1,0 +1,16 @@
+{
+  "deb": [
+    "bzip2",
+    "libayatana-appindicator3-1",
+    "libgtk-3-0",
+    "libwebkit2gtk-4.1-0",
+    "tar"
+  ],
+  "rpm": [
+    "bzip2",
+    "gtk3",
+    "libappindicator-gtk3",
+    "tar",
+    "webkit2gtk4.1"
+  ]
+}

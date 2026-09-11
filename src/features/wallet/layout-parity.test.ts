@@ -105,7 +105,6 @@ const SURFACES: Surface[] = [
     landscapeEquivalent: "SyncStatusPanel",
     note: "See XmrSyncCard.",
   },
-  { name: "SourceAddressesCard", landscapeEquivalent: null },
 
   // --- Added on the origin/main merge (2026-09-03). These surfaces landed on
   // the swap-desk line while this registry was being written on main, so they

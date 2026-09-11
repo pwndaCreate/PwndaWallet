@@ -161,22 +161,42 @@ async function main() {
   if (!winGrove) {
     // Not fatal: a Linux-only build machine legitimately has no Windows runtime.
     console.log(`${LOG} no Windows runtime present to compare against — skipping parity check`);
-  } else if (linuxGrove.patchLevel !== winGrove.patchLevel) {
+  } else if (linuxGrove.id !== winGrove.id) {
+    // Compare the whole identity, not the patch level alone.
+    //
+    // Until 2026-09-10 this compared `patchLevel` only, and that was a hole
+    // exactly the shape this gate exists to close: a Linux runtime at
+    // `0.18.5+p31` against Windows at `0.18.6+p31` would have passed, printed
+    // "engine parity ok", and shipped a different upstream engine to Linux
+    // users. That is the very outcome a "just apply the missing patches"
+    // shortcut produces when the series has been rebased onto a newer
+    // upstream -- so the advice below is split by WHAT differs, because the
+    // patch-only fix is the wrong one when the upstream has moved.
+    const sameUpstream = linuxGrove.upstream?.version === winGrove.upstream?.version;
     const ok =
+      sameUpstream &&
       ALLOWED_PATCH_LEVEL_GAP &&
       ALLOWED_PATCH_LEVEL_GAP.linux === linuxGrove.patchLevel &&
       ALLOWED_PATCH_LEVEL_GAP.win === winGrove.patchLevel;
     if (!ok) {
+      const fix = sameUpstream
+        ? `${LOG} Fix:     node scripts/apply-engine-patches.mjs --target .swap-sidecar-work/linux-runtime`
+        : `${LOG} Fix:     the Linux runtime's basicswap package is a DIFFERENT UPSTREAM (` +
+          `${linuxGrove.upstream?.version} vs ${winGrove.upstream?.version}). Applying patches
+` +
+          `${LOG}          cannot bridge that; rebuild it from the pin -- see
+` +
+          `${LOG}          basicswap-upstream-sync.md § THE BUMP IS NOW TWO-PLATFORM.`;
       console.error(
-        `${LOG} FATAL: engine patch levels differ — linux ${linuxGrove.id} vs windows ${winGrove.id}.
+        `${LOG} FATAL: engine identities differ — linux ${linuxGrove.id} vs windows ${winGrove.id}.
 ` +
           `${LOG} Linux users would get a different swap engine from Windows users, which is
 ` +
           `${LOG} how p19 shipped against p27 for ten days.
 ` +
-          `${LOG} Fix:     node scripts/apply-engine-patches.mjs --target .swap-sidecar-work/linux-runtime
-` +
-          `${LOG} Declare: set ALLOWED_PATCH_LEVEL_GAP in this file, with the reason.`
+          fix +
+          `
+${LOG} Declare: a patch-level gap on the SAME upstream may be declared via ALLOWED_PATCH_LEVEL_GAP, with the reason.`
       );
       process.exit(1);
     }

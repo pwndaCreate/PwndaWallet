@@ -27,6 +27,7 @@ import {
   trackToHistoryStatus,
   type SwapExecutionStatus,
 } from "./swap-execute";
+import type { SourceSecret } from "./asset-capabilities";
 import type { NormalizedQuote } from "./useSwapQuote";
 import { effectiveModeForSource } from "./router-modes";
 import { decimalToBaseUnitsBigInt } from "./swap-sources";
@@ -64,7 +65,7 @@ export function SwapConfirmModal({
   fromBlockchain,
   quote,
   sourceAddress,
-  sourceMnemonic,
+  sourceSecret,
   destinationAddress,
   onClose,
 }: {
@@ -82,13 +83,13 @@ export function SwapConfirmModal({
   quote: NormalizedQuote;
   sourceAddress: string;
   /**
-   * The vault's BIP-39 mnemonic — passed ONLY when `fromAsset` is ADA.
-   * Cardano is the one source signed in TS (see `executeIntentsTrade`),
-   * so the modal forwards this as `cardanoMnemonic`. The parent reads it
-   * from `walletsByChain.cardano.mnemonic` (the same place ADA Send does);
-   * it's `undefined` for every other source.
+   * The signing secret for a TS-signed source chain (ADA, XRP, Tron), or
+   * `undefined` for the Rust-signed majority, which sign inside the swap
+   * session. The modal forwards it verbatim and never inspects it; both
+   * swap surfaces build it with the same `sourceSecretFor` helper so the
+   * "which chain needs which kind of secret" decision lives in one place.
    */
-  sourceMnemonic?: string;
+  sourceSecret?: SourceSecret;
   destinationAddress: string;
   onClose: () => void;
 }) {
@@ -317,9 +318,9 @@ export function SwapConfirmModal({
           sourceAddress,
           userIntendedAtomic,
           fromBlockchain,
-          // Only ADA uses this — TS-signed source (no Rust signer). It's
-          // `undefined` for every other chain, which signs via sessionId.
-          cardanoMnemonic: sourceMnemonic,
+          // Set only for the TS-signed sources (ADA, XRP, Tron); undefined
+          // for every chain that signs via sessionId.
+          sourceSecret,
           onPhase: (s) => setExec(s),
         });
 
