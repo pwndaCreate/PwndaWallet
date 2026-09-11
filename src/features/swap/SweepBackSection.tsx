@@ -23,7 +23,7 @@
  *
  * `prepare(coin)` needs a live swap session (`swap_unlock`), which is what
  * gives Rust the seed to derive the destination from. The same
- * unlock-then-relock shape `SourceAddressesCard` and `SwapConfirmModal`
+ * unlock-then-relock shape `SwapConfirmModal`
  * already use. The session is dropped again as soon as the sweep resolves.
  */
 import { useCallback, useEffect, useRef, useState } from "react";

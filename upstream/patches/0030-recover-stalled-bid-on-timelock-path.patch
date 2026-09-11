@@ -1,0 +1,94 @@
+Grove PATCH-30: pwndaRecoverStalledBid must recover a bid parked in BID_ERROR
+ON the timelock path, not decline it
+
+PATCH-11's Gate 2 reads, in full:
+
+    # Gate 2 -- a refund in flight means the timelock path owns the
+    # funds now. Re-queueing a redeem against it is the one genuinely
+    # unsafe thing this could do.
+    if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
+        return {
+            "recovered": False,
+            "state": state_before,
+            "reason": "A refund is already in flight for this swap; the timelock path will complete it.",
+        }
+
+The first half is right and stays: re-queueing a chain-A REDEEM against a bid
+whose lock has already moved into the refund tx is the unsafe thing, and it
+must not happen. The second half is the bug. "The timelock path will complete
+it" is stated as a fact about a bid that Gate 1 has just established is in
+BID_ERROR -- and BID_ERROR is precisely the state in which the timelock path is
+NOT running. checkXmrBidState has no BID_ERROR branch, so the bid is never
+re-examined and nothing publishes the refund spend or the swipe.
+
+So the gate declines to act on the grounds that something else will handle it,
+where that something else is the exact thing that has stopped. This is the
+"precondition copied from a neighbouring operation" shape: it is a correct
+precondition for the REDEEM this function used to be the only way to trigger,
+and it was carried onto the function as a whole.
+
+The cost is not hypothetical. Live mainnet bid 000000006a9c9d96...9bb980,
+2026-09-07: taker on LTC/XMR, both legs locked, counterparty gone, lock-refund
+tx confirmed on chain, waiting for the coin-A swipe that would pay this side
+the LTC it was buying. A transient Monero daemon outage tripped the (defective,
+see PATCH-29) RPC-error escalation and parked it in BID_ERROR. The supervisor's
+janitor (swap_bid.rs) POSTed pwndarecover on schedule, as designed -- and got
+`recovered: false` with the sentence above, every time, for seven hours. The
+swap survived only because the node happened to be restarted, which re-derives
+state from chain outside this code path entirely.
+
+The fix: when a refund IS in flight, put the bid back ON the timelock path
+instead of declining. The state restored is XMR_SWAP_SCRIPT_TX_PREREFUND, which
+is not a chosen state -- it is the one process_XMR_SWAP_A_LOCK_tx_spend sets on
+seeing exactly the fact this branch has just tested for (the coin-A lock spent
+into the lock-refund tx). The chain already justifies it; this only stops the
+engine having forgotten. No transaction is built, nothing is published, and the
+engine's own maturity checks decide what happens next, as they would have if
+the bid had never been parked.
+
+Still refused, unchanged: any bid not in BID_ERROR (Gate 1), and the chain-A
+REDEEM re-queue against a refunding bid -- that path is now unreachable for
+such a bid, which is what Gate 2 was protecting in the first place.
+
+Idempotent: calling it on a bid already at PREREFUND is a no-op reassertion of
+the state it is in.
+
+Not an upstream candidate: pwndaRecoverStalledBid is ours (PATCH-11).
+
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -7716,10 +7716,31 @@
+             # funds now. Re-queueing a redeem against it is the one genuinely
+             # unsafe thing this could do.
+             if TxTypes.XMR_SWAP_A_LOCK_REFUND in bid.txns:
++                # PWNDA-PATCH-30: ...and that redeem is exactly what is NOT
++                # done here. But this used to RETURN, on the reasoning that
++                # "the timelock path will complete it" -- false for the only
++                # bids that reach this function. Gate 1 has just established
++                # BID_ERROR, and BID_ERROR is the state in which the timelock
++                # path is NOT running: checkXmrBidState has no branch for it.
++                #
++                # So put the bid back on that path. PREREFUND is not a chosen
++                # state; it is what process_XMR_SWAP_A_LOCK_tx_spend sets on
++                # seeing the very fact this branch tested for. Nothing is
++                # built and nothing is published -- the engine's own CSV
++                # maturity checks decide what happens next.
++                bid.setState(BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND)
++                self.activateBid(cursor, bid)
++                self.saveBidInSession(bid_id, bid, cursor, xmr_swap)
++                self.commitDB()
++                self.log.info(
++                    f"PWNDA-PATCH-30: returned stalled bid {self.log.id(bid_id)} "
++                    f"to the timelock path (was {state_before})."
++                )
+                 return {
+-                    "recovered": False,
+-                    "state": state_before,
+-                    "reason": "A refund is already in flight for this swap; the timelock path will complete it.",
++                    "recovered": True,
++                    "state_before": state_before,
++                    "state": strBidState(bid.state),
++                    "reason": "A refund is in flight. The swap has been put back on the timelock path so the node drives it again.",
+                 }
+             # PWNDA-PATCH-27 -- Gate 2b: the engine's own record says the
+             # chain-A redeem was PUBLISHED. When the chain agrees (>= 1

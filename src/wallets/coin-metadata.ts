@@ -376,5 +376,25 @@ const ASSET_RANK: ReadonlyMap<string, number> = new Map(
  * caller should add a stable secondary key (e.g. `localeCompare`).
  */
 export function assetRank(ticker: string): number {
-  return ASSET_RANK.get(ticker.toUpperCase()) ?? Number.MAX_SAFE_INTEGER;
+  const key = ticker.toUpperCase();
+  const direct = ASSET_RANK.get(key);
+  if (direct !== undefined) return direct;
+
+  // Per-(symbol, network) leg keys — `USDC-ARB`, `USDT0-POL` — rank as their
+  // SYMBOL. Without this they fell through to MAX_SAFE_INTEGER and happened
+  // to land last, which looked right for stablecoins and was luck: they were
+  // sorting as UNKNOWN, indistinguishable from a typo, and would have moved
+  // the moment anything else unknown appeared beside them. `USDT0` also has
+  // no rank row of its own, so it resolves through `USDT` here rather than
+  // needing a second entry in the canonical order.
+  const dash = key.indexOf("-");
+  if (dash > 0) {
+    const bySymbol = ASSET_RANK.get(key.slice(0, dash));
+    if (bySymbol !== undefined) return bySymbol;
+    // `USDT0-ARB` -> `USDT0` has no row; fall back to the stable it is.
+    const trimmed = key.slice(0, dash).replace(/0$/, "");
+    const byBase = ASSET_RANK.get(trimmed);
+    if (byBase !== undefined) return byBase;
+  }
+  return Number.MAX_SAFE_INTEGER;
 }

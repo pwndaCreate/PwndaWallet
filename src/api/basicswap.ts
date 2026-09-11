@@ -128,6 +128,19 @@ export interface SidecarStatus {
   /** Set when this session started with a different seed than the one that
    *  created the datadir. While set, account-key sharing is refused. */
   seedMismatch?: { datadirSeed: string; sessionSeed: string } | null;
+  /**
+   * True when this node's Particl chain was synced on the old full-index
+   * layout, so it keeps ~2.9 GB where a new install uses ~1.3 GB.
+   *
+   * particl-core cannot drop `txindex`/`spentindex` from a chain already synced
+   * with them, so this is not a setting the wallet can flip — it is a fact about
+   * the datadir, and reclaiming the space needs a fresh Particl sync. Surfaced
+   * only so the gap between the wizard's quoted footprint and what is actually
+   * on disk has an explanation; nothing acts on it automatically.
+   *
+   * Absent (undefined) on a status from a build that predates the flag.
+   */
+  particlUnpruned?: boolean;
 }
 
 /**
@@ -454,7 +467,26 @@ export interface BasicSwapBidDetail {
    * wall clock would promise a refund earlier than the chain will allow it.
    */
   coin_a_lock_refund_tx_est_final?: number | null;
-  /** The chain's median time, the clock the lock above is measured against. */
+  /**
+   * Unix seconds: the earliest the chain-A lock-refund output can be SWIPED —
+   * the *second* timelock, and the one that matters once the pre-refund tx is
+   * already in chain (`XMR_SWAP_SCRIPT_TX_PREREFUND`).
+   *
+   * `coin_a_lock_refund_tx_est_final` above is the FIRST deadline and is
+   * already in the past by the time a bid reaches state 14, so a screen that
+   * renders only that one has no deadline left to show at exactly the point
+   * the user most wants one. Missing from this interface until 2026-09-08,
+   * when a live bid sat in state 14 for 28 hours with nothing on screen saying
+   * when it would end.
+   *
+   * Measured against `coin_a_last_median_time`, never wall clock — see the
+   * note on the field above. The engine's own gate is literally
+   * `chain_mtp >= coin_mtp + lock_value`
+   * (`interface/btc/btc.py::isCsvLockMature`), and this field is the
+   * right-hand side of it.
+   */
+  coin_a_lock_refund_swipe_tx_est_final?: number | null;
+  /** The chain's median time, the clock the locks above are measured against. */
   coin_a_last_median_time?: number | null;
   /** True when the on-chain roles are mirrored (scriptless `coin_from`). */
   reverse_bid: boolean;

@@ -33,8 +33,8 @@ import { useEffect, useRef, useState } from "react";
 import { Backdrop, Stat } from "../swap/modal-parts";
 import { Btn } from "../../components/PrimitivesV2";
 import { swapSidecarRecoverBid } from "../../api/basicswap";
-import { BID_STATE_IDS } from "./bidStates";
-import type { BidSeverity } from "./bidStates";
+import { BID_STATE_IDS, nodeProseIsOtherLegsStory, swapLegOf } from "./bidStates";
+import type { BidSeverity, SwapLeg } from "./bidStates";
 import type {
   SidecarSwapState,
   SidecarTrackedSwap,
@@ -196,7 +196,7 @@ function RecoveryPanel({
           r.settled
             ? `Settled. Your claim on the other chain was already confirmed${
                 r.confirmations ? ` (${r.confirmations} confirmations)` : ""
-              } — the swap node had lost track of it, not the coins. It is now marked Completed.`
+              }. The swap node had lost track of it, not the coins. Now marked Completed.`
             : r.recovered
               ? `Restarted. The swap node will retry the claim${
                   r.retryInSeconds ? ` in about ${r.retryInSeconds}s` : ""
@@ -224,10 +224,7 @@ function RecoveryPanel({
     >
       <div style={{ ...LABEL, color: "var(--warn)" }}>try to restart it</div>
       <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
-        The swap node stopped following this swap. That often means the step it
-        was on had already succeeded on-chain and it could not tell. Restarting
-        asks it to look again — it does not send anything or move any coins, and
-        it cannot spend twice.
+        Asks the node to look again. It sends nothing and moves no coins.
       </div>
       {result && (
         <div
@@ -242,7 +239,7 @@ function RecoveryPanel({
       )}
       <div style={{ marginTop: 10 }}>
         <Btn variant="ghost" caret={false} disabled={busy} onClick={run}>
-          {busy ? "Restarting…" : "Restart this swap"}
+          {busy ? "Restarting" : "Restart this swap"}
         </Btn>
       </div>
     </div>
@@ -315,6 +312,9 @@ function Body({
   // emphatically not the "abandon" the console offers, which would stop the
   // node driving the very recovery that returns the coins.
   const lockedAndWaiting = counterpartyHoldsLockedFunds(swap.detail);
+  const leg = swapLegOf(swap.detail);
+  const refunding = refundStage(swap.detail, leg);
+  const onSwipeTimelock = awaitingSwipe(swap.detail, leg);
 
   return (
     <>
@@ -344,9 +344,17 @@ function Body({
               {formatElapsed(elapsed)}
             </div>
           </div>
+          {/* The ETA window describes the HAPPY arc, and only that. Once a
+              swap is on the timelock path its duration is set by a CSV lock,
+              not by four confirmations, and quoting "usually 20 to 40 min"
+              beside 51 hours elapsed is a comparison to nothing. That is
+              exactly what the live 2026-09-08 bid showed. Off-arc, the clock
+              is just a clock, and the panels below own the deadline. */}
           {!stage.terminal && (
             <div style={{ ...NOTE, textAlign: "right", maxWidth: "62%" }}>
-              {etaSentence(elapsed, window)}
+              {onArc
+                ? etaSentence(elapsed, window)
+                : "Time since you placed this swap. The deadline that ends it is below."}
             </div>
           )}
         </div>
@@ -365,8 +373,7 @@ function Body({
         {confirming && (
           <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
             Waiting for the other chain's lock to reach {confirming.needed}{" "}
-            confirmations — {confirming.have} so far. The node retries on its
-            own; nothing is stuck.
+            confirmations. {confirming.have} so far.
           </div>
         )}
         {pausing && (
@@ -383,6 +390,78 @@ function Body({
         <RecoveryPanel swap={swap} onRefresh={state.refresh} />
       )}
 
+      {/* Only the FINISHED refund gets its own block. While it is running the
+          "current step" panel directly above already says "Refunding" and what
+          to do, and two panels repeating one fact is what made this screen a
+          wall of text. */}
+      {refunding === "done" && (
+        <div
+          style={{
+            ...PANEL,
+            borderColor:
+              refunding === "done"
+                ? "rgba(0,255,102,0.45)"
+                : "rgba(255,170,0,0.4)",
+          }}
+          data-refund-stage={refunding}
+        >
+          <div
+            style={{
+              ...LABEL,
+              color: refunding === "done" ? "var(--success)" : "var(--warn)",
+            }}
+          >
+            {refunding === "done"
+              ? "refund complete. your coins are back"
+              : "refund running now"}
+          </div>
+          <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
+            {refunding === "done"
+              ? "Your coins came back. Nothing outstanding."
+              : "Your coins come back automatically. Keep the app open until it finishes."}
+          </div>
+        </div>
+      )}
+
+      {/* State 14 on the scriptless leg. The counterparty's lock has moved
+          into the refund script and THIS side's coin has not moved at all, so
+          the one thing worth saying is which of two things happens next and
+          when. Both outcomes return value; neither needs the user to act. */}
+      {onSwipeTimelock && (
+        <div
+          style={{ ...PANEL, borderColor: "rgba(255,170,0,0.4)" }}
+          data-swipe-timelock
+        >
+          <div style={{ ...LABEL, color: "var(--warn)" }}>
+            the timelock is unwinding this swap
+          </div>
+          <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
+            The other user moved their side into the refund script and stopped.
+            Your {swap.sendCoin} has not moved and is still locked. One of two
+            things ends this, and your node drives both:
+          </div>
+          <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
+            They take their {swap.receiveCoin} back, which releases the key
+            share your node needs to bring your {swap.sendCoin} home. Or the
+            deadline below passes first, and your node takes their{" "}
+            {swap.receiveCoin} instead. Either way you end up with coins.
+          </div>
+          <div style={{ marginTop: 8 }}>
+            <Stat
+              k="deadline passes"
+              v={swipeDeadlineLabel(swap.detail)}
+            />
+          </div>
+          <div style={{ ...NOTE, marginTop: 6 }}>
+            Measured against the chain's own clock, which runs behind real
+            time. <strong>This needs the app open to happen.</strong> Your node
+            publishes the transaction itself, but only while it is running. Do
+            not abandon the swap: that stops the node driving the very step
+            that ends it.
+          </div>
+        </div>
+      )}
+
       {lockedAndWaiting && (
         <div
           style={{ ...PANEL, borderColor: "rgba(255,170,0,0.4)" }}
@@ -394,9 +473,8 @@ function Body({
           <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
             Both sides locked their funds, and the other user has not released
             theirs. This is the one case where a swap is waiting on somebody
-            rather than on a chain — and the protocol already has the answer:
-            the refund that returns your coins was signed before either side
-            locked anything.
+            rather than on a chain. The refund that returns your coins was
+            signed before either side locked anything.
           </div>
           <div style={{ marginTop: 8 }}>
             <Stat
@@ -405,10 +483,12 @@ function Body({
             />
           </div>
           <div style={{ ...NOTE, marginTop: 6 }}>
-            Measured against the chain's own clock, which runs behind real time.
-            Nothing for you to do: this node publishes the refund itself and
-            resumes after a restart. Leave the swap alone — do not abandon it,
-            which would stop the node driving the recovery.
+            Measured against the chain's own clock, which runs behind real
+            time. <strong>The refund needs this app open to happen.</strong> The
+            node publishes it itself, but only while it is running. If the
+            deadline passes while the app is closed, nothing moves until you
+            reopen it. Do not abandon the swap: that stops the node driving the
+            recovery.
           </div>
         </div>
       )}
@@ -421,12 +501,12 @@ function Body({
           <div style={LABEL}>no funds moved</div>
           <div style={{ ...NOTE, marginTop: 6, color: "var(--text)" }}>
             The other user never accepted, so this bid closed on its own. Your
-            coins were never committed — nothing to recover.
+            coins were never committed. Nothing to recover.
           </div>
           <div style={{ ...NOTE, marginTop: 6 }}>
             That offer and its maker are now skipped for{" "}
             {Math.round(COOLDOWN_MS / 60000)} minutes, so quoting again reaches
-            a different one. They are not blocked — the skip expires by itself.
+            a different one. They are not blocked. The skip expires by itself.
           </div>
         </div>
       )}
@@ -466,34 +546,27 @@ function Body({
         <Stat k="you receive" v={`${swap.receiveAmount} ${swap.receiveCoin}`} />
         <Stat k="bid id" v={shortId(swap.bidId)} />
         <Stat k="offer id" v={shortId(swap.offerId)} />
-        {swap.detail?.state_description && (
-          <div style={{ ...NOTE, marginTop: 4 }}>
-            Swap node detail: {swap.detail.state_description}
-          </div>
-        )}
+        {/* The node's raw sentence is good diagnostics right up until it is
+            the OTHER leg's story, at which point it contradicts the label four
+            lines above it. On 2026-09-08 this panel would have read "Settled
+            by the timelock ... It is in your wallet" over "Swap node detail:
+            Swap failed, the other party claimed the refund", on a bid that had
+            just been paid. */}
+        {swap.detail?.state_description &&
+          !nodeProseIsOtherLegsStory(swap.detail.bid_state_ind, leg) && (
+            <div style={{ ...NOTE, marginTop: 4 }}>
+              Swap node detail: {swap.detail.state_description}
+            </div>
+          )}
       </div>
 
       {/* Refund copy, shown while the swap is still in flight rather than only
           once it happens. A user who first meets the word "refund" at the
           moment their swap ends reads it as something going wrong. */}
-      {!stage.terminal && (
-        <div style={PANEL}>
-          <div style={LABEL}>if the other user walks away</div>
-          <div style={NOTE}>
-            The timelock returns your funds to the swap node's wallet
-            automatically. That is a normal outcome of this protocol, not an
-            error, and no coins are lost. You do not have to be here for it —
-            the node runs the timer itself and resumes after a restart.
-          </div>
-        </div>
-      )}
-
       <div style={PANEL}>
         <div style={LABEL}>updates</div>
         <div style={NOTE}>
-          {state.transport === "websocket"
-            ? "Live — connected to the swap node's event feed, with a background check every 15 seconds as a backstop."
-            : "Checking the swap node every 15 seconds. The live event feed is not connected, which slows updates but changes nothing about the swap."}
+          {state.transport === "websocket" ? "Live." : "Checking every 15s."}
           {swap.lastPolledAt
             ? ` Last checked ${agoSentence(swap.lastPolledAt)}.`
             : " Waiting for the first check."}
@@ -517,7 +590,7 @@ function Body({
           disabled={state.checking}
           onClick={state.refresh}
         >
-          {state.checking ? "Checking…" : "Check now"}
+          {state.checking ? "Checking" : "Check now"}
         </Btn>
         <Btn variant="accent" full caret={false} onClick={state.closeTracker}>
           {stage.terminal ? "Done" : "Run in background"}
@@ -525,8 +598,8 @@ function Body({
       </div>
       {!stage.terminal && (
         <div style={{ ...NOTE, marginTop: 8, textAlign: "center" }}>
-          Closing this does not stop the swap. It takes 30 to 90 minutes and
-          continues whether or not the wallet is open.
+          Closing this box is fine. Closing the wallet stops the swap node,
+          and anything waiting on a timelock waits until you open it again.
         </div>
       )}
     </>
@@ -570,6 +643,63 @@ export function confirmationsFromEvents(
  * 19:12 and then nothing for over an hour, with
  * `coin_a_lock_refund_tx_est_final` a day out.
  */
+/**
+ * Has the refund actually STARTED, and how far has it got?
+ *
+ * `counterpartyHoldsLockedFunds` covers the wait. This covers what happens
+ * next, and the gap between them was real: the moment a swap left state 11 the
+ * whole reassuring panel vanished and the user saw nothing at all about the
+ * refund that was, at that second, executing on chain. Observed live on bid
+ * `000000006a9c9d96…` at 23:43 on 2026-09-06.
+ *
+ *   14 SCRIPT_TX_PREREFUND   the scripted leg has moved into the pre-refund tx
+ *   16 NOSCRIPT_TX_RECOVERED the scriptless coin — yours — is back
+ *   17 FAILED_REFUNDED       swap over, funds refunded
+ *   18 FAILED_SWIPED         swap over, funds swiped back
+ */
+export type RefundStage = "running" | "done" | null;
+
+export function refundStage(
+  detail: { bid_state_ind?: number | null } | null | undefined,
+  leg: SwapLeg = "unknown",
+): RefundStage {
+  const s = detail?.bid_state_ind;
+  if (s === BID_STATE_IDS.XMR_SWAP_SCRIPT_TX_PREREFUND) return "running";
+  if (
+    s === BID_STATE_IDS.XMR_SWAP_NOSCRIPT_TX_RECOVERED ||
+    s === BID_STATE_IDS.XMR_SWAP_FAILED_REFUNDED
+  ) {
+    return "done";
+  }
+  // FAILED_SWIPED is a refund only for the side that LOST the scripted leg.
+  // On the scriptless leg this node is the swiper — it was paid the coin it
+  // was buying — and "refund complete, your coins are back" would name the
+  // wrong coin and the wrong event. That side gets `SwipePanel` instead.
+  if (s === BID_STATE_IDS.XMR_SWAP_FAILED_SWIPED) {
+    return leg === "scriptless" ? null : "done";
+  }
+  return null;
+}
+
+/**
+ * Is this the scriptless leg sitting on the second timelock?
+ *
+ * The one state where the old screen had nothing to say and the most to say.
+ * `counterpartyHoldsLockedFunds` (state 11) rendered a deadline panel; the
+ * instant the bid moved to 14 that panel vanished, and what replaced it was a
+ * single line asserting a refund that was not this side's refund. A live bid
+ * sat here for 28 hours.
+ */
+export function awaitingSwipe(
+  detail: { bid_state_ind?: number | null } | null | undefined,
+  leg: SwapLeg = "unknown",
+): boolean {
+  return (
+    leg === "scriptless" &&
+    detail?.bid_state_ind === BID_STATE_IDS.XMR_SWAP_SCRIPT_TX_PREREFUND
+  );
+}
+
 export function counterpartyHoldsLockedFunds(
   detail: { bid_state_ind?: number | null } | null | undefined,
 ): boolean {
@@ -602,7 +732,46 @@ export function refundDeadlineLabel(
   const median = detail?.coin_a_last_median_time;
   if (!median || !Number.isFinite(median) || median >= at) return stamp;
   const hours = Math.round((at - median) / 3600);
-  return `${stamp} — about ${hours}h of chain time away`;
+  return `${stamp}, about ${hours}h of chain time away`;
+}
+
+/**
+ * When the SECOND timelock matures and this node can take the counterparty's
+ * scripted coin, in the chain's own terms.
+ *
+ * Same clock discipline as {@link refundDeadlineLabel} — median-time-past, not
+ * wall clock — but a different field and a different deadline.
+ * `coin_a_lock_refund_tx_est_final` is behind us by the time this renders;
+ * `coin_a_lock_refund_swipe_tx_est_final` is the one the engine actually gates
+ * on (`chain_mtp >= coin_mtp + lock_value`, `interface/btc/btc.py:634`), and
+ * the field the API has always sent and this client never read.
+ *
+ * Minutes below two hours, because that is the range where the number is worth
+ * watching; hours above it, because "about 21h" is the honest resolution of an
+ * estimate built from a median of eleven block timestamps.
+ */
+export function swipeDeadlineLabel(
+  detail:
+    | {
+        coin_a_lock_refund_swipe_tx_est_final?: number | null;
+        coin_a_last_median_time?: number | null;
+      }
+    | null
+    | undefined,
+): string {
+  const at = detail?.coin_a_lock_refund_swipe_tx_est_final;
+  if (!at || !Number.isFinite(at)) return "as soon as the chain allows it";
+  const stamp =
+    new Date(at * 1000).toISOString().replace("T", " ").slice(0, 16) + " UTC";
+  const median = detail?.coin_a_last_median_time;
+  if (!median || !Number.isFinite(median)) return stamp;
+  if (median >= at) return `${stamp}, due now`;
+  const secs = at - median;
+  if (secs < 2 * 3600) {
+    const mins = Math.max(1, Math.round(secs / 60));
+    return `${stamp}, about ${mins} min of chain time away`;
+  }
+  return `${stamp}, about ${Math.round(secs / 3600)}h of chain time away`;
 }
 
 function stepLabel(step: (typeof ARC)[number]): string {
@@ -623,7 +792,7 @@ function stepLabel(step: (typeof ARC)[number]): string {
 }
 
 function shortId(id: string): string {
-  if (!id) return "—";
+  if (!id) return "unknown";
   return id.length <= 18 ? id : `${id.slice(0, 8)}…${id.slice(-6)}`;
 }
 

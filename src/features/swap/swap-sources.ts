@@ -24,6 +24,8 @@ import {
 } from "./safety-invariants";
 import { httpProxyCall, proxyGetJson, proxyPostJson } from "../../wallets/_proxy";
 import { decodeCashAddr } from "../../wallets/bch-wallet";
+import { atomicToDecimal } from "../../wallets/decimal-amount";
+import type { ChainType } from "../../wallets/types";
 
 // ─── Solana ─────────────────────────────────────────────────────
 
@@ -1297,6 +1299,88 @@ export async function executeCardanoTransfer(args: {
     amountLovelace: lovelace,
   });
   return { txHash: result.txHash };
+}
+
+// ─── XRP + Tron sources — TS-signed, not Rust ───────────────────
+
+/**
+ * Submit a NEAR Intents deposit through one of the wallet's own chain
+ * adapters, for the chains whose signing lives in TypeScript rather than the
+ * Rust core.
+ *
+ * # Why one helper instead of a branch per chain
+ *
+ * XRP, native TRX and TRC-20 USDT reach the network by three different
+ * routes — `xrpl`'s `submitAndWait`, Tron's `createtransaction`, and Tron's
+ * `triggersmartcontract` — but the wallet already hides all three behind the
+ * identical `ChainAdapter.sendTransaction(privateKey, to, amount)`. That is
+ * the same call the dashboard Send button makes, so a swap deposit and a
+ * manual send take one code path and cannot drift apart.
+ *
+ * The chain is selected by `chainKey`, which is the asset's
+ * `walletsByChainKey`. That is what separates `TRX` from `USDT-TRON`: both
+ * are `chainKind: "TRON"`, both sign with secp256k1 over a node-assigned
+ * txID, and they differ only in which adapter builds the transaction.
+ *
+ * # The units hazard this function exists to contain
+ *
+ * 1Click states `quote.amountIn` in ATOMIC units (drops, sun). Every adapter
+ * here takes DISPLAY units and scales internally. Getting that wrong does not
+ * throw; it silently sends the wrong amount of someone's money, and a factor
+ * of 1e6 in the wrong direction is not a rounding error.
+ *
+ * So the conversion is done once, here, with {@link atomicToDecimal} — exact
+ * string arithmetic over a bigint, no float anywhere on the path. A
+ * `Number(atomic) / 1e6` would be correct for small amounts and start
+ * dropping digits above 2^53 atomic units, which is 9 billion XRP: not
+ * reachable, but the same expression is what a future 18-decimal chain would
+ * inherit, and there it fails at 9 tokens.
+ */
+export async function executeAdapterTransfer(args: {
+  /** The asset's `walletsByChainKey` — `"xrp"`, `"tron"`, `"usdt-tron"`. */
+  chainKey: ChainType;
+  /** Hex private key for the source chain. */
+  privateKey: string;
+  /** 1Click deposit address. */
+  depositAddress: string;
+  /** Atomic units as a decimal string, straight from `quote.amountIn`. */
+  amountAtomic: string;
+  /** Atomic-unit exponent for this asset (6 for XRP, TRX and USDT-TRON). */
+  decimals: number;
+  /** For error copy only. */
+  ticker: string;
+}): Promise<{ txHash: string }> {
+  const atomic = atomicStringToBigInt(args.amountAtomic);
+  if (atomic <= 0n) {
+    throw new Error(
+      `${args.ticker} amount must be positive (got ${args.amountAtomic}).`,
+    );
+  }
+  if (!args.privateKey) {
+    throw new Error(
+      `${args.ticker} source swap needs the ${args.ticker} private key. Open ` +
+        `the ${args.ticker} chain in the dashboard so the wallet is derived, ` +
+        `then retry.`,
+    );
+  }
+  const display = atomicToDecimal(atomic, args.decimals);
+  const { getAdapter } = await import("../../wallets");
+  const adapter = getAdapter(args.chainKey);
+  if (!adapter) {
+    throw new Error(
+      `No wallet adapter registered for ${args.chainKey}; ${args.ticker} ` +
+        `cannot be a swap source in this build.`,
+    );
+  }
+  const result = await adapter.sendTransaction(
+    args.privateKey,
+    args.depositAddress,
+    display,
+  );
+  if (!result?.hash) {
+    throw new Error(`${args.ticker} deposit did not return a transaction id.`);
+  }
+  return { txHash: result.hash };
 }
 
 // ─── shared helpers ─────────────────────────────────────────────

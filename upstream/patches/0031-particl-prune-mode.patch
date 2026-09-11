@@ -1,0 +1,104 @@
+Grove PATCH-31: let the Particl conf be generated pruned
+
+BasicSwap writes `spentindex=1` + `txindex=1` into every Particl conf it
+generates. Those two lines serve exactly one thing the engine does: swaps in
+which PART ITSELF is a leg. `getrawtransaction` by txid (basicswap.py, the
+`if coin_from == Coins.PART:  # Has txindex` branch) needs txindex, and
+`checkForSpends` -> `getspentinfo` needs spentindex. Every other coin watches
+its own leg through the index-free path in interface/btc/btc.py, which upstream
+built because BTC/LTC/DOGE/DASH/BCH are pruned by upstream's own defaults:
+`getLockTxHeight` prefers `gettxout` (a UTXO-set lookup, never pruned) and the
+generic spend loop already carries a "Block not available (pruned data)"
+handler that jumps to pruneheight.
+
+SMSG -- the reason particld is mandatory at all -- needs none of it. Measured
+against particl-core master: there is no txindex reference anywhere in
+src/smsg/, its keys live in SMSG's own database (CSMSG::ImportPrivkey ->
+SecMsgDB.WriteKey), it starts with or without a wallet, and its only chain
+reads are tip-shaped (GetSmsgDifficulty / GetSmsgFeeRate against ActiveChain,
+plus the IsInitialBlockDownload gate in ReceiveData/SendData). Block bodies are
+read only under -smsgscanchain, which is off by default.
+
+So an installation that never trades PART pays for two indexes it cannot use,
+and pays in the one currency that matters for a desktop wallet: it cannot
+prune. particl-core refuses -prune alongside -txindex/-spentindex
+(init.cpp:1130, :1136-1140). Measured on this branch, mainnet at height
+2,239,559:
+
+    unpruned, with both indexes        2.9 GB
+      blocks 1.77 GB, blocks/index 1.1 GB, txindex 136 MB, chainstate 30 MB
+    prune=550, no indexes              1.15 GB
+      blocks 330 MiB, blocks/index 766 MB, chainstate 66 MB
+
+and the pruned node still retained 475,213 blocks (~1.8 years, pruneheight
+1,764,346), against a maximum swap lock window of 96 hours. SMSG was verified
+working on the pruned node: 479 messages across 13 buckets, 16 SMSG peers.
+
+Why this has to be here rather than in a caller's config rewrite: prepare
+STARTS the daemon (initialise_wallets), so a conf fixed up after prepare
+returns is already too late. particld aborts before the wallet exists:
+
+    You need to rebuild the database using -reindex to change -spentindex.
+    This will redownload the entire blockchain.
+    Aborted block database rebuild. Exiting.
+
+That is the observed failure when a datadir carrying a pruned chain (a restored
+snapshot) meets a generated conf that asks for the indexes. The same abort
+happens in reverse on a fresh datadir: prepare's brief daemon run creates the
+index, and stripping the conf lines afterwards makes the NEXT start refuse.
+Generating the conf correctly is the only ordering that works.
+
+Opt-in and off by default, so upstream behaviour is unchanged unless asked:
+
+    PART_PRUNE=<MiB>   >=550 : write prune=<MiB>, omit both index lines
+                       unset : upstream behaviour, both indexes, no prune
+
+550 is particl-core's own floor (MIN_DISK_SPACE_FOR_BLOCK_FILES). A value below
+it is rejected loudly rather than clamped, because a clamp would let a caller
+believe it had configured something it had not. PART_PRUNE=0 is accepted as an
+explicit "archival, no pruning" and takes the upstream path.
+
+Non-goal: making PART-leg swaps work on a pruned node. They do not, and this
+patch does not pretend otherwise -- with the indexes gone, the PART branches
+raise and the swap times out (funds are safe; the timelocks refund). Routing
+PART through the same index-free path BTC already uses is a separate change.
+PART_ANON / PART_BLIND are outside that path entirely and were not assessed.
+
+diff --git a/basicswap/interface/part/core.py b/basicswap/interface/part/core.py
+index e101b86a..842820f6 100644
+--- a/basicswap/interface/part/core.py
++++ b/basicswap/interface/part/core.py
+@@ -120,8 +120,31 @@ class PARTPrepare(CoinPrepareModule):
+             except Exception as e:  # noqa: F841
+                 raise ValueError("zmqsecret must be base64 encoded")
+             fp.write(f"serverkeyzmq={zmqsecret}\n")
+-        fp.write("spentindex=1\n")
+-        fp.write("txindex=1\n")
++        # PWNDA-PATCH-31: PART_PRUNE=<MiB> generates a pruned, index-less conf.
++        # spentindex/txindex serve PART-as-a-swap-leg only, and particl-core
++        # refuses -prune alongside either (init.cpp:1130). An installation that
++        # uses Particl purely as SMSG transport pays 2.9 GB for capabilities it
++        # never calls; pruned it is 1.15 GB and still retains ~1.8 years of
++        # blocks against a 96 h maximum lock window.
++        #
++        # This must be decided HERE, at conf generation: prepare starts the
++        # daemon to initialise wallets, so a later rewrite is already too late
++        # ("You need to rebuild the database using -reindex to change
++        # -spentindex. ... Aborted block database rebuild. Exiting.").
++        part_prune = os.getenv("PART_PRUNE", "")
++        prune_mib = int(part_prune) if part_prune.strip() else 0
++        if prune_mib and prune_mib < 550:
++            # Loud rather than clamped: a clamp lets a caller believe it
++            # configured something it did not.
++            raise ValueError(
++                "PART_PRUNE must be at least 550 (particl-core's own "
++                f"MIN_DISK_SPACE_FOR_BLOCK_FILES); got {prune_mib}"
++            )
++        if prune_mib:
++            fp.write(f"prune={prune_mib}\n")
++        else:
++            fp.write("spentindex=1\n")
++            fp.write("txindex=1\n")
+         fp.write("staking=0\n")
+         self.writeRpcAuth(fp, salt)
+ 

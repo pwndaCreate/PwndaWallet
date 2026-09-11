@@ -36,6 +36,7 @@ import type {
 } from "../../lib/proxy-types";
 import {
   parseMinAtomicFromUpstreamError,
+  parseMinUsdFromUpstreamError,
   setPairMinimum,
   type PairMinEntry,
 } from "./intents-pair-min-cache";
@@ -107,6 +108,80 @@ export function dollarAmountAtomic(
   // For high-decimal tokens (NEAR=24, FLR=18) shift the rest in BigInt.
   const extra = token.decimals - 15;
   return (BigInt(scaled) * 10n ** BigInt(extra)).toString();
+}
+
+/**
+ * Headroom over a stated dollar floor, when converting it to an amount of
+ * the source asset.
+ *
+ * The floor is enforced on the swap's USD value as 1Click prices it, at the
+ * moment of the request, against a price that moves between our conversion
+ * and their check. Landing exactly on the line is landing on the wrong side
+ * of it: probed live 2026-09-09, $1,000.00 of USDC on Polygon was refused
+ * and $1,009.95 quoted. So MIN offers a size that actually fills, and the
+ * copy says "about" and quotes the bridge's own figure as the real rule.
+ */
+const USD_FLOOR_HEADROOM = 1.02;
+
+/**
+ * Significant digits kept when a dollar floor is converted to an amount of
+ * the source asset.
+ *
+ * `$1,000 x 1.02 / $38.6` is `26.49776747216676` AVAX, and eighteen decimal
+ * places of a number we rounded up from a price tick reads as a precision
+ * that is not there. Four digits says `26.5`.
+ *
+ * Rounding UP is what makes this safe to do at all: the result stays above
+ * the floor, so it is still a floor, and MIN still fills a size that quotes.
+ * Rounding to nearest would sometimes land under it and turn the preset into
+ * a button that reliably produces a refusal.
+ */
+const USD_FLOOR_SIG_DIGITS = 4;
+
+/** Round an atomic amount UP to `sig` significant digits. */
+function roundUpToSignificant(atomic: string, sig: number): string {
+  const v = BigInt(atomic);
+  const digits = v.toString().length;
+  if (digits <= sig) return atomic;
+  const scale = 10n ** BigInt(digits - sig);
+  const q = v / scale;
+  return ((v % scale === 0n ? q : q + 1n) * scale).toString();
+}
+
+/**
+ * Learn a dollar denominated floor from an upstream rejection and cache it
+ * as an amount of the SOURCE asset.
+ *
+ * Called wherever `parseMinAtomicFromUpstreamError` gives up, which is the
+ * right place for it: a message carrying a dollar figure and no atomic one
+ * is precisely the case the atomic parser is now built to refuse.
+ *
+ * Returns the entry's atomic string on success, null when the message names
+ * no dollar floor or the source asset has no cached price to convert with.
+ * A null keeps the cache empty rather than guessing, same contract as the
+ * atomic path.
+ */
+export function learnUsdLimitFromError(args: {
+  message: string;
+  fromAsset: NearIntentsToken;
+  toAsset: NearIntentsToken;
+}): string | null {
+  const usd = parseMinUsdFromUpstreamError(args.message);
+  if (!usd) return null;
+  const raw = dollarAmountAtomic(
+    args.fromAsset,
+    Number(usd) * USD_FLOOR_HEADROOM,
+  );
+  // "0" is `dollarAmountAtomic`'s no-price answer. Caching it would make
+  // `belowMinimum` compare against zero and pass everything, which reads as
+  // "no limit" on a screen where there certainly is one.
+  if (raw === "0") return null;
+  const atomic = roundUpToSignificant(raw, USD_FLOOR_SIG_DIGITS);
+  setPairMinimum(args.fromAsset.assetId, args.toAsset.assetId, atomic, {
+    source: "usd-limit",
+    usdFloor: usd,
+  });
+  return atomic;
 }
 
 /**
@@ -278,6 +353,16 @@ export async function probeExactInputFallback(args: {
       });
       return { minAtomicIn: parsed, probesUsed };
     }
+    // No atomic floor in the message. It may still name a DOLLAR one, which
+    // is what the HOT Omni Bridge assets answer with (2026-09-09). Learning
+    // it here is what makes the hint appear on pair selection instead of
+    // after the user types an amount and watches a quote get refused.
+    const usdLearned = learnUsdLimitFromError({
+      message: errorMessage,
+      fromAsset: args.fromAsset,
+      toAsset: args.toAsset,
+    });
+    if (usdLearned) return { minAtomicIn: usdLearned, probesUsed };
     // Unparseable rejection at this level — try the next rung, if any.
   }
   return null;
@@ -545,6 +630,16 @@ export async function probePairFloor(args: {
         });
         return { minAtomicIn: parsed, probesUsed };
       }
+      // A dollar floor names the answer outright, so climbing the ladder can
+      // only rediscover it one call at a time. Take it and stop: on the HOT
+      // Omni Bridge assets the floor sits near $1,000 and this ladder starts
+      // three orders of magnitude below it.
+      const usdLearned = learnUsdLimitFromError({
+        message: lastMessage,
+        fromAsset: args.fromAsset,
+        toAsset: args.toAsset,
+      });
+      if (usdLearned) return { minAtomicIn: usdLearned, probesUsed };
       // Unparseable: too small to route at all (every pair answers this at one
       // atomic unit). Ask for more.
       size *= BigInt(FLOOR_PROBE_STEP);
@@ -626,6 +721,15 @@ export async function bisectExactInputMinimum(args: {
       setPairMinimum(args.fromAsset.assetId, args.toAsset.assetId, parsed, { source: "probe" });
       return { minAtomicIn: parsed, probesUsed };
     }
+    // A dollar denominated limit refuses every rung a bisection could try,
+    // so there is nothing to bisect: convert it and stop. Without this the
+    // whole ladder burns its probe budget re-reading the same sentence.
+    const usdLearned = learnUsdLimitFromError({
+      message: first,
+      fromAsset: args.fromAsset,
+      toAsset: args.toAsset,
+    });
+    if (usdLearned) return { minAtomicIn: usdLearned, probesUsed };
     return null;
   }
   while (probesUsed < maxProbes && hi - lo > 1n) {

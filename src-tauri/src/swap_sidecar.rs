@@ -621,6 +621,23 @@ pub struct SidecarStatus {
     /// because from its side nothing changed — so "is this MY engine?" cannot be
     /// answered from the coin status alone.
     pub swap_seed_fingerprint: Option<String>,
+    /// True when this datadir's Particl chain was synced on the OLD full-index
+    /// layout, so Option A's `prune=` cannot engage on it.
+    ///
+    /// A3. Detection only — nothing here deletes a chain. `-prune` and
+    /// `txindex`/`spentindex` are mutually exclusive in particl-core, and a
+    /// chain already synced with the indexes cannot have them removed in place
+    /// (`init.cpp:2302`, "best block of the index goes beyond pruned data"), so
+    /// an existing install keeps its ~2.9 GB until someone chooses to re-sync
+    /// into a fresh datadir. Silence would be the wrong answer: the user would
+    /// read the wizard's new "about 1.5 GB" and see three times that on disk
+    /// with nothing explaining the gap.
+    ///
+    /// `false` also for "no chain yet" and "already pruned" — see
+    /// [`particl_chain_mode`]. It answers "is this node stuck on the old
+    /// layout", not "is this node pruned".
+    #[serde(default)]
+    pub particl_unpruned: bool,
 }
 
 // =========================================================================
@@ -860,6 +877,9 @@ pub struct SidecarConfig {
     /// env/argv placement table in the interface contract, and R1 for why the
     /// argv exposure is bounded.
     pub particl_mnemonic: Option<Secret>,
+    /// Mirror of [`OptInRecord::archival_chain`], read once when the config is
+    /// built so the prepare env is a pure function of the config.
+    pub archival_chain: bool,
     /// C3 - the coins the user has enabled for the DEX, in
     /// [`WALLET_SIDECAR_COINS`] order and always including `particl`.
     ///
@@ -1168,6 +1188,50 @@ fn prepare_time_envs(cfg: &SidecarConfig) -> Vec<(String, String)> {
             "WALLET_ENCRYPTION_PWD".to_string(),
             pwd.expose().to_string(),
         ));
+    }
+    // Option A, and it has to be HERE rather than in a post-prepare rewrite.
+    // PWNDA-PATCH-31 makes upstream's Particl conf writer honour this, so the
+    // conf is generated pruned and index-less in the first place.
+    //
+    // The ordering is not a preference. `prepare` STARTS particld to
+    // initialise wallets, so a conf corrected after prepare returns is already
+    // too late — particld aborts with "You need to rebuild the database using
+    // -reindex to change -spentindex … Aborted block database rebuild." That
+    // was observed, not predicted: it is what a snapshot-seeded datadir did
+    // when prepare wrote the index lines over it (2026-09-09).
+    //
+    // Harmless on an unpatched runtime: `os.getenv` on a name nothing reads is
+    // a no-op, so a runtime one deploy behind simply keeps upstream behaviour.
+    // [`apply_particl_prune_policy`] is the belt-and-braces for that case and
+    // for configs generated before this existed.
+    // `0` is PWNDA-PATCH-31's explicit "archival, no pruning": it takes
+    // upstream's path and writes both index lines back. Sent rather than
+    // omitted so the value always says which node was asked for, instead of
+    // the absence of a variable meaning two different things.
+    envs.push((
+        "PART_PRUNE".to_string(),
+        if cfg.archival_chain {
+            "0".to_string()
+        } else {
+            PARTICL_PRUNE_MIB.to_string()
+        },
+    ));
+    // S0 (PWNDA-PATCH-32). ONLY when a chain is already on disk that prepare
+    // did not put there — i.e. a restored snapshot.
+    //
+    // `-1` skips the wallet's birthday scan. That is right for a wallet this
+    // process is about to derive (it has no history to find) and would be wrong
+    // for a chain the node synced itself, where upstream's default costs
+    // nothing because the wallet grew with the chain. Gating on the datadir
+    // rather than on a flag keeps the two in step: the condition IS the
+    // situation, not a claim about it.
+    //
+    // Without this, a restored snapshot cannot be brought up at all — the
+    // wallet either rescans 475,213 blocks past the engine's 10 s RPC timeout,
+    // or is created against an empty chain and ends up below `pruneheight`,
+    // where particld refuses to start.
+    if crate::snapshot::chain_awaiting_first_prepare(&cfg.datadir) {
+        envs.push(("PART_WALLET_SCAN_FROM".to_string(), "-1".to_string()));
     }
     envs
 }
@@ -2947,6 +3011,19 @@ pub struct OptInRecord {
     /// somebody who opted in once and swaps twice a year.
     #[serde(default)]
     pub autostart: bool,
+    /// Keep the full chain and both transaction indexes instead of pruning.
+    ///
+    /// A **one-time setup choice**, not a live toggle: particl-core cannot add
+    /// `txindex`/`spentindex` to a chain that was pruned, nor prune one that
+    /// has them, so this can only be honoured at the first prepare. Flipping it
+    /// afterwards would be a preference the node can never act on.
+    ///
+    /// Defaults to **false** — pruned — because the two indexes serve only
+    /// PART-as-a-swap-leg, which this wallet does not offer, and they cost
+    /// ~1.6 GB. Someone who wants to trade PART itself needs them, which is the
+    /// entire reason the choice exists.
+    #[serde(default)]
+    pub archival_chain: bool,
     /// Which wallet's seed created this engine datadir — see
     /// [`seed_fingerprint`]. `None` on installs prepared before this existed,
     /// which is treated as "unknown", never as "matches".
@@ -3215,6 +3292,33 @@ pub enum Adoption {
     /// swap node" when they are not.
     #[default]
     Deposit,
+}
+
+/// Does the pre-share balance gate apply to a coin in this adoption state?
+///
+/// The gate exists for ONE situation: the engine built this coin's wallet from
+/// its own seed, funds landed on those addresses, and installing the host's
+/// account key would make PWNDA-PATCH-3 discard the address table that watches
+/// them. That is real, and for `Deposit` / `HostWallet` it stays enforced.
+///
+/// [`Adoption::AccountKey`] is the one state where it cannot be true.
+/// It is VERIFIED, not intent: the engine was confirmed to have built this
+/// wallet from THIS host's account key. A re-push rebuilds the same table from
+/// the same key, and the balance the gate would call "stranded" is already in
+/// the user's own wallet. `swap_sidecar_push_account_keys` refuses outright
+/// when the session's seed differs from the datadir's, which is what makes
+/// "the same key" a fact rather than an assumption.
+///
+/// Pinned 2026-09-08. A share pass runs on every node start for every sharing
+/// coin, adopted ones INCLUDED -- and must, because PATCH-3 needs the key
+/// again to rebuild the wallet after a restart. With the gate applied
+/// unconditionally, a node with BTC, LTC and BCH all adopted and all funded
+/// produced three red errors on every start, telling the user to sweep back
+/// first. They could not: `sweepableCoins` excludes adopted coins on purpose,
+/// because for those a sweep is a fee-paying self-transfer. Gate said sweep,
+/// sweep list said nothing to sweep.
+pub fn balance_gate_applies(adoption: &Adoption) -> bool {
+    !matches!(adoption, Adoption::AccountKey)
 }
 
 /// One coin's explicit choice inside [`OptInRecord::coins`].
@@ -3564,15 +3668,24 @@ pub fn can_run_lean(coin: &str) -> bool {
 ///   ALL for these two (host-wallet-only, see [`WALLET_SIDECAR_COINS`]'s doc
 ///   comment), so they are zero unconditionally rather than only in one mode.
 ///
-/// **particl is the one coin that cannot be pruned**: its conf carries
-/// `txindex=1` + `spentindex=1` (`interface/part/core.py:123-124`), both
-/// required for swap validation.
+/// **particl is pruned like the rest** since Option A
+/// (`particl-pruned-node-and-snapshot-plan.md`): upstream's `txindex=1` +
+/// `spentindex=1` (`interface/part/core.py:123-124`) serve PART-as-a-swap-leg
+/// only, which this wallet never offers, so [`apply_particl_prune_policy`]
+/// strips them and writes `prune=`[`PARTICL_PRUNE_MIB`].
 ///
-/// Still order-of-magnitude budget figures, not measurements. UI copy must say
+/// Still order-of-magnitude budget figures, not measurements — **except
+/// particl**, whose row is a measurement (see below). UI copy must say
 /// "about" — [`crate::swap_sidecar`]'s footprint page carries the sourcing.
 const COIN_DISK_GB: &[(&str, f64)] = &[
-    // full chain + indexes, unpruneable
-    ("particl", 8.0),
+    // MEASURED 2026-09-08 on a synced `prune=550` probe: 1,155 MB — block
+    // files 330 MiB (oscillating to the 550 MiB target between prunes),
+    // block index 766 MB (headers + per-block records; unprunable and the
+    // real floor), chainstate 66 MB. Quoted 1.3 rather than 1.15 so the
+    // number stays true just BEFORE a prune fires, not only just after.
+    // Was 8.0 while the node ran unpruned, itself an over-estimate: the
+    // unpruned node measured 2.9 GB.
+    ("particl", 1.3),
     // prune=2000 MiB blocks + ~12 GB chainstate
     ("bitcoin", 15.0),
     // prune=4000 MiB + chainstate; zero in electrum mode (see est_disk_gb)
@@ -4555,9 +4668,14 @@ pub fn decide_mode_change(
     // on it and say something technically true and useless. "SMSG needs a full
     // node" is the reason a user can act on.
     if key == MANDATORY_COIN && mode == CoinMode::Lean {
+        // "synced", not "full": since Option A the node IS pruned (~1.3 GB),
+        // so saying it needs a full node would be a claim the install itself
+        // contradicts. What Lean cannot do is point SMSG at a third-party
+        // server — there is no light-client protocol for it to speak.
         return Err(
-            "particl carries the offer and bid transport (SMSG), which needs a full local node — \
-             it cannot run against a third-party server"
+            "particl carries the offer and bid transport (SMSG), which needs a local synced \
+             node — it cannot run against a third-party server. The node is pruned, so this \
+             is about a GB or so of disk, not the whole chain"
                 .to_string(),
         );
     }
@@ -5963,6 +6081,155 @@ fn conf_has_key(text: &str, key: &str) -> bool {
     text.lines().any(|l| l.trim_start().starts_with(&needle))
 }
 
+// =========================================================================
+// Particl pruning (Option A) — particl-pruned-node-and-snapshot-plan.md
+// =========================================================================
+
+/// Block-file budget for a pruned Particl node, in MiB.
+///
+/// 550 is particl-core's own floor (`MIN_DISK_SPACE_FOR_BLOCK_FILES`; a node
+/// started with it reports `prune_target_size` 576,716,800). It is not a
+/// compromise: a Particl block is ~250 bytes (one coinstake), so a measured
+/// probe at tip 2,239,559 still retained from height 1,764,346 — **475,213
+/// blocks, about 1.8 years**. Every swap lock window is 24-96 h, so the
+/// retained span is three orders of magnitude larger than anything the engine
+/// needs to look back at.
+pub const PARTICL_PRUNE_MIB: u64 = 550;
+
+/// The Particl daemon this build ships, as `scripts/fetch-swap-runtime.mjs`
+/// pins it.
+///
+/// Used to refuse a chain snapshot built for a different daemon: a LevelDB
+/// chainstate and Particl's own block-index fields belong to the version that
+/// wrote them, and loading one under another version is how a "corrupt
+/// chainstate" report arrives from a user whose disk is fine. Pinned against
+/// the fetcher by [`tests::particld_version_matches_the_fetcher_pin`], so the
+/// two cannot drift silently — the same guard shape `grove.rs` uses for the
+/// engine tag.
+pub const PARTICLD_VERSION: &str = "27.2.4.0";
+
+/// What a Particl datadir on disk allows us to do with `prune=`.
+///
+/// The distinction exists because `-prune` and the two indexes are mutually
+/// exclusive in particl-core (`init.cpp:1130`, `:1136-1140`), and a chain that
+/// was *already synced* with `txindex`/`spentindex` cannot simply have them
+/// removed: the node aborts with "best block of the index goes beyond pruned
+/// data" (`init.cpp:2302`). Converting needs a `-reindex` (measured ~8 h,
+/// slower than a fresh network sync) or a fresh datadir, and neither is a
+/// thing a config writer may decide to do to a user's node behind their back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParticlChainMode {
+    /// No chain yet, or a chain that already carries no indexes. Safe to write
+    /// the pruned conf.
+    Prunable,
+    /// An existing chain synced WITH the indexes. Leave the conf alone; the
+    /// migration is the operator's (fresh datadir, or a snapshot).
+    IndexedChainPresent,
+}
+
+/// Classify a Particl datadir by what is on disk.
+///
+/// Deliberately a pure function of two path probes so the decision can be
+/// tested without a node:
+///
+/// * no `blocks/` → nothing has synced yet → [`Prunable`](ParticlChainMode::Prunable)
+/// * `blocks/` **and** `indexes/txindex` → an indexed chain →
+///   [`IndexedChainPresent`](ParticlChainMode::IndexedChainPresent)
+/// * `blocks/` and no `indexes/txindex` → already index-less (a previous
+///   pruned run, or a restored snapshot) → `Prunable`
+///
+/// The `indexes/txindex` probe rather than a conf read is deliberate: the conf
+/// is what we are about to rewrite, so trusting it would let one bad write
+/// make every later run agree with it. The directory is the evidence.
+pub fn particl_chain_mode(particl_dir: &Path) -> ParticlChainMode {
+    if !particl_dir.join("blocks").is_dir() {
+        return ParticlChainMode::Prunable;
+    }
+    if particl_dir.join("indexes").join("txindex").is_dir() {
+        return ParticlChainMode::IndexedChainPresent;
+    }
+    ParticlChainMode::Prunable
+}
+
+/// Rewrite a `particl.conf` for pruned operation, or `None` when it already is.
+///
+/// Upstream's `interface/part/core.py:123-124` writes `spentindex=1` and
+/// `txindex=1` into every Particl conf it generates. Those two lines serve
+/// exactly one thing the engine does — swaps in which **PART itself is a leg**
+/// (`basicswap.py:9659` `getrawtransaction`, `:10897` `getspentinfo`) — and
+/// pwnda never offers PART as a leg ([`MANDATORY_COIN`] is transport;
+/// `FOLLOWER_COUNTERPARTY_TICKERS` omits it). SMSG, which is the reason
+/// particld is mandatory at all, reads a synced *tip* and nothing else: no
+/// txindex reference exists anywhere in particl-core's `smsg/`, and its keys
+/// live in SMSG's own database. So dropping the indexes costs a capability we
+/// do not use and keeps the one we depend on. Full argument, with the
+/// measurements: `particl-coin-vs-transport.md`.
+///
+/// Returns `None` when nothing needs to change, so a re-run is a no-op and the
+/// file is written at most once — the same contract
+/// [`harden_daemon_confs`] holds.
+///
+/// A hand-set `prune=` is honoured as-is (any value, including `prune=0` for
+/// someone who deliberately wants an archival node); the index lines are still
+/// stripped, because leaving them beside a `prune=` is the one combination
+/// particld refuses to start on.
+pub fn prune_particl_conf(text: &str, prune_mib: u64) -> Option<String> {
+    let has_index_lines = text
+        .lines()
+        .any(|l| is_conf_line(l, "txindex") || is_conf_line(l, "spentindex"));
+    let has_prune = conf_has_key(text, "prune");
+    if !has_index_lines && has_prune {
+        return None;
+    }
+    let kept: Vec<&str> = text
+        .lines()
+        .filter(|l| !is_conf_line(l, "txindex") && !is_conf_line(l, "spentindex"))
+        .collect();
+    let mut out = String::new();
+    if !has_prune {
+        out.push_str(&format!("prune={}\n", prune_mib));
+    }
+    out.push_str(&kept.join("\n"));
+    if text.ends_with('\n') && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// True when a conf line sets `key`, ignoring leading whitespace.
+///
+/// Separate from [`conf_has_key`] because this one is applied per line to
+/// decide what to DELETE, and deleting on a prefix match would eat a
+/// hypothetical `txindexfoo=`. Both halves matter: `txindex=1` must go and
+/// `# txindex=1` must stay (a comment is a user's note, not a setting).
+fn is_conf_line(line: &str, key: &str) -> bool {
+    let t = line.trim_start();
+    t.starts_with(key) && t[key.len()..].starts_with('=')
+}
+
+/// Apply [`prune_particl_conf`] to a datadir, if the chain on disk allows it.
+///
+/// `Ok(true)` = the conf was rewritten, `Ok(false)` = nothing to do (already
+/// pruned, no conf yet, or an indexed chain we must not touch). Non-fatal at
+/// the call site like its neighbours: a disk-size preference must never block
+/// a start.
+fn apply_particl_prune_policy(datadir: &Path) -> Result<bool, String> {
+    let particl_dir = datadir.join(MANDATORY_COIN);
+    let conf = particl_dir.join(format!("{}.conf", MANDATORY_COIN));
+    if !conf.is_file() {
+        return Ok(false);
+    }
+    if particl_chain_mode(&particl_dir) == ParticlChainMode::IndexedChainPresent {
+        return Ok(false);
+    }
+    let text = std::fs::read_to_string(&conf).map_err(|e| format!("read particl.conf: {}", e))?;
+    let Some(out) = prune_particl_conf(&text, PARTICL_PRUNE_MIB) else {
+        return Ok(false);
+    };
+    std::fs::write(&conf, out.as_bytes()).map_err(|e| format!("write particl.conf: {}", e))?;
+    Ok(true)
+}
+
 /// dbcache size in MB, sized from system RAM.
 ///
 /// `total_mb / 8`, clamped to `[512, 4096]`:
@@ -7331,6 +7598,7 @@ pub fn build_config(
     Ok(SidecarConfig {
         python: python_exe(app)?,
         wallet_encrypted: rec.wallet_encrypted,
+        archival_chain: rec.archival_chain,
         adoption_coins: adoption_coins(&rec),
         // Only the electrum-capable coins can be lean, so the record is
         // consulted for those and ignored for the rest. A record that somehow
@@ -8027,6 +8295,38 @@ fn apply_local_config_policy(cfg: &SidecarConfig) {
     }
     if let Err(e) = harden_daemon_confs(datadir) {
         eprintln!("[swap-sidecar] could not harden daemon confs: {}", e);
+    }
+    // Option A: Particl carries SMSG and the swap keys, never a swap leg, so
+    // the two indexes upstream writes buy us nothing and cost the ability to
+    // prune. Measured on a synced probe: 2.9 GB -> 1.15 GB. Refuses itself on
+    // a datadir that already synced WITH the indexes, because that conversion
+    // needs a reindex or a fresh datadir and is not a config writer's call.
+    match apply_particl_prune_policy(datadir) {
+        Ok(true) => eprintln!(
+            "[swap-sidecar] particl set to prune={} MiB (no txindex/spentindex — \
+             PART is transport here, never a swap leg)",
+            PARTICL_PRUNE_MIB
+        ),
+        Ok(false) => {
+            // A3: say WHY when the answer is "this install keeps its old
+            // footprint". Declining silently is how a user ends up reading
+            // "about 1.5 GB" in the wizard while ~2.9 GB sits on disk.
+            if particl_chain_mode(&datadir.join(MANDATORY_COIN))
+                == ParticlChainMode::IndexedChainPresent
+            {
+                eprintln!(
+                    "[swap-sidecar] particl keeps its full-index chain (~2.9 GB): this datadir \
+                     was synced with txindex/spentindex, and particl-core cannot drop them in \
+                     place. A pruned chain (~{:.1} GB) needs a fresh Particl datadir.",
+                    COIN_DISK_GB
+                        .iter()
+                        .find(|(c, _)| *c == MANDATORY_COIN)
+                        .map(|(_, gb)| *gb)
+                        .unwrap_or(1.3)
+                );
+            }
+        }
+        Err(e) => eprintln!("[swap-sidecar] could not apply the particl prune policy: {}", e),
     }
     // C0.2 / R17. Runs on BOTH paths - after a prepare (where upstream has just
     // baked the env var in, so this is usually a no-op) and on the
@@ -9348,6 +9648,8 @@ pub async fn swap_sidecar_status(
             g.seed_mismatch.clone()
         },
         swap_seed_fingerprint: rec.swap_seed_fingerprint.clone(),
+        particl_unpruned: particl_chain_mode(&dd.join(MANDATORY_COIN))
+            == ParticlChainMode::IndexedChainPresent,
     })
 }
 
@@ -9546,7 +9848,15 @@ pub async fn swap_sidecar_update_engine(
 /// Record (or revoke) the user's opt-in. Nothing else in this module runs
 /// before this says yes.
 #[tauri::command]
-pub async fn swap_sidecar_opt_in(app: AppHandle, accepted: bool) -> Result<OptInRecord, String> {
+///
+/// `archival`: `Some(true)` keeps the full chain and its indexes; `None` leaves
+/// the stored choice alone, so a re-consent from a caller that does not know
+/// about this cannot silently reset it.
+pub async fn swap_sidecar_opt_in(
+    app: AppHandle,
+    accepted: bool,
+    archival: Option<bool>,
+) -> Result<OptInRecord, String> {
     let at = chrono::Utc::now().to_rfc3339();
     let prev = read_optin(&app);
     let rec = OptInRecord {
@@ -9563,6 +9873,10 @@ pub async fn swap_sidecar_opt_in(app: AppHandle, accepted: bool) -> Result<OptIn
         // loaded gun: re-consenting later would start the node immediately
         // without the user having asked for that.
         autostart: accepted && prev.autostart,
+        // A fact about the chain on disk, not a preference, so it survives a
+        // revoke/re-consent exactly as `wallet_encrypted` does. Clearing it
+        // would silently promise a pruned node over an archival datadir.
+        archival_chain: archival.unwrap_or(prev.archival_chain),
         // C3 / P1. Same "cleared on revoke" reasoning as `autostart`: a coin
         // set surviving a revoke would re-enable whatever was chosen the
         // instant the user re-consented, and the safe direction on a fresh
@@ -11125,8 +11439,8 @@ pub async fn swap_sidecar_push_account_keys(
         // between the default-ON inversion and this fix) a fresh install
         // deadlocked — engine refuses to build, host refuses to send — and the
         // coin ended up with no wallet at all.
-        let shares = coin_key_from(&ticker)
-            .and_then(|c| consented.coins.get(c))
+        let entry = coin_key_from(&ticker).and_then(|c| consented.coins.get(c));
+        let shares = entry
             .map(|e| shares_lean_wallet(consented.opted_in, e))
             .unwrap_or(false);
         if !shares {
@@ -11144,33 +11458,64 @@ pub async fn swap_sidecar_push_account_keys(
         // it built from its own (PWNDA-PATCH-3). Anything already deposited to
         // that wallet would stop being watched, so refuse rather than strand
         // it — and fail closed when the balance cannot be read.
-        let existing = crate::swap_bridge::wallet_balance(port, &auth, &ticker)
-            .await
-            .ok();
-        // Only asked when the balance could not be read, because that is the
-        // only case where it changes the answer: a coin with no addresses has
-        // nothing to strand, and PWNDA-PATCH-3 guarantees the engine cannot
-        // have built it a wallet behind our back. Without this the gate was
-        // unpassable for a coin's FIRST push — BCH read `NaN` for a day
-        // (2026-09-05) because "no wallet yet" and "node not responding" were
-        // the same input.
-        let addresses = if existing.is_none() {
-            crate::swap_bridge::wallet_address_count(port, &auth, &ticker)
+        //
+        // ...but ONLY for a wallet that is still the engine's own.
+        //
+        // `Adoption::AccountKey` is VERIFIED state, not intent: the engine was
+        // confirmed to have built this coin's wallet from THIS host's account
+        // key. The address table a re-push discards is therefore rebuilt from
+        // the same key, to the same addresses, and the balance being "stranded"
+        // is already in the user's own wallet. There is nothing left for the
+        // gate to protect.
+        //
+        // The seed guard above is what makes "the same key" a fact rather than
+        // a hope: a session whose seed differs from the datadir's is refused
+        // before this loop starts, so a push that reaches here is by the same
+        // wallet that did the adopting.
+        //
+        // Why this had to change (2026-09-08): a share pass runs on every node
+        // start, for every coin set to share, INCLUDING ones already adopted --
+        // and it must, because PWNDA-PATCH-3 needs the key again to build the
+        // wallet after a restart. So on a node where BTC, LTC and BCH were all
+        // adopted and all held a balance, every start produced three permanent
+        // red errors telling the user to "sweep it back first". They could not:
+        // the sweep-back list excludes adopted coins ON PURPOSE ("the balance
+        // is already in the user's wallet, and the sweep would pay a fee to
+        // send coins from an address to itself"). Gate said sweep first, sweep
+        // list said nothing to sweep, and the user was left with an
+        // unclearable error about their own money. The operator's LTC row was
+        // 3.65468546 -- the payout from the swap that had settled an hour
+        // earlier, into the wallet this gate was calling unwatchable.
+        let gate_applies = entry.map(|e| balance_gate_applies(&e.adoption)).unwrap_or(true);
+        if gate_applies {
+            let existing = crate::swap_bridge::wallet_balance(port, &auth, &ticker)
                 .await
-                .ok()
-        } else {
-            None
-        };
-        if let Err(reason) =
-            crate::swap_bridge::pre_share_balance_gate(existing.as_deref(), addresses)
-        {
-            outcomes.push(AccountKeyOutcome {
-                ticker,
-                initialized: false,
-                shared: false,
-                error: Some(reason),
-            });
-            continue;
+                .ok();
+            // Only asked when the balance could not be read, because that is
+            // the only case where it changes the answer: a coin with no
+            // addresses has nothing to strand, and PWNDA-PATCH-3 guarantees
+            // the engine cannot have built it a wallet behind our back.
+            // Without this the gate was unpassable for a coin's FIRST push —
+            // BCH read `NaN` for a day (2026-09-05) because "no wallet yet"
+            // and "node not responding" were the same input.
+            let addresses = if existing.is_none() {
+                crate::swap_bridge::wallet_address_count(port, &auth, &ticker)
+                    .await
+                    .ok()
+            } else {
+                None
+            };
+            if let Err(reason) =
+                crate::swap_bridge::pre_share_balance_gate(existing.as_deref(), addresses)
+            {
+                outcomes.push(AccountKeyOutcome {
+                    ticker,
+                    initialized: false,
+                    shared: false,
+                    error: Some(reason),
+                });
+                continue;
+            }
         }
         match push_account_key(port, &auth, &ticker, &k.account_key, &k.address_type).await {
             Err(e) => outcomes.push(AccountKeyOutcome {
@@ -11884,6 +12229,7 @@ mod tests {
 
     fn test_config() -> SidecarConfig {
         SidecarConfig {
+            archival_chain: false,
             python: PathBuf::from(r"C:\app\swap-sidecar\runtime\python.exe"),
             datadir: PathBuf::from(r"C:\app\swap-sidecar\datadir"),
             bin_dir: PathBuf::from(r"C:\app\swap-sidecar\bin"),
@@ -15321,6 +15667,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     #[test]
     fn revoking_consent_clears_autostart() {
         let revoked = OptInRecord {
+            archival_chain: false,
             opted_in: false,
             at: None,
             autostart: false,
@@ -15355,6 +15702,7 @@ pub fn on_app_ready(").expect("gate end moved")];
 
     fn optin_with(coins: &[(&str, bool)]) -> OptInRecord {
         OptInRecord {
+            archival_chain: false,
             opted_in: true,
             at: Some("2026-08-19T00:00:00+00:00".to_string()),
             autostart: false,
@@ -15481,6 +15829,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     #[test]
     fn the_first_explicit_choice_preserves_the_legacy_set() {
         let legacy = OptInRecord {
+            archival_chain: false,
             opted_in: true,
             at: None,
             autostart: false,
@@ -16451,6 +16800,30 @@ pub fn on_app_ready(").expect("gate end moved")];
 
     /// Auth header is Basic with the password in the password half — upstream
     /// only ever compares the password (http_server.py:989-997).
+    /// W-15 - the 2026-09-08 unclearable-error loop, pinned.
+    ///
+    /// The gate protects an ENGINE-BUILT wallet from having its address
+    /// table discarded. Once the wallet IS the host's, there is nothing
+    /// left to protect -- and applying it anyway produced a refusal whose
+    /// stated remedy (sweep back) is deliberately unavailable for exactly
+    /// the coins it fired on.
+    #[test]
+    fn balance_gate_skipped_only_for_an_already_adopted_coin() {
+        // The one state where a re-push changes nothing.
+        assert!(!balance_gate_applies(&Adoption::AccountKey));
+
+        // Everything else keeps the gate. Deposit is the default and the
+        // case the gate was written for; HostWallet coins (XMR/ZEPH/ZANO)
+        // do not push account keys at all, so leaving them gated costs
+        // nothing and fails closed if that ever changes.
+        assert!(balance_gate_applies(&Adoption::Deposit));
+        assert!(balance_gate_applies(&Adoption::HostWallet));
+
+        // Default() is Deposit, so a record written before adoption
+        // existed is gated, not waved through.
+        assert!(balance_gate_applies(&Adoption::default()));
+    }
+
     #[test]
     fn basic_auth_header_encodes_password_half() {
         use base64::Engine;
@@ -17099,6 +17472,7 @@ pub fn on_app_ready(").expect("gate end moved")];
             },
             seed_mismatch: None,
             swap_seed_fingerprint: None,
+            particl_unpruned: false,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("password"), "status leaked a password: {json}");
@@ -17133,6 +17507,7 @@ pub fn on_app_ready(").expect("gate end moved")];
             },
             seed_mismatch: None,
             swap_seed_fingerprint: None,
+            particl_unpruned: false,
         };
         let json = serde_json::to_string(&drifted).unwrap();
         assert!(json.contains(r#""engine""#), "engine field absent: {json}");
@@ -17692,6 +18067,315 @@ rpcport=19796
         assert_eq!(again.matches("dbcache=").count(), 1, "second pass duplicated dbcache");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =====================================================================
+    // Option A — Particl pruning
+    // =====================================================================
+
+    /// Per-test scratch dir with a generated `particl.conf`, shaped like the
+    /// one `interface/part/core.py` actually writes.
+    fn prune_fixture(tag: &str, extra: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-prune-test-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let part = dir.join("particl");
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::write(
+            part.join("particl.conf"),
+            format!(
+                "dbcache=4096\nlisten=0\nrpcport=19792\nwallet=bsx_wallet\n\
+                 zmqpubsmsg=tcp://127.0.0.1:20792\nspentindex=1\ntxindex=1\nstaking=0\n{extra}"
+            ),
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The core rewrite: both index lines out, `prune=` in, everything else
+    /// byte-identical. The negative half matters as much as the positive —
+    /// eating `wallet=` or `zmqpubsmsg=` would break the node silently.
+    #[test]
+    fn prune_particl_conf_strips_both_indexes_and_adds_prune() {
+        let src = "dbcache=4096\nspentindex=1\nrpcport=19792\ntxindex=1\nwallet=bsx_wallet\n";
+        let out = prune_particl_conf(src, PARTICL_PRUNE_MIB).expect("must rewrite");
+        assert!(out.starts_with(&format!("prune={}\n", PARTICL_PRUNE_MIB)), "{out}");
+        assert!(!out.contains("txindex="), "txindex survived: {out}");
+        assert!(!out.contains("spentindex="), "spentindex survived: {out}");
+        for keep in ["dbcache=4096", "rpcport=19792", "wallet=bsx_wallet"] {
+            assert!(out.contains(keep), "rewrite ate {keep}: {out}");
+        }
+    }
+
+    /// Idempotence, stated as the property that matters: a second pass must
+    /// return None, not "a file that happens to look the same". `None` is what
+    /// stops the caller writing the file on every single start.
+    #[test]
+    fn prune_particl_conf_is_a_noop_once_applied() {
+        let src = "spentindex=1\ntxindex=1\nrpcport=19792\n";
+        let once = prune_particl_conf(src, PARTICL_PRUNE_MIB).expect("first pass rewrites");
+        assert!(
+            prune_particl_conf(&once, PARTICL_PRUNE_MIB).is_none(),
+            "second pass must be a no-op, got a rewrite of: {once}"
+        );
+    }
+
+    /// A hand-set `prune=` is the user's. We still strip the indexes, because
+    /// `prune=` beside `txindex=1` is the one combination particld REFUSES to
+    /// start on (`init.cpp:1130`) — leaving it would be honouring a preference
+    /// by breaking the node.
+    ///
+    /// The fixture carries BOTH index lines and the assertions name both:
+    /// an earlier version set only `txindex=1` and asserted only on it, so a
+    /// regression that stripped one index and left the other would have kept
+    /// this test green while the node refused to start. Caught by injecting
+    /// exactly that fault (2026-09-09) — the test said "strips indexes" and
+    /// checked one.
+    #[test]
+    fn prune_particl_conf_keeps_a_hand_set_prune_but_still_strips_indexes() {
+        let src = "prune=2000\ntxindex=1\nspentindex=1\nrpcport=19792\n";
+        let out = prune_particl_conf(src, PARTICL_PRUNE_MIB).expect("indexes must still go");
+        assert!(out.contains("prune=2000"), "user's value replaced: {out}");
+        assert_eq!(out.matches("prune=").count(), 1, "second prune line: {out}");
+        assert!(!out.contains("txindex="), "txindex survived: {out}");
+        assert!(!out.contains("spentindex="), "spentindex survived: {out}");
+    }
+
+    /// A commented line is a note, not a setting. Deleting it would silently
+    /// rewrite something the user wrote for themselves.
+    #[test]
+    fn prune_particl_conf_leaves_commented_index_lines_alone() {
+        let src = "# txindex=1 was here for PART-leg swaps\nrpcport=19792\n";
+        let out = prune_particl_conf(src, PARTICL_PRUNE_MIB).expect("must add prune");
+        assert!(out.contains("# txindex=1 was here"), "comment eaten: {out}");
+    }
+
+    /// The safety gate, and the reason this is not just a conf rewrite: a
+    /// datadir that already synced WITH the indexes must be left alone.
+    /// Stripping them there produces "best block of the index goes beyond
+    /// pruned data" (`init.cpp:2302`) — a node that will not start.
+    #[test]
+    fn an_already_indexed_chain_is_refused() {
+        let dir = prune_fixture("indexed", "");
+        std::fs::create_dir_all(dir.join("particl").join("blocks")).unwrap();
+        std::fs::create_dir_all(dir.join("particl").join("indexes").join("txindex")).unwrap();
+
+        assert_eq!(
+            particl_chain_mode(&dir.join("particl")),
+            ParticlChainMode::IndexedChainPresent
+        );
+        assert!(!apply_particl_prune_policy(&dir).unwrap(), "must refuse");
+        let conf = std::fs::read_to_string(dir.join("particl").join("particl.conf")).unwrap();
+        assert!(conf.contains("txindex=1"), "conf was rewritten anyway: {conf}");
+        assert!(!conf.contains("prune="), "prune added to an indexed chain: {conf}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A fresh datadir (no `blocks/` at all) is the normal first-run case.
+    #[test]
+    fn a_fresh_datadir_is_pruned() {
+        let dir = prune_fixture("fresh", "");
+        assert_eq!(particl_chain_mode(&dir.join("particl")), ParticlChainMode::Prunable);
+        assert!(apply_particl_prune_policy(&dir).unwrap(), "must rewrite");
+
+        let conf = std::fs::read_to_string(dir.join("particl").join("particl.conf")).unwrap();
+        assert!(conf.contains(&format!("prune={}", PARTICL_PRUNE_MIB)), "{conf}");
+        assert!(!conf.contains("txindex="), "{conf}");
+        assert!(conf.contains("wallet=bsx_wallet"), "{conf}");
+
+        // Second run writes nothing.
+        assert!(!apply_particl_prune_policy(&dir).unwrap(), "second pass rewrote");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A chain that is already index-less — a previous pruned run, or a
+    /// restored snapshot — is prunable, not "an existing chain, hands off".
+    /// Getting this wrong would leave a snapshot-restored node unconfigured.
+    #[test]
+    fn an_index_less_chain_is_still_prunable() {
+        let dir = prune_fixture("pruned-already", "");
+        std::fs::create_dir_all(dir.join("particl").join("blocks")).unwrap();
+        assert_eq!(particl_chain_mode(&dir.join("particl")), ParticlChainMode::Prunable);
+        assert!(apply_particl_prune_policy(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The retained window must dwarf the longest lock a swap can ask for.
+    /// `lock_value` is bounded at 96 h upstream; at ~250 bytes per Particl
+    /// block and 2-minute spacing, 550 MiB is ~1.8 years. This pins the
+    /// REASON rather than the number, so it stays honest if the floor moves.
+    #[test]
+    fn the_prune_budget_retains_far_more_than_any_lock_window() {
+        const PARTICL_BLOCK_BYTES: u64 = 300; // measured 247-287, rounded up
+        const SECONDS_PER_BLOCK: u64 = 120;
+        let blocks_retained = PARTICL_PRUNE_MIB * 1024 * 1024 / PARTICL_BLOCK_BYTES;
+        let hours_retained = blocks_retained * SECONDS_PER_BLOCK / 3600;
+        assert!(
+            hours_retained > 96 * 100,
+            "prune={PARTICL_PRUNE_MIB} MiB retains only {hours_retained} h; the longest \
+             swap lock is 96 h and the margin must be orders of magnitude, not tight"
+        );
+    }
+
+    /// The archival choice must reach `PART_PRUNE`, and both values must be
+    /// SENT — never omitted.
+    ///
+    /// `0` is PWNDA-PATCH-31's explicit "archival, no pruning". Omitting the
+    /// variable instead would make its absence mean two different things
+    /// ("archival" and "this build is too old to care"), and the patch reads
+    /// upstream behaviour from exactly that absence.
+    #[test]
+    fn the_chain_choice_reaches_the_prepare_env() {
+        let base = test_config();
+
+        let pruned = prepare_time_envs(&SidecarConfig {
+            archival_chain: false,
+            ..base.clone()
+        });
+        let v = pruned
+            .iter()
+            .find(|(k, _)| k == "PART_PRUNE")
+            .map(|(_, v)| v.clone())
+            .expect("PART_PRUNE must always be sent");
+        assert_eq!(v, PARTICL_PRUNE_MIB.to_string());
+
+        let archival = prepare_time_envs(&SidecarConfig {
+            archival_chain: true,
+            ..base
+        });
+        let v = archival
+            .iter()
+            .find(|(k, _)| k == "PART_PRUNE")
+            .map(|(_, v)| v.clone())
+            .expect("PART_PRUNE must always be sent, archival included");
+        assert_eq!(
+            v, "0",
+            "archival must send 0, not omit the variable — absence already \
+             means 'upstream default' to the patch"
+        );
+    }
+
+    /// The daemon pin must match the fetcher, or a snapshot built for the
+    /// daemon we actually ship would be refused (or worse, one built for
+    /// another daemon accepted). Same guard shape `grove.rs` uses for the
+    /// engine tag, and for the same reason: a restated version in a constant is
+    /// exactly what goes stale.
+    #[test]
+    fn particld_version_matches_the_fetcher_pin() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .join("scripts")
+            .join("fetch-swap-runtime.mjs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+        // Anchor on the COIN_CORES entry key, not on the bare word: "particl"
+        // appears in comments and URLs long before the table, and the first
+        // version after one of those belongs to a different coin entirely. The
+        // first attempt at this test read "3.1.6" that way and failed for a
+        // reason that had nothing to do with the pin.
+        let key = "coin: \"particl\",";
+        let idx = src
+            .find(key)
+            .expect("no `coin: \"particl\"` entry in COIN_CORES — did the table move?");
+        let after = &src[idx + key.len()..];
+        let vi = after.find("version:").expect("no version in the particl entry");
+        let rest = &after[vi + "version:".len()..];
+        let start = rest.find('"').unwrap() + 1;
+        let end = start + rest[start..].find('"').unwrap();
+        assert_eq!(
+            &rest[start..end],
+            PARTICLD_VERSION,
+            "the fetcher pins a different particld than PARTICLD_VERSION"
+        );
+    }
+
+    /// The scan-skip is passed ONLY for a chain prepare did not create.
+    ///
+    /// Both halves matter. Missing it on a restored snapshot means the node
+    /// cannot start at all; passing it on an ordinary install would skip a
+    /// birthday scan that upstream does for free and that a future restored-seed
+    /// case may depend on.
+    #[test]
+    fn the_wallet_scan_skip_is_only_for_a_restored_chain() {
+        let dir = std::env::temp_dir().join(format!("pwnda-scanfrom-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("particl")).unwrap();
+
+        // Fresh install: no chain at all.
+        assert!(!crate::snapshot::chain_awaiting_first_prepare(&dir));
+
+        // A restored snapshot: chain present, prepare has never run.
+        std::fs::create_dir_all(dir.join("particl").join("blocks")).unwrap();
+        assert!(crate::snapshot::chain_awaiting_first_prepare(&dir));
+
+        // Once prepare has run, the chain is the node's own business again —
+        // a later reconfigure must NOT skip the scan.
+        std::fs::write(dir.join("basicswap.json"), "{}").unwrap();
+        assert!(
+            !crate::snapshot::chain_awaiting_first_prepare(&dir),
+            "a configured datadir must not look like a pending restore"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A3: the three datadir shapes must map onto the status flag the UI reads,
+    /// and only ONE of them is the "stuck on the old layout" case. Getting this
+    /// backwards would either nag every healthy install or stay silent on the
+    /// one install that needs the explanation.
+    #[test]
+    fn only_an_indexed_chain_reports_as_unpruned() {
+        let cases: [(&str, bool, bool, bool); 3] = [
+            // (tag, make blocks/, make indexes/txindex/, expect unpruned)
+            ("fresh", false, false, false),
+            ("pruned", true, false, false),
+            ("legacy", true, true, true),
+        ];
+        for (tag, blocks, txindex, expect_unpruned) in cases {
+            let dir = prune_fixture(&format!("a3-{tag}"), "");
+            let part = dir.join("particl");
+            if blocks {
+                std::fs::create_dir_all(part.join("blocks")).unwrap();
+            }
+            if txindex {
+                std::fs::create_dir_all(part.join("indexes").join("txindex")).unwrap();
+            }
+            let unpruned =
+                particl_chain_mode(&part) == ParticlChainMode::IndexedChainPresent;
+            assert_eq!(
+                unpruned, expect_unpruned,
+                "{tag}: blocks={blocks} txindex={txindex} reported unpruned={unpruned}"
+            );
+            // And the flag must agree with what the policy actually DOES, or the
+            // UI would explain a state the supervisor is not in.
+            let rewrote = apply_particl_prune_policy(&dir).unwrap();
+            assert_eq!(
+                rewrote, !expect_unpruned,
+                "{tag}: status says unpruned={unpruned} but the policy \
+                 {} — these must never disagree",
+                if rewrote { "rewrote the conf" } else { "declined" }
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// The disk quote must reflect the pruned node the supervisor now writes.
+    /// Left as an inequality against the OLD unpruned figure so it fails loudly
+    /// if someone restores 8.0 without restoring the prune policy with it.
+    #[test]
+    fn the_particl_disk_quote_is_the_pruned_one() {
+        let gb = est_disk_gb(MANDATORY_COIN, false, CoinMode::Full);
+        assert!(
+            gb > 0.0 && gb < 3.0,
+            "particl is pruned now (measured 1.15 GB, quoted just under the \
+             pre-prune peak); {gb} GB looks like the old unpruned budget"
+        );
     }
 
     /// The sizing formula: never below Core's default, never a runaway
@@ -19425,6 +20109,7 @@ mod itest {
         let password = crate::wallet_rpc_common::random_hex(24);
 
         let make_cfg = |dd: &Path, offset: u16| SidecarConfig {
+            archival_chain: false,
             python: python.clone(),
             datadir: dd.to_path_buf(),
             bin_dir: bin_dir.clone(),

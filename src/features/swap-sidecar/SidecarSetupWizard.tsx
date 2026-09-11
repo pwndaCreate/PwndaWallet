@@ -77,21 +77,93 @@ interface OptInRecord {
   at: string | null;
 }
 
+/**
+ * Rust `snapshot::SnapshotOffer` — is a Particl chain snapshot on offer?
+ *
+ * `available` is false for ordinary reasons as well as faults (none published,
+ * built for another daemon, this datadir already has a chain), which is why the
+ * command answers rather than errors: a wizard that showed red because a CDN
+ * blipped would push people away from a fast start they could just retry.
+ */
+interface SnapshotOffer {
+  available: boolean;
+  downloadBytes: number;
+  snapshotId: string | null;
+  unavailableReason: string | null;
+}
+
 /** Rust `swap_sidecar::PROGRESS_EVENT`. */
 const PROGRESS_EVENT = "swap-sidecar-progress";
+
+/** The three ways a Particl chain can get onto this machine. */
+export type ChainMode = "snapshot" | "sync" | "archive";
+
+/**
+ * Reconcile the default chain mode against what the snapshot probe answered.
+ *
+ * The wizard has to pick a default before it knows whether a snapshot exists,
+ * and `snapshot` is the right guess: it is the better outcome whenever it is
+ * real. When the probe comes back empty that guess names an option that is not
+ * rendered, and a radio group whose selected value has no radio shows as
+ * NOTHING selected — with a footnote describing a fast start the user cannot
+ * see. Found 2026-09-10 in the sandbox under `VITE_MOCK_SNAPSHOT=none`; the
+ * three-way choice had been verified only in the snapshot-available case,
+ * where the default happens to be valid.
+ *
+ * Only the untouched default is rewritten. A user who picked sync or archive
+ * while the probe was still in flight has made a real choice, and it outranks
+ * a default being cleaned up behind them.
+ */
+export function reconcileChainMode(
+  prev: ChainMode,
+  snapshotAvailable: boolean,
+): ChainMode {
+  if (snapshotAvailable) return prev;
+  return prev === "snapshot" ? "sync" : prev;
+}
+
+/**
+ * The sentence under the chain choice, per mode.
+ *
+ * One per mode, and each has to stand on its own: the fast start is absent
+ * whenever nothing is published, so a line that counts the options ("both …")
+ * is false on the screen that only shows sync and full — which is exactly what
+ * the two-option version of this said until 2026-09-10.
+ *
+ * Every branch repeats the PART consequence because this is the screen where
+ * it is decided: particl-core cannot add the indexes to a pruned chain
+ * afterwards.
+ */
+export function chainModeNote(mode: ChainMode): string {
+  switch (mode) {
+    case "archive":
+      return "A full node stores every block and both transaction indexes. Swaps between other coins do not use them, so this is only worth it if you plan to trade PART. It cannot be turned on later without re-syncing.";
+    case "snapshot":
+      return "Fast start and sync end at the same pruned node — only the hours differ, and neither can trade PART itself. The snapshot is chain data only: signed, checked against its published hash, and the chain re-checked once the node starts.";
+    case "sync":
+      return "A pruned node relays offers and swaps every other coin, but cannot trade PART itself. Only the full node can, and that cannot be turned on later without re-syncing.";
+  }
+}
 
 /**
  * Footprint quoted on the consent screen.
  *
- * These are the **plan's budget** figures, not a measurement:
- * `CLIENT-PLAN-SIDECAR-EXECUTION.md` § Phase 0 "Weight budget" records
- * ~9–11 GB total, of which particld is ~2.3 GB, LTC in electrum mode avoids a
- * multi-GB chain, and a remote XMR node avoids ~190 GB. That same section's
- * "record the measured install size from the spike" item is still open — when
- * the spike lands, **replace this with the measured number**. Rendered with
- * "about" precisely because it is a budget.
+ * **Measured, 2026-09-08** — this replaces the "about 9–11 GB" budget figure
+ * that `CLIENT-PLAN-SIDECAR-EXECUTION.md` § Phase 0 carried, and closes that
+ * section's standing "record the measured install size" item.
+ *
+ * The default install runs BTC/LTC/BCH lean (ElectrumX, no chain) and XMR /
+ * ZEPH / ZANO against remote daemons (no chain), so **Particl is the only
+ * chain on disk** — and since Option A it is pruned
+ * (`particl-pruned-node-and-snapshot-plan.md`). A synced probe measured
+ * 1,155 MB, oscillating to ~1.3 GB just before a prune fires. On top of that
+ * sit the embedded Python runtime and engine (~32 MB) and the coin binaries
+ * (~125 MB).
+ *
+ * Still rendered with "about": a user who switches a coin to Full mode adds
+ * that coin's own chain, which `est_disk_gb` quotes separately on the coin row.
  */
-export const SIDECAR_FOOTPRINT = "about 9–11 GB";
+export const SIDECAR_FOOTPRINT = "about 1.5 GB";
 
 function errMsg(e: unknown): string {
   if (typeof e === "string") return e;
@@ -157,12 +229,73 @@ export function SidecarSetupWizard({
   const [status, setStatus] = useState<SidecarStatus | null>(null);
   const [error, setError] = useState("");
   const [done, setDone] = useState(false);
+  /**
+   * S3. What the backend says about a published snapshot, and whether the user
+   * wants it.
+   *
+   * `null` while the probe is in flight and after a failed one: the choice is
+   * only rendered when a snapshot is genuinely on offer, so the wizard never
+   * shows a fast start that is not there. `useSnapshot` defaults to true
+   * because it is the better outcome for almost everyone — hours saved — and
+   * the alternative stays one click away.
+   */
+  const [snapshot, setSnapshot] = useState<SnapshotOffer | null>(null);
+  const [snapshotNote, setSnapshotNote] = useState("");
+  /**
+   * How the Particl chain gets here, as one three-way choice.
+   *
+   * `snapshot` is the default because it is the better outcome for almost
+   * everyone: minutes instead of hours, same node at the end.
+   *
+   * `archive` exists because until now pruning was not a default, it was the
+   * only behaviour — there was no way to ask for a full-index node at all.
+   * That matters for anyone who wants to TRADE PART itself: the two indexes a
+   * pruned node drops (`txindex`/`spentindex`) are exactly what a PART-leg
+   * swap needs, and particl-core cannot add them to a pruned chain afterwards.
+   * So it is a choice made once, at setup, or not at all.
+   */
+  const [chainMode, setChainMode] = useState<ChainMode>("snapshot");
+  const useSnapshot = chainMode === "snapshot";
   const alive = useRef(true);
 
   useEffect(() => {
     alive.current = true;
     return () => {
       alive.current = false;
+    };
+  }, []);
+
+  // S3. Ask once, on mount, whether a snapshot is on offer. Advisory: the
+  // command never rejects (a missing snapshot is an ordinary answer, not an
+  // error), and if it did, the wizard simply never shows the choice and the
+  // network sync happens — which is what used to happen for everyone.
+  useEffect(() => {
+    let cancelled = false;
+    // The default is `snapshot`, chosen before this answer exists. When the
+    // answer is "nothing published", that default names an option the user
+    // cannot see: the radio group renders with NOTHING selected and the
+    // footnote narrates a fast start that is not on screen. So the default
+    // has to be reconciled against the offer, not just set once.
+    //
+    // Only `snapshot` is rewritten, and only via the functional form: a user
+    // who picked sync or archive while this request was still in flight has
+    // made a real choice, and it outranks a default being cleaned up.
+    const fallBackToSync = () => {
+      if (cancelled || !alive.current) return;
+      setChainMode((prev) => reconcileChainMode(prev, false));
+    };
+    void (async () => {
+      try {
+        const offer = await invoke<SnapshotOffer>("swap_snapshot_offer");
+        if (!cancelled && alive.current) setSnapshot(offer);
+        if (!offer.available) fallBackToSync();
+      } catch {
+        /* no snapshot on offer; the network path is unaffected */
+        fallBackToSync();
+      }
+    })();
+    return () => {
+      cancelled = true;
     };
   }, []);
 
@@ -225,7 +358,15 @@ export function SidecarSetupWizard({
       //    refuses without it — and doing it first means a failure here leaves
       //    the UI gate closed rather than opening a surface the backend will
       //    reject.
-      await invoke<OptInRecord>("swap_sidecar_opt_in", { accepted: true });
+      // The chain choice rides the consent, because it is recorded in the same
+      // place and for the same reason: both are one-time facts about this
+      // install. `archival` reaches `PART_PRUNE` at the first prepare and can
+      // never be honoured after it — particl-core cannot add the indexes to a
+      // pruned chain, or prune one that has them.
+      await invoke<OptInRecord>("swap_sidecar_opt_in", {
+        accepted: true,
+        archival: chainMode === "archive",
+      });
       // 2. Frontend gate, so the app layer can mount the swap surface without
       //    having to invoke anything to find out.
       await onSetUp();
@@ -237,6 +378,25 @@ export function SidecarSetupWizard({
         //
         // Both are secrets: they are passed straight through and never stored
         // in component state, so a re-render cannot retain them.
+        // S2/S3. The snapshot lands BEFORE the first start, because the start
+        // is what runs prepare, and prepare is what creates the wallet. A chain
+        // dropped in afterwards leaves that wallet's last-synced height below
+        // the snapshot's pruneheight, and particld then refuses to start
+        // outright ("Prune: last wallet synchronisation goes beyond pruned
+        // data"). See snapshot.rs's module docs for the two orderings that fail.
+        //
+        // Failure here is NOT failure of setup: the network sync is always
+        // available and is what happens if this does nothing. So it is caught
+        // and shown as a note, never raised.
+        if (useSnapshot && snapshot?.available) {
+          try {
+            await invoke<string>("swap_snapshot_restore");
+          } catch (e) {
+            setSnapshotNote(
+              `Could not use the snapshot (${errMsg(e)}). Syncing from the network instead — this takes a few hours but needs nothing from you.`,
+            );
+          }
+        }
         let particlMnemonic: string | undefined;
         if (deriveSwapMaterial) {
           const material = await deriveSwapMaterial();
@@ -447,6 +607,105 @@ export function SidecarSetupWizard({
             Swap node running on 127.0.0.1
             {status ? `:${status.htmlPort}` : ""}. XMR and ZEPH swaps are now
             available from the Swap tab.
+          </div>
+        )}
+
+        {/* S3. Three ways to get the Particl chain. The first two end at the
+            same node and differ only in hours; the third is a different node,
+            and its label says so rather than burying it.
+
+            Rendered whenever setup is still pending — not only when a snapshot
+            is on offer, because the pruned/archival choice is real even with no
+            snapshot published, and it can only be made HERE: particl-core
+            cannot add txindex/spentindex to a chain that was pruned, so this is
+            a one-time decision at first prepare. */}
+        {!done && (
+          <div
+            style={{
+              marginTop: 16,
+              padding: 10,
+              border: "1px solid var(--border-soft)",
+              borderRadius: 4,
+              fontFamily: "var(--font-mono)",
+              fontSize: 11,
+              lineHeight: 1.6,
+            }}
+          >
+            <div style={{ color: "var(--text-muted)", fontSize: 10, marginBottom: 6 }}>
+              PARTICL CHAIN
+            </div>
+            {/* Only offered when a snapshot is actually published and usable —
+                otherwise the wizard would advertise a fast start that is not
+                there. When it is absent the choice degrades to sync-vs-archive,
+                which is still a real decision. */}
+            {snapshot?.available && (
+              <label style={{ display: "flex", gap: 8, cursor: busy ? "default" : "pointer" }}>
+                <input
+                  type="radio"
+                  name="pwnda-chain-mode"
+                  checked={chainMode === "snapshot"}
+                  disabled={busy}
+                  onChange={() => setChainMode("snapshot")}
+                />
+                <span>
+                  <strong>Fast start</strong> — download a verified{" "}
+                  {(snapshot.downloadBytes / 1_073_741_824).toFixed(1)} GB snapshot.
+                  Ready in minutes. <em>Recommended.</em>
+                </span>
+              </label>
+            )}
+            <label
+              style={{
+                display: "flex",
+                gap: 8,
+                marginTop: snapshot?.available ? 6 : 0,
+                cursor: busy ? "default" : "pointer",
+              }}
+            >
+              <input
+                type="radio"
+                name="pwnda-chain-mode"
+                checked={chainMode === "sync"}
+                disabled={busy}
+                onChange={() => setChainMode("sync")}
+              />
+              <span>
+                <strong>Sync from the network</strong> — build the chain yourself
+                from other peers. A few hours, and nothing needed from you.
+              </span>
+            </label>
+            <label
+              style={{ display: "flex", gap: 8, marginTop: 6, cursor: busy ? "default" : "pointer" }}
+            >
+              <input
+                type="radio"
+                name="pwnda-chain-mode"
+                checked={chainMode === "archive"}
+                disabled={busy}
+                onChange={() => setChainMode("archive")}
+              />
+              <span>
+                <strong>Full node</strong> — keep the whole chain and its indexes,
+                about 2.9 GB instead of 1.3 GB. Only needed to trade PART itself.
+              </span>
+            </label>
+            <div style={{ color: "var(--text-muted)", marginTop: 6, fontSize: 10 }}>
+              {chainModeNote(chainMode)}
+            </div>
+          </div>
+        )}
+
+        {snapshotNote && (
+          <div
+            style={{
+              marginTop: 12,
+              fontFamily: "var(--font-mono)",
+              fontSize: 10.5,
+              lineHeight: 1.6,
+              color: "var(--text-muted)",
+            }}
+          >
+            {snapshotNote}
           </div>
         )}
 

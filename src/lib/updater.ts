@@ -20,15 +20,32 @@
  *
  * ## Platform behaviour
  *
- * Tauri can only replace the running binary for formats that own their own
- * install: Windows (MSI/NSIS) and Linux AppImage. `.deb` and `.rpm` are owned
- * by the system package manager, so the plugin refuses to self-replace there —
- * correctly, since overwriting apt-managed files behind apt's back is how you
- * get an unbootable package database. Those users get told a new version
- * exists and are pointed at the download.
+ * Every format this project ships can self-update: Windows NSIS, Linux
+ * AppImage, `.deb` and `.rpm`. The plugin replaces the AppImage in place and
+ * installs the two packages with `pkexec dpkg -i` / `pkexec rpm -U`, which is
+ * what apt and dnf run underneath and is recorded in the package database
+ * exactly as a normal install is. Package users get a polkit prompt.
  *
- * `isUpdaterSupported()` encodes that split so the caller can avoid showing a
- * "Restart to update" button that could never work.
+ * `isUpdaterSupported()` asks the backend, which asks the BUNDLER: the marker
+ * `__TAURI_BUNDLE_TYPE`, stamped into each artifact as it is built. So the
+ * answer is "was this produced by a bundler" rather than a guess from the
+ * environment, and the only `false` is an unstamped binary — a `cargo run` dev
+ * build, or a tarball someone extracted by hand.
+ *
+ * ### This used to say the opposite
+ *
+ * Until 2026-09-10 the comment here claimed `.deb`/`.rpm` could not
+ * self-update because "overwriting apt-managed files behind apt's back is how
+ * you get an unbootable package database", and `isUpdaterSupported()` returned
+ * false for them. Both were wrong. What actually kept those two formats from
+ * updating was that `release-local.ps1` never uploaded their signatures, so no
+ * manifest could list them — a missing glob, not a platform constraint. See
+ * `scripts/releaseArtifactParity.test.mjs`.
+ *
+ * One real caveat survives, and it lives on the build side rather than here:
+ * `dpkg -i` does not resolve dependencies, so a release that ADDS one can
+ * half-configure on a machine that lacks it. `scripts/check-linux-deps.mjs`
+ * refuses such a release before it is built.
  */
 
 import { invoke } from "./tauri";

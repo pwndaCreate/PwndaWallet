@@ -87,13 +87,22 @@ import {
   SWAP_COIN_META,
   broadcastChainKind,
   getSwapCoinMeta,
+  tickerToChain,
   type SwapChainKind,
 } from "./swap-data";
 import {
   effectiveModeForSource,
   isMockSwapKitResponse,
 } from "./router-modes";
+// TYPE-ONLY on purpose. `sourceSecretFor` and `SourceSecret` live in
+// `asset-capabilities.ts` and callers import them from there directly: a
+// runtime `export ... from` here would pull the registry into this module's
+// graph, and registry entries evaluate their RPC lists at module load. Three
+// executor tests mock `./swap-data` precisely so the registry never loads, and
+// a value re-export defeats that mock from a direction the mock cannot see.
+import type { SourceSecret } from "./asset-capabilities";
 import {
+  executeAdapterTransfer,
   executeCardanoTransfer,
   executeNearNativeTransfer,
   executeSolanaTransfer,
@@ -478,15 +487,27 @@ export interface ExecuteIntentsInput {
   account?: number;
   index?: number;
   /**
-   * The vault's BIP-39 mnemonic, REQUIRED only when `fromAsset` is ADA.
-   * Cardano is the one source chain signed in TS (not the Rust session) —
-   * its deposit tx is built + signed + submitted by `executeCardanoTransfer`
-   * via the same `cardano-tx.ts` stack the dashboard Send uses. The confirm
-   * modal threads this from `walletsByChain.cardano.mnemonic` (the same
-   * place ADA Send reads it). Unused for every other chain, which sign via
-   * the Rust `sessionId`.
+   * The secret for a TS-SIGNED source chain, tagged with what kind it is.
+   *
+   * Most source chains sign inside the Rust swap session and need nothing
+   * here. Three do not — Cardano, XRP and Tron — and they do not want the
+   * same secret:
+   *
+   *   - ADA rebuilds its whole key set from the vault's BIP-39 mnemonic
+   *     (`{ kind: "mnemonic" }`), because Cardano's Icarus derivation needs
+   *     the seed, not a single key.
+   *   - XRP and Tron sign with one chain private key
+   *     (`{ kind: "privateKey" }`), which is what their adapters take.
+   *
+   * Tagged rather than two optional fields (`cardanoMnemonic`, `xrpKey`, ...)
+   * so the shape stops growing a field per chain, and so a caller cannot pass
+   * a mnemonic where a private key is meant and have it fail deep inside a
+   * signer. The branch that consumes it checks the tag first.
+   *
+   * Same security posture as the mnemonic it replaces: held in memory for the
+   * duration of the call, never logged, never persisted.
    */
-  cardanoMnemonic?: string;
+  sourceSecret?: SourceSecret;
   onPhase?: (s: SwapExecutionStatus) => void;
 }
 
@@ -937,7 +958,7 @@ export async function executeIntentsTrade(
       // See executeCardanoTransfer for the rationale. The mnemonic is
       // threaded in from walletsByChain.cardano (same as ADA Send); the
       // Rust swap session isn't used for this chain.
-      if (!input.cardanoMnemonic) {
+      if (input.sourceSecret?.kind !== "mnemonic" || !input.sourceSecret.value) {
         throw new Error(
           "ADA source swap requires the Cardano mnemonic. Open the Cardano " +
             "chain in the dashboard so the wallet is derived, then retry."
@@ -946,10 +967,58 @@ export async function executeIntentsTrade(
       phase({ phase: "signing" });
       // amountIn = lovelace (6dp atomic) per 1Click's response shape.
       const r = await executeCardanoTransfer({
-        mnemonic: input.cardanoMnemonic,
+        mnemonic: input.sourceSecret.value,
         fromAddress: input.sourceAddress,
         depositAddress,
         amountAtomic: amountIn,
+      });
+      phase({ phase: "broadcasting" });
+      sourceTxHash = r.txHash;
+      break;
+    }
+
+    case "XRP":
+    case "TRON": {
+      // XRP, native TRX and TRC-20 USDT — the other TS-signed sources
+      // (2026-09-09). All three go through the wallet's own chain adapter,
+      // which is the same call the dashboard Send button makes, so a swap
+      // deposit and a manual send cannot drift apart.
+      //
+      // `walletsByChainKey` is what picks the adapter, and it is the ONLY
+      // thing separating native TRX from TRC-20 USDT: same chainKind, same
+      // key, same signature, different transaction builder. Branching on
+      // chainKind alone would send USDT as if it were TRX.
+      if (
+        input.sourceSecret?.kind !== "privateKey" ||
+        !input.sourceSecret.value
+      ) {
+        throw new Error(
+          `${fromMeta.ticker} source swap requires the ${fromMeta.ticker} ` +
+            `private key. Open the ${fromMeta.ticker} chain in the dashboard ` +
+            `so the wallet is derived, then retry.`
+        );
+      }
+      // Resolved through swap-data rather than the registry directly: it is
+      // the same answer (`tickerToChain` falls back to the registry's own
+      // `walletsByChainKey`), and it keeps this module off a direct import of
+      // `asset-capabilities`, whose entries evaluate RPC lists at module load.
+      const chainKey = tickerToChain(input.fromAsset);
+      if (!chainKey) {
+        throw new Error(
+          `${input.fromAsset} has no wallet chain key, so the swap cannot ` +
+            `pick a signer for it. This is a registry bug — please report it.`
+        );
+      }
+      phase({ phase: "signing" });
+      // amountIn is ATOMIC (drops / sun). executeAdapterTransfer converts to
+      // the display units every adapter takes, with exact string math.
+      const r = await executeAdapterTransfer({
+        chainKey,
+        privateKey: input.sourceSecret.value,
+        depositAddress,
+        amountAtomic: amountIn,
+        decimals: fromMeta.decimals,
+        ticker: fromMeta.ticker,
       });
       phase({ phase: "broadcasting" });
       sourceTxHash = r.txHash;

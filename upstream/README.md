@@ -12,10 +12,10 @@ re-fetch deterministically from the pin table below on any machine.
 
 | repo | tag | commit | tag date | local path |
 |---|---|---|---|---|
-| github.com/basicswap/basicswap | **v0.18.5** | `3859612035f8c4476b5cadedf36b875d2f2def5b` | 2026-08-28 | `upstream/basicswap/` |
+| github.com/basicswap/basicswap | **v0.18.6** | `ea39faddbcaffd51a34d6bbd72fb9607654227f5` | 2026-09-06 | `upstream/basicswap/` |
 | github.com/basicswap/coincurve | **basicswap_v0.4** | `ff375ce4ac551afc99f359da784ffceeda03203f` | 2026-08-13 | `upstream/coincurve/` |
 
-Notes at pin time: `v0.18.5` == upstream `master` HEAD on 2026-08-29 (moved from `v0.18.4` that day; see `PwndaWalletVault/log.md`). **This bump carries a datadir migration** — `CURRENT_DB_VERSION` 37→38 and `CURRENT_DB_DATA_VERSION` 9→10, unlike the v0.18.4 bump which was a pure binary replacement. Both steps are additive (three indices; four new bid-state rows) and an older engine returns early rather than refusing a newer DB, so the runtime swap stays reversible — verified, not assumed. The coincurve tag is the
+Notes at pin time: moved to `v0.18.6` on 2026-09-08 (from `v0.18.5`, pinned 2026-08-29; see `PwndaWalletVault/log.md`). **No datadir migration this time** — probe 5b reports `CURRENT_DB_VERSION` and `CURRENT_DB_DATA_VERSION` unchanged, so the runtime swap is a pure binary replacement, unlike the v0.18.5 bump which moved them 37→38 and 9→10. Two patches needed rebasing and neither was superseded: 0007 onto upstream's rewritten `_computeElectrumLegacyFundsInfo` (822383af, which disabled the caller by default but did not make the function adoption-aware, so our fix still applies), and 0016 onto the `chain_client_settings` tuple upstream appended `electrum_poll_interval` to. The coincurve tag is the
 exact tag `upstream/basicswap/requirements.txt:7` pins AND the tag
 `pwnda-engine-handoff/engine-ltc/requirements.txt` already pins — one fork tag serves both.
 
@@ -23,7 +23,7 @@ exact tag `upstream/basicswap/requirements.txt:7` pins AND the tag
 
 ```
 git clone https://github.com/basicswap/basicswap upstream/basicswap
-git -C upstream/basicswap checkout v0.18.5
+git -C upstream/basicswap checkout v0.18.6
 git clone https://github.com/basicswap/coincurve upstream/coincurve
 git -C upstream/coincurve checkout basicswap_v0.4
 ```

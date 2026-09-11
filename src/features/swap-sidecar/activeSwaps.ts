@@ -58,6 +58,12 @@ export function activeSwapToTracked(row: BasicSwapActiveSwap): SidecarTrackedSwa
     receiveAmount: (sent ? row.amount_from : row.amount_to) ?? "",
     createdAt: row.created_at,
     detail: null,
+    // No leg. `/json/active` carries `was_sent` but NOT `reverse_bid`, and on
+    // a reverse ADS bid `was_sent: true` puts this node on the opposite leg —
+    // so `was_sent` alone cannot answer it. The neutral copy holds for the one
+    // poll cycle until `/json/bids/<id>` lands with `reverse_bid`; a guess
+    // here would show the counterparty's story on four states. See
+    // `bidStates.ts::swapLegOf`.
     stage: classifyBidState(row.bid_state),
     lastPolledAt: null,
     error: null,
@@ -72,9 +78,16 @@ export function activeSwapToTracked(row: BasicSwapActiveSwap): SidecarTrackedSwa
  *
  * Rules, in order:
  *
- * 1. **Nothing local is dropped.** A swap the user just placed may not be in
- *    `swaps_in_progress` for a second or two, and a terminal one the user is
- *    still reading stays on screen.
+ * 1. **A live swap is never dropped.** One the user just placed may not be in
+ *    `swaps_in_progress` for a second or two.
+ * 1b. **A FINISHED swap the node no longer lists IS dropped.** Rule 1 used to
+ *    have no exception, so a completed or refunded swap sat on the Swap screen
+ *    forever and came back on every restart — reported 2026-09-07 against a
+ *    swap that had been over for a day. Terminal AND absent from the node's
+ *    map is the safe pair: absence alone would drop a live swap the node
+ *    briefly omits, and terminality alone would yank a result away while the
+ *    user is still reading it, since the engine keeps a finished bid in
+ *    `swaps_in_progress` for a while first.
  * 2. **Local detail wins.** An entry the app owns carries polled `detail`, a
  *    `payoutAddress` and retry bookkeeping; the node's row carries none of
  *    those, so it must never overwrite them.
@@ -87,6 +100,7 @@ export function mergeActiveSwaps(
   fromNode: readonly SidecarTrackedSwap[],
 ): SidecarTrackedSwap[] {
   const byId = new Map(local.map((s) => [s.bidId, s]));
+  const nodeIds = new Set(fromNode.map((s) => s.bidId));
   const added: SidecarTrackedSwap[] = [];
   for (const node of fromNode) {
     const mine = byId.get(node.bidId);
@@ -100,5 +114,8 @@ export function mergeActiveSwaps(
   }
   // Node-known swaps first: the newest thing the user did is the thing they
   // are looking for, and `/json/active` orders by the engine's own map.
-  return [...added, ...local.map((s) => byId.get(s.bidId) ?? s)];
+  const kept = local
+    .map((s) => byId.get(s.bidId) ?? s)
+    .filter((s) => !(s.stage.terminal && !nodeIds.has(s.bidId)));
+  return [...added, ...kept];
 }

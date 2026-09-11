@@ -136,7 +136,9 @@ describe("formatting", () => {
   });
 
   it("renders the window in round five-minute steps", () => {
-    expect(formatEtaWindow(etaWindow("BCH", "XMR")!)).toBe("about 30–60 min");
+    // No dashes in user-facing copy (operator's rule, 2026-09-07): the range
+    // reads "30 to 60", not "30-60".
+    expect(formatEtaWindow(etaWindow("BCH", "XMR")!)).toBe("about 30 to 60 min");
   });
 });
 
@@ -184,11 +186,45 @@ describe("the locked-and-waiting state", () => {
         coin_a_lock_refund_tx_est_final: 1_788_735_095,
         coin_a_last_median_time: 1_788_653_161,
       }),
-    ).toBe("2026-09-06 22:51 UTC — about 23h of chain time away");
+    ).toBe("2026-09-06 22:51 UTC, about 23h of chain time away");
     // No median time: the stamp alone, never an invented countdown.
     expect(
       refundDeadlineLabel({ coin_a_lock_refund_tx_est_final: 1_788_735_095 }),
     ).toBe("2026-09-06 22:51 UTC");
     expect(refundDeadlineLabel(null)).toMatch(/as soon as the chain allows/);
+  });
+
+  it("keeps telling the user about the refund AFTER it starts running", async () => {
+    const { refundStage, counterpartyHoldsLockedFunds } = await import(
+      "./SidecarSwapTracker"
+    );
+
+    // The gap this closes, from the live bid: at 23:43 on 2026-09-06 it left
+    // state 11 for 14, and every word of reassurance vanished with it -- while
+    // the refund was at that second executing on chain.
+    expect(counterpartyHoldsLockedFunds({ bid_state_ind: 14 })).toBe(false);
+    expect(refundStage({ bid_state_ind: 14 })).toBe("running");
+
+    // Terminal refund states: the coins are back, say so.
+    for (const ind of [16, 17, 18]) {
+      expect(refundStage({ bid_state_ind: ind }), String(ind)).toBe("done");
+    }
+
+    // The two classifiers must never both claim a bid, or the UI stacks two
+    // panels telling the user different things about the same swap.
+    for (const ind of [11, 14, 16, 17, 18]) {
+      const both =
+        counterpartyHoldsLockedFunds({ bid_state_ind: ind }) &&
+        refundStage({ bid_state_ind: ind }) !== null;
+      expect(both, `state ${ind} claimed by both panels`).toBe(false);
+    }
+
+    // Everything with no refund story stays silent -- including 13 and 15,
+    // the REDEEMED states, which are the swap succeeding and must not be
+    // dressed up as a refund.
+    for (const ind of [0, 1, 8, 9, 11, 12, 13, 15, 19, 20, undefined]) {
+      expect(refundStage({ bid_state_ind: ind }), String(ind)).toBe(null);
+    }
+    expect(refundStage(null)).toBe(null);
   });
 });

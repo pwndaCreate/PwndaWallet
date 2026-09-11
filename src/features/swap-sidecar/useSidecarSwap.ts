@@ -135,6 +135,7 @@ import {
 } from "./spread";
 import {
   classifyBidState,
+  swapLegOf,
   type BidStateClassification,
 } from "./bidStates";
 import {
@@ -1308,6 +1309,31 @@ const ACTIVE_SYNC_MS = 15_000;
 export const CHECKING_MIN_VISIBLE_MS = 600;
 
 /**
+ * Does this swap still need a read from `/json/bids/<id>`?
+ *
+ * "Not terminal" is not sufficient, and the gap was reachable with funds on
+ * the line. A swap rehydrated from `/json/active` is classified WITHOUT a leg
+ * (that endpoint has `was_sent` but no `reverse_bid`), and the neutral reading
+ * of `XMR_SWAP_FAILED_SWIPED` is `counterparty-recovered` — terminal. So:
+ *
+ *   adopt from /json/active → terminal → never polled → leg never learned
+ *   → the screen tells the side that WAS PAID that the other user took the
+ *     funds, permanently, with no path out of it.
+ *
+ * Reproduced in the sandbox on 2026-09-08 under `VITE_MOCK_STATE=swap_swiped`:
+ * the leg-aware copy was correct and simply never rendered, because nothing
+ * ever asked for the payload that carries the leg.
+ *
+ * So a swap with no `detail` is always read once, whatever its stage looks
+ * like. After that first read the stage is leg-aware and terminality governs.
+ * This is the right rule independently of the leg question: the list row
+ * carries strictly less than the detail, so reading it once is never wasted.
+ */
+export function needsRead(s: SidecarTrackedSwap): boolean {
+  return s.detail == null || !s.stage.terminal;
+}
+
+/**
  * Owns in-flight BasicSwap swaps for the whole app session.
  *
  * ## Mount this ABOVE the view router
@@ -1412,8 +1438,13 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
       }
       if (cancelled || isApiError(rows) || !Array.isArray(rows)) return;
       const fromNode = rows.map(activeSwapToTracked);
-      if (fromNode.length === 0) return;
+      // Merge even when the node lists NOTHING. This used to return early on
+      // an empty list, which meant the one event that should clear a finished
+      // swap -- the node no longer reporting it -- was the one event that
+      // could never reach the merge. A completed swap therefore stayed on the
+      // Swap screen indefinitely and returned on every restart.
       setSwaps((prev) => mergeActiveSwaps(prev, fromNode));
+      if (fromNode.length === 0) return;
       // A swap that was mid-flight when the app closed is holding funds in a
       // joint lock with a timelock running. Finding that out only if the user
       // happens to open the Swap tab is not acceptable — but say it ONCE, or
@@ -1451,7 +1482,16 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
             // `bid_state_ind` is preferred over `bid_state`: the string is
             // upstream display text and can be reworded in any release, the
             // int is the protocol value.
-            const next = classifyBidState(rv.bid_state_ind ?? rv.bid_state);
+            //
+            // The LEG matters as much as the state. Four states mean opposite
+            // things to the two sides (see `bidStates.ts` § "A bid state does
+            // NOT determine the story on its own"), and this is the only call
+            // site with a payload rich enough to tell them apart — the
+            // `/json/active` rehydrate has `was_sent` but no `reverse_bid`.
+            const next = classifyBidState(
+              rv.bid_state_ind ?? rv.bid_state,
+              swapLegOf(rv),
+            );
             // SWAP_DELAYING is not a place in the protocol — it is the engine
             // pausing before its NEXT action, from wherever it was. Its stage
             // is "internal" (no label), and rendering that emptied the
@@ -1479,9 +1519,7 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
   }, []);
 
   const pollAll = useCallback(async () => {
-    const ids = swapsRef.current
-      .filter((s) => !s.stage.terminal)
-      .map((s) => s.bidId);
+    const ids = swapsRef.current.filter(needsRead).map((s) => s.bidId);
     if (ids.length === 0) return;
     // Visible to the tracker: "Check now" looked unresponsive because a
     // sub-second poll changed nothing on screen but a timestamp (2026-09-05).
@@ -1501,10 +1539,7 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
   }, [pollIds]);
 
 
-  const hasLive = useMemo(
-    () => swaps.some((s) => !s.stage.terminal),
-    [swaps],
-  );
+  const hasLive = useMemo(() => swaps.some(needsRead), [swaps]);
 
   useEffect(() => {
     if (!enabled || !hasLive) return;

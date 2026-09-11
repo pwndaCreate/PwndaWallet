@@ -38,19 +38,46 @@ const CATALOG_SYMBOLS = new Set(
   NEAR_INTENTS_ASSETS.map((a) => a.symbol.toUpperCase()),
 );
 
+/**
+ * Every asset ID the catalog carries.
+ *
+ * Stronger than the symbol set, and only checkable since the stablecoin legs
+ * landed (2026-09-09): a per-leg entry names ONE specific 1Click asset, so a
+ * mistyped or stale id can be caught outright instead of passing because the
+ * symbol happens to exist somewhere in the catalog.
+ */
+const CATALOG_ASSET_IDS = new Set(NEAR_INTENTS_ASSETS.map((a) => a.assetId));
+
+/**
+ * The SYMBOL an entry trades as, which since 2026-09-09 is not the same
+ * thing as its key: stablecoin legs are keyed per (symbol, network)
+ * — `USDC-ARB` — because `AssetCapability` holds one chainId and one asset
+ * id. `.ticker` is the symbol; the key is the leg.
+ */
+const symbolOf = (key: string): string =>
+  (ASSET_CAPABILITIES[key]?.ticker ?? key).toUpperCase();
+
 describe("intents capability matches the shipped catalog", () => {
   it("no asset claims an Intents route the catalog does not carry", () => {
     // This direction is the dangerous one: a route the wallet offers and
     // 1Click cannot serve fails at quote time, after the user has committed
     // attention to the pair.
+    //
+    // Compared by ASSET ID, not by symbol. Symbol comparison is wrong here
+    // and was actively misleading on 2026-09-09: 1Click lists Arbitrum's and
+    // Polygon's USD₮0 under `USDT` while the wallet calls them `USDT0`, so a
+    // symbol check reported two perfectly routable legs as "absent from the
+    // catalog". The id is the identity; the symbol is a label two systems
+    // are allowed to disagree about.
     const claimsButAbsent = Object.entries(ASSET_CAPABILITIES)
-      .filter(([t, c]) => c.nearIntentsAsset && !CATALOG_SYMBOLS.has(t.toUpperCase()))
-      .map(([t]) => t);
+      .filter(([, c]) => c.nearIntentsAsset)
+      .filter(([, c]) => !CATALOG_ASSET_IDS.has(c.nearIntentsAsset!))
+      .map(([t, c]) => `${t} -> ${c.nearIntentsAsset}`);
     expect(
       claimsButAbsent,
-      "these assets carry a nearIntentsAsset but are absent from the shipped " +
-        "catalog — either the catalog is stale (run sync-intents-assets) or " +
-        "the capability is wrong",
+      "these assets carry a nearIntentsAsset id that is absent from the " +
+        "shipped catalog — either the catalog is stale (run " +
+        "sync-intents-assets) or the capability is wrong",
     ).toEqual([]);
   });
 
@@ -59,7 +86,7 @@ describe("intents capability matches the shipped catalog", () => {
     // the wallet, with `nearIntentsAsset: null`, is a route quietly switched
     // off — which is exactly how LTC sat dark for three months.
     const catalogedButNull = Object.entries(ASSET_CAPABILITIES)
-      .filter(([t, c]) => !c.nearIntentsAsset && CATALOG_SYMBOLS.has(t.toUpperCase()))
+      .filter(([t, c]) => !c.nearIntentsAsset && CATALOG_SYMBOLS.has(symbolOf(t)))
       .map(([t]) => t);
     expect(
       catalogedButNull,
@@ -67,6 +94,42 @@ describe("intents capability matches the shipped catalog", () => {
         "is null — if that is deliberate, say why in a comment on the field " +
         "and add the ticker to this test's allow-list",
     ).toEqual([]);
+  });
+
+  it("every wallet stablecoin leg is routable — the 2026-09-09 gap", () => {
+    // Sixteen legs existed in the wallet AND in the catalog while the picker
+    // showed none of them, because the roster's "USDC"/"USDT" entries were
+    // filtered through a registry that had no stablecoin keys at all.
+    for (const leg of [
+      "USDC-ETH", "USDC-ARB", "USDC-BASE", "USDC-OP", "USDC-POL",
+      "USDC-AVAX", "USDC-BSC", "USDC-SOL",
+      "USDT-ETH", "USDT-OP", "USDT-BSC", "USDT-AVAX", "USDT-SOL",
+      "USDT0-ARB", "USDT0-POL",
+    ]) {
+      const cap = ASSET_CAPABILITIES[leg];
+      expect(cap, `${leg} missing from the registry`).toBeDefined();
+      expect(cap.nearIntentsAsset, `${leg} has no Intents route`).toBeTruthy();
+      expect(
+        CATALOG_ASSET_IDS.has(cap.nearIntentsAsset!),
+        `${leg} names an asset id the catalog does not carry`,
+      ).toBe(true);
+    }
+  });
+
+  it("USDT0 legs are matched by CONTRACT, not by symbol", () => {
+    // 1Click lists Arbitrum's and Polygon's USD₮0 under the symbol `USDT`;
+    // the wallet calls them `USDT0`. Same contract, different label. Matching
+    // on symbol reports them as absent from the catalog — a false negative
+    // that would have left two real legs unroutable.
+    for (const leg of ["USDT0-ARB", "USDT0-POL"]) {
+      const cap = ASSET_CAPABILITIES[leg];
+      expect(cap.ticker).toBe("USDT0");
+      const asset = NEAR_INTENTS_ASSETS.find(
+        (a) => a.assetId === cap.nearIntentsAsset,
+      );
+      expect(asset, `${leg} id not in catalog`).toBeDefined();
+      expect(asset!.symbol.toUpperCase()).toBe("USDT");
+    }
   });
 
   it("LTC specifically is routable — the 2026-08-25 regression", () => {

@@ -84,7 +84,7 @@ gitignored workspace.
 | 27 | `0027-settle-redeemed-bid-error.patch` | `pwndaRecoverStalledBid` settles a `BID_ERROR` bid whose chain-A redeem is already confirmed (≥ 1 confirmation via the electrum backend or the node/wallet RPC): `SCRIPT_TX_REDEEMED` → `SWAP_COMPLETED` for the redeeming side, deactivated, `settled: true` in the reply. The 2026-08-23 mainnet bid sat "in progress" for twelve days because PATCH-11 could only re-queue a redeem the chain had already accepted. Called by the supervisor's bid janitor | `PWNDA-PATCH-27` | no — upstream's exit is `manualBidUpdate` (arbitrary state); this takes none |
 | 28 | `0028-zephyr-coingecko-id.patch` | `getExchangeName` returns `zephyr-protocol` for ZEPH instead of its chain name `zephyr`, which is a DIFFERENT CoinGecko asset trading at ~4% of ZEPH's price — 67.27 ZEPH read $1.19 in the console against the wallet's $27.08. Same shape as the BCH and FIRO exceptions already in that function. `lookupFiatRates` also feeds the offer book's rate columns and the AMM page | `PWNDA-PATCH-28` | yes, if Zephyr lands upstream — a one-line id correction of a shape already present twice |
 
-Applies to: **basicswap `v0.18.5`** (`3859612035f8c4476b5cadedf36b875d2f2def5b`).
+Applies to: **basicswap `v0.18.6`** (`ea39faddbcaffd51a34d6bbd72fb9607654227f5`).
 Rebased from `v0.17.9` on 2026-08-26 — only **0006** needed a change, and only its
 first hunk's context (upstream reshaped the `basicswap_util` import into a
 parenthesized multi-import). 1–12 verified by `git apply` AND by
@@ -477,7 +477,7 @@ Against a fresh checkout of the pinned tag (never against `upstream/basicswap/` 
 
 ```sh
 git clone https://github.com/basicswap/basicswap /path/to/work/basicswap
-git -C /path/to/work/basicswap checkout v0.18.5
+git -C /path/to/work/basicswap checkout v0.18.6
 git -C /path/to/work/basicswap apply /path/to/repo/upstream/patches/0001-guard-sighup-on-windows.patch
 git -C /path/to/work/basicswap apply /path/to/repo/upstream/patches/0002-configurable-pid-wait.patch
 ```

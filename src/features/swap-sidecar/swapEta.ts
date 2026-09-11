@@ -152,7 +152,7 @@ function minutes(sec: number): number {
 export function formatEtaRange(w: EtaWindow): string {
   const lo = Math.max(5, Math.round(minutes(w.typicalSec) / 5) * 5);
   const hi = Math.round(minutes(w.highSec) / 5) * 5;
-  return hi > lo ? `${lo}–${hi} min` : `${lo} min`;
+  return hi > lo ? `${lo} to ${hi} min` : `${lo} min`;
 }
 
 /** `about 30–60 min` — the window, in the phrasing the prose surfaces use. */
@@ -184,18 +184,35 @@ export function etaStanding(elapsedSec: number | null, w: EtaWindow | null): Eta
  *
  * Every branch says the swap is still running, because it is: past the window
  * is a slow chain, not a lost swap, and the funds stay locked until either the
- * swap completes or the timelock returns them. Alarming the user into a manual
+ * swap completes or a timelock resolves it. Alarming the user into a manual
  * recovery they do not need is the failure mode this copy is written against.
+ *
+ * # Only valid ON the happy arc
+ *
+ * Callers must not render this once a swap has left the arc for the timelock
+ * path — see `SidecarSwapTracker.tsx`, which gates it on `onArc`. Two reasons,
+ * both observed on the same live bid (`000000006a9c9d96…`, 2026-09-08):
+ *
+ * 1. `overdue` read "Longer than the usual about 20 to 40 min" beside an
+ *    elapsed time of **51 hours**. Comparing a swap that is now governed by a
+ *    CSV lock against a four-confirmation estimate is not a comparison.
+ * 2. The old `overdue` branch ended "the timelock returns your funds if it
+ *    never completes", which is only true on the SCRIPTED leg. On the
+ *    scriptless leg the timelock pays out the counterparty's coin instead —
+ *    still a good outcome, but not the one that sentence promises, and the
+ *    user reasonably read it as "I have been refunded".
+ *
+ * The wording below now holds on either leg.
  */
 export function etaSentence(elapsedSec: number | null, w: EtaWindow | null): string {
   switch (etaStanding(elapsedSec, w)) {
     case "onTrack":
-      return `Swaps on this pair usually take ${formatEtaWindow(w as EtaWindow)}. Nothing to do.`;
+      return `Usually ${formatEtaWindow(w as EtaWindow)}. Nothing to do.`;
     case "slow":
-      return `Past the usual ${formatEtaWindow(w as EtaWindow)} for this pair — still normal when a chain is confirming slowly. The node keeps working; nothing to do.`;
+      return `Past the usual ${formatEtaWindow(w as EtaWindow)}. Still normal. Nothing to do.`;
     case "overdue":
-      return `Longer than the usual ${formatEtaWindow(w as EtaWindow)}. The swap is still live and the node keeps retrying on its own; your funds stay locked until it finishes or the timelock returns them.`;
+      return `Longer than the usual ${formatEtaWindow(w as EtaWindow)}. Still live. A timelock ends it either way, so neither side can walk away with your coins.`;
     default:
-      return "The node keeps working on this swap in the background, on its own schedule.";
+      return "Running in the background.";
   }
 }

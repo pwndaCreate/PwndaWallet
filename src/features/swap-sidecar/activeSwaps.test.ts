@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { activeSwapToTracked, mergeActiveSwaps } from "./activeSwaps";
 import type { BasicSwapActiveSwap } from "../../api/basicswap";
 import type { SidecarTrackedSwap } from "./useSidecarSwap";
+import { classifyBidState } from "./bidStates";
 
 /** The live row from `/json/active`, 2026-09-05, verbatim. */
 const LIVE: BasicSwapActiveSwap = {
@@ -118,5 +119,35 @@ describe("mergeActiveSwaps", () => {
   it("is a no-op when the node reports nothing", () => {
     const mine = local();
     expect(mergeActiveSwaps([mine], [])).toEqual([mine]);
+  });
+});
+
+describe("a finished swap leaves the list", () => {
+  const mk = (id: string, terminal: boolean): SidecarTrackedSwap =>
+    ({
+      bidId: id,
+      stage: { ...classifyBidState("SWAP_COMPLETED"), terminal },
+      detail: null,
+      lastPolledAt: null,
+      error: null,
+    }) as unknown as SidecarTrackedSwap;
+
+  it("drops a terminal swap the node no longer lists", () => {
+    // The 2026-09-07 report: a swap that had been over for a day kept coming
+    // back on every restart.
+    const out = mergeActiveSwaps([mk("done", true)], []);
+    expect(out.map((s) => s.bidId)).toEqual([]);
+  });
+
+  it("KEEPS a terminal swap the node still lists, so a result is readable", () => {
+    const out = mergeActiveSwaps([mk("done", true)], [mk("done", true)]);
+    expect(out.map((s) => s.bidId)).toEqual(["done"]);
+  });
+
+  it("never drops a LIVE swap the node briefly omits", () => {
+    // Absence alone must not remove anything: /json/active can miss a swap
+    // for a poll or two, and dropping a live one hides locked funds.
+    const out = mergeActiveSwaps([mk("live", false)], []);
+    expect(out.map((s) => s.bidId)).toEqual(["live"]);
   });
 });

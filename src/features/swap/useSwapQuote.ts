@@ -51,11 +51,13 @@ import {
   getPairMinimum,
   getPairMinimumEntry,
   parseMinAtomicFromUpstreamError,
+  parseMinUsdFromUpstreamError,
   setPairMinimum,
 } from "./intents-pair-min-cache";
 import {
   bisectExactInputMinimum,
   FLOOR_PROBE_WAIT_MS,
+  learnUsdLimitFromError,
   probeExactInputFallback,
   probePairFloor,
   probePerPairMinimum,
@@ -232,7 +234,7 @@ export interface SwapQuoteState {
   intentsMinimum: {
     displayAmount: string;
     ticker: string;
-    source: "probe" | "upstream-error" | "loading";
+    source: "probe" | "upstream-error" | "loading" | "usd-limit";
     /** Destination USD value the minimum was derived against (probe
      *  entries only). Used to render "(receives ~$X of TICKER)". */
     expectedAmountOutUsd?: string;
@@ -245,6 +247,11 @@ export interface SwapQuoteState {
     /** Display name of the destination asset for the hint copy
      *  ("for ETH → BTC"). */
     destinationDisplayName?: string;
+    /** The floor as UPSTREAM stated it, in dollars, when it stated one.
+     *  `source === "usd-limit"` only. `displayAmount` on such an entry is
+     *  our conversion at a live price, so the copy leads with this figure
+     *  and marks the coin amount approximate. */
+    usdFloor?: string;
   } | null;
   /**
    * True when the user's typed amount is BELOW `intentsMinimum`.
@@ -328,13 +335,20 @@ const PROBE_DEBOUNCE_MS = 250;
  *  These are well-known test vectors: the ABANDON BIP-39 BIP-84 first
  *  receive address (BTC), the Hardhat test account 0 (EVM), the SLIP-10
  *  address from the same ABANDON seed (Solana). */
-const PLACEHOLDER_ADDRESSES = {
+export const PLACEHOLDER_ADDRESSES = {
   evm: "0xf39Fd6e51aad88F6F4ce6aB8827279cffFb92266",
   btc: "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
   ltc: "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh",
   doge: "DBus3bamQjgJULBJtYXpEzDWQRwF5iwxgC",
   bch: "bitcoincash:qqyx49mu0kkn9ftfj6hje6g2wfer34yfnq5tahq3q6",
-  dash: "XbBKwyVpYDoXcAYUdJ1XBQzfAkr8aLBmL2",
+  // Corrected 2026-09-09. The previous string, `XbBKwyVpYDoXcAYUdJ1XBQzf
+  // Akr8aLBmL2`, was Dash-SHAPED (34 chars, version byte 0x4c, leading "X")
+  // but its base58check checksum did not verify, so 1Click answered every
+  // DASH probe with "recipient is not valid" and no DASH minimum was ever
+  // learned. Same failure as the missing `cardano` entry below, which is why
+  // `probeAddresses.test.ts` now derives every placeholder rather than
+  // eyeballing it. This one is the abandon mnemonic at m/44'/5'/0'/0/0.
+  dash: "XoJA8qE3N2Y3jMLEtZ3vcN42qseZ8LvFf5",
   sol: "HAgk14JpMQLgt6rVgv7cBQFJWFto5Dqxi472uT3DKpqk",
   // Added 2026-09-05. Its absence is why MIN did nothing on every ADA pair:
   // `addressForAssetId` throws for `cardano.omft.near` without one, so the
@@ -778,7 +792,9 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
               routable: boolean
             ): string | null =>
               routable && r.status === "rejected"
-                ? humanizeError(r.reason)
+                ? humanizeError(r.reason, {
+                    basicswapAlternative: canBasicswap,
+                  })
                 : null;
             firstErr =
               rejection(swapResult, canSwapKit) ??
@@ -836,7 +852,11 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
         setCacheBumpKey((k) => k + 1);
         setError(null);
       } else {
-        setError(humanizeError(e));
+        setError(
+          humanizeError(e, {
+            basicswapAlternative: isBasicswapRoutable(from, to),
+          }),
+        );
       }
     } finally {
       if (reqId === reqIdRef.current) setLoading(false);
@@ -1178,6 +1198,9 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       if (cachedEntry.expectedAmountOutUsd) {
         result.expectedAmountOutUsd = cachedEntry.expectedAmountOutUsd;
       }
+      if (cachedEntry.usdFloor) {
+        result.usdFloor = cachedEntry.usdFloor;
+      }
       const usd = minimumUsdFor(fromMeta.nearIntentsAsset, displayAmount);
       if (usd) result.minimumUsd = usd;
       if (toMeta) {
@@ -1306,6 +1329,13 @@ export function minimumUsdFor(
  *   2. Numeric-only with at-least keywords surrounding the integer
  *   3. The proxy's wrapper envelope passing the upstream message in an
  *      `upstreamMessage` JSON field (string still gets searched)
+ *
+ * Since 2026-09-09 it also handles a fourth family that is not an integer
+ * at all: a floor stated in dollars ("Temporary swap limits: minimum swap
+ * amount is $1,000"), which the HOT Omni Bridge assets answer with. That
+ * one is converted at the source asset's live price rather than parsed,
+ * and is cached under a distinct source so the hint can quote the bridge's
+ * dollar figure instead of presenting our conversion as its word.
  */
 function maybeLearnPairMinimum(
   errMsg: string,
@@ -1323,11 +1353,27 @@ function maybeLearnPairMinimum(
     /minimum|too\s+(small|low)|below|less\s+than|at\s+least|min(imum)?[\s_-]*(deposit|amount|in)/i;
   if (!TRIGGER.test(errMsg)) return false;
   const learned = parseMinAtomicFromUpstreamError(errMsg);
-  if (!learned) return false;
-  setPairMinimum(fromMeta.nearIntentsAsset, toMeta.nearIntentsAsset, learned, {
-    source: "upstream-error",
-  });
-  return true;
+  if (learned) {
+    setPairMinimum(fromMeta.nearIntentsAsset, toMeta.nearIntentsAsset, learned, {
+      source: "upstream-error",
+    });
+    return true;
+  }
+  // No atomic floor. The message may still state a DOLLAR one, which is how
+  // the HOT Omni Bridge assets refuse (2026-09-09). Converting needs the
+  // source asset's live price, so this only works once the tokens cache is
+  // warm; a cold cache falls through to the humanized message, which now
+  // quotes the bridge's sentence rather than the JSON around it.
+  const fromToken = lookupTokenByAssetId(fromMeta.nearIntentsAsset);
+  const toToken = lookupTokenByAssetId(toMeta.nearIntentsAsset);
+  if (!fromToken || !toToken) return false;
+  return (
+    learnUsdLimitFromError({
+      message: errMsg,
+      fromAsset: fromToken,
+      toAsset: toToken,
+    }) !== null
+  );
 }
 
 /* ─── helpers ───────────────────────────────────────────────── */
@@ -1950,7 +1996,24 @@ function friendlySwapKitNoRoute(resp: SwapKitQuoteResponse): string | null {
   return null;
 }
 
-function humanizeError(e: unknown): string {
+/**
+ * Turn a thrown quote failure into a sentence for the user.
+ *
+ * Exported (instead of file-local) so unit tests can pin the copy against
+ * verbatim upstream captures, matching the rest of this file's convention.
+ * That matters more here than elsewhere: the branches below are the only
+ * thing standing between a proxy envelope and the swap screen, and the
+ * fallback was a JSON dumper until 2026-09-09.
+ */
+export function humanizeError(
+  e: unknown,
+  opts?: {
+    /** True when `isBasicswapRoutable(from, to)` for the CURRENT pair. Lets
+     *  an upstream "no such route" name the venue that does have one, rather
+     *  than leaving the user at a dead end on a pair the wallet can swap. */
+    basicswapAlternative?: boolean;
+  },
+): string {
   // Pre-flight resolver/format errors get rendered verbatim — they
   // already carry a clear actionable message ("No derived BTC address
   // — open the Bitcoin chain in the dashboard…") and were thrown
@@ -2033,8 +2096,85 @@ function humanizeError(e: unknown): string {
       "smallest size NEAR will quote, or try the other direction."
     );
   }
+  // HOT Omni Bridge floors are stated in DOLLARS, not in atomic units, and
+  // apply to a whole family of assets rather than to one pair. Verified live
+  // 2026-09-09 against 1Click: AVAX to BTC at $21 and at $160 refused, at
+  // $1,038 quoted; USDC on Polygon to BTC refused at exactly $1,000.00 and
+  // quoted at $1,009.95; ETH to AVAX refused too, so the asset counts on
+  // either leg. Thirteen of the wallet's thirty routable NEAR assets are on
+  // this bridge: AVAX, BNB, MON, POL, XLM, and the USDC/USDT legs on
+  // Avalanche, BSC, Optimism and Polygon.
+  //
+  // Normally the user never reads this sentence, because the reactive
+  // learner converts the floor and the inline hint says it in the form. This
+  // is the path for a cold tokens cache, where there is no price to convert
+  // with.
+  if (/Temporary swap limits/i.test(msg)) {
+    const floor = parseMinUsdFromUpstreamError(msg);
+    const amount = floor
+      ? `$${Number(floor).toLocaleString("en-US")}`
+      : "a fixed dollar amount";
+    return (
+      `NEAR Intents has a temporary minimum of ${amount} per swap on this route. ` +
+      `It comes from the bridge behind these assets, applies whichever side they are on, ` +
+      `and is not a wallet limit. Swap at least that much, or pick a pair without one of them.`
+    );
+  }
+  // 1Click's structural refusal, as distinct from `No liquidity available`.
+  // The two are worth telling apart and upstream does: the liquidity one is
+  // transient (observed on DOGE to BTC on 2026-09-09, recovered inside a
+  // minute at the same size), while this one means the pair is not offered at
+  // all. Litecoin has been in this state since about 2026-09-08 14:39 UTC
+  // with its bridge, token contract and catalog entry all healthy, so a user
+  // reading "no route" would reasonably conclude the wallet was broken.
+  if (/Quoting for this pair is not available/i.test(msg)) {
+    const base =
+      "NEAR Intents is not currently offering this pair. That is upstream, " +
+      "not a wallet problem, and it is not about the amount.";
+    return opts?.basicswapAlternative
+      ? `${base} The P2P tab can swap this pair over BasicSwap instead.`
+      : `${base} Try a different pair, or check back later.`;
+  }
   if (/proxy returned 4[0-9]{2}/.test(msg)) {
-    return `Quote request rejected by upstream: ${msg}`;
+    // Show the venue's own sentence, never the envelope around it. Before
+    // 2026-09-09 this branch printed `msg` whole, so any wording the
+    // branches above did not recognise reached the user as raw JSON,
+    // requestId and all. That first happened on 2026-05-10 ("Amount is too
+    // low for bridge") and was answered by teaching the parser that one
+    // shape, which left the JSON dumper in place to catch the next new
+    // wording. It caught "Temporary swap limits" on 2026-09-09.
+    const upstream = upstreamSentence(msg);
+    return upstream
+      ? `Quote request rejected by upstream: ${upstream}`
+      : `Quote request rejected by upstream (HTTP 4xx). No further detail was returned.`;
   }
   return msg;
+}
+
+/**
+ * Pull the venue's own sentence out of the proxy's wrapper envelope.
+ *
+ * The proxy relays an upstream 4xx as
+ *
+ *   proxy returned 400: {"error":"UPSTREAM","message":"Upstream API request
+ *   failed","upstreamStatus":400,"upstreamMessage":"<the real sentence>",
+ *   "requestId":"..."}
+ *
+ * Everything outside `upstreamMessage` is transport bookkeeping. Returns
+ * null when there is no envelope to unwrap, which is also the case when the
+ * venue answered in the bare shape (`{"message":"..."}`) that
+ * `getIntentsQuote` already unwraps for us.
+ *
+ * Exported so a test can pin it against the verbatim envelope from the
+ * 2026-09-09 AVAX capture rather than a paraphrase of it.
+ */
+export function upstreamSentence(msg: string): string | null {
+  const m = msg.match(/"upstreamMessage"\s*:\s*"((?:[^"\\]|\\.)*)"/);
+  if (!m) return null;
+  try {
+    const decoded = JSON.parse(`"${m[1]}"`) as string;
+    return decoded.trim() || null;
+  } catch {
+    return m[1].trim() || null;
+  }
 }

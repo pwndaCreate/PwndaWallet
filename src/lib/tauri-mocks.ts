@@ -158,6 +158,8 @@ type MockScenario =
   | "swap_sidecar_idle"
   | "swap_sidecar_active"
   | "swap_sidecar_stuck"
+  | "swap_refunding"
+  | "swap_swiped"
   | "utxo_change_stranded";
 
 
@@ -409,6 +411,8 @@ function scenario(): MockScenario {
   if (raw === "swap_sidecar_idle") return "swap_sidecar_idle";
   if (raw === "swap_sidecar_active") return "swap_sidecar_active";
   if (raw === "swap_sidecar_stuck") return "swap_sidecar_stuck";
+  if (raw === "swap_refunding") return "swap_refunding";
+  if (raw === "swap_swiped") return "swap_swiped";
   if (raw === "utxo_change_stranded") return "utxo_change_stranded";
   return "idle";
 }
@@ -442,6 +446,8 @@ function walletFunded(): boolean {
     s === "swap_sidecar_idle" ||
     s === "swap_sidecar_active" ||
     s === "swap_sidecar_stuck" ||
+    s === "swap_refunding" ||
+    s === "swap_swiped" ||
     // The projected-balance fixture is funded ON PURPOSE: the Mine tab's
     // SIMPLE hero multiplies a MINED XMR BALANCE by a convert rate, so a
     // scenario with mining but no balance (which is what
@@ -616,6 +622,8 @@ function pluginStore(cmd: string, args: any): unknown {
         if (
           s === "swap_sidecar_active" ||
           s === "swap_sidecar_stuck" ||
+          s === "swap_refunding" ||
+          s === "swap_swiped" ||
           s === "swap_sidecar_idle"
         ) {
           return [Date.now() - 3 * 86_400_000, true];
@@ -1504,16 +1512,7 @@ function dispatchUrl(
   //      degrades every minimum hint to silence, which isn't a useful
   //      thing to demo here. ----
   if (url.includes("/api/intents/tokens")) {
-    return {
-      status: 200,
-      json: [
-        { assetId: "nep141:eth.omft.near", decimals: 18, blockchain: "eth", symbol: "ETH", price: priceFor("ETH") },
-        { assetId: "nep141:btc.omft.near", decimals: 8, blockchain: "btc", symbol: "BTC", price: priceFor("BTC") },
-        { assetId: "nep141:sol.omft.near", decimals: 9, blockchain: "sol", symbol: "SOL", price: priceFor("SOL") },
-        { assetId: "nep141:wrap.near", decimals: 24, blockchain: "near", symbol: "NEAR", price: priceFor("NEAR") },
-        { assetId: "nep245:v2_1.omni.hot.tg:137_11111111111111111111", decimals: 18, blockchain: "pol", symbol: "POL", price: priceFor("POL") },
-      ],
-    };
+    return { status: 200, json: intentsTokenCatalog() };
   }
 
   // ---- Zephyr Protocol scanner livestats — oracle prices + reserve audit.
@@ -2042,46 +2041,126 @@ function swapKitBuildTx() {
 }
 
 /**
- * Mock floor for the HOT Omni-Bridge (`nep245:`) demo below — mirrors the
- * real ~74.8 POL floor captured live against 1Click on 2026-07-01 (see
- * `intents-pair-min-probe.ts::probeExactInputFallback`).
+ * The assets `/api/intents/tokens` reports, and the single source the USD
+ * gate below prices a request with.
+ *
+ * One table rather than two: the floor is checked in dollars, so a request
+ * the mock refuses must be a request the catalog can price. Keeping the
+ * catalog and the gate on separate lists is how you get a sandbox that
+ * refuses a swap for being under $1,000 and then renders no minimum, because
+ * the hint had no price to convert with.
+ *
+ * AVAX and USDC-on-Polygon are here because they are the two legs of the
+ * 2026-09-09 report; POL, because it was the first HOT Omni-Bridge asset the
+ * wallet carried.
  */
-const HOT_BRIDGE_MOCK_FLOOR_ATOMIC = 75_000_000_000_000_000_000n; // 75 (18dp)
+function intentsTokenCatalog(): Array<{
+  assetId: string;
+  decimals: number;
+  blockchain: string;
+  symbol: string;
+  price: number;
+}> {
+  return [
+    { assetId: "nep141:eth.omft.near", decimals: 18, blockchain: "eth", symbol: "ETH", price: priceFor("ETH") },
+    { assetId: "nep141:btc.omft.near", decimals: 8, blockchain: "btc", symbol: "BTC", price: priceFor("BTC") },
+    { assetId: "nep141:sol.omft.near", decimals: 9, blockchain: "sol", symbol: "SOL", price: priceFor("SOL") },
+    { assetId: "nep141:wrap.near", decimals: 24, blockchain: "near", symbol: "NEAR", price: priceFor("NEAR") },
+    { assetId: "nep245:v2_1.omni.hot.tg:137_11111111111111111111", decimals: 18, blockchain: "pol", symbol: "POL", price: priceFor("POL") },
+    { assetId: "nep245:v2_1.omni.hot.tg:43114_11111111111111111111", decimals: 18, blockchain: "avax", symbol: "AVAX", price: priceFor("AVAX") },
+    { assetId: "nep245:v2_1.omni.hot.tg:137_qiStmoQJDQPTebaPjgx5VBxZv6L", decimals: 6, blockchain: "pol", symbol: "USDC", price: priceFor("USDC") },
+    // XRP + Tron (2026-09-09). Added with the source enablement, because
+    // `assertAssetIsRoutable` refuses any asset id missing from the primed
+    // tokens cache — so a sandbox catalog that omits them reports the three
+    // new legs as unroutable, which is a fixture gap wearing the costume of a
+    // product bug. Ids verified against the live 1Click catalog the same day.
+    { assetId: "nep141:xrp.omft.near", decimals: 6, blockchain: "xrp", symbol: "XRP", price: priceFor("XRP") },
+    { assetId: "nep141:tron.omft.near", decimals: 6, blockchain: "tron", symbol: "TRX", price: priceFor("TRX") },
+    { assetId: "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near", decimals: 6, blockchain: "tron", symbol: "USDT", price: priceFor("USDT") },
+  ];
+}
 
 /**
- * `intents_quote` mock. Request-aware for one specific, real bug: assets
- * routed through the HOT Omni-Bridge (`nep245:` asset ids — first seen on
- * POL) answer a dry EXACT_OUTPUT probe with a generic, unparseable
- * rejection but a dry EXACT_INPUT probe with the specific "try at least N"
- * shape. Simulating that split here lets the sandbox demonstrate
- * `probeExactInputFallback` (the fix for the "minimum only shows after
- * typing" bug) without touching the real network. Every other request
- * shape (non-`nep245:` sources, or a non-dry real quote) gets the
- * original canned success below unchanged.
+ * Dollar value of a quote request's SOURCE side, from the catalog above.
+ *
+ * Returns Infinity when the source asset is not in the catalog, so an asset
+ * the mock cannot price is never refused for being too small. Guessing the
+ * other way would block quotes in the sandbox for a reason that does not
+ * exist upstream.
+ */
+function sandboxUsdOfRequest(req?: Record<string, unknown>): number {
+  const assetId = typeof req?.originAsset === "string" ? req.originAsset : "";
+  const amount = typeof req?.amount === "string" ? req.amount : "";
+  const token = intentsTokenCatalog().find((t) => t.assetId === assetId);
+  if (!token || !token.price) return Infinity;
+  let atomic: bigint;
+  try {
+    atomic = BigInt(amount);
+  } catch {
+    return Infinity;
+  }
+  // EXACT_OUTPUT states the amount in the DESTINATION asset, so pricing it
+  // against the source would be nonsense. The probe ladder asks in dollars a
+  // few cents at a time, far under any floor worth modelling, so treat that
+  // shape as below the limit outright.
+  if (req?.swapType === "EXACT_OUTPUT") return 0;
+  return (Number(atomic) / 10 ** token.decimals) * token.price;
+}
+
+/**
+ * The HOT Omni-Bridge floor, in DOLLARS, as 1Click enforces it today.
+ *
+ * Re-captured live on 2026-09-09 against `https://1click.chaindefuser.com`
+ * for all thirteen `nep245:v2_1.omni.hot.tg:*` assets the wallet carries
+ * (AVAX, BNB, MON, POL, XLM and the USDC/USDT legs on Avalanche, BSC,
+ * Optimism and Polygon). Every one of them, on both the EXACT_INPUT and the
+ * EXACT_OUTPUT shape, answers a small size with
+ *
+ *   "Temporary swap limits: minimum swap amount is $1,000"
+ *
+ * and quotes above it. Bracketed on USDC-Polygon: $1,000.00 refused,
+ * $1,009.95 quoted, so the comparison is strictly greater than.
+ *
+ * This REPLACES the 2026-07-01 fixture, which modelled the bridge as
+ * answering EXACT_OUTPUT with "Failed to get quote" and EXACT_INPUT with an
+ * atomic "try at least 74818831572074059154". Neither is what it says now.
+ * A fixture reproducing behaviour upstream no longer has is worse than no
+ * fixture: it was the reason the sandbox could not reproduce the error a
+ * user hit on this very path.
+ */
+const HOT_BRIDGE_MOCK_FLOOR_USD = 1000;
+
+/** What the bridge says below that floor, character for character. */
+const HOT_BRIDGE_MOCK_MESSAGE =
+  "proxy returned 400: " +
+  '{"error":"UPSTREAM","message":"Upstream API request failed",' +
+  '"upstreamStatus":400,"upstreamMessage":"Temporary swap limits: minimum ' +
+  'swap amount is $1,000","requestId":"809f3f8a0427200ccb69c3102e2de7a5"}';
+
+/**
+ * `intents_quote` mock. Request-aware for one specific, real behaviour:
+ * assets routed through the HOT Omni-Bridge (`nep245:` asset ids) carry a
+ * temporary dollar floor, on EITHER leg, and refuse everything below it with
+ * a message that names no atomic amount at all.
+ *
+ * Simulating it here is what lets the sandbox reproduce the 2026-09-09
+ * report (AVAX 2.6 to BTC, and to USDC on Polygon) and show that the screen
+ * now renders the limit rather than the proxy's JSON envelope. Every other
+ * request shape (no `nep245:` leg, or a size over the floor) gets the canned
+ * success below unchanged.
  */
 function intentsQuote(args?: { req?: Record<string, unknown> }): unknown {
   const req = args?.req;
   const originAsset = typeof req?.originAsset === "string" ? req.originAsset : "";
-  const isHotBridgeSource = originAsset.startsWith("nep245:");
+  const destinationAsset =
+    typeof req?.destinationAsset === "string" ? req.destinationAsset : "";
+  // Either leg. The limit follows the asset, not the direction: ETH to AVAX
+  // is refused exactly like AVAX to ETH (verified live 2026-09-09).
+  const touchesHotBridge =
+    originAsset.startsWith("nep245:") || destinationAsset.startsWith("nep245:");
 
-  if (req?.dry === true && isHotBridgeSource) {
-    if (req.swapType === "EXACT_OUTPUT") {
-      throw new Error("Failed to get quote");
-    }
-    if (req.swapType === "EXACT_INPUT") {
-      const amount = typeof req.amount === "string" ? req.amount : "";
-      let amountAtomic: bigint | null = null;
-      try {
-        amountAtomic = BigInt(amount);
-      } catch {
-        amountAtomic = null;
-      }
-      if (amountAtomic !== null && amountAtomic < HOT_BRIDGE_MOCK_FLOOR_ATOMIC) {
-        throw new Error(
-          `Amount is too low for bridge, try at least ${HOT_BRIDGE_MOCK_FLOOR_ATOMIC.toString()}`,
-        );
-      }
-    }
+  if (touchesHotBridge && sandboxUsdOfRequest(req) < HOT_BRIDGE_MOCK_FLOOR_USD) {
+    throw new Error(HOT_BRIDGE_MOCK_MESSAGE);
   }
 
   const now = Date.now();
@@ -2369,6 +2448,9 @@ interface SidecarMockState {
   /** "Start with the wallet" preference — the persisted one, not the effective
    *  value; PWNDA_SWAP_SIDECAR_AUTOSTART does not exist in a browser run. */
   autostart: boolean;
+  /** The wizard's Particl chain choice: full node instead of pruned. A setup
+   *  fact, so like the real record it survives a re-consent. */
+  archivalChain: boolean;
   phase: SidecarPhaseName;
   failReason: string;
   configured: boolean;
@@ -2648,7 +2730,11 @@ let sidecarState: SidecarMockState | null = null;
 function sidecar(): SidecarMockState {
   if (!sidecarState) {
     const s = scenario();
-    const active = s === "swap_sidecar_active" || s === "swap_sidecar_stuck";
+    const active =
+      s === "swap_sidecar_active" ||
+      s === "swap_sidecar_stuck" ||
+      s === "swap_refunding" ||
+      s === "swap_swiped";
     const enabled = active || s === "swap_sidecar_idle";
     sidecarState = {
       optedIn: enabled,
@@ -2656,6 +2742,8 @@ function sidecar(): SidecarMockState {
         ? new Date(Date.now() - 3 * 86_400_000).toISOString()
         : null,
       autostart: false,
+      // Pruned by default, matching the real record's `#[serde(default)]`.
+      archivalChain: false,
       phase: active ? "healthy" : "stopped",
       failReason: "",
       configured: enabled,
@@ -2716,6 +2804,13 @@ function sidecarStatus(): unknown {
     engine: mockEngineIdentity(),
     datadir: SIDECAR_DATADIR,
     autostart: st.autostart,
+    // A3 (Option A). `VITE_MOCK_PARTICL_UNPRUNED=1` reaches the "this chain
+    // predates pruning" line in SidecarStatusCard. Added with the flag rather
+    // than hardcoded false for the reason `engine` above was: a branch no
+    // sandbox state can reach is a branch nobody looks at, and this one is
+    // shown to exactly the users who already have a node — never to a fresh
+    // install, which is the state the sandbox otherwise always simulates.
+    particlUnpruned: import.meta.env.VITE_MOCK_PARTICL_UNPRUNED === "1",
     // The coins the RUNNING node reports — Rust reads them out of the engine
     // (`activeCoins()`: every chainclient block whose `connection_type` is
     // not "none"), so this is derived from the same rows `swap_sidecar_coin_
@@ -3109,25 +3204,58 @@ function sidecarBids(): unknown[] {
   const offers = sidecarOffers() as any[];
   const o = offers[1];
   const stuck = scenario() === "swap_sidecar_stuck";
-  if (scenario() !== "swap_sidecar_active" && !stuck) return [];
+  const timelock = onTimelockPath();
+  if (scenario() !== "swap_sidecar_active" && !stuck && !timelock) return [];
+  // The two timelock scenarios reproduce the live 2026-09-08 bid, which ran
+  // the OTHER way up: LTC offered for XMR, so this node sends XMR and is on
+  // the SCRIPTLESS leg. That direction is the whole point of the fixture —
+  // it is the leg the tracker used to describe with the counterparty's story
+  // — so it must not inherit the default XMR-for-LTC row above.
   return [
-    {
-      bid_id: sidecarId("bid-inflight"),
-      offer_id: o.offer_id,
-      created_at: now - 22 * 60,
-      expire_at: now + 38 * 60,
-      coin_from: "Monero",
-      coin_to: "Litecoin",
-      amount_from: amt(0.4, 12),
-      amount_to: amt(0.4 * (162.3 / 117) * 1.014, 8),
-      bid_rate: amt((162.3 / 117) * 1.014, 8),
-      bid_state: stuck ? "Error" : "Scriptless coin locked",
-      addr_from: "pwndaSandboxBidderAddrXXXXXXXXXXXXX",
-      addr_to: o.addr_to,
-      tx_state_a: "Confirmed",
-      tx_state_b: "Confirmed",
-    },
+    timelock
+      ? {
+          bid_id: sidecarId("bid-inflight"),
+          offer_id: o.offer_id,
+          created_at: now - 51 * 3600 - 33 * 60,
+          expire_at: now - 50 * 3600,
+          coin_from: "Litecoin",
+          coin_to: "Monero",
+          amount_from: "0.09992627",
+          amount_to: "0.009999971468",
+          bid_rate: "0.100073498871",
+          bid_state:
+            scenario() === "swap_swiped"
+              ? "Failed, swiped"
+              : "Script pre-refund tx in chain",
+          addr_from: "pwndaSandboxBidderAddrXXXXXXXXXXXXX",
+          addr_to: o.addr_to,
+          tx_state_a: "Confirmed",
+          tx_state_b: "Confirmed",
+          was_sent: true,
+        }
+      : {
+          bid_id: sidecarId("bid-inflight"),
+          offer_id: o.offer_id,
+          created_at: now - 22 * 60,
+          expire_at: now + 38 * 60,
+          coin_from: "Monero",
+          coin_to: "Litecoin",
+          amount_from: amt(0.4, 12),
+          amount_to: amt(0.4 * (162.3 / 117) * 1.014, 8),
+          bid_rate: amt((162.3 / 117) * 1.014, 8),
+          bid_state: stuck ? "Error" : "Scriptless coin locked",
+          addr_from: "pwndaSandboxBidderAddrXXXXXXXXXXXXX",
+          addr_to: o.addr_to,
+          tx_state_a: "Confirmed",
+          tx_state_b: "Confirmed",
+        },
   ];
+}
+
+/** The two scenarios whose bid has left the happy arc for a timelock. */
+function onTimelockPath(): boolean {
+  const s = scenario();
+  return s === "swap_refunding" || s === "swap_swiped";
 }
 
 /** `describeBid(..., for_api=True)` (ui/util.py:353-402). Same mid-swap state
@@ -3137,45 +3265,125 @@ function sidecarBidDetail(bidId: string): unknown {
   const now = Math.floor(Date.now() / 1000);
   const rate = (162.3 / 117) * 1.014;
   const offers = sidecarOffers() as any[];
+  const s = scenario();
+  const timelock = onTimelockPath();
+  const swiped = s === "swap_swiped";
+
+  // The two timelock scenarios are a byte-level reproduction of the live
+  // 2026-09-08 bid `000000006a9c9d96...`: LTC offered for XMR, this node the
+  // taker, so it SENDS the scriptless coin and is the side that swipes.
+  //
+  // Direction matters more than the numbers here. The old fixture kept the
+  // default XMR-for-LTC direction while asserting `was_sent: true` and
+  // `reverse_bid: false`, which puts this node on the SCRIPTED leg -- the one
+  // whose story the tracker was already telling correctly. So the copy that
+  // was actually wrong was unreachable in the sandbox, and stayed wrong for
+  // two days on a screen with real funds behind it.
+  const base = timelock
+    ? {
+        coin_from: "Litecoin",
+        coin_to: "Monero",
+        amt_from: "0.09992627",
+        amt_to: "0.009999971468",
+        bid_rate: "0.100073498871",
+        ticker_from: "LTC",
+        ticker_to: "XMR",
+        created_at: now - 51 * 3600 - 33 * 60,
+        created_at_timestamp: now - 51 * 3600 - 33 * 60,
+        state_time_timestamp: now - 4 * 60,
+        expired_at: now - 50 * 3600,
+      }
+    : {
+        coin_from: "Monero",
+        coin_to: "Litecoin",
+        amt_from: amt(0.4, 12),
+        amt_to: amt(0.4 * rate, 8),
+        bid_rate: amt(rate, 8),
+        ticker_from: "XMR",
+        ticker_to: "LTC",
+        created_at: now - 22 * 60,
+        created_at_timestamp: now - 22 * 60,
+        state_time_timestamp: now - 6 * 60,
+        expired_at: now + 38 * 60,
+      };
+
+  // Median time past runs BEHIND the wall clock -- about 14 minutes on
+  // Litecoin's 2.5-minute blocks, measured live. The swipe deadline is set an
+  // hour of chain time out so the countdown renders a real interval rather
+  // than "due now".
+  const medianTime = now - 14 * 60;
+
   return {
-    coin_from: "Monero",
-    coin_to: "Litecoin",
-    amt_from: amt(0.4, 12),
-    amt_to: amt(0.4 * rate, 8),
-    bid_rate: amt(rate, 8),
-    ticker_from: "XMR",
-    ticker_to: "LTC",
+    ...base,
     bid_state:
-      scenario() === "swap_sidecar_stuck" ? "Error" : "Scriptless coin locked",
-    bid_state_ind: scenario() === "swap_sidecar_stuck" ? 23 : 11,
+      s === "swap_sidecar_stuck"
+        ? "Error"
+        : swiped
+          ? "Failed, swiped"
+          : s === "swap_refunding"
+            ? "Script pre-refund tx in chain"
+            : "Scriptless coin locked",
+    bid_state_ind:
+      s === "swap_sidecar_stuck" ? 23 : swiped ? 18 : s === "swap_refunding" ? 14 : 11,
     state_description:
-      scenario() === "swap_sidecar_stuck"
+      s === "swap_sidecar_stuck"
         ? "Bid error, check events for details"
-        : "Both lock txs confirmed, waiting for offerer to release the LTC lock tx",
+        : swiped
+          // Upstream's own prose for state 18, verbatim from the live
+          // 2026-09-08 bid. Written from the SCRIPTED leg's point of view and
+          // handed to the side that was just paid, which is why the tracker
+          // suppresses it here (`nodeProseIsOtherLegsStory`).
+          ? "Swap failed, the other party claimed the refund"
+          : s === "swap_refunding"
+            ? "Pre-refund tx in chain, waiting for offerer to redeem or locktime to expire"
+            : "Both lock txs confirmed, waiting for offerer to release the LTC lock tx",
     itx_state: "Confirmed",
     ptx_state: "Confirmed",
     offer_id: offers[1].offer_id,
     addr_from: "pwndaSandboxBidderAddrXXXXXXXXXXXXX",
     addr_from_label: "",
     addr_fund_proof: null,
-    created_at: now - 22 * 60,
-    created_at_timestamp: now - 22 * 60,
-    state_time_timestamp: now - 6 * 60,
-    expired_at: now + 38 * 60,
+    // `was_received: null` is what upstream actually sends on a bid this node
+    // sent -- NOT `false`. `swapLegOf` only treats an explicit `true` as
+    // evidence, so a fixture that says `false` would exercise a shape the
+    // engine never emits.
     was_sent: true,
-    was_received: false,
+    was_received: timelock ? null : false,
     initiate_tx: null,
     initiate_conf: "None",
     participate_tx: null,
     participate_conf: "None",
     show_txns: false,
-    can_abandon: false,
-    events: [
-      { at: now - 22 * 60, desc: "Bid sent" },
-      { at: now - 18 * 60, desc: "Bid accepted" },
-      { at: now - 12 * 60, desc: "LTC lock tx confirmed" },
-      { at: now - 6 * 60, desc: "XMR lock tx confirmed" },
-    ],
+    can_abandon: !timelock,
+    // The FIRST timelock, long past by state 14. Kept so the state-11 panel
+    // still renders its own deadline.
+    coin_a_lock_refund_tx_est_final: timelock ? medianTime - 27 * 3600 : now + 21 * 3600,
+    // The SECOND timelock: when this node may swipe. The field the client did
+    // not read until 2026-09-08.
+    coin_a_lock_refund_swipe_tx_est_final: timelock
+      ? swiped
+        ? medianTime - 20 * 60
+        : medianTime + 66 * 60
+      : null,
+    coin_a_last_median_time: medianTime,
+    events: timelock
+      ? [
+          { at: now - 51 * 3600, desc: "Lock tx A seen in mempool" },
+          { at: now - 51 * 3600 + 20 * 60, desc: "Lock tx A confirmed in chain" },
+          { at: now - 51 * 3600 + 26 * 60, desc: "Lock tx B published" },
+          { at: now - 51 * 3600 + 34 * 60, desc: "Lock tx B confirmed in chain" },
+          { at: now - 22 * 3600, desc: "Lock tx A pre-refund tx published" },
+          { at: now - 22 * 3600 + 4 * 60, desc: "Lock tx A pre-refund tx confirmed in chain" },
+          ...(swiped
+            ? [{ at: now - 18 * 60, desc: "Lock tx A refund swipe tx published" }]
+            : []),
+        ]
+      : [
+          { at: now - 22 * 60, desc: "Bid sent" },
+          { at: now - 18 * 60, desc: "Bid accepted" },
+          { at: now - 12 * 60, desc: "LTC lock tx confirmed" },
+          { at: now - 6 * 60, desc: "XMR lock tx confirmed" },
+        ],
     debug_ui: false,
     reverse_bid: false,
     message_nets: ["smsg"],
@@ -4131,12 +4339,52 @@ const MOCKS: Record<string, (args: any) => unknown> = {
     // Mirrors the Rust rule: revoking consent clears autostart, so
     // re-consenting later cannot silently start the node.
     if (!st.optedIn) st.autostart = false;
-    return { optedIn: st.optedIn, at: st.optedInAt, autostart: st.autostart };
+    // The chain choice rides the consent (Rust `swap_sidecar_opt_in`'s
+    // `archival`). `undefined` must PRESERVE, not reset — a caller that does
+    // not know about the field cannot be allowed to silently flip it.
+    if (args?.archival !== undefined) st.archivalChain = args.archival === true;
+    return {
+      optedIn: st.optedIn,
+      at: st.optedInAt,
+      autostart: st.autostart,
+      archivalChain: st.archivalChain === true,
+    };
   },
   swap_sidecar_opt_in_status: () => {
     const st = sidecar();
     return { optedIn: st.optedIn, at: st.optedInAt, autostart: st.autostart };
   },
+  // S3. The snapshot offer. `VITE_MOCK_SNAPSHOT=none` reaches the "no snapshot
+  // published" path, which is the state every user sees until one is published
+  // — and therefore the one most likely to be wrong if it is never looked at.
+  swap_snapshot_offer: () => {
+    if (import.meta.env.VITE_MOCK_SNAPSHOT === "none") {
+      return {
+        available: false,
+        downloadBytes: 0,
+        snapshotId: null,
+        unavailableReason: "no snapshot is published for this Particl version",
+      };
+    }
+    return {
+      available: true,
+      downloadBytes: 767526335,
+      snapshotId: "particl-mainnet-2026-09-09",
+      unavailableReason: null,
+    };
+  },
+  // Resolves after a beat so the wizard's busy state is exercised rather than
+  // skipped. `VITE_MOCK_SNAPSHOT=fail` takes the fallback-to-network path.
+  swap_snapshot_restore: () =>
+    new Promise((resolve, reject) =>
+      setTimeout(
+        () =>
+          import.meta.env.VITE_MOCK_SNAPSHOT === "fail"
+            ? reject(new Error("the download does not match the manifest"))
+            : resolve("particl-mainnet-2026-09-09"),
+        800,
+      ),
+    ),
   swap_sidecar_set_autostart: (args: any) => {
     const st = sidecar();
     if (!st.optedIn) {

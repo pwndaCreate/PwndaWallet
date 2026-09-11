@@ -1,0 +1,123 @@
+Grove PATCH-29: count lock-tx-B RPC errors CONSECUTIVELY, and never abort a
+bid whose remedy is on chain A
+
+Upstream's escalation in checkXmrBidState reads:
+
+    rpc_error_count = self.countBidEvents(bid, EventLogTypes.LOCK_TX_B_RPC_ERROR, cursor)
+    if rpc_error_count < 10: ... log it ...
+    else: "Too many consecutive RPC errors" -> BidStates.BID_ERROR
+
+countBidEvents counts every LOCK_TX_B_RPC_ERROR row the bid has EVER logged.
+Those rows are permanent history; nothing clears them on a successful findTxB.
+So the count is a LIFETIME total wearing the word "consecutive", and it is
+monotonic: once a bid has logged ten of them, the threshold is met forever and
+EVERY subsequent transient blip re-runs the abort.
+
+That is not theoretical. Live mainnet bid 000000006a9c9d96...9bb980,
+2026-09-07, taker on an LTC/XMR swap with both legs locked and the
+counterparty already gone:
+
+  13:20:56  Temporary RPC error checking lock tx B (9/10): no connection to daemon
+  13:21:53  Temporary RPC error checking lock tx B (10/10): no connection to daemon
+  13:22:53  Too many consecutive RPC errors (10), aborting swap      -> BID_ERROR
+  15:23:47  (state re-derived as 14)
+  15:23:50  Too many consecutive RPC errors (10), aborting swap      -> BID_ERROR
+
+The second abort landed THREE SECONDS after the bid came back, on the first
+error of a fresh outage, because the counter was already at ten. The bid then
+held BID_ERROR for seven hours across 540 consecutive checkBidState polls.
+
+BID_ERROR is terminal for the adaptor-signature state machine: checkXmrBidState
+has no branch for it (unlike checkBidState, which carries an explicit
+`pass  # Wait for user input`). So the abort did not pause the swap, it ended
+the engine's participation in it. What the bid was waiting for at the time was
+the coin-A lock-refund SWIPE -- the taker's only remedy once a counterparty
+stalls after both locks, and the thing that pays the taker the coin they were
+buying. It survived only because the node happened to be restarted, which
+re-derived state 14 from chain.
+
+Two changes, both narrow:
+
+  1. COUNT CONSECUTIVELY. A run of failures is tracked in memory on the client
+     (`_lock_tx_b_rpc_runs`, bid_id -> int) and CLEARED the moment findTxB
+     returns. The event rows are still written, because the operator's history
+     is worth keeping; they are simply no longer what the threshold reads. A
+     restart clears the runs, which is correct: a fresh process has observed no
+     failures yet.
+
+  2. NEVER ABORT FROM XMR_SWAP_SCRIPT_TX_PREREFUND. At that state the remedy is
+     entirely on chain A -- publish the lock-refund spend (leader) or the swipe
+     (follower) when the CSV matures. Chain B is not consulted by either. So a
+     chain-B RPC outage is not a reason to stop driving a chain-A timelock, and
+     making it one converts somebody else's node outage into the loss of the
+     user's only claim. The run counter still logs, and now says plainly why it
+     is not escalating.
+
+     XMR_SWAP_SCRIPT_COIN_LOCKED keeps the abort: there the node IS waiting to
+     see its own chain-B lock, so an unreadable chain B is a genuine dead end.
+
+Upstream candidate: yes for (1) -- the message already says "consecutive" and
+the code does not implement it, so this is a straight defect fix. (2) is
+arguably upstream too but is stated here in our own terms.
+
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -479,6 +479,10 @@
+ 
+         self.debug_ui = self.settings.get("debug_ui", False)
+         self._debug_cases = []
++        # PWNDA-PATCH-29: bid_id -> length of the CURRENT run of transient
++        # lock-tx-B RPC failures. In memory on purpose: a restart has observed
++        # no failures yet, and the persisted event rows are history, not state.
++        self._lock_tx_b_rpc_runs: dict = {}
+         self._last_checked_actions = 0
+         self._last_checked_expired = 0
+         self._last_checked_expiring_bids_offers = 0
+@@ -9257,14 +9261,34 @@
+                 bid_changed: bool = False
+                 try:
+                     bid_changed = self.findTxB(ci_to, xmr_swap, bid, cursor, was_sent)
++                    # PWNDA-PATCH-29: a success ENDS the run. Without this the
++                    # count below is a lifetime total, and the tenth error a
++                    # bid ever sees becomes a permanent death sentence.
++                    self._lock_tx_b_rpc_runs.pop(bid_id, None)
+                 except Exception as e:
+                     if ci_to.is_transient_error(e):
+-                        rpc_error_count = self.countBidEvents(
+-                            bid, EventLogTypes.LOCK_TX_B_RPC_ERROR, cursor
++                        # PWNDA-PATCH-29: consecutive, not lifetime. The event
++                        # rows are still written for the operator's history;
++                        # they are just no longer what the threshold reads.
++                        rpc_error_count = self._lock_tx_b_rpc_runs.get(bid_id, 0) + 1
++                        self._lock_tx_b_rpc_runs[bid_id] = rpc_error_count
++                        # PWNDA-PATCH-29: at PREREFUND the remedy is chain-A
++                        # only (the leader's refund spend, or the follower's
++                        # swipe once the CSV matures). Neither reads chain B,
++                        # so a chain-B outage must not stop the timelock being
++                        # driven: BID_ERROR would end the engine's part in the
++                        # one path that still pays this side.
++                        remedy_is_on_chain_a: bool = (
++                            state == BidStates.XMR_SWAP_SCRIPT_TX_PREREFUND
+                         )
+-                        if rpc_error_count < 10:
++                        if rpc_error_count < 10 or remedy_is_on_chain_a:
+                             self.log.warning(
+-                                f"Bid {self.log.id(bid_id)}: Temporary RPC error checking lock tx B ({rpc_error_count + 1}/10): {e}"
++                                f"Bid {self.log.id(bid_id)}: Temporary RPC error checking lock tx B ({rpc_error_count}/10): {e}"
++                                + (
++                                    "; not escalating, this bid's remedy is on chain A"
++                                    if remedy_is_on_chain_a
++                                    else ""
++                                )
+                             )
+                             self.logBidEvent(
+                                 bid.bid_id,
+@@ -9280,7 +9304,7 @@
+                             self.logBidEvent(
+                                 bid.bid_id,
+                                 EventLogTypes.ERROR,
+-                                f"Persistent RPC error after {rpc_error_count} attempts: {e}",
++                                f"Persistent RPC error after {rpc_error_count} consecutive attempts: {e}",
+                                 cursor,
+                             )
+                             bid_changed = True

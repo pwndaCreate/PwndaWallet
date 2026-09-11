@@ -16,14 +16,18 @@ import {
   BID_STATE_IDS,
   BID_STATE_STAGES,
   BID_STATE_WIRE_LABELS,
+  SCRIPTLESS_LEG_STAGES,
+  nodeProseIsOtherLegsStory,
   bidStageLabel,
   bidStateNameOf,
   classifyBidState,
   isRefundOutcome,
+  isSwipeOutcome,
   isTerminal,
   isTerminalBidState,
   shouldSurface,
   stageForBidState,
+  swapLegOf,
   type BidStage,
   type BidStateName,
 } from "../bidStates";
@@ -50,10 +54,13 @@ const EXPECTED: Record<BidStage, BidStateName[]> = {
     "XMR_SWAP_NOSCRIPT_TX_REDEEMED",
   ],
   done: ["SWAP_COMPLETED"],
+  // PREREFUND is the refund STARTING, and belongs to its own non-terminal
+  // stage: it used to sit in `refunded` and told the user their funds were
+  // already back while the tx was still confirming (live bid, 2026-09-06).
+  refunding: ["XMR_SWAP_SCRIPT_TX_PREREFUND"],
   refunded: [
     "XMR_SWAP_FAILED_REFUNDED",
     "XMR_SWAP_NOSCRIPT_TX_RECOVERED",
-    "XMR_SWAP_SCRIPT_TX_PREREFUND",
     // v0.18.5: mercy USED means the scriptless leg came back to this side.
     "XMR_SWAP_FAILED_SWIPED_USED_MERCY",
   ],
@@ -80,6 +87,13 @@ const EXPECTED: Record<BidStage, BidStateName[]> = {
   ],
   // Reachable only from an unrecognised input, never from a protocol state.
   unknown: [],
+  // Reachable only with a LEG. These three are what the scriptless side reads
+  // instead of `refunding` / `counterparty-recovered` / `recovering`, and no
+  // state maps to them in the neutral table by construction — see
+  // `SCRIPTLESS_LEG_STAGES` and the leg-aware describe block below.
+  "timelock-unwinding": [],
+  swiped: [],
+  "swiped-settling": [],
 };
 
 describe("the protocol enum", () => {
@@ -133,7 +147,9 @@ describe("refunds are NORMAL outcomes, not errors", () => {
 
   it.each(refunds)("%s is severity normal, never attention", (name) => {
     const c = classifyBidState(name);
-    expect(c.stage).toBe("refunded");
+    // Both refund stages are non-failures; only the terminal one is past tense.
+    expect(["refunding", "refunded"]).toContain(c.stage);
+    expect(c.terminal).toBe(name !== "XMR_SWAP_SCRIPT_TX_PREREFUND");
     expect(c.severity).toBe("normal");
     expect(c.severity).not.toBe("attention");
     expect(isRefundOutcome(name)).toBe(true);
@@ -308,6 +324,221 @@ describe("arcProgress — where a stage sits on the happy path", () => {
   it("is null off the arc — a refund, an error, an internal pause", () => {
     for (const s of ["refunded", "needs-attention", "internal", "unknown", "cancelled"] as const) {
       expect(arcProgress(s)).toBeNull();
+    }
+  });
+});
+
+// =========================================================================
+// The leg split
+// =========================================================================
+
+/**
+ * Regression guard for the 2026-09-08 incident.
+ *
+ * Live bid `000000006a9c9d96…`: this node was the taker on an LTC/XMR swap,
+ * sent 0.00999997 XMR to receive 0.09992627 LTC, both legs locked, and the
+ * counterparty went quiet. It then sat in `XMR_SWAP_SCRIPT_TX_PREREFUND` for
+ * 28 hours while the tracker said "The refund is on chain now. Leave the app
+ * open until it settles." The operator read that, concluded they had been
+ * refunded a day earlier, and asked why the finished swap would not leave the
+ * screen. Nothing had been refunded: the pre-refund tx moves the
+ * COUNTERPARTY's chain-A lock, and the XMR was still locked at the shared
+ * address.
+ *
+ * The assertions below are written against the engine, not against the copy:
+ * each names the `basicswap.py` line that decides which side does what, so a
+ * future upstream bump that moves the asymmetry fails here rather than in
+ * front of a user with locked funds.
+ */
+describe("the same state means opposite things to the two legs", () => {
+  const scriptless = { was_sent: true, was_received: null, reverse_bid: false };
+  const scripted = { was_sent: null, was_received: true, reverse_bid: false };
+
+  describe("swapLegOf", () => {
+    it("reads a plain sent bid as the scriptless leg", () => {
+      expect(swapLegOf(scriptless)).toBe("scriptless");
+    });
+
+    it("reads a plain received bid as the scripted leg", () => {
+      expect(swapLegOf(scripted)).toBe("scripted");
+    });
+
+    it("mirrors the legs on a reverse ADS bid, as the engine does", () => {
+      // basicswap.py::checkXmrBidState:
+      //   was_sent = bid.was_received if reverse_bid else bid.was_sent
+      expect(swapLegOf({ ...scriptless, reverse_bid: true })).toBe("scripted");
+      expect(swapLegOf({ ...scripted, reverse_bid: true })).toBe("scriptless");
+    });
+
+    it("refuses to guess without reverse_bid", () => {
+      // /json/active rows carry was_sent and NOT reverse_bid. Guessing there
+      // is a coin flip between two opposite stories.
+      expect(swapLegOf({ was_sent: true })).toBe("unknown");
+      expect(swapLegOf({ was_sent: true, reverse_bid: null })).toBe("unknown");
+      expect(swapLegOf(null)).toBe("unknown");
+      expect(swapLegOf(undefined)).toBe("unknown");
+    });
+
+    it("treats a null on both sides as unknown, not as scripted", () => {
+      expect(
+        swapLegOf({ was_sent: null, was_received: null, reverse_bid: false }),
+      ).toBe("unknown");
+    });
+  });
+
+  describe("XMR_SWAP_SCRIPT_TX_PREREFUND (14) — THE incident", () => {
+    const S = "XMR_SWAP_SCRIPT_TX_PREREFUND";
+
+    it("does not tell the scriptless leg its own refund is on chain", () => {
+      const c = classifyBidState(S, "scriptless");
+      expect(c.stage).toBe("timelock-unwinding");
+      const copy = `${c.label} ${c.description}`.toLowerCase();
+      // The exact claim that produced the incident.
+      expect(copy).not.toContain("the refund is on chain");
+      expect(copy).not.toContain("refund");
+      // ...and it says the thing that was actually true for 28 hours.
+      expect(copy).toContain("has not moved");
+    });
+
+    it("still tells the scripted leg its refund is on chain, because it is", () => {
+      expect(classifyBidState(S, "scripted").stage).toBe("refunding");
+      expect(classifyBidState(S, "scripted").description).toContain(
+        "refund is on chain",
+      );
+    });
+
+    it("is non-terminal and severity normal on BOTH legs", () => {
+      for (const leg of ["scriptless", "scripted", "unknown"] as const) {
+        const c = classifyBidState(S, leg);
+        expect(c.terminal, leg).toBe(false);
+        expect(c.severity, leg).toBe("normal");
+      }
+    });
+
+    it("stays in the refund vocabulary, so no branch reaches for error copy", () => {
+      expect(isRefundOutcome(S, "scriptless")).toBe(true);
+      expect(isRefundOutcome(S, "scripted")).toBe(true);
+    });
+  });
+
+  describe("XMR_SWAP_FAILED_SWIPED (18) — inverted, not merely vague", () => {
+    const S = "XMR_SWAP_FAILED_SWIPED";
+
+    it("tells the scriptless leg it was PAID, not that it lost the swap", () => {
+      // basicswap.py:8880 publishes the swipe under `if was_sent:`, and
+      // createCoinALockRefundSwipeTx (:17154) pays
+      // getReceiveAddressForCoin — this node's own address.
+      const c = classifyBidState(S, "scriptless");
+      expect(c.stage).toBe("swiped");
+      const copy = `${c.label} ${c.description}`.toLowerCase();
+      expect(copy).not.toContain("the other user took");
+      expect(copy).toContain("in your wallet");
+      expect(c.terminal).toBe(true);
+      expect(c.severity).toBe("normal");
+    });
+
+    it("still tells the scripted leg the other side recovered", () => {
+      expect(classifyBidState(S, "scripted").stage).toBe(
+        "counterparty-recovered",
+      );
+    });
+
+    it("is not a refund on either leg — nothing came back", () => {
+      expect(isRefundOutcome(S, "scriptless")).toBe(false);
+      expect(isSwipeOutcome(S, "scriptless")).toBe(true);
+      expect(isSwipeOutcome(S, "scripted")).toBe(false);
+    });
+  });
+
+  describe("XMR_SWAP_FAILED_SWIPED_SENDING_MERCY (39) — swiper only", () => {
+    const S = "XMR_SWAP_FAILED_SWIPED_SENDING_MERCY";
+
+    it("does not tell the swiper its own funds are being recovered", () => {
+      // Set at basicswap.py:10583, on the swiper, once its mercy tx is queued.
+      const c = classifyBidState(S, "scriptless");
+      expect(c.stage).toBe("swiped-settling");
+      expect(c.label).not.toContain("Recovering your funds");
+      // Still moving: nothing downstream may settle against it.
+      expect(c.terminal).toBe(false);
+    });
+  });
+
+  describe("the victim-only mercy states keep the neutral reading", () => {
+    // All three are set on the side that was swiped (basicswap.py:10557,
+    // :9501, :10545), so the base table is already their correct reading.
+    it.each([
+      "XMR_SWAP_FAILED_SWIPED_USING_MERCY",
+      "XMR_SWAP_FAILED_SWIPED_USED_MERCY",
+      "XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED",
+    ] as BidStateName[])("%s is not overridden by leg", (name) => {
+      expect(classifyBidState(name, "scriptless").stage).toBe(
+        classifyBidState(name).stage,
+      );
+    });
+  });
+
+  it("overrides EXACTLY the three asymmetric states and nothing else", () => {
+    expect(Object.keys(SCRIPTLESS_LEG_STAGES).sort()).toEqual([
+      "XMR_SWAP_FAILED_SWIPED",
+      "XMR_SWAP_FAILED_SWIPED_SENDING_MERCY",
+      "XMR_SWAP_SCRIPT_TX_PREREFUND",
+    ]);
+  });
+
+  it("leaves every other state identical on every leg", () => {
+    for (const name of ALL_BID_STATE_NAMES) {
+      if (name in SCRIPTLESS_LEG_STAGES) continue;
+      for (const leg of ["scriptless", "scripted", "unknown"] as const) {
+        expect(stageForBidState(name, leg), `${name} @ ${leg}`).toBe(
+          stageForBidState(name),
+        );
+      }
+    }
+  });
+
+  describe("the node's own prose is suppressed when it is the other leg's", () => {
+    // Observed live 2026-09-08 at the moment this very bid settled IN THE
+    // USER'S FAVOUR. `state_description` on the paid side read, verbatim:
+    //
+    //   "Swap failed, the other party claimed the refund"
+    //
+    // The tracker renders that under "Swap node detail:", four lines below the
+    // stage label. Without the guard the panel asserted both "It is in your
+    // wallet" and "the other party claimed the refund" at once, about the same
+    // 0.09992346 LTC.
+    it("suppresses it for the states the leg overrides", () => {
+      for (const name of Object.keys(SCRIPTLESS_LEG_STAGES) as BidStateName[]) {
+        expect(nodeProseIsOtherLegsStory(name, "scriptless"), name).toBe(true);
+      }
+    });
+
+    it("keeps it on the scripted leg, whose story it actually is", () => {
+      for (const name of Object.keys(SCRIPTLESS_LEG_STAGES) as BidStateName[]) {
+        expect(nodeProseIsOtherLegsStory(name, "scripted"), name).toBe(false);
+        expect(nodeProseIsOtherLegsStory(name), name).toBe(false);
+      }
+    });
+
+    it("keeps it for every state the leg does not change", () => {
+      for (const name of ALL_BID_STATE_NAMES) {
+        if (name in SCRIPTLESS_LEG_STAGES) continue;
+        expect(nodeProseIsOtherLegsStory(name, "scriptless"), name).toBe(false);
+      }
+    });
+
+    it("accepts the bid_state_ind the tracker actually holds", () => {
+      // The call site passes `swap.detail.bid_state_ind`, an int, not a name.
+      expect(nodeProseIsOtherLegsStory(18, "scriptless")).toBe(true);
+      expect(nodeProseIsOtherLegsStory(14, "scriptless")).toBe(true);
+      expect(nodeProseIsOtherLegsStory(11, "scriptless")).toBe(false);
+      expect(nodeProseIsOtherLegsStory(null, "scriptless")).toBe(false);
+    });
+  });
+
+  it("defaults to the neutral mapping, so an un-migrated caller is unchanged", () => {
+    for (const name of ALL_BID_STATE_NAMES) {
+      expect(classifyBidState(name).stage).toBe(BID_STATE_STAGES[name]);
+      expect(classifyBidState(name).leg).toBe("unknown");
     }
   });
 });

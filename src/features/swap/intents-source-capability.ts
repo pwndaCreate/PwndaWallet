@@ -81,7 +81,21 @@ export const SOURCE_CAPABLE_BLOCKCHAINS: ReadonlySet<IntentsBlockchain> =
     // tokens — so the chain is single-asset on this route.
     "cardano",
 
-    // NOT source-capable (deliberate): xrp, tron, ton. Address derivation works
-    // so the user can RECEIVE on them, but no source-tx signer is wired, so
-    // they cannot be the FROM side. Move them up when a signer lands.
+    // 2026-09-09 (XRP + Tron source) — the second and third TS-SIGNED sources,
+    // for the same reason Cardano is one: the signing already exists in the
+    // adapter the dashboard Send button uses, and neither chain offers an
+    // unsigned-transaction seam a Rust signer could take over. XRP signs and
+    // submits inside `xrpl`; Tron signs a node-assigned `txID`, so the signer
+    // only ever sees a hash.
+    //
+    // `tron` covers BOTH native TRX and TRC-20 USDT: same chain, same key,
+    // same signature, different transaction builders (`trx-wallet.ts` vs
+    // `trc20-wallet.ts`). This set is keyed by CHAIN, so one entry enables
+    // both assets; `walletsByChainKey` is what separates them downstream.
+    "xrp",
+    "tron",
+
+    // NOT source-capable (deliberate): ton. Address derivation works so the
+    // user can RECEIVE on it, but no source-tx signer is wired, so it cannot
+    // be the FROM side. Move it up when a signer lands.
   ]);

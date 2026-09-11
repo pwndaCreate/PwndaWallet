@@ -25,6 +25,7 @@ import {
 import { useSwapQuote } from "./useSwapQuote";
 import { DeskConfirmModal } from "./DeskConfirmModal";
 import type { DeskSwapSummary } from "../../api/desk-rust";
+import { sourceSecretFor } from "./asset-capabilities";
 import { SwapConfirmModal } from "./SwapConfirmModal";
 // ONE implementation, imported — never a landscape-local fork. A second
 // copy of either is the same drift the router list already suffered; see
@@ -705,13 +706,7 @@ export function SwapLandscapeView({
           fromBlockchain={fromBlockchain}
           quote={liveQuoteState.quote}
           sourceAddress={sourceAddress}
-          sourceMnemonic={
-            // ADA is the one TS-signed swap source — it needs the mnemonic
-            // (same value ADA Send uses). undefined for every other source.
-            fromCoin.toUpperCase() === "ADA"
-              ? walletsByChain.cardano?.mnemonic
-              : undefined
-          }
+          sourceSecret={sourceSecretFor(fromCoin, walletsByChain)}
           destinationAddress={destinationAddress}
           onClose={() => setConfirmOpen(false)}
         />

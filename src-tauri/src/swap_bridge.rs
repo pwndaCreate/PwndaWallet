@@ -986,7 +986,7 @@ pub(crate) fn pre_share_balance_gate(
     if parsed > 0.0 {
         return Err(format!(
             "the swap node already holds {} of this coin in its own wallet. Sweep it \
-             back to your wallet first (Swap ▸ Sweep back), then this coin will use \
+             back to your wallet first (Settings ▸ swap node ▸ Sweep back), then this coin will use \
              your own wallet — sharing now would leave that balance unwatched",
             raw
         ));
@@ -1758,6 +1758,24 @@ mod tests {
         // an override, so a funded wallet stays refused however many (or few)
         // addresses the engine reports.
         assert!(pre_share_balance_gate(Some("0.5"), Some(0)).is_err());
+    }
+
+    /// The remedy a refusal names has to EXIST.
+    ///
+    /// This said "(Swap > Sweep back)" until 2026-09-08. Sweep-back left the
+    /// Swap tab on 2026-09-05 for `settings/SwapNodeExtras.tsx`, on the
+    /// operator's own request ("I only want things pertaining to any swaps
+    /// [in the swap tab]), and this string did not move with it -- so a user
+    /// who hit the gate was sent to a screen that had been deliberately
+    /// emptied of the control they were being told to use.
+    #[test]
+    fn pre_share_balance_gate_points_at_where_sweep_back_actually_is() {
+        let e = pre_share_balance_gate(Some("3.65468546"), None).unwrap_err();
+        assert!(e.contains("Settings"), "must name Settings: {e}");
+        assert!(
+            !e.contains("(Swap"),
+            "still points at the emptied Swap route: {e}"
+        );
     }
 
     /// The 2026-09-05 deadlock, pinned: a coin the engine has never handed out

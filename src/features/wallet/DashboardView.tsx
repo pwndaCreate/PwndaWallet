@@ -25,7 +25,6 @@ import { LitecoinDerivationPanel } from "./LitecoinDerivationPanel";
 import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { DerivationInfoCard } from "./DerivationInfoCard";
 
-import { SourceAddressesCard } from "../swap/SourceAddressesCard";
 import { Card, MiniSpark } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { SwapBalanceSubline } from "./SwapBalanceSubline";
@@ -805,11 +804,6 @@ export function DashboardView(props: {
         swapRows={dexSwapRows}
       />
 
-      {/* Funding addresses for chains that can act as a NEAR Intents
-          source but lack a first-party wallet view (LTC/DOGE/BCH/SOL/
-          NEAR). Sealed by default; one-shot password unlock to derive +
-          display. */}
-      <SourceAddressesCard />
     </div>
   );
 }
