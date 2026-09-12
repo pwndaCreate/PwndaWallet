@@ -142,7 +142,7 @@ basicswap/interface/electrumx.py and basicswap/bin/prepare.py's
 `electrum_supported_coins` dict are PWNDA-PATCH-18's (BCH) files, not
 touched here.
 
-Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b),
+Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175),
 after PWNDA-PATCH-13 (basicswap/interface/zephyr/ must exist first).
 Marker: PWNDA-PATCH-14
 ---

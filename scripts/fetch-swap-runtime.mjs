@@ -46,7 +46,7 @@
 //   wheels/  9 wheels                           7 from PyPI + 2 built locally
 //   sources/ coincurve-basicswap_v0.4.zip       build input for the fork wheel
 //   cores/   particl/ litecoin/ monero/ zephyr/ extracted daemons for --bindir
-//                                              (zano pending — see ZANO_CORE_PLACEHOLDER,
+//                                              (zano is BUILT, not fetched — see ZANO_CORE_PLACEHOLDER,
 //                                               filled by Grove expansion unit A5)
 //   swap-runtime.json                           the manifest
 //
@@ -95,8 +95,8 @@ const LOG = "[swap-runtime]";
 
 // Upstream source pins. These MUST match upstream/README.md's pin table — that
 // file is the human-readable copy of the same contract.
-const PIN_BASICSWAP_TAG = "v0.18.6";
-const PIN_BASICSWAP_COMMIT = "ea39faddbcaffd51a34d6bbd72fb9607654227f5";
+const PIN_BASICSWAP_TAG = "v0.18.7";
+const PIN_BASICSWAP_COMMIT = "079a0d43ed16590eecda2f3d6a3481f847360175";
 const PIN_COINCURVE_TAG = "basicswap_v0.4";
 const PIN_COINCURVE_COMMIT = "ff375ce4ac551afc99f359da784ffceeda03203f";
 
@@ -253,11 +253,15 @@ const PYPI_WHEELS = [
   },
   {
     name: "websocket-client",
-    version: "1.9.0",
-    file: "websocket_client-1.9.0-py3-none-any.whl",
-    url: "https://files.pythonhosted.org/packages/34/db/b10e48aa8fff7407e67470363eac595018441cf32d5e1001567a7aeba5d2/websocket_client-1.9.0-py3-none-any.whl",
-    sha256: "af248a825037ef591efbf6ed20cc5faa03d3b47b9e5a2230a529eeee1c1fc3ef",
-    bytes: 82616,
+    version: "1.9.2",
+    file: "websocket_client-1.9.2-py3-none-any.whl",
+    url: "https://files.pythonhosted.org/packages/d5/d2/cc4dc1271e464942db7ee278baae2daa99ee77cb2af744025c04da585a3e/websocket_client-1.9.2-py3-none-any.whl",
+    // Moved by upstream's v0.18.7 requirements.txt (1.9.0 -> 1.9.2). The sha256
+    // below is the one PyPI serves AND one of the two --hash= pins in upstream's
+    // own requirements.txt, so it is cross-checked against two sources rather
+    // than copied from whichever one was consulted first.
+    sha256: "e1a673830a9c7bfa47b1cd3d5e4178f4c9651d80a4eab02c9c23a1c3ec6250ce",
+    bytes: 95786,
     importName: "websocket",
   },
 ];
@@ -352,12 +356,21 @@ const LOCAL_WHEELS = [
     name: "basicswap",
     version: "0.18.6",
     file: "basicswap-0.18.6-py3-none-any.whl",
-    // Rebuilt 2026-09-08 from upstream/basicswap @ v0.18.6 with the buildCmd
-    // below; hash computed from the produced file, not taken from pip's log.
-    // `reproducible: false` (below) is why this is "what we built and
+    // Rebuilt 2026-09-12 from upstream/basicswap @ v0.18.7 with the buildCmd
+    // below; hash computed from the produced file, not taken from pip's log
+    // (they agreed, which is the point of checking rather than the reason to
+    // skip it). `reproducible: false` (below) is why this is "what we built and
     // verified" rather than a value anyone else can rederive byte-for-byte.
-    sha256: "206971cfb959bfe8523ae4dbae00e555fc33cb5c63d01cd02e2d4fbc2280428e",
-    bytes: 5215510,
+    //
+    // NOTE the version is still 0.18.6 at tag v0.18.7. Upstream did not bump
+    // basicswap/__init__.py when they tagged, so hatchling names the wheel from
+    // a version string that no longer tracks the release. Their own matrix
+    // channel has both halves of this: "The new version still has 0.18.6 in
+    // basicswap/__init__.py", and a user whose UI keeps telling him to update an
+    // already-updated node. The file name is therefore NOT evidence of which
+    // source built it -- the sha256 is.
+    sha256: "f864e6d3d30f5ac14252525fb5ee9ee5662a3ca0967b0ae12c7794ac00d6770b",
+    bytes: 5218782,
     buildFrom: `upstream/basicswap @ ${PIN_BASICSWAP_TAG} (${PIN_BASICSWAP_COMMIT})`,
     buildBackend: "hatchling",
     buildCmd: "python -m pip wheel . --no-deps -w <wheelhouse>",
@@ -637,14 +650,38 @@ const ZANO_CORE_PLACEHOLDER = {
     bytes: { "zanod.exe": 19246080, "simplewallet.exe": 17922048 },
     binaries: ["zanod.exe", "simplewallet.exe"],
   },
-  // TODO(A5-linux): the Linux arm is still unbuilt -- build-zano-linux.sh needs
-  // Docker, whose engine does not start on this machine (backend crash on its
-  // own ingest socket, see zano-build/README.md "Gate status"). Windows
-  // installers ship zano as of today; Linux ones do not.
-  linux: { file: null, urls: [], sha256: null, bytes: null, binaries: ["zanod", "simplewallet"] },
+  // BUILT 2026-09-11 (linux-x64). The Docker blocker in zano-build/README.md's
+  // "Gate status" is gone -- the engine starts on this machine now -- and
+  // build-zano-linux.sh ran end to end for the first time, after three
+  // Windows-host defects in it were fixed (MSYS path conversion in both
+  // directions, MSYS_NO_PATHCONV breaking git, the whole repo as build context)
+  // and a fourth that was never Windows-specific: the vendored patch is CRLF and
+  // a Linux checkout is LF, so `git apply` could not match a single context
+  // line. See PwndaWalletVault/log.md 2026-09-11.
+  //
+  // Same shape as `win` above: OUR hashes of OUR build, `urls` empty, still NOT
+  // spliced into COIN_CORES because there is nothing to fetch. STATIC=TRUE, so
+  // unlike the Windows build there are no OpenSSL DLLs to ship beside it --
+  // `PLATFORM_COIN_BINARIES` in bundle-binaries.mjs carries that difference.
+  //
+  // Patch presence verified against the BINARY, not assumed: `generate_from_keys`
+  // is present here and absent from the stock Linux build produced from the same
+  // commit with APPLY_PATCH=0, with `getbalance` present in both as the control
+  // proving the probe discriminates. `--version` cannot tell them apart (both
+  // report `ee3de1e-dirty`), which is why the probe is a symbol search.
+  linux: {
+    file: "simplewallet + zanod (local build, scripts/swap/zano-build/out/)",
+    urls: [],
+    sha256: {
+      zanod: "08accc5a6d465942357739273f449774e05975146e435b7befb19fb7ab7fbdae",
+      simplewallet: "d4cd107279505e7dc3135177055eb5a6760bef930dbe9570ff77d120b0805b1f",
+    },
+    bytes: { zanod: 47289320, simplewallet: 46879880 },
+    binaries: ["zanod", "simplewallet"],
+  },
   signer: null,
   assertFile: null,
-  placeholder: false, // win-x64 real; linux still pending
+  placeholder: false, // both platforms real as of 2026-09-11
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1206,7 +1243,7 @@ async function runFull() {
     },
     pins: {
       cpython: PIN_CPYTHON,
-      basicswap: { tag: PIN_BASICSWAP_TAG, commit: PIN_BASICSWAP_COMMIT, version: "0.18.5" },
+      basicswap: { tag: PIN_BASICSWAP_TAG, commit: PIN_BASICSWAP_COMMIT, version: "0.18.7" },
       coincurve: { tag: PIN_COINCURVE_TAG, commit: PIN_COINCURVE_COMMIT, version: "21.0.4", fork: true },
       cores: Object.fromEntries(COIN_CORES.map((c) => [c.coin, c.version])),
     },

@@ -1,0 +1,120 @@
+Grove PATCH-34: the mercy tx signed against the wrong pubkey hash on Particl
+
+Found 2026-09-12 finishing ZANO's regtest matrix. Both ZANO swipe-refund cases
+ended in BID_ERROR on every engine tried, 0.18.6+p32 and v0.18.7 alike, while the
+same cases with BITCOIN as chain A passed. The swipe itself always succeeded --
+the bid reached XMR_SWAP_FAILED_SWIPED_SENDING_MERCY and our side was paid -- and
+then Particl refused the mercy transaction:
+
+    RPC error {'code': -26, 'message': 'mandatory-script-verify-flag-failed
+      (Signature must be zero for failed CHECK(MULTI)SIG operation)'}
+
+The mercy tx is the courtesy payment that hands the counterparty back the
+keyshare they need to recover. Failing it costs us nothing and costs THEM the
+recovery, and leaves the bid in BID_ERROR rather than XMR_SWAP_FAILED_SWIPED.
+
+THE BUG
+
+BTCInterface.createMercyTx builds the scriptCode by slicing the prevout script:
+
+    prevout_script[2:22]
+
+which is the pubkey hash of a P2WPKH (0014<20 bytes>) and of nothing else.
+BTCInterface.getScriptForPubkeyHash does return P2WPKH -- but PARTInterface
+overrides it:
+
+    BTC : CScript([OP_0, pkh])                                  -> 0014<hash>
+    PART: CScript([OP_DUP, OP_HASH160, pkh, OP_EQUALVERIFY, ...]) -> 76a914<hash>88ac
+
+On P2PKH the hash starts one byte later. Instrumenting a live Particl swipe
+showed the slice taking the push opcode plus 19 of the 20 hash bytes:
+
+    payout spk   76a914 9c31b6846171f9b770c305c0d6a83521c304ed82 88ac
+    script_code  76a914 149c31b6846171f9b770c305c0d6a83521c304ed 88ac
+
+Wrong sighash, invalid signature, NULLFAIL. A coin overrode the script shape and
+a consumer of that script kept Bitcoin's byte layout -- the paired-site defect
+this project keeps meeting.
+
+THE FIX
+
+Derive the scriptCode from the KEY rather than from the prevout script's bytes.
+The scriptCode for a P2WPKH input (BIP143) and for a legacy P2PKH input are both
+the P2PKH script of that pubkey hash, so this is correct for every coin and
+deletes the layout assumption instead of special-casing Particl.
+
+VERIFICATION
+
+test_06_ads_part_coin_swipe_refund, which had failed on every prior run:
+
+    Ran 1 test in 141.850s
+    OK
+
+with zero NULLFAIL rejections, against v0.18.7 with the fingerprint gate armed.
+
+WHAT THIS DOES NOT APPLY TO, corrected after asserting the opposite
+
+An earlier draft of this header said "applies to v0.18.7 and v0.18.6 -- the code
+is identical in both". That is FALSE and was not checked before writing it.
+`prevout_script[2:22]` does not exist in v0.18.6 at all:
+
+    0.18.6 deployed (linux)   prevout_script[2:22] = 0 occurrences
+    0.18.6 deployed (win)     prevout_script[2:22] = 0 occurrences
+    v0.18.7 staged            prevout_script[2:22] = 1 occurrence
+
+v0.18.6's createMercyTx has no key-signing branch: it ends in
+`signTxWithWallet(tx.serialize())` unconditionally, and `swipePaysKey` does not
+exist there. So on v0.18.6 the mercy tx is always wallet-signed, and it fails on
+a Particl swipe because the payout went to a swap-derived key the wallet does not
+hold -- same NULLFAIL symptom, different cause.
+
+That makes upstream's v0.18.7 swipe/mercy rework the RIGHT fix for the v0.18.6
+fault, carrying a one-byte bug of its own. This patch completes it rather than
+working around it.
+
+Consequence worth stating: this patch CANNOT repair the deployed v0.18.6 engine,
+because the code it corrects is not there. A working mercy path on Particl
+requires v0.18.7 + this patch.
+
+Applies to: basicswap v0.18.7 only.
+
+diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
+--- a/basicswap/interface/btc/btc.py
++++ b/basicswap/interface/btc/btc.py
+@@ -5135,11 +5135,35 @@
+ 
+         # A key derived for this swap instead, which the wallet does not hold, so
+         # nothing else can spend the output and it is signed here.
++        # PWNDA-PATCH-34: derive the scriptCode from the KEY, not by slicing the
++        # prevout script at a fixed offset.
++        #
++        # prevout_script[2:22] is the pubkey hash of a P2WPKH (0014<20>) and of
++        # nothing else. BTCInterface.getScriptForPubkeyHash returns P2WPKH, but
++        # PARTInterface OVERRIDES it to P2PKH (76a914<20>88ac), where the hash
++        # starts one byte later. Measured on a live Particl swipe:
++        #
++        #   payout spk   76a914 9c31b6846171f9b770c305c0d6a83521c304ed82 88ac
++        #   script_code  76a914 149c31b6846171f9b770c305c0d6a83521c304ed 88ac
++        #
++        # -- the push opcode plus 19 of the 20 hash bytes. Wrong sighash, invalid
++        # signature, and Particl refuses the mercy tx:
++        #
++        #   RPC error {'code': -26, 'message': 'mandatory-script-verify-flag-failed
++        #     (Signature must be zero for failed CHECK(MULTI)SIG operation)'}
++        #
++        # The swipe still pays, so no funds are lost -- but the counterparty never
++        # gets the keyshare the mercy tx exists to hand back, and the bid ends in
++        # BID_ERROR instead of XMR_SWAP_FAILED_SWIPED.
++        #
++        # The scriptCode for a P2WPKH input (BIP143) and for a legacy P2PKH input
++        # are both the P2PKH script of that pubkey hash, so deriving it from `key`
++        # is correct for every coin and removes the layout assumption entirely.
+         script_code = CScript(
+             [
+                 OP_DUP,
+                 OP_HASH160,
+-                prevout_script[2:22],
++                self.pkh(self.getPubkey(key)),
+                 OP_EQUALVERIFY,
+                 OP_CHECKSIG,
+             ]

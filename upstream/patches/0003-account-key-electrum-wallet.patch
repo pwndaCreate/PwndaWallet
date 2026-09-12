@@ -41,7 +41,7 @@ Spending legacy inputs needs PATCH 6 (the signer is witness-only upstream);
 the transport is PATCH 4. Not an upstream-PR candidate: who owns the wallet's
 keys, and in which encoding, is an embedder's question.
 
-Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175)
 Marker in patched source: PWNDA-PATCH-3
 ---
  basicswap/wallet_manager.py | 151 ++++++++++
