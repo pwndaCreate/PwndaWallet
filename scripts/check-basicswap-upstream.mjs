@@ -65,7 +65,7 @@
  */
 
 import { readFile, readdir, mkdtemp, mkdir, rm, writeFile, realpath } from "node:fs/promises";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { tmpdir } from "node:os";
@@ -238,7 +238,34 @@ const walkForRuntimes = async (dir, depth) => {
   }
 };
 await walkForRuntimes(workDir, 0);
-const pinnedVersion = pins.tag.replace(/^v/, "");
+// [GROVE FIX 2026-09-12] Derive the pinned VERSION from the pinned SOURCE, not
+// from the tag string. Upstream does not always bump `basicswap/__init__.py`
+// when it tags: v0.18.7 and v0.18.6 BOTH declare `__version__ = "0.18.6"`, and
+// nothing in the gap touched that file. A runtime reports what the package
+// declares, so comparing it against a tag-derived "0.18.7" made the DEPLOYED
+// check permanently unsatisfiable -- it would have demanded a rebuild, been
+// given one, and still gone red. Falling back to the tag keeps the old
+// behaviour when the file cannot be read.
+const pinnedVersion = (() => {
+  try {
+    const initSrc = readFileSync(
+      path.join(CLONE, "basicswap", "__init__.py"),
+      "utf8",
+    );
+    const m = initSrc.match(/^__version__\s*=\s*["']([^"']+)["']/m);
+    if (m) return m[1];
+    console.warn(
+      `${LOG} WARN   could not read __version__ from the pinned source; ` +
+        `falling back to the tag string.`,
+    );
+  } catch (e) {
+    // NOT a bare catch. The first attempt at this used `catch {}` and silently
+    // swallowed a ReferenceError from a missing readFileSync import, so the
+    // fallback fired and the fix looked like it had simply not worked.
+    console.warn(`${LOG} WARN   __version__ probe failed (${e.message}); using the tag.`);
+  }
+  return pins.tag.replace(/^v/, "");
+})();
 // The canonical install path, realpath'd so the dev-home junction collapses
 // onto it rather than counting as a second, separate runtime.
 let liveRuntimeReal = path.join(workDir, "runtime");

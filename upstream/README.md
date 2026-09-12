@@ -10,12 +10,63 @@ re-fetch deterministically from the pin table below on any machine.
 
 ## The pin (Phase-0 "pin an upstream release tag" — recorded 2026-08-15)
 
+> ## v0.18.7 + PATCH-34 — DEPLOYED on both platforms (2026-09-12)
+>
+> Earlier banners on this pin claimed first that v0.18.7 regressed the mercy
+> transaction, then that it was untested. Both were wrong and are retracted; the
+> runs behind the first had silently used the deployed 0.18.6 tree. See
+> `PwndaWalletVault/log.md` 2026-09-12.
+>
+> **Identify a tree by CONTENT, never by the stamp.** Upstream never bumped
+> `__version__`, so every tree here stamps `pwnda-grove 0.18.6+p<n>` regardless of
+> which upstream it came from, and `check-basicswap-upstream.mjs` inherits that
+> blindness in its per-runtime lines.
+>
+> | tree | fingerprint |
+> |---|---|
+> | 0.18.6+p32 (previous, kept as rollback) | `abe564463c5b` |
+> | **v0.18.7 + PATCH-34 (deployed, both platforms)** | **`dc766b9fdb4d`** |
+>
+> | gate | 0.18.6+p32 | **v0.18.7 + p34** |
+> |---|---|---|
+> | patch series | 32 | **33** |
+> | invariant suites, Linux | 13/13 | **13/13** |
+> | invariant suites, Windows | 13/13 | **13/13** |
+> | ZEPH matrix | 8/8 | **8/8** |
+> | ZANO matrix | 5/8 | **8/8** |
+>
+> Windows and Linux engines are byte-identical across all 173 `.py` files.
+>
+> **Rollback**, if ever needed — identify it by fingerprint, not by the directory
+> name, because every backup here is called `0.18.6`:
+>
+> ```
+> .swap-sidecar-work/runtime-backup-0.18.6-20260912-081557        fp abe564463c5b  (windows)
+> .swap-sidecar-work/linux-runtime-backup-0.18.6p32-20260912-081703  (linux)
+> ```
+>
+> **Installing a Linux runtime must be done FROM Linux.** A `cp -r` from MSYS bash
+> silently fails to create the symlinks the tree needs — including `bin/python3`,
+> the interpreter itself — and leaves a directory that looks complete and has no
+> python in it. Use `cp -a` inside the container.
+>
+> **Running a matrix against a staged tree:**
+>
+> ```
+> -e GROVE_RUNTIME=/io/.swap-sidecar-work/linux-runtime-0187
+> -e GROVE_EXPECT=dc766b9fdb4d
+> ```
+>
+> `GROVE_EXPECT` makes the runner refuse to start on the wrong tree. With no
+> `GROVE_RUNTIME` it uses the deployed tree, which is the point of a post-deploy
+> re-run.
+
 | repo | tag | commit | tag date | local path |
 |---|---|---|---|---|
-| github.com/basicswap/basicswap | **v0.18.6** | `ea39faddbcaffd51a34d6bbd72fb9607654227f5` | 2026-09-06 | `upstream/basicswap/` |
+| github.com/basicswap/basicswap | **v0.18.7** | `079a0d43ed16590eecda2f3d6a3481f847360175` | 2026-09-11 | `upstream/basicswap/` |
 | github.com/basicswap/coincurve | **basicswap_v0.4** | `ff375ce4ac551afc99f359da784ffceeda03203f` | 2026-08-13 | `upstream/coincurve/` |
 
-Notes at pin time: moved to `v0.18.6` on 2026-09-08 (from `v0.18.5`, pinned 2026-08-29; see `PwndaWalletVault/log.md`). **No datadir migration this time** — probe 5b reports `CURRENT_DB_VERSION` and `CURRENT_DB_DATA_VERSION` unchanged, so the runtime swap is a pure binary replacement, unlike the v0.18.5 bump which moved them 37→38 and 9→10. Two patches needed rebasing and neither was superseded: 0007 onto upstream's rewritten `_computeElectrumLegacyFundsInfo` (822383af, which disabled the caller by default but did not make the function adoption-aware, so our fix still applies), and 0016 onto the `chain_client_settings` tuple upstream appended `electrum_poll_interval` to. The coincurve tag is the
+Notes at pin time: moved to `v0.18.7` on 2026-09-12 (from `v0.18.6`, pinned 2026-09-08; see `PwndaWalletVault/log.md`). **No datadir migration** — probe 5b reports `CURRENT_DB_VERSION` and `CURRENT_DB_DATA_VERSION` unchanged, so the runtime swap is a pure binary replacement. **The SMSG wire is byte-identical** and the coin enum is unchanged, so ZANO=16 and ZEPH=19 stay safe. Exactly one patch needed rebasing and it was not superseded: 0007, onto upstream's `refactor: thread db cursor through fundTx and fundSCLockTx` (8699f135), which added a `cursor=None` parameter to `fundSCLockTx`/`fundTx`/`_fundTxElectrum` and reformatted one call site into the shape the patch used to introduce. Pure context drift — checked first, because "stopped applying" and "stopped being necessary" look identical from the failure: v0.18.7 still does not filter which UTXOs may fund a chain-A lock (the unimplemented `# TODO: Manually select only segwit prevouts` is still there), so the patch's premise holds. One PyPI pin moved with it, `websocket-client` 1.9.0 → 1.9.2. The coincurve tag is the
 exact tag `upstream/basicswap/requirements.txt:7` pins AND the tag
 `pwnda-engine-handoff/engine-ltc/requirements.txt` already pins — one fork tag serves both.
 

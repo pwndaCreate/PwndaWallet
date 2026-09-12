@@ -9,7 +9,28 @@
 > node. The applier is idempotent and refuses ambiguous context rather than
 > guessing; see its header for why fuzzy patching is banned here.
 
-Nineteen patches, in five groups.
+~~Nineteen patches, in five groups.~~ **Thirty-three as of 2026-09-11**, and the
+group prose below stops at 12. It has been drifting since 0020 and this note is
+not a fix for that — it is a pointer to the authority, which is the series itself:
+
+```
+node scripts/apply-engine-patches.mjs --check --target <runtime>
+```
+
+That prints every patch, whether it is present, and the engine level it adds up
+to. One patch is EXEMPT (0022 touches only `tests/`, which an assembled runtime
+does not ship), so thirty-three files yield `+p32`. `src-tauri/src/grove.rs`'s
+`EXPECTED_PATCH_LEVEL` is pinned to that count by
+`grove::tests::expected_patch_level_matches_the_series`, which recomputes it from
+this directory — so the number cannot drift silently even while this prose does.
+
+The newest is **0033-zano-scratch-wallet-identity.patch**: ZANO's half of upstream
+`10ee0843`'s wrong-wallet guard, which ZEPH inherits from `XMRInterface` and
+`ZanoInterface` — a sibling of `CoinInterface` — inherits nothing of. See
+`scripts/swap/verify-xmr-security-inheritance.py`, which is what will catch the
+next one.
+
+Nineteen patches, in five groups (as originally written):
 
 **1–2 are platform fixes.** Both make the pinned engine run natively on Windows; neither
 changes swap protocol, wire format, or consensus behaviour, and both are no-ops on POSIX.
@@ -84,7 +105,7 @@ gitignored workspace.
 | 27 | `0027-settle-redeemed-bid-error.patch` | `pwndaRecoverStalledBid` settles a `BID_ERROR` bid whose chain-A redeem is already confirmed (≥ 1 confirmation via the electrum backend or the node/wallet RPC): `SCRIPT_TX_REDEEMED` → `SWAP_COMPLETED` for the redeeming side, deactivated, `settled: true` in the reply. The 2026-08-23 mainnet bid sat "in progress" for twelve days because PATCH-11 could only re-queue a redeem the chain had already accepted. Called by the supervisor's bid janitor | `PWNDA-PATCH-27` | no — upstream's exit is `manualBidUpdate` (arbitrary state); this takes none |
 | 28 | `0028-zephyr-coingecko-id.patch` | `getExchangeName` returns `zephyr-protocol` for ZEPH instead of its chain name `zephyr`, which is a DIFFERENT CoinGecko asset trading at ~4% of ZEPH's price — 67.27 ZEPH read $1.19 in the console against the wallet's $27.08. Same shape as the BCH and FIRO exceptions already in that function. `lookupFiatRates` also feeds the offer book's rate columns and the AMM page | `PWNDA-PATCH-28` | yes, if Zephyr lands upstream — a one-line id correction of a shape already present twice |
 
-Applies to: **basicswap `v0.18.6`** (`ea39faddbcaffd51a34d6bbd72fb9607654227f5`).
+Applies to: **basicswap `v0.18.7`** (`079a0d43ed16590eecda2f3d6a3481f847360175`).
 Rebased from `v0.17.9` on 2026-08-26 — only **0006** needed a change, and only its
 first hunk's context (upstream reshaped the `basicswap_util` import into a
 parenthesized multi-import). 1–12 verified by `git apply` AND by

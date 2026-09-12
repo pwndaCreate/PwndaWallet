@@ -28,7 +28,7 @@ and the supervisor denies this path to the embedded console's proxy.
 
 Not an upstream-PR candidate: it exists to serve an embedding host.
 
-Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175)
 Marker in patched source: PWNDA-PATCH-4
 ---
  basicswap/js_server.py |  72 ++++++++++

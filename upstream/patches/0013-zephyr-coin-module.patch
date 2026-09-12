@@ -89,7 +89,7 @@ only. Not `git apply`-safe with this padding (git's own parser would insert
 a literal blank line instead of restoring an implicit trailing newline);
 this patch's applier is scripts/apply-engine-patches.mjs, not git apply.
 
-Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175)
 Marker: PWNDA-PATCH-13
 ---
 diff --git a/basicswap/interface/zephyr/__init__.py b/basicswap/interface/zephyr/__init__.py

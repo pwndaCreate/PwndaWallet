@@ -21,7 +21,7 @@ belongs in the environment rather than in a new upstream default.
 
 Upstream-PR candidate (not yet submitted).
 
-Applies to: basicswap v0.18.5 (3859612035f8c4476b5cadedf36b875d2f2def5b)
+Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175)
 Marker in patched source: PWNDA-PATCH-2
 ---
  basicswap/basicswap.py | 6 +++++-

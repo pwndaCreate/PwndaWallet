@@ -113,7 +113,7 @@ pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.6";
 /// created against an empty chain first, ends up below `pruneheight` and
 /// particld refuses to start. Off by default; absent the env var the call is
 /// upstream's own single-argument form.
-pub const EXPECTED_PATCH_LEVEL: u32 = 31;
+pub const EXPECTED_PATCH_LEVEL: u32 = 32;
 
 /// The identifier this build expects a correctly-patched runtime to carry,
 /// e.g. `pwnda-grove 0.18.5+p26`.
@@ -404,21 +404,60 @@ mod tests {
     /// updating this module is a test failure rather than a stale comment. That
     /// stale comment is not hypothetical — `swap_sidecar.rs` restated `v0.17.9`
     /// for two days after the pin moved to `v0.18.4`.
+    /// [GROVE FIX 2026-09-12] Derive the expectation from the pinned SOURCE's
+    /// `__version__`, NOT from the tag string.
+    ///
+    /// Upstream does not always bump `basicswap/__init__.py` when it tags.
+    /// v0.18.7 and v0.18.6 BOTH declare `__version__ = "0.18.6"`, and nothing in
+    /// the gap touched that file. This test used to strip the "v" off
+    /// PIN_BASICSWAP_TAG, so moving the pin to v0.18.7 made it demand "0.18.7"
+    /// from a runtime that can only ever report "0.18.6" — an assertion no build
+    /// could satisfy.
+    ///
+    /// It is upstream's own bug and it is known: their matrix channel has
+    /// "The new version still has 0.18.6 in basicswap/__init__.py" and a user
+    /// reporting the UI nagging him to update a node that is already updated,
+    /// for exactly this reason. We should not encode their slip as our
+    /// invariant. What a runtime reports is what the package declares, so that
+    /// is what this compares against.
     #[test]
     fn expected_version_matches_the_pin() {
-        let path = repo_root().join("scripts").join("fetch-swap-runtime.mjs");
+        let path = repo_root()
+            .join("upstream")
+            .join("basicswap")
+            .join("basicswap")
+            .join("__init__.py");
         let src = fs::read_to_string(&path)
             .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
-        let marker = "const PIN_BASICSWAP_TAG = \"";
+        let marker = "__version__ = \"";
         let start = src
             .find(marker)
-            .expect("PIN_BASICSWAP_TAG not found — did the pin move to another file?")
+            .expect("__version__ not found in the pinned basicswap source")
             + marker.len();
-        let tag = &src[start..start + src[start..].find('"').expect("unterminated pin")];
-        let pinned = tag.strip_prefix('v').unwrap_or(tag);
+        let declared = &src[start..start + src[start..].find('"').expect("unterminated version")];
         assert_eq!(
-            pinned, EXPECTED_UPSTREAM_VERSION,
-            "pin is {pinned} but EXPECTED_UPSTREAM_VERSION is {EXPECTED_UPSTREAM_VERSION}"
+            declared, EXPECTED_UPSTREAM_VERSION,
+            "the pinned source declares {declared} but EXPECTED_UPSTREAM_VERSION is              {EXPECTED_UPSTREAM_VERSION}"
+        );
+    }
+
+    /// The tag still has to be recorded somewhere a human reads, even when it
+    /// cannot be compared against `__version__`. This asserts the two pins that
+    /// DO name the tag agree with each other, so the runtime-identity gap above
+    /// cannot also hide a pin-table/fetch-script split.
+    #[test]
+    fn pin_table_and_fetch_script_name_the_same_tag() {
+        let fetch = fs::read_to_string(repo_root().join("scripts").join("fetch-swap-runtime.mjs"))
+            .expect("cannot read fetch-swap-runtime.mjs");
+        let marker = "const PIN_BASICSWAP_TAG = \"";
+        let start = fetch.find(marker).expect("PIN_BASICSWAP_TAG not found") + marker.len();
+        let tag = &fetch[start..start + fetch[start..].find('"').expect("unterminated pin")];
+
+        let readme = fs::read_to_string(repo_root().join("upstream").join("README.md"))
+            .expect("cannot read upstream/README.md");
+        assert!(
+            readme.contains(&format!("**{tag}**")),
+            "fetch-swap-runtime pins {tag} but upstream/README.md's table does not name it"
         );
     }
 

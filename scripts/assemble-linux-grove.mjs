@@ -20,9 +20,9 @@
 // renames it to `runtime/` inside the tar via `--transform`. See that
 // script's `buildPayload` doc for the full account.
 //
-// So this script's only filesystem work is copying the FIVE COIN BINARIES
-// (plain ELF files, no symlinks, unaffected by any of the above) into one
-// place with the coins-in-one-place. If the coin sources ever gain the same
+// So this script's only filesystem work is copying the COIN BINARIES (plain
+// ELF files, no symlinks, unaffected by any of the above) into one place with
+// the coins-in-one-place. If the coin sources ever gain the same
 // symlink problem, the fix is the same: point bundle-binaries.mjs at the
 // original location and let it rename at tar time, not here.
 //
@@ -54,8 +54,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(__dirname, "..");
 import {
   BUNDLED_COINS as ALL_BUNDLED_COINS,
-  COIN_BINARIES as ALL_COIN_BINARIES,
   bundledCoinsFor,
+  coinBinariesFor,
 } from "./bundle-binaries.mjs";
 
 const LOG = "[assemble-linux-grove]";
@@ -80,8 +80,11 @@ export const LINUX_GROVE_BIN = path.join(REPO, ".swap-sidecar-work", "linux-grov
 // what the bundler will ask for — including which coins this PLATFORM omits
 // and why (`NOT_BUNDLED_FOR` there).
 const LINUX_COINS = bundledCoinsFor("linux");
+// The LINUX lists, not the product's: zano's Linux build is static and ships no
+// DLLs (2026-09-11, `PLATFORM_COIN_BINARIES` in the bundler).
+const LINUX_COIN_BINARIES = coinBinariesFor("linux");
 const COIN_BINARIES = Object.fromEntries(
-  LINUX_COINS.map((c) => [c, ALL_COIN_BINARIES[c]]),
+  LINUX_COINS.map((c) => [c, LINUX_COIN_BINARIES[c]]),
 );
 
 const CHECK_ONLY = process.argv.includes("--check");
@@ -234,7 +237,7 @@ ${LOG} Declare: a patch-level gap on the SAME upstream may be declared via ALLOW
   const stale = [];
   for (const coin of ALL_BUNDLED_COINS) {
     if (LINUX_COINS.includes(coin)) continue;
-    const files = ALL_COIN_BINARIES[coin] ?? [];
+    const files = LINUX_COIN_BINARIES[coin] ?? [];
     const present = [];
     for (const f of files) {
       if (await exists(path.join(CORES_SRC, coin, f))) present.push(f);

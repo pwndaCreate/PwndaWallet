@@ -93,14 +93,28 @@ because for such a coin every address is legacy by that test. The other
 eleven hunks (segwit-only lock funding, per-input vsize pricing, electrumx)
 carried over unchanged.
 
----
- basicswap/basicswap.py           |  17 +++++++++++++++++
- basicswap/interface/btc/btc.py   | 122 ++++++++++++++++++++--------------
- basicswap/interface/electrumx.py |  11 ++++++++++-
- 3 files changed, 135 insertions(+), 15 deletions(-)
 
+Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175)
+
+REBASE 2026-09-12, v0.18.6 -> v0.18.7. Three of this patch's ten btc.py hunks
+stopped applying, all three for the same reason: upstream's "refactor: thread db
+cursor through fundTx and fundSCLockTx" (8699f135) added a `cursor=None`
+parameter to fundSCLockTx, fundTx and _fundTxElectrum, and reformatted fundTx's
+call to _fundTxElectrum into the multi-line form this patch used to introduce
+itself. Pure context drift: require_segwit_inputs now sits beside `cursor` in all
+three signatures and both call sites forward both. The other seven btc.py hunks,
+and both non-btc.py files, applied unchanged.
+
+CHECKED BEFORE REBASING, per the runbook's rule that "stopped applying" and
+"stopped being necessary" look identical from the failure. Upstream v0.18.7 still
+does NOT filter which UTXOs may fund a chain-A lock: the unimplemented
+"# TODO: Manually select only segwit prevouts" is still in the RPC-mode path, and
+_fundTxElectrum still selects from every signable address without regard to
+address type. The premise holds, so this is a rebase and not a deletion.
+
+---
 diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
-index 45327c56..ccf54afb 100644
+index 60eb924..8ada398 100644
 --- a/basicswap/basicswap.py
 +++ b/basicswap/basicswap.py
 @@ -3230,6 +3230,23 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
@@ -128,14 +142,14 @@ index 45327c56..ccf54afb 100644
              # migration.  Filter before querying, a wallet with none needs no
              # electrum traffic at all.
 diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
-index d1161279..35b86f40 100644
+index 8f156a3..9a4dfb7 100644
 --- a/basicswap/interface/btc/btc.py
 +++ b/basicswap/interface/btc/btc.py
-@@ -1433,7 +1433,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-         return tx.serialize()
- 
-     def fundSCLockTx(self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None) -> bytes:
--        funded_tx = self.fundTx(tx_bytes, feerate, bid_id=bid_id)
+@@ -1435,7 +1435,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+     def fundSCLockTx(
+         self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None, cursor=None
+     ) -> bytes:
+-        funded_tx = self.fundTx(tx_bytes, feerate, bid_id=bid_id, cursor=cursor)
 +        # PWNDA-PATCH-7: the chain-A lock tx's refund is pre-signed against
 +        # THIS tx's predicted (pre-signing) txid -- see basicswap.py
 +        # createSCLockRefundTx / sendXmrBidCoinALockTx. That binding only
@@ -144,38 +158,36 @@ index d1161279..35b86f40 100644
 +        # refuses (before any counterparty message is sent) rather than
 +        # building a lock tx that would fail upstream's OWN late guard.
 +        funded_tx = self.fundTx(
-+            tx_bytes, feerate, bid_id=bid_id, require_segwit_inputs=True
++            tx_bytes, feerate, bid_id=bid_id, cursor=cursor, require_segwit_inputs=True
 +        )
  
          if self._disable_lock_tx_rbf:
              tx = self.loadTx(funded_tx)
-@@ -2192,10 +2201,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-         lock_unspents: bool = True,
+@@ -2196,6 +2205,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          subfee: bool = False,
          bid_id: bytes = None,
+         cursor=None,
 +        require_segwit_inputs: bool = False,
      ) -> bytes:
          if self.useBackend():
              return self._fundTxElectrum(
--                tx, feerate, lock_unspents=lock_unspents, subfee=subfee, bid_id=bid_id
-+                tx,
-+                feerate,
-+                lock_unspents=lock_unspents,
-+                subfee=subfee,
-+                bid_id=bid_id,
+@@ -2205,6 +2215,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+                 subfee=subfee,
+                 bid_id=bid_id,
+                 cursor=cursor,
 +                require_segwit_inputs=require_segwit_inputs,
              )
  
          feerate_str = self.format_amount(feerate)
-@@ -2221,6 +2236,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-         lock_unspents: bool = True,
+@@ -2231,6 +2242,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          subfee: bool = False,
          bid_id: bytes = None,
+         cursor=None,
 +        require_segwit_inputs: bool = False,
      ) -> bytes:
          wm = self.getWalletManager()
          backend = self.getBackend()
-@@ -2274,10 +2290,58 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2290,10 +2302,58 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  )
              raise ValueError("No UTXOs available")
  
@@ -236,7 +248,7 @@ index d1161279..35b86f40 100644
          if isinstance(feerate, int):
              fee_per_vbyte = max(1, feerate // 1000)
          else:
-@@ -2286,14 +2350,14 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2302,14 +2362,14 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
  
          selected_utxos = []
          total_input = 0
@@ -254,7 +266,7 @@ index d1161279..35b86f40 100644
              est_fee = est_vsize * fee_per_vbyte
              target = total_output if subfee else total_output + est_fee
              if total_input >= target:
-@@ -2308,13 +2372,24 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2324,13 +2384,24 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          funded_tx.nVersion = self.txVersion()
  
          dummy_witness_stack = []
@@ -280,7 +292,7 @@ index d1161279..35b86f40 100644
  
          for out in parsed_tx.vout:
              funded_tx.vout.append(out)
-@@ -2322,13 +2397,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2338,13 +2409,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          witness_bytes_len_est = self.getWitnessStackSerialisedLength(
              dummy_witness_stack
          )
@@ -303,7 +315,7 @@ index d1161279..35b86f40 100644
          rough_fee = max(round(feerate_satkb * rough_vsize / 1000), min_relay_fee)
          rough_change = (
              (total_input - total_output)
-@@ -2343,12 +2426,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2359,12 +2438,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  change_addr = wm.getExistingInternalAddress(self.coin_type())
              if not change_addr:
                  change_addr = selected_utxos[0].get("address")
@@ -326,7 +338,7 @@ index d1161279..35b86f40 100644
              )
              final_fee = max(round(feerate_satkb * final_vsize / 1000), min_relay_fee)
              change = (
-@@ -2362,7 +2452,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2378,7 +2464,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
              else:
                  funded_tx.vout.pop()
                  final_vsize = self.getTxVSize(
@@ -337,7 +349,7 @@ index d1161279..35b86f40 100644
                  )
                  final_fee = max(
                      round(feerate_satkb * final_vsize / 1000), min_relay_fee
-@@ -2370,7 +2462,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2386,7 +2474,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  change = 0
          else:
              final_vsize = self.getTxVSize(
@@ -349,7 +361,7 @@ index d1161279..35b86f40 100644
              final_fee = max(round(feerate_satkb * final_vsize / 1000), min_relay_fee)
              change = 0
 diff --git a/basicswap/interface/electrumx.py b/basicswap/interface/electrumx.py
-index 3e89c883..a2dd0ce4 100644
+index 3e89c88..a2dd0ce 100644
 --- a/basicswap/interface/electrumx.py
 +++ b/basicswap/interface/electrumx.py
 @@ -593,7 +593,16 @@ def scripthash_from_address(address, network_params):

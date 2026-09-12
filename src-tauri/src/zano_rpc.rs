@@ -162,6 +162,7 @@ const READY_POLL_MS: u64 = 250;
 // hash; the actual ZIP lives on Zano's own build server. Verified 2026-08-27
 // against the real v2.2.1.506 release page (raw HTML, not a summarized
 // fetch, after an earlier summarized read mis-transcribed a checksum).
+#[cfg(target_os = "windows")]
 const ZANO_RELEASE_TAG: &str = "2.2.1.506";
 
 // Windows only, deliberately. Zano's Windows release is a ZIP containing a
@@ -171,12 +172,19 @@ const ZANO_RELEASE_TAG: &str = "2.2.1.506";
 // separately-extractable `simplewallet` binary vs. only the GUI app) — no
 // Linux branch is shipped rather than guess at an unverified format. Add one
 // once that's confirmed against a real AppImage.
+// Windows-gated along with the downloader itself (2026-09-11): there is no
+// non-Windows caller, and an ungated constant here is three dead-code warnings
+// on every Linux build.
+#[cfg(target_os = "windows")]
 const ZANO_ZIP_FILENAME: &str = "zano-win-x64-release-v2.2.1.506[b76fa18].zip";
+#[cfg(target_os = "windows")]
 const ZANO_ZIP_URL: &str =
     "https://build.zano.org/builds/zano-win-x64-release-v2.2.1.506%5Bb76fa18%5D.zip";
+#[cfg(target_os = "windows")]
 const ZANO_ZIP_SHA256: &str =
     "ab805baf58b78d3a4210ad85a9c74e8156746e1aebcb0a8a4dda32d0203cf87f";
 
+#[cfg(target_os = "windows")]
 #[derive(Clone, serde::Serialize)]
 pub struct ZanoDownloadProgress {
     pub stage: String,
@@ -1142,6 +1150,41 @@ pub async fn zano_probe_node(url: String, timeout_ms: u64) -> Result<NodeProbeRe
 /// the other two.
 #[tauri::command]
 pub async fn zano_download_wallet_rpc(app: AppHandle) -> Result<(), String> {
+    // The pinned archive is `zano-win-x64-release-...zip` and there is no Linux
+    // equivalent to point at: Zano's Linux release is an AppImage, a format this
+    // project has never confirmed even CONTAINS a separately-extractable
+    // `simplewallet` (see the ZANO_ZIP_FILENAME block above).
+    //
+    // Before 2026-09-11 this function had no platform branch at all, so a Linux
+    // user whose bundled payload was missing downloaded 236 MB of WINDOWS
+    // binaries and then failed on `simplewallet not found inside the downloaded
+    // zip` — the zip holds `simplewallet.exe`, and `ZANO_BINARY_NAME` is
+    // `simplewallet` on this platform, so the in-zip match could never succeed.
+    // A quarter-gigabyte spent to reach a message that names the wrong problem.
+    //
+    // Linux gets its `simplewallet` from the BUNDLED payload instead
+    // (`resolve_rpc_binary` tier 3), built from the pinned Zano source by
+    // `scripts/swap/zano-build/build-zano-linux.sh` and staged by
+    // `scripts/fetch-sidecars.mjs linux`. So on Linux the honest answer is "not
+    // by download", said immediately.
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = &app;
+        return Err(concat!(
+            "Zano's wallet binary is not downloadable on Linux: upstream publishes a ",
+            "win-x64 ZIP and an AppImage, and only the ZIP carries a separately ",
+            "extractable simplewallet. The Linux build ships one inside the installer ",
+            "instead, built from the pinned Zano source by ",
+            "scripts/swap/zano-build/build-zano-linux.sh. If you are seeing this in a ",
+            "packaged build, that payload is missing: reinstall, or place a stock ",
+            "simplewallet binary in the app's zano/ directory by hand.",
+        )
+        .to_string()
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
     let zano_dir = get_zano_dir(&app)?;
     let exe_path = zano_dir.join(ZANO_BINARY_NAME);
 
@@ -1293,6 +1336,7 @@ pub async fn zano_download_wallet_rpc(app: AppHandle) -> Result<(), String> {
         },
     );
     Ok(())
+    } // end #[cfg(target_os = "windows")]
 }
 
 #[tauri::command]

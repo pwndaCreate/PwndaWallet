@@ -1,0 +1,86 @@
+Grove PATCH-33: ZANO must verify the scratch wallet it just installed
+
+Asked on 2026-09-11: make sure the security work upstream has done for XMR is
+inherited by the two follower coins. It is not inherited the same way by both,
+because they are not related the same way:
+
+    class ZEPHInterface(XMRInterface)   -> inherits. 60 methods, 7 overridden,
+                                           none of them a guard.
+    class ZanoInterface(CoinInterface)  -> a SIBLING. ~57 same-named methods,
+                                           every one written independently.
+
+So ZEPH got upstream 10ee0843 ("xmr: guard against wrong-wallet reads made
+possible due to the preceding optimization commit") for free, and ZANO got
+nothing. An audit of the seven XMR safety mechanisms found ZANO carrying six of
+them -- the existing-spend recovery branch, the unlock-time check, the
+unlocked_balance check, the wallet mutex, the transient-error classification and
+the main-wallet identity confirmation are all present and all documented -- and
+missing exactly this one.
+
+WHAT XMR GUARDS, AND WHY ZANO NEEDS THE SAME PROMISE
+
+Upstream's optimization (740360dc) stopped issuing open_wallet on every
+operation. That made it possible for a stale latch to leave the WRONG wallet
+open, so 10ee0843 added a postcondition at both points where the coin-B lock is
+read and spent:
+
+    open_wallet_addr = self.rpc_wallet("get_address")["address"]
+    if open_wallet_addr != address_b58:
+        raise TemporaryError("... refusing to spend coin B lock")
+
+ZANO reaches the same place by a different road. It never relies on "whichever
+wallet is open": every call names self.rpc_wallet_scratch explicitly, and
+findTxB/spendBLockTx re-provision that connection to the joint address with
+generate_from_keys immediately before use. That is a genuinely stronger design
+and it is why the stale-latch bug cannot occur here.
+
+But it has no postcondition. createWallet checks that SOME address came back and
+returns; nothing compares it to the address that was asked for. If
+generate_from_keys ever installs something other than the requested wallet -- a
+version skew, a partially-applied patch, a key/address disagreement in the
+caller -- the balance read in findTxB and the spend in spendBLockTx both run
+against the previous swap's joint wallet, and neither notices. The amount check
+is not a backstop: two swaps of the same size read identically.
+
+WHY HERE RATHER THAN AT THE CALL SITES
+
+XMR checks at read time because that is the only place it can: its wallet is
+selected by a latch it does not control. Zano is handed the answer directly --
+generate_from_keys returns the address it installed -- so the check belongs at
+provisioning time, where it is one comparison instead of an extra RPC per call,
+and where it covers every future caller of createWallet rather than the two that
+exist today.
+
+TemporaryError, not ValueError, deliberately: it matches what XMR raises, and it
+keeps a transient wallet hiccup from marking a live bid BID_ERROR. A correct
+swap can never trip it -- the caller derives address_b58 from the same keys it
+passes -- so the only behaviour change on a healthy path is none.
+
+Scope: ZANO only. ZEPH needs nothing; it inherits both XMR call-site guards
+unmodified, which scripts/swap/verify-xmr-security-inheritance.py now asserts by
+parsing the class hierarchy rather than grepping for a token.
+
+Upstream candidate: no. ZanoInterface is Grove's own module (PATCH-15).
+
+diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
+--- a/basicswap/interface/zano/zano.py
++++ b/basicswap/interface/zano/zano.py
+@@ -482,6 +482,18 @@
+         rv = self.rpc_wallet_scratch("generate_from_keys", params)
+         if "address" in rv:
+             new_address: str = rv["address"]
++            # PWNDA-PATCH-33: the wallet it installed must be the wallet we asked
++            # for. generate_from_keys hands the address straight back, so this
++            # costs one comparison and closes the ZANO half of upstream 10ee0843
++            # ("guard against wrong-wallet reads"), which ZEPH inherits from
++            # XMRInterface and ZANO -- a sibling of CoinInterface, not a subclass
++            # of XMRInterface -- inherits nothing of.
++            requested: str = params.get("address", "")
++            if requested and new_address != requested:
++                raise TemporaryError(
++                    "ZANO generate_from_keys installed {}, not the requested {}; "
++                    "refusing to use this wallet".format(new_address, requested)
++                )
+             is_watch_only: bool = "spendkey" not in params or params.get("spendkey", "") == ""
+             self._log.info(
+                 "Generated{} {} wallet: {}".format(

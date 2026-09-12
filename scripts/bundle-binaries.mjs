@@ -6,9 +6,9 @@
 //
 // Ships the AV-sensitive binaries INSIDE the installer, dormant until opt-in:
 //   * miners  (xmrig, lolMiner, SRBMiner-MULTI)  -> extracted into <app-data>/miners
-//   * grove   (Python/BasicSwap runtime + 5 coin daemons: particl, bitcoin,
-//              litecoin, bitcoincash, monero) -> extracted into
-//              <app-data>/swap-sidecar/ (i.e. runtime/ + bin/<coin>/)
+//   * grove   (Python/BasicSwap runtime + the coin daemons in BUNDLED_COINS,
+//              minus a target's DECLARED gaps in NOT_BUNDLED_FOR) -> extracted
+//              into <app-data>/swap-sidecar/ (i.e. runtime/ + bin/<coin>/)
 //
 // Per payload:  tar -> xz -9 -> AES-256-GCM(nonce || ciphertext+tag)  ->  <name>.enc
 // Plus:         bundle-manifest.json (enc_file + tar_sha256 gate) and
@@ -100,115 +100,24 @@ const TMP = path.join(REPO, ".cache", "bundle-build");
 // Exactly the files each payload ships. Coin binary lists mirror
 // fetch-swap-runtime.mjs; miner files mirror miners-manifest.json (extract_all
 // miners keep their whole staged folder).
-export const COIN_BINARIES = {
-  particl: ["particld", "particl-cli", "particl-tx", "particl-wallet"],
-  bitcoin: ["bitcoind", "bitcoin-cli", "bitcoin-tx", "bitcoin-wallet"],
-  litecoin: ["litecoind", "litecoin-cli", "litecoin-tx", "litecoin-wallet"],
-  bitcoincash: ["bitcoind", "bitcoin-cli", "bitcoin-tx", "bitcoin-wallet"],
-  monero: ["monerod", "monero-wallet-rpc"],
-  // PWNDA 2026-09-04: zephyr. Same daemon+wallet-rpc pair shape as monero
-  // (Zephyr is a Monero fork). Get-SwapCoinBinaries.ps1 stages exactly these
-  // two out of the release archive -- deliberately not zephyr-wallet-cli,
-  // which nothing uses and which would otherwise be encrypted into every
-  // installer.
-  zephyr: ["zephyrd", "zephyr-wallet-rpc"],
-  // PWNDA 2026-09-04: dogecoin + dash. Both were STAGED and GPG-verified by
-  // Get-SwapCoinBinaries.ps1 and present in every dev tree (7 exes each), and
-  // both were missing from BUNDLED_COINS with no comment saying so -- so they
-  // worked on the operator's machine and would have been absent from every
-  // shipped installer. Exactly the zephyr defect this file's own guard was
-  // written for, twice more, undetected because that guard compared this file
-  // against itself. Same four-binary shape as bitcoin; -qt, -util and test_*
-  // are deliberately excluded (unused, and -qt alone is ~30 MB per coin).
-  dogecoin: ["dogecoind", "dogecoin-cli", "dogecoin-tx", "dogecoin-wallet"],
-  dash: ["dashd", "dash-cli", "dash-tx", "dash-wallet"],
-  // PWNDA 2026-09-04: zano, unit A5. NOT a stock download -- the swap engine's
-  // scratch wallet needs `generate_from_keys`, which upstream Zano does not
-  // have, so this is the locally BUILT patched binary from
-  // scripts/swap/zano-build/ (hyle-team/zano @ ee3de1e5 + the vendored patch).
-  // Verified patched, not stock, by string-probing the built binary against the
-  // stock one we already ship: generate_from_keys FOUND vs absent, with
-  // getbalance present in both as the control proving the probe discriminates.
-  // The two OpenSSL DLLs are listed because the build is STATIC=FALSE.
-  zano: [
-    "zanod",
-    "simplewallet",
-    "libcrypto-3-x64.dll",
-    "libssl-3-x64.dll",
-  ],
-};
-
-/**
- * Engine coins that are KNOWINGLY not bundled, with the reason.
- *
- * Being in this map is a decision; being in neither this map nor
- * BUNDLED_COINS is an accident, and the guard below is what tells them apart.
- */
-const NOT_BUNDLED = {
-  // (empty) Every coin the engine can run is bundled as of 2026-09-04, when
-  // unit A5's patched Zano wallet was finally built. Keep the map: an entry
-  // here is a DECLARED omission with a reason, which is what the guard below
-  // distinguishes from an accidental one.
-};
-
-/**
- * Coins a given PLATFORM cannot ship, with the reason. Same contract as
- * `NOT_BUNDLED` — a declaration is a decision, silence is a bug — but scoped
- * to the target rather than to the product.
- *
- * # Why this had to exist (2026-09-06)
- *
- * `assemble-linux-grove.mjs` carried its own copy of `COIN_BINARIES` with a
- * comment saying it was "kept in sync by inspection". It was not: the bundler
- * gained zephyr, dogecoin, dash and zano on 2026-09-04 and the assembler kept
- * its five, so a Linux release staged 5 coins, the bundler demanded 9, and the
- * build died on the first one it could not find:
- *
- *     [assemble-linux-grove] all 5 coins present as Linux binaries
- *     [bundle] grove source missing: linux-grove/bin/zephyr/zephyrd
- *
- * That is the THIRD time this file's own lists have drifted from a sibling —
- * after the zephyr defect the v1 guard was written for and the dogecoin/dash
- * pair that v2 caught. The pattern is always the same: one fact in two places,
- * synchronised by a comment. So the assembler now IMPORTS these tables (the
- * reason it did not was "that script has no exports", which this commit
- * removes), and the platform's own gaps are declared here where the guard can
- * see them.
- *
- * These four are absent from `.swap-sidecar-work/linux-stage/cores` — a
- * hand-staged tree, per swap-runtime.json's "Staged, not assembled" note. Zano
- * additionally has no Linux release at all (`fetch-sidecars.mjs` says so on
- * every run: "zano: skipped (Windows-only; no pinned Linux archive)").
- */
-const NOT_BUNDLED_FOR = {
-  linux: {
-    zephyr: "no Linux binaries staged in .swap-sidecar-work/linux-stage/cores",
-    dogecoin: "no Linux binaries staged in .swap-sidecar-work/linux-stage/cores",
-    dash: "no Linux binaries staged in .swap-sidecar-work/linux-stage/cores",
-    zano: "Windows-only: no pinned Linux archive, and the patched wallet is a Windows build",
-  },
-};
-
-/**
- * The coins a target actually ships. Exported so
- * `assemble-linux-grove.mjs` stages exactly this set instead of mirroring it.
- */
-export function bundledCoinsFor(target) {
-  const skip = NOT_BUNDLED_FOR[target] ?? {};
-  return BUNDLED_COINS.filter((c) => !skip[c]);
-}
-
-export const BUNDLED_COINS = [
-  "particl",
-  "bitcoin",
-  "litecoin",
-  "bitcoincash",
-  "monero",
-  "zephyr",
-  "dogecoin",
-  "dash",
-  "zano",
-];
+// The coin tables live in lib/bundle-coins.mjs so tests can import them without
+// tripping over this file's shebang. Re-exported so existing importers of
+// bundle-binaries.mjs keep working unchanged.
+export {
+  COIN_BINARIES,
+  coinBinariesFor,
+  bundledCoinsFor,
+  BUNDLED_COINS,
+} from "./lib/bundle-coins.mjs";
+import {
+  COIN_BINARIES,
+  coinBinariesFor,
+  bundledCoinsFor,
+  BUNDLED_COINS,
+  NOT_BUNDLED,
+  NOT_BUNDLED_FOR,
+  PLATFORM_COIN_BINARIES,
+} from "./lib/bundle-coins.mjs";
 
 // ── Paired-site guard, v2 (2026-09-04) ──────────────────────────────────────
 //
@@ -300,6 +209,17 @@ for (const [target, skips] of Object.entries(NOT_BUNDLED_FOR)) {
       throw new Error(
         `bundle-binaries: NOT_BUNDLED_FOR.${target}["${coin}"] exempts a coin that is ` +
           `not bundled anywhere. Stale entry -- remove it.`,
+      );
+    }
+  }
+}
+// And for the per-platform binary overrides.
+for (const [target, over] of Object.entries(PLATFORM_COIN_BINARIES)) {
+  for (const coin of Object.keys(over)) {
+    if (!COIN_BINARIES[coin]) {
+      throw new Error(
+        `bundle-binaries: PLATFORM_COIN_BINARIES.${target}["${coin}"] overrides a coin ` +
+          `with no COIN_BINARIES entry. Stale entry -- remove it.`,
       );
     }
   }
@@ -690,14 +610,16 @@ async function main() {
     // a coin the target cannot stage is what failed the 2026-09-06 Linux
     // release on `zephyr/zephyrd`.
     const coinsForTarget = bundledCoinsFor(TARGET);
+    const binariesForTarget = coinBinariesFor(TARGET);
     for (const coin of coinsForTarget) {
-      for (const b of COIN_BINARIES[coin]) {
+      for (const b of binariesForTarget[coin]) {
         // A name that already carries an extension is taken verbatim. Zano's
-        // build is STATIC=FALSE, so libcrypto/libssl must ship BESIDE the
-        // .exe or the shipped daemon cannot start -- and appending ".exe" to
-        // a ".dll" would have produced "libssl-3-x64.dll.exe", a file that
+        // WINDOWS build is STATIC=FALSE, so libcrypto/libssl must ship BESIDE
+        // the .exe or the shipped daemon cannot start -- and appending ".exe"
+        // to a ".dll" would have produced "libssl-3-x64.dll.exe", a file that
         // does not exist, failing the build loudly rather than silently. Loud
-        // is right; expressible is better.
+        // is right; expressible is better. (The LINUX build is STATIC=TRUE and
+        // has no such siblings -- see PLATFORM_COIN_BINARIES.)
         const rel = path.join(binRel, coin, /\.[a-z0-9]+$/i.test(b) ? b : `${b}${EXE}`);
         if (!(await exists(path.join(groveBase, rel)))) {
           console.error(`${LOG} grove source missing: ${rel} under ${groveBase}`);
