@@ -10,7 +10,7 @@ import {
 } from "../swap-sidecar";
 import { DexCoinsSection } from "./DexCoinsSection";
 import { SwapNodeExtras } from "./SwapNodeExtras";
-import type { WalletKind } from "../../vault-schema";
+import type { AddWalletOpts, WalletKind } from "../../vault-schema";
 import type { ChainType } from "../../wallets";
 import { useAppState } from "../../state/AppStateContext";
 import { deriveSwapWalletMaterial } from "../../lib/swapWalletKey";
@@ -103,7 +103,8 @@ export function SettingsLandscapeView({
     kind: WalletKind,
     input: string,
     name: string,
-    chain?: ChainType
+    chain?: ChainType,
+    opts?: AddWalletOpts
   ) => Promise<boolean>;
   onRenameWallet: (id: string, name: string) => Promise<void>;
   onRemoveWallet: (id: string) => Promise<void>;

@@ -1620,6 +1620,15 @@ export function WalletLandscapeView({
                seed was to switch to portrait first — which is why those two
                chains were effectively undiscoverable. */
             <div style={{ maxWidth: 560 }}>{importPanelSlot}</div>
+          ) : activeChain === "zano" && zanoCenterSlot ? (
+            /* Zano selected with no wallet: its import / generate panel.
+               `zanoCenterSlot` was rendered only inside the HAS-A-WALLET branch
+               above, so with no Zano wallet this view fell through to "No Zano
+               wallet imported." — on Windows and Linux alike — and landscape
+               had no way to create or import one (reported 2026-09-13). The
+               slot already carries the import panel when there is no wallet;
+               it just had nowhere to render. */
+            <div style={{ maxWidth: 560 }}>{zanoCenterSlot}</div>
           ) : (
             <EmptyMsg
               text={`No ${activeAdapter.displayName} wallet imported.`}

@@ -27,11 +27,15 @@ import type { ChainType, WalletInfo } from "../../wallets";
  *    see `zano-keys.ts`'s header — so the copy says so plainly rather than
  *    implying the button validates it.
  *
- * `saveZanoSeedToVault` is accepted as a prop for structural parity with
- * `ZphImportPanel`, but Zano has no vault-persistence wiring yet (see the
- * plan's Phase 5 status) — the caller currently passes a no-op. The session
- * this panel starts is real and works for the current app run; it just
- * won't survive a restart until that wiring lands.
+ * `saveZanoSeedToVault` persists the seed (and passphrase) into the vault —
+ * `useVault.saveZanoSeedToVault`. CORRECTED 2026-09-13: this comment used to
+ * say the caller passed a no-op and the wallet would not survive a restart;
+ * that stopped being true when Zano became a `WalletEntry` (2026-09-02).
+ *
+ * Mounted by portrait `DashboardView` and by landscape through
+ * `LandscapeRoot`'s `zanoCenterSlot`. Landscape only rendered that slot for a
+ * wallet that already existed until 2026-09-13, so this panel was unreachable
+ * there — see `WalletLandscapeView.tsx`'s no-wallet branch.
  */
 export function ZanoImportPanel({
   sessionPassword,

@@ -632,16 +632,65 @@ export interface NewWalletSpec {
   xmrSeedFormat?: "polyseed" | "legacy";
   /** xmr/zph. */
   restoreHeight?: number | null;
+  /** zano only — Secured-Seed passphrase, when the seed declares one. */
+  zanoSeedPassphrase?: string;
   /** privateKey/watch — the single chain. */
   chain?: ChainType;
   /** privateKey (derived) / watch (entered) — the public address. */
   address?: string;
+  /** Join this existing group instead of starting a new one — used to fill
+   *  the primary group's empty xmr/zph/zano slot (`primaryGroupSlotFor`). */
+  groupId?: string;
 }
 
 /**
- * Append a new INDEPENDENT wallet (its own group). Returns the next v3 and the
- * created entry. The entry's `id` is fresh; xmr/zph get a per-wallet
- * `sidecarFile`; privateKey/watch carry `chain` + `address`.
+ * The primary group's id when that group has NO wallet of `kind`, else
+ * undefined — the slot an added Monero / Zephyr / Zano wallet should fill.
+ *
+ * 2026-09-13 (operator, Linux): removing Main's Monero wallet and adding the
+ * seed back through Settings ▸ Wallets made it a standalone wallet in its own
+ * group. Unlock opens the primary group, which then had no Monero, so no
+ * Monero wallet was open in the app's monero-wallet-rpc — the process the swap
+ * node shares — and the node reported
+ * `'NoneType' object has no attribute 'update'`. Zephyr, re-added through its
+ * dashboard panel (which writes into the open group), was unaffected.
+ */
+export function primaryGroupSlotFor(v3: VaultPayloadV3, kind: WalletKind): string | undefined {
+  if (kind !== "xmr" && kind !== "zph" && kind !== "zano") return undefined;
+  const gid = primaryGroupId(v3);
+  if (gid === undefined) return undefined;
+  if (v3.wallets.some((w) => w.kind === kind && groupKey(w) === gid)) return undefined;
+  if (kind === "zano" && legacyZanoSeedFor(v3, gid)) return undefined;
+  return gid;
+}
+
+/**
+ * True when `entry` is in the context the app has open (`lastActiveWalletId`),
+ * so its xmr/zph/zano wallet is the one the sidecar session holds — the only
+ * case in which removing it must also tear the session down.
+ */
+export function isInActiveContext(v3: VaultPayloadV3, entry: WalletEntry): boolean {
+  return groupKey(entry) === groupIdForWallet(v3, v3.lastActiveWalletId ?? "all");
+}
+
+/** Options for Settings ▸ Wallets ▸ Add, beyond kind / input / name / chain. */
+export interface AddWalletOpts {
+  /** zano only — the Secured-Seed passphrase, when the seed declares one. */
+  zanoSeedPassphrase?: string;
+  /** xmr/zph imports — "YYYY-MM-DD" the wallet was created around; scanning
+   *  starts ~30 days before it. Blank means scan from genesis. */
+  restoreDate?: string;
+  /** The seed was generated in this dialog a moment ago: it has no history,
+   *  so scanning starts at the chain tip. An IMPORTED seed must never start
+   *  at the tip — that hides every earlier output. */
+  newlyCreated?: boolean;
+}
+
+/**
+ * Append a new wallet — by default INDEPENDENT (its own group), or into
+ * `spec.groupId` when given. Returns the next v3 and the created entry. The
+ * entry's `id` is fresh; xmr/zph/zano get a per-wallet `sidecarFile`;
+ * privateKey/watch carry `chain` + `address`.
  */
 export function addWalletEntry(
   v3: VaultPayloadV3,
@@ -656,7 +705,7 @@ export function addWalletEntry(
     kind: spec.kind,
     seed: spec.seed,
     createdAt: now,
-    groupId: genId(), // a standalone wallet is its own group
+    groupId: spec.groupId ?? genId(), // a standalone wallet is its own group
   };
   if (spec.kind === "bip39") {
     entry.derivationChoice = spec.derivationChoice;
@@ -664,6 +713,13 @@ export function addWalletEntry(
     entry.restoreHeight = spec.restoreHeight ?? null;
     entry.sidecarFile = newSidecarFile(spec.kind, id);
     if (spec.kind === "xmr") entry.xmrSeedFormat = spec.xmrSeedFormat;
+  } else if (spec.kind === "zano") {
+    // Its own sidecar file, exactly like xmr/zph. Until 2026-09-13 a zano spec
+    // fell into the single-chain branch below — no file — so a second Zano
+    // wallet would have opened the legacy fixed-name file (the first one's).
+    // No restore height: a Zano seed self-encodes its creation date.
+    entry.sidecarFile = newSidecarFile(spec.kind, id);
+    if (spec.zanoSeedPassphrase) entry.zanoSeedPassphrase = spec.zanoSeedPassphrase;
   } else {
     // privateKey / watch — single-chain accounts.
     entry.chain = spec.chain;

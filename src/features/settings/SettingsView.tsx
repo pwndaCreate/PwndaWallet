@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { WalletsCard } from "./WalletsCard";
-import type { WalletKind } from "../../vault-schema";
+import type { AddWalletOpts, WalletKind } from "../../vault-schema";
 import type { ChainType } from "../../wallets/types";
 import { isWindows, isLinux, isMac } from "../../platform/os";
 import {
@@ -136,7 +136,8 @@ export function SettingsView({
     kind: WalletKind,
     input: string,
     name: string,
-    chain?: ChainType
+    chain?: ChainType,
+    opts?: AddWalletOpts
   ) => Promise<boolean>;
   onRenameWallet?: (id: string, name: string) => Promise<void>;
   onRemoveWallet?: (id: string) => Promise<void>;

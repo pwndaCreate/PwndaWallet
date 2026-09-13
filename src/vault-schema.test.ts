@@ -18,6 +18,8 @@ import {
   contextForWallet,
   memberOfKind,
   shouldShowSwitcher,
+  primaryGroupSlotFor,
+  isInActiveContext,
   LEGACY_XMR_SIDECAR_FILE,
   LEGACY_ZPH_SIDECAR_FILE,
   LEGACY_ZANO_SIDECAR_FILE,
@@ -385,6 +387,82 @@ describe("multi-wallet CRUD helpers", () => {
     expect(entry.sidecarFile).not.toBe(LEGACY_XMR_SIDECAR_FILE);
     expect(entry.xmrSeedFormat).toBe("legacy");
     expect(entry.restoreHeight).toBe(3_300_000);
+  });
+
+  // 2026-09-13: Settings ▸ Wallets could not add a Zano wallet. addWalletEntry
+  // gave xmr/zph a per-wallet sidecar file and dropped zano into the
+  // single-chain branch (chain/address, no file) — so a second Zano wallet
+  // would have opened the legacy fixed-name file, i.e. the FIRST wallet's.
+  it("addWalletEntry gives a NEW zano wallet its own sidecar file and keeps its passphrase", () => {
+    const v3 = migrateV2ToV3(fullV2(), det());
+    const { entry } = addWalletEntry(
+      v3,
+      { kind: "zano", seed: "second zano seed", name: "Cold ZANO", zanoSeedPassphrase: "pw" },
+      { now: NOW, genId: idGen() }
+    );
+    expect(entry.sidecarFile).toBe(`pwnda-zano-${entry.id}.zan`);
+    expect(entry.sidecarFile).not.toBe(LEGACY_ZANO_SIDECAR_FILE);
+    expect(entry.zanoSeedPassphrase).toBe("pw");
+    expect(entry.chain).toBeUndefined();
+    expect(entry.address).toBeUndefined();
+
+    // No passphrase → the field is absent, not "" (an ordinary seed).
+    const plain = addWalletEntry(v3, { kind: "zano", seed: "third zano seed", name: "Z" }, { now: NOW, genId: idGen() }).entry;
+    expect(plain.zanoSeedPassphrase).toBeUndefined();
+  });
+
+  // 2026-09-13 (operator, Linux): Main's Monero wallet was removed and the seed
+  // re-added in Settings ▸ Wallets. It became a standalone wallet in its own
+  // group, unlock opened the primary group (no Monero), nothing was open in the
+  // wallet-rpc the swap node shares, and the node's XMR dot read
+  // "'NoneType' object has no attribute 'update'".
+  describe("a re-added Monero / Zephyr / Zano wallet fills the primary group's empty slot", () => {
+    function withoutMainXmr(): VaultPayloadV3 {
+      const v3 = migrateV2ToV3(fullV2(), det());
+      const mainXmr = v3.wallets.find((w) => w.kind === "xmr")!;
+      return removeWalletEntry(v3, mainXmr.id).v3;
+    }
+
+    it("positive control: a primary group that still has Monero offers no slot", () => {
+      const v3 = migrateV2ToV3(fullV2(), det());
+      expect(primaryGroupSlotFor(v3, "xmr")).toBeUndefined();
+      expect(primaryGroupSlotFor(v3, "zph")).toBeUndefined();
+    });
+
+    it("the empty slot is the primary group, and only for the missing kind", () => {
+      const v3 = withoutMainXmr();
+      const primaryGid = v3.wallets.find((w) => w.kind === "bip39")!.groupId;
+      expect(primaryGroupSlotFor(v3, "xmr")).toBe(primaryGid);
+      expect(primaryGroupSlotFor(v3, "zph")).toBeUndefined();
+      expect(primaryGroupSlotFor(v3, "bip39")).toBeUndefined();
+    });
+
+    it("an entry added into the slot is what unlock projects, with its own file", () => {
+      let v3 = withoutMainXmr();
+      expect(projectV3ToV2(v3, "all").xmrSeed).toBeNull();
+      const { v3: next, entry } = addWalletEntry(
+        v3,
+        { kind: "xmr", seed: "re-added seed", name: "Monero wallet", xmrSeedFormat: "legacy", groupId: primaryGroupSlotFor(v3, "xmr") },
+        { now: NOW + 1, genId: idGen() }
+      );
+      v3 = next;
+      expect(projectV3ToV2(v3, "all").xmrSeed).toBe("re-added seed");
+      const ctx = contextForWallet(v3, "all");
+      expect(memberOfKind(ctx, "xmr")?.id).toBe(entry.id);
+      // Its OWN file, not the removed wallet's legacy name, whose files may
+      // still be on disk.
+      expect(sidecarFileForEntry(entry)).toBe(`pwnda-xmr-${entry.id}`);
+      expect(isInActiveContext(v3, entry)).toBe(true);
+    });
+
+    it("a wallet in another context is not the open session", () => {
+      const v3 = multiV3(); // Cold XMR is standalone; the active context is Main
+      const cold = v3.wallets.find((w) => w.name === "Cold")!;
+      const mainXmr = v3.wallets.find((w) => w.kind === "xmr" && w.name !== "Cold")!;
+      expect(isInActiveContext(v3, cold)).toBe(false);
+      expect(isInActiveContext(v3, mainXmr)).toBe(true);
+      expect(isInActiveContext({ ...v3, lastActiveWalletId: cold.id }, cold)).toBe(true);
+    });
   });
 
   it("renameWalletEntry updates only the target", () => {
