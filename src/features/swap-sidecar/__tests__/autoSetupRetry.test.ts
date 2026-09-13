@@ -158,6 +158,46 @@ describe("wallet-seed readiness is re-checked after the account-key push, not on
   });
 });
 
+/**
+ * Incident, 2026-09-12 (operator's mainnet node): the pass settled at 21:35:19
+ * — key pushed, unlocked, `LTC initialized from account key` — and 17 s later
+ * the supervisor's unpark watcher restarted the node to add ZANO. The doorbell
+ * handler ran stop → key → start and nothing else, while `done` was already
+ * latched. The engine keeps account keys in memory only, so the node came back
+ * unlocked but keyless for LTC (`PWNDA-PATCH-3: LTC expects a host-wallet
+ * account key; none pushed yet`, 21:39:08) for the rest of the session. Any
+ * restart the hook did not perform itself (Settings Stop/Start, a crash,
+ * apply-pending-coins) has the same shape, so there are two fixes: the doorbell
+ * re-enters the pass, and a watchdog re-enters it after any observed restart.
+ */
+describe("a node restart after the pass settled re-runs the pass", () => {
+  const hook = src("../useSwapAutoSetup.ts");
+
+  it("the unpark doorbell re-enters the pass after its own start", () => {
+    const startAt = hook.indexOf("await swapSidecarStart();");
+    const reenter = hook.indexOf("done.current = false;\n          runRef.current?.();");
+    expect(startAt).toBeGreaterThan(-1);
+    expect(reenter).toBeGreaterThan(startAt);
+  });
+
+  it("a watchdog on AUTO_SETUP_WATCH_MS records when the node was last not healthy", () => {
+    expect(hook).toMatch(/window\.setInterval\([\s\S]*?AUTO_SETUP_WATCH_MS\)/);
+    expect(hook).toMatch(/lastDownAt\.current = Date\.now\(\)/);
+  });
+
+  it("the watchdog re-enters only for a restart NEWER than the settled attempt", () => {
+    // Without the comparison, the down observations from the app's own start
+    // (node still booting) would re-run a pass that already ran on the up node.
+    expect(hook).toMatch(/lastDownAt\.current > settledAfter\.current/);
+    expect(hook).toMatch(/settledAfter\.current = startedAt/);
+  });
+
+  it("the watchdog never overlaps an attempt in flight", () => {
+    const watch = hook.slice(hook.indexOf("the restart watchdog"));
+    expect(watch).toMatch(/inFlight\.current/);
+  });
+});
+
 describe("the share pass has ONE owner, and the card shows its outcome", () => {
   const card = src("../SidecarStatusCard.tsx");
   const hookSrc = src("../useSwapAutoSetup.ts");

@@ -34,28 +34,38 @@ export function useSend(args: {
   setError: (msg: string) => void;
   setSuccess: (msg: string) => void;
   /**
-   * C8 — an alternate transport for the active chain's send, used INSTEAD OF
-   * `adapter.sendTransaction` when present.
+   * An alternate transport for the active chain's send, used INSTEAD OF
+   * `adapter.sendTransaction` when present. Today: Stellar / NEAR / Sui, whose
+   * signers are session-gated in Rust (`App.tsx::sessionSignedSendOverride`).
    *
    * `useSend` has no swap-sidecar awareness by design (BOUNDARIES.md scopes
    * the `send` feature to `src/wallets/*` + `src/store` + `src/state/*`
-   * only). The caller decides when an override applies — e.g. a BTC/LTC
-   * wallet the swap engine has VERIFIED as shared routes through the engine
-   * instead of this wallet's own signer (see `sharedCoinBalance.ts`'s header).
-   * `undefined` means "no override for the active chain right now" — every
-   * other chain, and a shared chain the caller has not (yet) confirmed, sends
-   * exactly as before.
+   * only), so the caller decides when an override applies. `undefined` means
+   * "send exactly as the adapter does".
    *
-   * **Correction, 2026-08-25.** This doc used to justify the override with
-   * "the engine holds the coin's complete account and this wallet's adapter
-   * does not". That was true when written and is no longer true for LTC —
-   * `sendFromAccount` now gathers the whole account here too. The override
-   * still takes precedence, but for a DIFFERENT and better reason: while the
-   * engine is live it is independently selecting UTXOs from the same account,
-   * and two signers choosing inputs concurrently can build conflicting
-   * transactions. One writer at a time, and the engine is it.
+   * **Correction, 2026-09-12.** This used to also carry C8's route for a
+   * Grove-shared BTC/LTC: the send went INTO the swap engine, justified first
+   * by "the engine holds the complete account" (false for LTC since
+   * 2026-08-25, when `sendFromAccount` gathered the whole account) and then by
+   * "one writer at a time". The second reason cost more than it protected: a
+   * conflicting spend is rejected by the mempool, not paid twice, while the
+   * routing made every BTC/LTC send depend on Grove being up, unlocked and
+   * keyed — and on 2026-09-12 an LTC send failed silently during a Grove
+   * restart. Shared coins now sign with the wallet's own account path like
+   * any other UTXO chain; the one real interaction (a swap funding a lock
+   * from the same coins) is `sendGuard`'s job below.
    */
   sendOverride?: (to: string, amount: string) => Promise<TxResult>;
+  /**
+   * Asked immediately before the send. Resolve with a message to refuse (it is
+   * shown as the failure, and nothing is signed), or `null` to send.
+   *
+   * Used for Grove-shared coins: `checkSharedCoinSend` refuses only when Grove
+   * definitely reports a swap in flight on the coin, and resolves `null` when
+   * Grove is stopped, locked or slow — so a guard can never make an ordinary
+   * send depend on the sidecar.
+   */
+  sendGuard?: (to: string, amount: string) => Promise<string | null>;
 }) {
   const {
     wallet,
@@ -67,6 +77,7 @@ export function useSend(args: {
     setError,
     setSuccess,
     sendOverride,
+    sendGuard,
   } = args;
 
   const [sendTo, setSendTo] = useState("");
@@ -98,8 +109,19 @@ export function useSend(args: {
     setSendAssetType(undefined);
   }, []);
 
-  const handleSend = useCallback(async () => {
+  /**
+   * `feeRate` is the Send modal's selected tier, in the adapter's base units
+   * per (v)byte, for chains whose estimate is a rate (`feeRateForSend`).
+   * Coerced: anything that is not a positive finite number is dropped, because
+   * a handler wired as `onClick={handleSend}` receives a MouseEvent here — the
+   * same shape as the `openSendModal` event bug documented above.
+   */
+  const handleSend = useCallback(async (feeRateArg?: unknown) => {
     if (!wallet) return;
+    const feeRate =
+      typeof feeRateArg === "number" && Number.isFinite(feeRateArg) && feeRateArg > 0
+        ? feeRateArg
+        : undefined;
     setError("");
     setSuccess("");
     setSending(true);
@@ -146,6 +168,13 @@ export function useSend(args: {
         assetType: sendAssetType,
       });
 
+      // Refusal BEFORE anything is signed. Thrown so it lands on the same
+      // "Transaction failed: …" line every other failure uses.
+      if (sendGuard) {
+        const refusal = await sendGuard(sendTo, sendAmount);
+        if (refusal) throw new Error(refusal);
+      }
+
       const result = sendOverride
         ? await sendOverride(sendTo, sendAmount)
         : useAccountSend
@@ -153,7 +182,8 @@ export function useSend(args: {
               wallet.mnemonic!,
               sendTo,
               sendAmount,
-              wallet.address
+              wallet.address,
+              { feeRate }
             )
           : await adapter.sendTransaction(
               keyMaterial,
@@ -185,6 +215,7 @@ export function useSend(args: {
     sendAmount,
     sendAssetType,
     sendOverride,
+    sendGuard,
     refreshBalance,
     refreshTxHistory,
     setError,

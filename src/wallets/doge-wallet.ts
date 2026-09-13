@@ -547,6 +547,8 @@ export const dogeAdapter: ChainAdapter = {
   },
 
   /** Account-wide send — see . */
+  // No `opts.feeRate` forwarding: DOGE's estimate is a TOTAL ("0.226 DOGE"),
+  // not a rate, so the modal never produces one for it (`feeRateForSend`).
   sendFromAccount(mnemonic: string, to: string, amount: string, fromAddress?: string) {
     return sendDogeFromAccount(mnemonic, to, amount, { fromAddress });
   },

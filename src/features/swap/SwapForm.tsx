@@ -32,6 +32,7 @@ import { formatAmount } from "../swap-sidecar/types";
 import { sidecarFeesReserve } from "../../api/basicswap";
 import { feeAppliesToSend, spendableAfterReserve } from "./feeReserve";
 import { minPresetTitle, planMinPreset } from "./minPreset";
+import { coinAmountFromUsd } from "../../lib/usdAmount";
 import {
   isGrouped,
   networkLabelFor,
@@ -334,6 +335,36 @@ export function SwapForm({
     if (!price || price <= 0 || toAmt <= 0) return null;
     return toAmt * price;
   })();
+
+  // ── USD entry on the send side (2026-09-12) ─────────────────────────────
+  //
+  // Typing dollars sets `fromAmt` at the source coin's price, rounded DOWN to a
+  // precision the source chain accepts (`coinAmountFromUsd`). The typed text is
+  // kept verbatim only while `fromAmt` is still the amount it produced: any
+  // other change — the coin field, a percent chip, MAX, a coin switch — makes
+  // `forAmt` stale, and the field falls back to the derived USD value. That
+  // avoids hooking every setter that touches `fromAmt`. Offered only when there
+  // is a price to convert with; without one the read-only line stays.
+  const fromUsdPrice = pricesByTicker[fromCoin.toUpperCase()];
+  const [usdEdit, setUsdEdit] = useState<{ text: string; forAmt: string; coin: string } | null>(
+    null,
+  );
+  const sourceUsdText =
+    usdEdit && usdEdit.forAmt === fromAmt && usdEdit.coin === fromCoin
+      ? usdEdit.text
+      : sourceUsd != null
+        ? sourceUsd.toFixed(2)
+        : "";
+  const onSourceUsdChange = (text: string) => {
+    const amt = coinAmountFromUsd(text, fromUsdPrice, fromCoin);
+    if (amt === null) {
+      // Not a number yet (or no price): keep what was typed, leave the amount.
+      setUsdEdit({ text, forAmt: fromAmt, coin: fromCoin });
+      return;
+    }
+    setUsdEdit({ text, forAmt: amt, coin: fromCoin });
+    setFromAmt(amt);
+  };
 
   const swapKitRoutable = isSwapKitRoutable(fromCoin, toCoin);
   const intentsRoutable = isIntentsRoutable(fromCoin, toCoin);
@@ -985,6 +1016,11 @@ export function SwapForm({
               ? `≈ $${formatUsdSubLine(sourceUsd.toString())}`
               : null
           }
+          // Editable in dollars whenever the source coin has a price — the
+          // same shared card renders in portrait (SwapView) and landscape
+          // (SwapLandscapeView), so this one wiring covers both.
+          usdAmount={fromUsdPrice && fromUsdPrice > 0 ? sourceUsdText : undefined}
+          onUsdAmountChange={fromUsdPrice && fromUsdPrice > 0 ? onSourceUsdChange : undefined}
           pickerSlot={
             <CoinPickerButton
               ticker={fromCoin}

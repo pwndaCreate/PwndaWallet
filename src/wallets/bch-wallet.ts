@@ -333,10 +333,20 @@ export function decodeCashAddr(input: string): { type: AddressType; hash: Uint8A
  * (`1...` for P2PKH, `3...` for P2SH). Returns the script pubkey
  * type and 20-byte hash160 — enough to build the output script.
  */
-function parseRecipient(addr: string): { type: AddressType; hash: Uint8Array } {
-  const trimmed = addr.trim();
-  // CashAddr if it contains ':' or starts with charset chars after stripping
-  if (trimmed.toLowerCase().includes(":") || trimmed.startsWith("q") || trimmed.startsWith("p")) {
+export function parseRecipient(addr: string): { type: AddressType; hash: Uint8Array } {
+  // A payment URI (`bitcoincash:q…?amount=0.1&label=…`, what a QR code or a
+  // "pay" link carries) is the address followed by a query — cut it there.
+  const trimmed = addr.trim().split("?")[0].trim();
+  // CashAddr: the `bitcoincash:` prefix is OPTIONAL — part of the checksum, but
+  // omitted in most wallets' copy buttons, and implied as mainnet when absent
+  // (`decodeCashAddr` handles both). Either form may be ALL-UPPERCASE: that is
+  // the QR-code form, because QR alphanumeric mode has no lowercase. So detect
+  // on the lowercased text. Until 2026-09-12 this tested `startsWith("q")` on
+  // the raw input, and a bare uppercase `QPM2…` fell through to the base58
+  // decoder: "Cannot parse address". Legacy base58 BCH addresses start with
+  // `1` (P2PKH) or `3` (P2SH), never `q`/`p`, so the test cannot misroute them.
+  const lower = trimmed.toLowerCase();
+  if (lower.includes(":") || lower.startsWith("q") || lower.startsWith("p")) {
     return decodeCashAddr(trimmed);
   }
   // Legacy base58check (BTC-style) — version 0x00 → P2PKH, 0x05 → P2SH.
@@ -1244,8 +1254,14 @@ export const bchAdapter: ChainAdapter = {
   },
 
   /** Account-wide send — see `sendBchFromAccount`. */
-  sendFromAccount(mnemonic: string, to: string, amount: string, fromAddress?: string) {
-    return sendBchFromAccount(mnemonic, to, amount, { fromAddress });
+  sendFromAccount(
+    mnemonic: string,
+    to: string,
+    amount: string,
+    fromAddress?: string,
+    opts?: { feeRate?: number },
+  ) {
+    return sendBchFromAccount(mnemonic, to, amount, { fromAddress, feeRateOverride: opts?.feeRate });
   },
   utxoAccounts: bchUtxoAccounts,
   chain: "bitcoin-cash",
@@ -1567,17 +1583,22 @@ export const bchAdapter: ChainAdapter = {
 
   async getFeeEstimate(): Promise<FeeEstimate> {
     let perByte = 1;
+    let isFallback = false;
     try {
       perByte = await tryEach([
         { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
         { name: "fullstack", fn: () => fetchFeeRateFullstack() },
       ]);
     } catch {
-      /* keep 1 sat/B */
+      /* keep 1 sat/B — and say it is the default, not a reading */
+      isFallback = true;
     }
     return {
       normal: { value: String(Math.max(perByte, 1)) },
       unit: "sat/B",
+      // 1-in / 2-out P2PKH (10 + 148 + 2×34) — lets the modal show a total.
+      typicalTxVBytes: 226,
+      ...(isFallback ? { isFallback: true } : {}),
       fetchedAt: Date.now(),
       raw: { perByte },
     };

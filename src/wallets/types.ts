@@ -159,6 +159,19 @@ export interface FeeEstimate {
   fast?: FeeTier;
   /** Display unit, e.g. "sat/vB", "Gwei", "lamports/sig", "XRP". */
   unit: string;
+  /**
+   * For per-(v)byte RATE units only (`sat/vB`, `sat/B`, `duffs/vB`): the size of
+   * a typical 1-input / 2-output send, so the modal can show a TOTAL in the coin
+   * and in USD instead of a bare rate nobody can price (2026-09-12). Absent when
+   * the unit is already a total (DOGE, XRP, …).
+   */
+  typicalTxVBytes?: number;
+  /**
+   * True when every live source failed and `normal` is the adapter's built-in
+   * default rate. Rendered as such — until 2026-09-12 LTC's fallback 10 sat/vB
+   * was shown as "ESTIMATED", indistinguishable from a live reading.
+   */
+  isFallback?: boolean;
   /** ms epoch when fetched. */
   fetchedAt: number;
   /** Free-form raw payload from the source — never required by callers. */
@@ -387,7 +400,14 @@ export interface ChainAdapter {
     to: string,
     amount: string,
     /** The wallet's displayed address, so the adapter can re-check the account. */
-    fromAddress?: string
+    fromAddress?: string,
+    /**
+     * `feeRate`: the Send modal's selected tier, in this adapter's fee UNIT
+     * (base units per (v)byte). Absent → the adapter picks its own rate. Added
+     * 2026-09-12: the modal offered Slow/Normal/Fast and no send ever used the
+     * choice. Adapters whose estimate is a total (DOGE) ignore it.
+     */
+    opts?: { feeRate?: number }
   ): Promise<TxResult>;
   getNetworkInfo(): Promise<NetworkInfo>;
 
