@@ -189,6 +189,22 @@ export function ParticlFootprintNote({ unpruned }: { unpruned: boolean }) {
  * rather than pretending. The `p…` ids stay visible in small print because
  * they are what a bug report needs.
  */
+/** Coins whose swap-node wallet is this app's own wallet process (C9). */
+const HOST_WALLET_TICKERS = /^(XMR|ZEPH|ZPH|ZANO)$/;
+
+/**
+ * The engine's `getWalletsInfo` calls `.update()` on what `getWalletInfo`
+ * returned, and that returns None whenever the wallet call failed — so a wallet
+ * that did not answer reaches this card as a Python AttributeError. For a
+ * host-wallet coin the usual cause is that no wallet of that coin is open in
+ * the app (2026-09-13: Main's Monero wallet was removed and re-added as a
+ * standalone wallet, and unlock opened none). The real failure is only in the
+ * engine log: `getWalletInfo for Monero failed with: …`.
+ */
+function isEngineWalletNoAnswer(error: string): boolean {
+  return /'NoneType' object has no attribute/.test(error);
+}
+
 function errMsg(e: unknown): string {
   if (typeof e === "string") return e;
   if (e && typeof e === "object" && "message" in e) {
@@ -710,7 +726,11 @@ export function SidecarStatusCard({
         tone: healthy ? "ok" : "warn",
         title: healthy
           ? `${t} is configured and its wallet is answering.`
-          : row?.error
+          : row?.error && isEngineWalletNoAnswer(row.error)
+            ? HOST_WALLET_TICKERS.test(t)
+              ? `${t} is configured, but no ${t} wallet is open in this app for the swap node to use — the wallet you are viewing has none, or it is still opening.`
+              : `${t} is configured, but its wallet did not answer the swap node.`
+            : row?.error
             ? `${t} is configured, but its wallet reported: ${row.error}`
             : row?.locked
               ? `${t} is configured, but its wallet is locked — the node cannot sign for it.`

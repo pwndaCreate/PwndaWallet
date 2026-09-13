@@ -414,7 +414,10 @@ export function useXmrSession(args: {
       }
     };
     tick();
-    txPollRef.current = setInterval(tick, 15_000);
+    // While the wallet is still scanning, the history is incomplete anyway
+    // and each `get_transfers` competes with the scan for the wallet-rpc — so
+    // poll every minute until synced, then every 15 s.
+    txPollRef.current = setInterval(tick, syncState === "synced" ? 15_000 : 60_000);
     return () => {
       if (txPollRef.current) {
         clearInterval(txPollRef.current);

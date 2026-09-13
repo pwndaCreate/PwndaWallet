@@ -26,9 +26,10 @@ import {
   contextForWallet,
   memberOfKind,
   sidecarFileForEntry,
-  LEGACY_XMR_SIDECAR_FILE,
-  LEGACY_ZPH_SIDECAR_FILE,
-  LEGACY_ZANO_SIDECAR_FILE,
+  primaryGroupSlotFor,
+  isInActiveContext,
+  groupIdForWallet,
+  type AddWalletOpts,
   type NewWalletSpec,
   type WalletKind,
   legacyZanoSeedFor,
@@ -40,6 +41,8 @@ function defaultWalletName(kind: WalletKind): string {
     ? "Monero wallet"
     : kind === "zph"
     ? "Zephyr wallet"
+    : kind === "zano"
+    ? "Zano wallet"
     : kind === "privateKey"
     ? "Imported key"
     : kind === "watch"
@@ -69,8 +72,15 @@ import {
 } from "../../wallets/xmr-wallet";
 import { zphAdapter } from "../../wallets/zph-wallet";
 import { raceBestNode as raceBestZphNode } from "../../wallets/zph-nodes";
-import { zanoAddressFromSeed } from "../../wallets/zano-keys";
+import {
+  zanoAddressFromSeed,
+  normalizeZanoSeed,
+  validateZanoSeed,
+  readZanoSeedMeta,
+  verifyZanoSeedIntegrity,
+} from "../../wallets/zano-keys";
 import { fetchCurrentDaemonHeight as fetchCurrentZphDaemonHeight } from "../../wallets/zph-rpc";
+import { dateStringToMoneroHeight, dateStringToZephyrHeight } from "../../utils/heightFromDate";
 import {
   entropyToMnemonic,
   mnemonicToEntropy,
@@ -599,9 +609,17 @@ export function useVault(args: {
         // Absent on a vault written before Zano became a `WalletKind` — the
         // sidecar then falls back to the legacy fixed name, which is the file
         // that vault's only Zano wallet already occupies.
-        const zanoEntry = contextForWallet(v3, restoredWalletId)?.members.find(
-          (m) => m.kind === "zano"
-        );
+        const restoredCtx = contextForWallet(v3, restoredWalletId);
+        const zanoEntry = memberOfKind(restoredCtx, "zano");
+        // Monero and Zephyr likewise (2026-09-13). Unlock used to start both
+        // on the legacy fixed filename whatever the entry said, which only
+        // held while the primary group's wallet was always the migrated one.
+        // A wallet that fills the primary group's empty slot keeps its own
+        // per-wallet file (`primaryGroupSlotFor`), and must open that file.
+        // Every entry stores `sidecarFile` (migration, merge and add all set
+        // it), so a migrated wallet still resolves to `pwnda-active`.
+        const xmrEntry = memberOfKind(restoredCtx, "xmr");
+        const zphEntry = memberOfKind(restoredCtx, "zph");
         setWalletEntries(v3.wallets);
         setActiveWalletId(restoredWalletId);
         // MERGE (not ??) so vaults written before `algorand`/`litecoin` existed
@@ -633,7 +651,8 @@ export function useVault(args: {
           startXmrSync(
             payload.xmrSeed,
             loginPassword,
-            payload.xmrRestoreHeight ?? 0
+            payload.xmrRestoreHeight ?? 0,
+            xmrEntry ? sidecarFileForEntry(xmrEntry) : undefined
           );
         } else {
           setXmrSeedLoaded(null);
@@ -650,7 +669,8 @@ export function useVault(args: {
           startZphSync(
             payload.zphSeed,
             loginPassword,
-            payload.zphRestoreHeight ?? 0
+            payload.zphRestoreHeight ?? 0,
+            zphEntry ? sidecarFileForEntry(zphEntry) : undefined
           );
         } else {
           setZphSeedLoaded(null);
@@ -1190,7 +1210,8 @@ export function useVault(args: {
       kind: WalletKind,
       input: string,
       name: string,
-      chain?: ChainType
+      chain?: ChainType,
+      opts?: AddWalletOpts
     ): Promise<boolean> => {
       if (!sessionPassword) {
         setError("Session password missing — lock and unlock the wallet, then try again.");
@@ -1200,14 +1221,46 @@ export function useVault(args: {
       const trimmedName = name.trim() || defaultWalletName(kind);
 
       // Single-chain kinds (privateKey / watch) require a chain and can't be
-      // CryptoNote (XMR/ZPH view-only is a separate, sidecar-backed feature).
+      // CryptoNote (XMR/ZPH/ZANO view-only is a separate, sidecar-backed feature).
       if (kind === "privateKey" || kind === "watch") {
         if (!chain) {
           setError("Pick a network for this account.");
           return false;
         }
-        if (chain === "monero" || chain === "zephyr") {
-          setError("Monero / Zephyr can't be imported this way — add their seed instead.");
+        if (chain === "monero" || chain === "zephyr" || chain === "zano") {
+          setError("Monero / Zephyr / Zano can't be imported this way — add their seed instead.");
+          return false;
+        }
+      }
+
+      // Zano (2026-09-13): the same checks `ZanoImportPanel` runs, because a
+      // Zano seed that passes a word count can still be the WRONG wallet — a
+      // mistyped word or a wrong Secured-Seed passphrase derives a different,
+      // perfectly valid-looking address instead of failing.
+      let zanoPassphrase = "";
+      if (kind === "zano") {
+        const z = normalizeZanoSeed(value);
+        if (!validateZanoSeed(z)) {
+          setError("Invalid Zano seed phrase — check the word count and spelling.");
+          return false;
+        }
+        const meta = readZanoSeedMeta(z);
+        if (meta.auditable) {
+          setError("This is an auditable Zano seed. Auditable wallets aren't supported yet.");
+          return false;
+        }
+        zanoPassphrase = meta.passwordProtected ? (opts?.zanoSeedPassphrase ?? "") : "";
+        if (meta.passwordProtected && !zanoPassphrase) {
+          setError("This Zano seed is password-protected — enter its Secured Seed passphrase.");
+          return false;
+        }
+        const integrity = verifyZanoSeedIntegrity(z, zanoPassphrase);
+        if (!integrity.ok && integrity.kind === "checksum") {
+          setError(
+            meta.passwordProtected
+              ? "That passphrase does not match this Zano seed — a wrong one silently opens a different, empty wallet."
+              : "This Zano seed's checksum does not match — a word is probably mistyped or out of order."
+          );
           return false;
         }
       }
@@ -1272,46 +1325,109 @@ export function useVault(args: {
           return true;
         }
 
-        // Seed kinds (bip39 / xmr / zph).
-        if (findDuplicateSeed(v3, value)) {
+        // Seed kinds (bip39 / xmr / zph / zano).
+        // Zano matches words exactly, so store the normalised form the
+        // validator above checked — the same form `ZanoImportPanel` saves.
+        const seedValue = kind === "zano" ? normalizeZanoSeed(value) : value;
+        if (findDuplicateSeed(v3, seedValue)) {
           setError("That seed is already one of your wallets.");
           return false;
         }
-        const spec: NewWalletSpec = { kind, seed: value, name: trimmedName };
-        if (kind === "bip39") {
+        const spec: NewWalletSpec = { kind, seed: seedValue, name: trimmedName };
+        if (kind === "zano") {
+          if (zanoPassphrase) spec.zanoSeedPassphrase = zanoPassphrase;
+        } else if (kind === "bip39") {
           // Secondary bip39 wallets default to the standard paths; the user can
           // switch per-coin later (same derivation panels as the primary).
           spec.derivationChoice = DEFAULT_DERIVATION_CHOICE;
         } else if (kind === "xmr") {
+          // Restore height. Until 2026-09-13 this was the chain TIP for every
+          // seed, imported or not — an imported seed then never saw an output
+          // older than the moment it was added. The tip is only right for a
+          // seed generated here; an import uses its polyseed birthday, else the
+          // date the user gave, else genesis (slow, but it cannot miss funds).
           spec.xmrSeedFormat = detectXmrSeedFormat(value) ?? undefined;
           let h: number | null = null;
-          try {
-            const tip = await probeCurrentXmrHeight();
-            if (tip > 0) h = tip;
-          } catch {
-            /* non-fatal */
+          if (opts?.newlyCreated) {
+            try {
+              const tip = await probeCurrentXmrHeight();
+              if (tip > 0) h = tip;
+            } catch {
+              /* non-fatal — falls through to the birthday */
+            }
           }
           if (h === null && spec.xmrSeedFormat === "polyseed") {
             const b = await polyseedRestoreHeight(value);
             if (b > 0) h = b;
           }
+          if (h === null && opts?.restoreDate) {
+            const d = dateStringToMoneroHeight(opts.restoreDate);
+            if (d > 0) h = d;
+          }
           spec.restoreHeight = h;
         } else if (kind === "zph") {
           let h: number | null = null;
-          try {
-            const node = await raceBestZphNode().catch(() => null);
-            if (node) {
-              const tip = await fetchCurrentZphDaemonHeight(node);
-              if (tip > 0) h = tip;
+          if (opts?.newlyCreated) {
+            try {
+              const node = await raceBestZphNode().catch(() => null);
+              if (node) {
+                const tip = await fetchCurrentZphDaemonHeight(node);
+                if (tip > 0) h = tip;
+              }
+            } catch {
+              /* non-fatal */
             }
-          } catch {
-            /* non-fatal */
+          }
+          if (h === null && opts?.restoreDate) {
+            const d = dateStringToZephyrHeight(opts.restoreDate);
+            if (d > 0) h = d;
           }
           spec.restoreHeight = h;
         }
-        const { v3: next } = addWalletEntry(v3, spec);
+        // Fill the primary group's empty slot instead of starting a new group
+        // — see `primaryGroupSlotFor` for the incident.
+        const slot = primaryGroupSlotFor(v3, kind);
+        if (slot) spec.groupId = slot;
+        const { v3: next, entry } = addWalletEntry(v3, spec);
         await saveVaultV3(next, sessionPassword);
         setWalletEntries(next.wallets);
+
+        // Into the context that is open right now → open it now, as unlock
+        // would, so the swap node's shared wallet process has a wallet without
+        // a relock.
+        if (slot && isInActiveContext(next, entry)) {
+          const file = sidecarFileForEntry(entry);
+          try {
+            if (kind === "xmr") {
+              const w = await xmrAdapter.deriveFromOwnSeed!(entry.seed);
+              setWalletsByChain((prev) => ({ ...prev, monero: w }));
+              setXmrSeedLoaded(entry.seed);
+              setActiveXmrSeed(entry.seed);
+              startXmrSync(entry.seed, sessionPassword, entry.restoreHeight ?? 0, file);
+            } else if (kind === "zph") {
+              const w = await zphAdapter.deriveFromOwnSeed!(entry.seed);
+              setWalletsByChain((prev) => ({ ...prev, zephyr: w }));
+              setZphSeedLoaded(entry.seed);
+              startZphSync(entry.seed, sessionPassword, entry.restoreHeight ?? 0, file);
+            } else if (kind === "zano") {
+              const passphrase = entry.zanoSeedPassphrase ?? "";
+              setWalletsByChain((prev) => ({
+                ...prev,
+                zano: {
+                  chain: "zano",
+                  address: zanoAddressFromSeed(entry.seed, passphrase),
+                  mnemonic: entry.seed,
+                  privateKey: "",
+                },
+              }));
+              setZanoSeedLoaded(entry.seed);
+              setZanoSeedPassphrase?.(passphrase || null);
+              startZanoSync(entry.seed, sessionPassword, passphrase, file);
+            }
+          } catch (e) {
+            console.warn("[useVault] addWallet: opening the added wallet failed:", e);
+          }
+        }
         setSuccess(`Added wallet "${trimmedName}".`);
         return true;
       } catch (e: any) {
@@ -1321,7 +1437,20 @@ export function useVault(args: {
         setWalletOpBusy(false);
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletEntries]
+    [
+      sessionPassword,
+      setError,
+      setSuccess,
+      setWalletEntries,
+      setWalletsByChain,
+      setXmrSeedLoaded,
+      setZphSeedLoaded,
+      setZanoSeedLoaded,
+      setZanoSeedPassphrase,
+      startXmrSync,
+      startZphSync,
+      startZanoSync,
+    ]
   );
 
   const renameWallet = useCallback(
@@ -1367,26 +1496,28 @@ export function useVault(args: {
           return;
         }
         const target = v3.wallets.find((w) => w.id === id);
-        // The primary group's xmr/zph entry is NOT a Phase-2 secondary
-        // wallet, identified by still pointing at the legacy sidecar file
-        // (every added-later wallet gets its own per-id filename). A plain
-        // removeWalletEntry() only edits the vault file; this one also has a
-        // LIVE session (sidecar wallet-rpc, walletsByChain, xmrSeedLoaded)
-        // that a bare vault edit leaves dangling — stale balance on screen,
-        // sidecar still holding the wallet open, until the next unlock.
-        const isPrimaryXmr =
-          target?.kind === "xmr" &&
-          sidecarFileForEntry(target) === LEGACY_XMR_SIDECAR_FILE;
-        const isPrimaryZph =
-          target?.kind === "zph" &&
-          sidecarFileForEntry(target) === LEGACY_ZPH_SIDECAR_FILE;
+        // An xmr/zph/zano entry in the OPEN context holds a LIVE session
+        // (sidecar wallet-rpc, walletsByChain, xmrSeedLoaded) that a bare
+        // vault edit leaves dangling — stale balance on screen, sidecar still
+        // holding the wallet open, until the next unlock. It is also the
+        // wallet the swap node shares.
+        //
+        // Until 2026-09-13 "live" was decided by the legacy file name
+        // (`pwnda-active` etc.). That was wrong both ways: a wallet in another
+        // context that happened to carry the legacy name was torn down —
+        // and `forget` deletes the file the session has open, i.e. the
+        // CURRENT context's wallet — while a per-wallet-file entry in the
+        // open context (a wallet re-added into the primary group, or any
+        // wallet opened via the switcher) was left running. Context
+        // membership is what the session actually follows.
+        const live = !!target && isInActiveContext(v3, target);
+        const isPrimaryXmr = live && target?.kind === "xmr";
+        const isPrimaryZph = live && target?.kind === "zph";
         // Zano gained a removeWallet path on 2026-09-02, when it became a
         // `WalletKind`. Before that it was a vault-wide field with no removal
         // route at all — "forgetting" it meant logging out (which closed the
         // sidecar but left the seed in the vault) or overwriting the field.
-        const isPrimaryZano =
-          target?.kind === "zano" &&
-          sidecarFileForEntry(target) === LEGACY_ZANO_SIDECAR_FILE;
+        const isPrimaryZano = live && target?.kind === "zano";
         if (isPrimaryXmr && checkXmrHostWalletInUse) {
           try {
             if (await checkXmrHostWalletInUse()) {
@@ -1459,9 +1590,10 @@ export function useVault(args: {
           setZanoSeedPassphrase?.(null);
           await forgetZanoSession();
         }
-        // A genuine Phase-2 secondary xmr/zph wallet has no on-disk sidecar
-        // file yet (its session never started — switching is Phase 3), so
-        // there is nothing further to tear down for that case.
+        // An xmr/zph/zano wallet in a context that is NOT open has no live
+        // session to tear down. Its wallet files (if it was ever switched to)
+        // stay on disk — deleting them here would need the session-free
+        // delete path, and `forget` always targets the OPEN wallet's file.
         setWalletEntries(next.wallets);
         setSuccess(`Removed wallet "${removed.name}".`);
       } catch (e: any) {

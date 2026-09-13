@@ -44,6 +44,7 @@ import {
   POLYSEED_ENGLISH_PREFIX_LEN,
 } from "./polyseed-wordlist";
 import { secureRandomBytes, bytesEqual } from "../secure-random";
+import { moneroHeightAtUnix } from "../utils/heightFromDate";
 
 // =========================================================================
 // Constants (match tevador/polyseed reference, src/storage.h + src/polyseed.c)
@@ -379,17 +380,16 @@ export function birthdayDecode(birthday: number): number {
 
 /**
  * Approximate Monero block height corresponding to a birthday value.
- * Monero genesis (block 0) was 2014-04-18; block interval is ~120s.
  * We bias back one TIME_STEP (~30 days) to give the scanner slack
  * against clock skew at wallet creation time.
+ *
+ * Until 2026-09-13 this assumed 120 s blocks since genesis. Monero's first
+ * 1,009,827 blocks were 60 s, so every polyseed restore started ~505,000
+ * blocks early. The conversion now lives in `moneroHeightAtUnix`, shared with
+ * the date picker.
  */
 export function birthdayToRestoreHeight(birthday: number): number {
-  const MONERO_GENESIS = 1397818193; // 2014-04-18 UTC
-  const MONERO_BLOCK_SEC = 120;
-  const unix = birthdayDecode(birthday);
-  const biased = unix - TIME_STEP;
-  const h = Math.floor((biased - MONERO_GENESIS) / MONERO_BLOCK_SEC);
-  return Math.max(0, h);
+  return moneroHeightAtUnix(birthdayDecode(birthday) - TIME_STEP);
 }
 
 // =========================================================================

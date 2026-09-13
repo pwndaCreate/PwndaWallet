@@ -1,11 +1,10 @@
 import { useMemo, useState } from "react";
-import { validateMnemonic } from "@scure/bip39";
-import { wordlist as bip39Wordlist } from "@scure/bip39/wordlists/english.js";
 import { Panel, Mono, ST } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { useAppState } from "../../state/AppStateContext";
 import { ALL_CHAINS, getAdapter, type ChainType } from "../../wallets";
-import { type WalletEntry, type WalletKind } from "../../vault-schema";
+import { detectSeedKind } from "../../wallets/seed-kind";
+import { type AddWalletOpts, type WalletEntry, type WalletKind } from "../../vault-schema";
 
 /**
  * Settings ▸ Wallets — list + add/import/rename/remove/reveal the wallets in
@@ -13,6 +12,12 @@ import { type WalletEntry, type WalletKind } from "../../vault-schema";
  * (kind auto-detected from what's pasted), Private Key, or Watch Address —
  * the latter two on a chosen chain. Reads `walletEntries` from context; the
  * CRUD actions come from `useVault` via props.
+ *
+ * 2026-09-13: the seed path learned Zano (detection, Secured-Seed passphrase)
+ * and gained "create new" for the three independent-seed coins — Monero,
+ * Zephyr and Zano — so an additional wallet of those kinds can be generated
+ * here, not only imported. Before, a Zano seed pasted here read
+ * "Unrecognized" and there was no way to create any of the three.
  *
  * Watch entries are view-only (eye chip); a private-key entry is single-chain.
  */
@@ -27,6 +32,13 @@ const KIND_META: Record<WalletKind, { short: string; color: string }> = {
 };
 
 type AddMode = "seed" | "privateKey" | "watch";
+
+/** Independent-seed coins that can be GENERATED here, with their chain. */
+const CREATABLE: ReadonlyArray<{ kind: "xmr" | "zph" | "zano"; chain: ChainType; label: string }> = [
+  { kind: "xmr", chain: "monero", label: "Monero" },
+  { kind: "zph", chain: "zephyr", label: "Zephyr" },
+  { kind: "zano", chain: "zano", label: "Zano" },
+];
 
 const inputStyle: React.CSSProperties = {
   width: "100%",
@@ -43,25 +55,8 @@ const inputStyle: React.CSSProperties = {
 
 /** Networks offered for private-key import / watch (CryptoNote excluded). */
 const SINGLE_CHAIN_OPTIONS: ChainType[] = ALL_CHAINS.filter(
-  (c) => c !== "monero" && c !== "zephyr"
+  (c) => c !== "monero" && c !== "zephyr" && c !== "zano"
 );
-
-/** Detect the seed kind from what's pasted. 25 words = XMR-legacy OR Zephyr
- *  (same wordlist — undetectable), so the caller must ask. */
-function detectSeedKind(input: string): {
-  kind: "bip39" | "xmr" | "zph" | null;
-  ambiguous: boolean;
-} {
-  const trimmed = input.trim();
-  const n = trimmed.split(/\s+/).filter(Boolean).length;
-  if (n === 0) return { kind: null, ambiguous: false };
-  if ([12, 15, 18, 21, 24].includes(n) && validateMnemonic(trimmed, bip39Wordlist)) {
-    return { kind: "bip39", ambiguous: false };
-  }
-  if (n === 16) return { kind: "xmr", ambiguous: false }; // polyseed
-  if (n === 25) return { kind: "xmr", ambiguous: true }; // xmr-legacy or zph
-  return { kind: null, ambiguous: false };
-}
 
 function KindChip({ kind }: { kind: WalletKind }) {
   const m = KIND_META[kind];
@@ -101,7 +96,8 @@ export function WalletsCard({
     kind: WalletKind,
     input: string,
     name: string,
-    chain?: ChainType
+    chain?: ChainType,
+    opts?: AddWalletOpts
   ) => Promise<boolean>;
   onRename: (id: string, name: string) => Promise<void>;
   onRemove: (id: string) => Promise<void>;
@@ -116,6 +112,14 @@ export function WalletsCard({
   const [addName, setAddName] = useState("");
   const [addChain, setAddChain] = useState<ChainType>("ethereum");
   const [zphChoice, setZphChoice] = useState(false); // 25-word: treat as ZPH?
+  const [zanoPassphrase, setZanoPassphrase] = useState("");
+  /** "YYYY-MM-DD" a 25-word Monero/Zephyr import was created around ("" = scan all). */
+  const [restoreDate, setRestoreDate] = useState("");
+  /** Set when the textarea holds a seed generated HERE (not pasted), so the
+   *  back-it-up warning shows for exactly that seed. */
+  const [generatedFor, setGeneratedFor] = useState<string | null>(null);
+  const [generating, setGenerating] = useState(false);
+  const [genError, setGenError] = useState("");
 
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editName, setEditName] = useState("");
@@ -146,7 +150,29 @@ export function WalletsCard({
     setAddValue("");
     setAddName("");
     setZphChoice(false);
+    setZanoPassphrase("");
+    setRestoreDate("");
+    setGeneratedFor(null);
+    setGenError("");
     setAdding(false);
+  };
+
+  const handleGenerate = async (c: (typeof CREATABLE)[number]) => {
+    setGenerating(true);
+    setGenError("");
+    try {
+      const fresh = await getAdapter(c.chain).generateOwnSeed?.();
+      if (!fresh) throw new Error(`${c.label} seed generation is not available`);
+      setAddValue(fresh);
+      setZphChoice(c.kind === "zph"); // a 25-word Zephyr seed is otherwise read as Monero
+      setZanoPassphrase("");
+      setGeneratedFor(c.label);
+      if (!addName.trim()) setAddName(`${c.label} wallet`);
+    } catch (e: any) {
+      setGenError(`Could not generate a ${c.label} seed: ${e?.message || String(e)}`);
+    } finally {
+      setGenerating(false);
+    }
   };
 
   const handleAdd = async () => {
@@ -154,7 +180,16 @@ export function WalletsCard({
     if (addMode === "seed") {
       const k = detected.ambiguous ? (zphChoice ? "zph" : "xmr") : detected.kind;
       if (!k) return;
-      ok = await onAdd(k, addValue, addName);
+      ok =
+        k === "zano"
+          ? await onAdd("zano", addValue, addName, undefined, {
+              zanoSeedPassphrase: zanoPassphrase,
+              newlyCreated: !!generatedFor,
+            })
+          : await onAdd(k, addValue, addName, undefined, {
+              restoreDate: restoreDate || undefined,
+              newlyCreated: !!generatedFor,
+            });
     } else if (addMode === "privateKey") {
       ok = await onAdd("privateKey", addValue, addName, addChain);
     } else {
@@ -163,10 +198,14 @@ export function WalletsCard({
     if (ok) resetAdd();
   };
 
+  const zanoNeedsPassphrase = detected.kind === "zano" && detected.zanoPasswordProtected === true;
   const addDisabled =
     busy ||
+    generating ||
     !addValue.trim() ||
-    (addMode === "seed" && !detected.kind);
+    (addMode === "seed" && !detected.kind) ||
+    (detected.kind === "zano" && detected.zanoAuditable === true) ||
+    (zanoNeedsPassphrase && !zanoPassphrase);
 
   const startEdit = (e: WalletEntry) => {
     setEditingId(e.id);
@@ -289,6 +328,11 @@ export function WalletsCard({
                     <Mono size={10} color="var(--text)" style={{ display: "block", wordBreak: "break-all", userSelect: "all" }}>
                       {secret || "—"}
                     </Mono>
+                    {e.kind === "zano" && e.zanoSeedPassphrase && (
+                      <Mono size={9} color="var(--warn)" style={{ display: "block", marginTop: 6 }}>
+                        Secured Seed passphrase: <span style={{ userSelect: "all" }}>{e.zanoSeedPassphrase}</span>
+                      </Mono>
+                    )}
                   </div>
                 )}
               </div>
@@ -325,7 +369,7 @@ export function WalletsCard({
                 return (
                   <button
                     key={m}
-                    onClick={() => { setAddMode(m); setAddValue(""); }}
+                    onClick={() => { setAddMode(m); setAddValue(""); setGeneratedFor(null); }}
                     style={{
                       flex: 1,
                       fontFamily: "var(--mono)",
@@ -365,8 +409,8 @@ export function WalletsCard({
             {addMode === "seed" ? (
               <textarea
                 value={addValue}
-                onChange={(e) => setAddValue(e.target.value)}
-                placeholder="Recovery phrase (12/24 BIP39 · 16-word Monero · 25-word Monero/Zephyr)…"
+                onChange={(e) => { setAddValue(e.target.value); setGeneratedFor(null); }}
+                placeholder="Recovery phrase — BIP39 · Monero (16/25) · Zephyr (25) · Zano (26)…"
                 rows={2}
                 spellCheck={false}
                 style={{ ...inputStyle, resize: "vertical", minHeight: 44 }}
@@ -381,11 +425,38 @@ export function WalletsCard({
               />
             )}
 
-            {/* Detected-kind feedback + 25-word disambiguation */}
+            {/* Create new — Monero / Zephyr / Zano, which each use their own
+                seed rather than the BIP39 one. Offered while the box is
+                empty; the generated seed lands in the box for review. */}
+            {addMode === "seed" && !addValue.trim() && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }} data-create-seed>
+                <Mono size={9} color="var(--text-dim)">or create new:</Mono>
+                {CREATABLE.map((c) => (
+                  <Btn
+                    key={c.kind}
+                    variant="ghost"
+                    size="sm"
+                    disabled={busy || generating}
+                    onClick={() => void handleGenerate(c)}
+                  >
+                    {c.label}
+                  </Btn>
+                ))}
+              </div>
+            )}
+            {genError && <Mono size={9} color="var(--danger)">{genError}</Mono>}
+            {addMode === "seed" && generatedFor && addValue.trim() && (
+              <Mono size={9} color="var(--warn)" style={{ display: "block", lineHeight: 1.5 }}>
+                New {generatedFor} seed — write these words down before adding it. They are the
+                only way to recover this wallet.
+              </Mono>
+            )}
+
+            {/* Detected-kind feedback + 25-word disambiguation + Zano passphrase */}
             {addMode === "seed" && addValue.trim() && (
               detected.kind === null ? (
                 <Mono size={9} color="var(--danger)">
-                  Unrecognized — expected 12/24 BIP39, 16-word Monero, or 25-word Monero/Zephyr.
+                  Unrecognized — expected 12/24 BIP39, 16-word Monero, 25-word Monero/Zephyr, or a Zano seed.
                 </Mono>
               ) : detected.ambiguous ? (
                 <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
@@ -404,11 +475,56 @@ export function WalletsCard({
                     })}
                   </div>
                 </div>
+              ) : detected.kind === "zano" ? (
+                detected.zanoAuditable ? (
+                  <Mono size={9} color="var(--danger)">
+                    Auditable Zano seed — auditable wallets aren't supported yet.
+                  </Mono>
+                ) : (
+                  <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+                    <Mono size={9} color="var(--accent)">Detected: Zano seed</Mono>
+                    {zanoNeedsPassphrase && (
+                      <>
+                        <input
+                          type="password"
+                          value={zanoPassphrase}
+                          onChange={(e) => setZanoPassphrase(e.target.value)}
+                          placeholder="Secured Seed passphrase (required for this seed)"
+                          style={inputStyle}
+                        />
+                        <Mono size={8} color="var(--warn)" style={{ display: "block", lineHeight: 1.5 }}>
+                          A wrong passphrase opens a different, empty wallet rather than failing —
+                          the checksum catches most mistakes, not all.
+                        </Mono>
+                      </>
+                    )}
+                  </div>
+                )
               ) : (
                 <Mono size={9} color="var(--accent)">
                   Detected: {detected.kind === "bip39" ? "BIP39 recovery phrase" : "Monero polyseed"}
                 </Mono>
               )
+            )}
+
+            {/* Restore date — 25-word Monero/Zephyr imports only. A polyseed
+                carries its own birthday, a Zano seed its own date, and a
+                seed generated here starts at the chain tip. */}
+            {addMode === "seed" && detected.ambiguous && !generatedFor && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }} data-restore-date>
+                <Mono size={9} color="var(--text-dim)">Created around (optional)</Mono>
+                <input
+                  type="date"
+                  value={restoreDate}
+                  max={new Date().toISOString().slice(0, 10)}
+                  onChange={(e) => setRestoreDate(e.target.value)}
+                  style={inputStyle}
+                />
+                <Mono size={8} color="var(--text-dim)" style={{ display: "block", lineHeight: 1.5 }}>
+                  Scanning starts a month before this date. Blank scans the whole chain — slow, but it
+                  can't miss funds.
+                </Mono>
+              </div>
             )}
 
             <input

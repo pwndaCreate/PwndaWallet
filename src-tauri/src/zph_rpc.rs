@@ -37,7 +37,6 @@ use crate::wallet_rpc_common::{
 // netstat-PID lookup and the by-PID force-kill were dropped 2026-08-13 with
 // the port-fallback change: we no longer need to evict whoever holds 18083,
 // so we no longer terminate processes we don't own.
-#[cfg(target_os = "windows")]
 use crate::platform::kill_process_by_pid_and_image;
 
 #[cfg(target_os = "windows")]
@@ -571,13 +570,14 @@ pub async fn zph_start_rpc(
 
     if port_is_bound(ZPH_RPC_PORT).await {
         if let Some(old_pid) = read_pidfile(&pidfile) {
-            #[cfg(target_os = "windows")]
-            {
-                let _ = kill_process_by_pid_and_image(old_pid, ZPH_BINARY_NAME).await;
-            }
-            #[cfg(not(target_os = "windows"))]
-            {
-                let _ = old_pid;
+            // Both platforms since 2026-09-13; Unix was `let _ = old_pid;`,
+            // so a wedged orphan on Linux was never removed.
+            let _ = kill_process_by_pid_and_image(old_pid, ZPH_BINARY_NAME).await;
+            for _ in 0..10 {
+                if !port_is_bound(ZPH_RPC_PORT).await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
     }

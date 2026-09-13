@@ -1009,9 +1009,26 @@ pub async fn xmr_start_rpc(
             {
                 let _ = kill_wallet_rpc_pid(old_pid).await;
             }
+            // Unix had no hard kill here until 2026-09-13 — the branch was
+            // `let _ = old_pid;`. A wedged orphan on Linux was never removed,
+            // so this run moved to a fallback port while the orphan kept the
+            // wallet file open. Same image-checked kill Zephyr's twin uses.
             #[cfg(not(target_os = "windows"))]
             {
-                let _ = old_pid;
+                let _ = crate::platform::kill_process_by_pid_and_image(
+                    old_pid,
+                    &monero_wallet_rpc_filename(),
+                )
+                .await;
+            }
+            // A killed process frees its socket shortly after, not instantly;
+            // without this wait the fallback-port check below fires on our own
+            // just-killed orphan.
+            for _ in 0..10 {
+                if !xmr_port_is_bound().await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
         }
     }
