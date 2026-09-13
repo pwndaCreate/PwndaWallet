@@ -323,8 +323,14 @@ export const btcAdapter: ChainAdapter = {
   },
 
   /** Account-wide send — see . */
-  sendFromAccount(mnemonic: string, to: string, amount: string, fromAddress?: string) {
-    return sendBtcFromAccount(mnemonic, to, amount, { fromAddress });
+  sendFromAccount(
+    mnemonic: string,
+    to: string,
+    amount: string,
+    fromAddress?: string,
+    opts?: { feeRate?: number },
+  ) {
+    return sendBtcFromAccount(mnemonic, to, amount, { fromAddress, feeRateOverride: opts?.feeRate });
   },
   utxoAccounts: btcUtxoAccounts,
   chain: "bitcoin",
@@ -548,6 +554,8 @@ export const btcAdapter: ChainAdapter = {
         normal: { value: String(r.halfHourFee), eta: "~30 min" },
         fast: { value: String(r.fastestFee), eta: "next block" },
         unit: "sat/vB",
+        // 1-in / 2-out P2WPKH (11 + 68 + 2×31) — lets the modal show a total.
+        typicalTxVBytes: 141,
         fetchedAt: Date.now(),
         raw: r,
       };
@@ -564,6 +572,7 @@ export const btcAdapter: ChainAdapter = {
         normal: { value: String(normal), eta: "~1 hr" },
         fast: { value: String(fast), eta: "next block" },
         unit: "sat/vB",
+        typicalTxVBytes: 141,
         fetchedAt: Date.now(),
         raw: r,
       };

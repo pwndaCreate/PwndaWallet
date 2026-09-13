@@ -219,6 +219,13 @@ export {
   SHARED_BALANCE_TIMEOUT_MS,
   type SharedBalanceDeps,
 } from "./fetchSharedCoinOverrides";
+// Sends of a shared coin sign locally; Grove is only asked whether a swap is
+// using the coin (2026-09-12 — see the module header).
+export {
+  checkSharedCoinSend,
+  sharedSendCoinFor,
+  SHARED_SEND_CHECK_TIMEOUT_MS,
+} from "./sharedCoinSendGuard";
 
 // ── The safety core ─────────────────────────────────────────────────
 // The spread gate is not a nicety: the measured book carries offers from

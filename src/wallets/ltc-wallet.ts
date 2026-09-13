@@ -120,6 +120,134 @@ async function tryEach<T>(
   );
 }
 
+// ── Fee rates ─────────────────────────────────────────────────────────────
+//
+// ONE fetcher for every LTC fee decision (2026-09-12). There were five copies:
+// the modal's estimate asked BlockCypher only, and the four signing paths
+// (send, account send, consolidation, legacy sweep) each asked BlockCypher then
+// litecoinspace `/fee-estimates` — an endpoint that instance answers with
+// `404 endpoint does not exist "/fee-estimates"`. With BlockCypher on
+// `429 {"error": "Limits reached."}`, every path silently fell to a hardcoded
+// 10 sat/vB and the modal displayed it as "ESTIMATED". litecoinspace is a
+// mempool.space instance; its tier endpoint is `/v1/fees/recommended`, and it
+// leads because it did not rate-limit a 25-request burst where BlockCypher did.
+
+/** Sat/vB used only when every live source fails. Shown as a DEFAULT, never
+ *  as an estimate (see `FeeEstimate.isFallback`). */
+export const LTC_DEFAULT_FEE_RATE = 10;
+
+/** A 1-input / 2-output P2WPKH send: 11 + 68 + 2×31 vB (`P2WPKH_SIZING`). */
+export const LTC_TYPICAL_TX_VBYTES = 141;
+
+export interface LtcFeeTiers {
+  slow: number;
+  normal: number;
+  fast: number;
+}
+
+const rate = (v: unknown): number | null =>
+  typeof v === "number" && Number.isFinite(v) && v > 0 ? Math.max(Math.ceil(v), 1) : null;
+
+/** mempool.space `/v1/fees/recommended`, sat/vB. Throws when a tier is missing. */
+export function parseMempoolRecommended(r: unknown): LtcFeeTiers {
+  const o = (r ?? {}) as Record<string, unknown>;
+  const slow = rate(o.hourFee) ?? rate(o.economyFee);
+  const normal = rate(o.halfHourFee);
+  const fast = rate(o.fastestFee);
+  if (slow == null || normal == null || fast == null) {
+    throw new Error("litecoinspace: fee tiers missing from /v1/fees/recommended");
+  }
+  return { slow, normal, fast };
+}
+
+/** BlockCypher chain info, satoshi per kB → sat/vB. Throws when a tier is missing. */
+export function parseBlockcypherTiers(info: unknown): LtcFeeTiers {
+  const o = (info ?? {}) as Record<string, unknown>;
+  const perVb = (v: unknown) => rate(typeof v === "number" ? v / 1000 : v);
+  const slow = perVb(o.low_fee_per_kb);
+  const normal = perVb(o.medium_fee_per_kb);
+  const fast = perVb(o.high_fee_per_kb);
+  if (slow == null || normal == null || fast == null) {
+    throw new Error("blockcypher: fee tiers missing from chain info");
+  }
+  return { slow, normal, fast };
+}
+
+/** Bitpay Bitcore `estimatesmartfee` for LTC by confirmation target. Answers
+ *  `{"feerate": <LTC per kB>, "blocks": N}`. Host already on the proxy
+ *  allowlist (`bitcore.io`, the DOGE/BCH balance primary). */
+const BITCORE_LTC_FEE = (blocks: number) =>
+  `https://api.bitcore.io/api/LTC/mainnet/fee/${blocks}`;
+
+/**
+ * Three Bitcore replies (targets 12 / 6 / 2 blocks) → sat/vB tiers. Throws
+ * when any reply carries no usable rate (a node that cannot estimate answers
+ * a negative or missing `feerate`).
+ *
+ * LTC/kB is rounded to whole litoshis BEFORE dividing: `0.00001 * 1e8` is
+ * `1000.0000000000001` in floating point, which would ceil to 2 sat/vB and
+ * double the fee on the most common reading.
+ */
+export function parseBitcoreFeeTiers(slow: unknown, normal: unknown, fast: unknown): LtcFeeTiers {
+  const perVb = (r: unknown, label: string) => {
+    const f = (r as { feerate?: unknown } | null)?.feerate;
+    const v = rate(typeof f === "number" ? Math.round(f * 1e8) / 1000 : undefined);
+    if (v == null) throw new Error(`bitcore: no usable ${label} feerate`);
+    return v;
+  };
+  return { slow: perVb(slow, "slow"), normal: perVb(normal, "normal"), fast: perVb(fast, "fast") };
+}
+
+/**
+ * litecoinspace → Bitcore → BlockCypher.
+ *
+ * Bitcore added 2026-09-12 (evening), after the operator's LTC send fell to the
+ * DEFAULT rate with BOTH earlier sources down at once: litecoinspace
+ * `/v1/fees/recommended` answering `503 Service Unavailable` (its other
+ * endpoints — tip height, mempool, mempool-blocks — still 200, so only its fee
+ * estimator was out) and BlockCypher `429 {"error": "Limits reached."}`.
+ * Blockchair, the other LTC host, answered `402` the same minute. Bitcore
+ * served ten consecutive requests without a limit. It sits second, ahead of
+ * BlockCypher, because BlockCypher's keyless tier is the one that is
+ * rate-limited most of the time.
+ */
+async function fetchLtcFeeTiers(): Promise<LtcFeeTiers> {
+  return tryEach<LtcFeeTiers>([
+    {
+      name: "litecoinspace",
+      fn: async () =>
+        parseMempoolRecommended(await proxyGetJson(`${LITECOINSPACE_BASE}/v1/fees/recommended`)),
+    },
+    {
+      name: "bitcore",
+      fn: async () => {
+        const [slow, normal, fast] = await Promise.all(
+          [12, 6, 2].map((blocks) => proxyGetJson(BITCORE_LTC_FEE(blocks))),
+        );
+        return parseBitcoreFeeTiers(slow, normal, fast);
+      },
+    },
+    {
+      name: "blockcypher",
+      fn: async () => parseBlockcypherTiers(await proxyGetJson(BLOCKCYPHER_BASE)),
+    },
+  ]);
+}
+
+/** The rate a signing path uses: the caller's choice when given, else the live
+ *  normal tier, else the default. Never throws — a fee oracle outage must not
+ *  make a send impossible. */
+async function ltcSendFeeRate(override?: number): Promise<number> {
+  if (override !== undefined && Number.isFinite(override) && override > 0) {
+    return Math.max(Math.ceil(override), 1);
+  }
+  try {
+    return (await fetchLtcFeeTiers()).normal;
+  } catch {
+    return LTC_DEFAULT_FEE_RATE;
+  }
+}
+
 /** Normalized UTXO across providers — shaped to match the existing PSBT
  *  loop (tx_hash / tx_output_n / value-litoshi) so the signing path is
  *  untouched. */
@@ -466,36 +594,8 @@ export async function sweepLegacyLtcToModern(
     value: u.value,
   }));
 
-  let feePerVB = feeRateOverride ?? 10; // sendTransaction's own default
-  if (feeRateOverride === undefined) {
-    // Same two oracles the send path consults, same order, same fallback.
-    try {
-      feePerVB = await tryEach<number>([
-        {
-          name: "blockcypher",
-          fn: async () => {
-            const info = await proxyGetJson<BlockCypherChainInfo>(BLOCKCYPHER_BASE);
-            const perKb = info.medium_fee_per_kb;
-            if (!perKb || perKb <= 0) throw new Error("no blockcypher fee");
-            return Math.max(Math.ceil(perKb / 1000), 1);
-          },
-        },
-        {
-          name: "litecoinspace",
-          fn: async () => {
-            const est = await proxyGetJson<Record<string, number>>(
-              `${LITECOINSPACE_BASE}/fee-estimates`
-            );
-            const v = est["6"] ?? est["3"] ?? est["1"];
-            if (!v || v <= 0) throw new Error("no esplora fee");
-            return Math.max(Math.ceil(v), 1);
-          },
-        },
-      ]);
-    } catch {
-      /* keep the default */
-    }
-  }
+  // Same fetcher every LTC signing path uses — see `fetchLtcFeeTiers`.
+  const feePerVB = await ltcSendFeeRate(feeRateOverride);
 
   const plan = planLegacyLtcSweep(utxos, feePerVB);
 
@@ -915,36 +1015,8 @@ export async function consolidateLtcAccount(
     );
   }
 
-  // 2) Resolve a fee rate from the same oracles the send path uses.
-  let feePerVB = opts?.feeRateOverride ?? 10;
-  if (opts?.feeRateOverride === undefined) {
-    try {
-      feePerVB = await tryEach<number>([
-        {
-          name: "blockcypher",
-          fn: async () => {
-            const info = await proxyGetJson<BlockCypherChainInfo>(BLOCKCYPHER_BASE);
-            const perKb = info.medium_fee_per_kb;
-            if (!perKb || perKb <= 0) throw new Error("no blockcypher fee");
-            return Math.max(Math.ceil(perKb / 1000), 1);
-          },
-        },
-        {
-          name: "litecoinspace",
-          fn: async () => {
-            const est = await proxyGetJson<Record<string, number>>(
-              `${LITECOINSPACE_BASE}/fee-estimates`,
-            );
-            const v = est["6"] ?? est["3"] ?? est["1"];
-            if (!v || v <= 0) throw new Error("no esplora fee");
-            return Math.max(Math.ceil(v), 1);
-          },
-        },
-      ]);
-    } catch {
-      /* keep the default */
-    }
-  }
+  // 2) Resolve a fee rate from the same fetcher the send path uses.
+  const feePerVB = await ltcSendFeeRate(opts?.feeRateOverride);
 
   const plan = planLtcConsolidation({
     destination,
@@ -1116,35 +1188,9 @@ export async function sendLtcFromAccount(
     throw new Error("Amount must be greater than zero.");
   }
 
-  let feePerVB = opts?.feeRateOverride ?? 10;
-  if (opts?.feeRateOverride === undefined) {
-    try {
-      feePerVB = await tryEach<number>([
-        {
-          name: "blockcypher",
-          fn: async () => {
-            const info = await proxyGetJson<BlockCypherChainInfo>(BLOCKCYPHER_BASE);
-            const perKb = info.medium_fee_per_kb;
-            if (!perKb || perKb <= 0) throw new Error("no blockcypher fee");
-            return Math.max(Math.ceil(perKb / 1000), 1);
-          },
-        },
-        {
-          name: "litecoinspace",
-          fn: async () => {
-            const est = await proxyGetJson<Record<string, number>>(
-              `${LITECOINSPACE_BASE}/fee-estimates`,
-            );
-            const v = est["6"] ?? est["3"] ?? est["1"];
-            if (!v || v <= 0) throw new Error("no esplora fee");
-            return Math.max(Math.ceil(v), 1);
-          },
-        },
-      ]);
-    } catch {
-      /* keep the default */
-    }
-  }
+  // The modal's selected tier when given (`opts.feeRateOverride`), else the
+  // live normal tier, else the default — `ltcSendFeeRate`.
+  const feePerVB = await ltcSendFeeRate(opts?.feeRateOverride);
 
   const { plan, sources, change } = await gatherAccountSpend({
     mnemonic,
@@ -1331,8 +1377,17 @@ export const ltcAdapter: ChainAdapter = {
   /** Account-wide send — see `sendLtcFromAccount`. `useSend` prefers this
    *  over `sendTransaction` whenever a mnemonic is available, because the
    *  single-key path cannot reach change addresses. */
-  sendFromAccount(mnemonic: string, to: string, amount: string, fromAddress?: string) {
-    return sendLtcFromAccount(mnemonic, to, amount, { fromAddress });
+  sendFromAccount(
+    mnemonic: string,
+    to: string,
+    amount: string,
+    fromAddress?: string,
+    opts?: { feeRate?: number },
+  ) {
+    return sendLtcFromAccount(mnemonic, to, amount, {
+      fromAddress,
+      feeRateOverride: opts?.feeRate,
+    });
   },
 
   async sendTransaction(
@@ -1366,36 +1421,8 @@ export const ltcAdapter: ChainAdapter = {
       throw new Error("No spendable UTXOs available for this address.");
     }
 
-    // 2) Fee rate: live oracle (multi-source), fall back to a sane default.
-    let feePerVB = 10;
-    try {
-      feePerVB = await tryEach<number>([
-        {
-          name: "blockcypher",
-          fn: async () => {
-            // BlockCypher returns satoshi/kB; convert to sat/vB.
-            const info = await proxyGetJson<BlockCypherChainInfo>(BLOCKCYPHER_BASE);
-            const perKb = info.medium_fee_per_kb;
-            if (!perKb || perKb <= 0) throw new Error("no blockcypher fee");
-            return Math.max(Math.ceil(perKb / 1000), 1);
-          },
-        },
-        {
-          name: "litecoinspace",
-          fn: async () => {
-            // Esplora /fee-estimates is a { "<target>": sat/vB } map.
-            const est = await proxyGetJson<Record<string, number>>(
-              `${LITECOINSPACE_BASE}/fee-estimates`
-            );
-            const v = est["6"] ?? est["3"] ?? est["1"];
-            if (!v || v <= 0) throw new Error("no esplora fee");
-            return Math.max(Math.ceil(v), 1);
-          },
-        },
-      ]);
-    } catch {
-      /* keep default 10 sat/vB */
-    }
+    // 2) Fee rate: live tiers (litecoinspace → BlockCypher), else the default.
+    const feePerVB = await ltcSendFeeRate();
     // P2PKH inputs are ~3× the size of a P2WPKH input's witness, so a legacy
     // 1-in/2-out tx is ~226 vB vs ~140 vB for segwit. Estimate before input
     // selection (the fee determines how many inputs to pull); LTC fees are
@@ -1531,30 +1558,33 @@ export const ltcAdapter: ChainAdapter = {
   },
 
   /**
-   * Fee tiers from BlockCypher. Returned as sat/vB to match what every
-   * BTC-style fee UI in this app already speaks. Falls back to a static
-   * 10 sat/vB when the oracle is down — same surface as the BTC adapter.
+   * Fee tiers in sat/vB — litecoinspace `/v1/fees/recommended`, then
+   * BlockCypher (`fetchLtcFeeTiers`). When both fail, the default rate is
+   * returned MARKED `isFallback`, so the modal labels it a default.
+   *
+   * CORRECTED 2026-09-12: this asked BlockCypher only and returned a bare
+   * `{ normal: "10" }` on any failure, which the modal rendered as
+   * "ESTIMATED 10 sat/vB" — observed while BlockCypher was answering 429 and
+   * the live rate was 1 sat/vB.
    */
   async getFeeEstimate(): Promise<FeeEstimate> {
     try {
-      const info = await proxyGetJson<BlockCypherChainInfo>(BLOCKCYPHER_BASE);
-      const high = info.high_fee_per_kb;
-      const med = info.medium_fee_per_kb;
-      const low = info.low_fee_per_kb;
-      const toVB = (perKb: number | undefined) =>
-        perKb && perKb > 0 ? Math.max(Math.ceil(perKb / 1000), 1) : 1;
+      const t = await fetchLtcFeeTiers();
       return {
-        slow: { value: String(toVB(low)), eta: "~1 hr" },
-        normal: { value: String(toVB(med)), eta: "~30 min" },
-        fast: { value: String(toVB(high)), eta: "next block" },
+        slow: { value: String(t.slow), eta: "~1 hr" },
+        normal: { value: String(t.normal), eta: "~30 min" },
+        fast: { value: String(t.fast), eta: "next block" },
         unit: "sat/vB",
+        typicalTxVBytes: LTC_TYPICAL_TX_VBYTES,
         fetchedAt: Date.now(),
-        raw: info,
+        raw: t,
       };
     } catch {
       return {
-        normal: { value: "10" },
+        normal: { value: String(LTC_DEFAULT_FEE_RATE) },
         unit: "sat/vB",
+        typicalTxVBytes: LTC_TYPICAL_TX_VBYTES,
+        isFallback: true,
         fetchedAt: Date.now(),
       };
     }

@@ -437,6 +437,8 @@ export function AmountCard({
   rightOfLabel,
   pickerSlot,
   footerSlot,
+  usdAmount,
+  onUsdAmountChange,
 }: {
   label: string;
   amount: string;
@@ -448,6 +450,14 @@ export function AmountCard({
   balanceLabel?: string | null;
   onMax?: () => void;
   usdLabel?: string | null;
+  /**
+   * An EDITABLE USD value, replacing `usdLabel`'s read-only line when
+   * `onUsdAmountChange` is given (2026-09-12, operator request: type the send
+   * in dollars, as Exodus allows). The caller owns the conversion — this card
+   * cannot know the price or the coin's precision (`src/lib/usdAmount.ts`).
+   */
+  usdAmount?: string;
+  onUsdAmountChange?: (usd: string) => void;
   networkLabel?: string | null;
   readOnly?: boolean;
   placeholder?: string;
@@ -571,7 +581,7 @@ export function AmountCard({
         )}
       </div>
 
-      {(usdLabel || networkLabel) && (
+      {(usdLabel || networkLabel || onUsdAmountChange) && (
         <div
           style={{
             display: "flex",
@@ -581,14 +591,48 @@ export function AmountCard({
             fontSize: 10,
           }}
         >
-          <span
-            style={{
-              color: "var(--text-dim)",
-              fontVariantNumeric: "tabular-nums",
-            }}
-          >
-            {usdLabel ?? ""}
-          </span>
+          {onUsdAmountChange ? (
+            <label
+              data-usd-entry
+              style={{
+                display: "inline-flex",
+                alignItems: "baseline",
+                gap: 2,
+                color: "var(--text-dim)",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              ≈ $
+              <input
+                value={usdAmount ?? ""}
+                onChange={(e) => onUsdAmountChange(e.target.value)}
+                placeholder="0.00"
+                inputMode="decimal"
+                aria-label={`${label} in USD`}
+                style={{
+                  width: "11ch",
+                  fontSize: 10,
+                  fontFamily: "var(--mono)",
+                  fontVariantNumeric: "tabular-nums",
+                  color: "var(--text)",
+                  background: "transparent",
+                  border: "none",
+                  borderBottom: "1px dashed var(--border)",
+                  outline: "none",
+                  padding: "0 2px",
+                }}
+              />
+            </label>
+          ) : (
+            <span
+              style={{
+                color: "var(--text-dim)",
+                fontVariantNumeric: "tabular-nums",
+              }}
+            >
+              {usdLabel ?? ""}
+            </span>
+          )}
           {networkLabel && (
             <span
               style={{

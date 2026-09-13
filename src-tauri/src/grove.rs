@@ -113,7 +113,17 @@ pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.6";
 /// created against an empty chain first, ends up below `pruneheight` and
 /// particld refuses to start. Off by default; absent the env var the call is
 /// upstream's own single-argument form.
-pub const EXPECTED_PATCH_LEVEL: u32 = 32;
+/// 32 -> 33 on 2026-09-12: 0034 (the mercy tx's scriptCode is built from the
+/// signing key, not a stored pubkey hash). It touches `basicswap/`, so it
+/// counts. It landed in f92cd6f WITHOUT this bump; the runtime was re-stamped
+/// p33 and deployed, and every Grove start then logged "installed runtime is
+/// pwnda-grove 0.18.6+p33, this build expects pwnda-grove 0.18.6+p32 —
+/// reinstalling from the bundle". `expected_patch_level_matches_the_series`
+/// did fail (`holds 33 ENGINE patches but EXPECTED_PATCH_LEVEL is 32`) — it
+/// had simply not been run. The reinstall is now also refused when the
+/// installed runtime is AHEAD of this constant (`reinstall_refusal`), so a
+/// stale constant can never again drive a downgrade.
+pub const EXPECTED_PATCH_LEVEL: u32 = 33;
 
 /// The identifier this build expects a correctly-patched runtime to carry,
 /// e.g. `pwnda-grove 0.18.5+p26`.
@@ -270,6 +280,82 @@ pub fn describe(identity: &EngineIdentity) -> String {
              Run: node scripts/apply-engine-patches.mjs --check"
         ),
     }
+}
+
+/// `(upstream [major, minor, patch], patch level)` from an id such as
+/// `pwnda-grove 0.18.6+p33`. `None` for anything else — `"unstamped"`, a
+/// foreign slug, a malformed version — so an unreadable id is never mistaken
+/// for an ordered one.
+pub fn parse_id(id: &str) -> Option<([u64; 3], u32)> {
+    let rest = id.trim().strip_prefix(DISTRO_SLUG)?.trim_start();
+    let (ver, patch) = rest.split_once("+p")?;
+    let mut parts = ver.split('.');
+    let mut next = || parts.next().and_then(|p| p.parse::<u64>().ok());
+    let v = [next()?, next()?, next()?];
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((v, patch.parse().ok()?))
+}
+
+/// True when `stamped` names an engine NEWER than this build expects: a later
+/// upstream, or the same upstream at a higher patch level. Unparseable ids are
+/// never "ahead".
+pub fn is_ahead_of_expected(stamped: &str) -> bool {
+    match (parse_id(stamped), parse_id(&expected_id())) {
+        // Tuple order is upstream first, then patch level — exactly precedence.
+        (Some(got), Some(want)) => got > want,
+        _ => false,
+    }
+}
+
+/// Why the bundled engine must NOT be unpacked over this install, or `None`
+/// when a reinstall is safe.
+///
+/// # The two refusals, both from the 2026-09-12 reinstall loop
+///
+/// Every Grove start logged `installed runtime is pwnda-grove 0.18.6+p33, this
+/// build expects pwnda-grove 0.18.6+p32 — reinstalling from the bundle`, then
+/// `untar … failed to create \\?\…\dev-home\runtime\bin`.
+///
+/// 1. **A downgrade.** The installed engine was one patch AHEAD: PATCH-34 was
+///    deployed without bumping [`EXPECTED_PATCH_LEVEL`]. "Drift" used to mean
+///    "replace it", in either direction; replacing a newer engine with an older
+///    payload removes fixes from a node that may be carrying swaps. An engine
+///    ahead of the build is reported, never overwritten.
+/// 2. **Writing through a hand-staged tree.** `dev-home\runtime` and `\bin` are
+///    junctions into `.swap-sidecar-work\`. The untar failed only because the
+///    `tar` crate canonicalises each parent and refuses paths outside the
+///    destination — a dependency's guard standing between a bundle and the
+///    deployed dev engine. `owned_dirs` that resolve outside `base` are not this
+///    install's to replace.
+pub fn reinstall_refusal(stamped: &str, base: &Path, owned_dirs: &[PathBuf]) -> Option<String> {
+    if is_ahead_of_expected(stamped) {
+        return Some(format!(
+            "the installed engine is {stamped}, NEWER than this build expects ({}). \
+             Reinstalling from the bundle would downgrade it; update the app instead",
+            expected_id()
+        ));
+    }
+    // Base not resolvable: nothing to compare against, and the reinstall's own
+    // errors will say why.
+    let canon_base = std::fs::canonicalize(base).ok()?;
+    for dir in owned_dirs {
+        // Absent: a first install, nothing to write through.
+        let Ok(canon) = std::fs::canonicalize(dir) else {
+            continue;
+        };
+        if !canon.starts_with(&canon_base) {
+            return Some(format!(
+                "{} resolves to {}, outside {} — a hand-staged runtime, not an installed \
+                 one. Deploy staged engines with scripts/swap/Swap-EngineRuntime.ps1",
+                dir.display(),
+                canon.display(),
+                canon_base.display()
+            ));
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -558,5 +644,78 @@ mod tests {
         let tmp = tmpdir("corrupt");
         fs::write(tmp.join(STAMP_FILE), "{not json").unwrap();
         assert_eq!(identify(&tmp, true), EngineIdentity::Unstamped);
+    }
+
+    // ── the 2026-09-12 reinstall loop ──────────────────────────────────
+    //
+    // `installed runtime is pwnda-grove 0.18.6+p33, this build expects
+    // pwnda-grove 0.18.6+p32 — reinstalling from the bundle`, on every start.
+
+    #[test]
+    fn parses_grove_ids_and_nothing_else() {
+        assert_eq!(parse_id("pwnda-grove 0.18.6+p33"), Some(([0, 18, 6], 33)));
+        assert_eq!(parse_id("unstamped"), None);
+        assert_eq!(parse_id("pwnda-grove 0.18+p3"), None);
+        assert_eq!(parse_id("pwnda-grove 0.18.6.1+p3"), None);
+        assert_eq!(parse_id("other-distro 0.18.6+p3"), None);
+    }
+
+    #[test]
+    fn ahead_means_a_later_upstream_or_a_higher_patch_level() {
+        let (v, p) = parse_id(&expected_id()).expect("expected id parses");
+        let id = |v: [u64; 3], p: u32| format!("pwnda-grove {}.{}.{}+p{}", v[0], v[1], v[2], p);
+        assert!(is_ahead_of_expected(&id(v, p + 1)), "one patch ahead");
+        assert!(
+            is_ahead_of_expected(&id([v[0], v[1], v[2] + 1], 0)),
+            "a later upstream is ahead even at a lower patch level"
+        );
+        assert!(!is_ahead_of_expected(&expected_id()), "equal is not ahead");
+        assert!(!is_ahead_of_expected(&id(v, p - 1)), "behind is not ahead");
+        assert!(!is_ahead_of_expected("unstamped"), "unknown is never ahead");
+    }
+
+    #[test]
+    fn a_newer_installed_engine_is_never_reinstalled() {
+        let base = tmpdir("ahead");
+        fs::create_dir_all(base.join("runtime")).unwrap();
+        let (v, p) = parse_id(&expected_id()).unwrap();
+        let newer = format!("pwnda-grove {}.{}.{}+p{}", v[0], v[1], v[2], p + 1);
+        let why = reinstall_refusal(&newer, &base, &[base.join("runtime")]).expect("must refuse");
+        assert!(why.contains("NEWER"), "{why}");
+
+        // Positive control: an engine BEHIND the build, installed inside the
+        // base, is exactly what the reconcile exists to replace.
+        let older = format!("pwnda-grove {}.{}.{}+p{}", v[0], v[1], v[2], p - 1);
+        assert_eq!(reinstall_refusal(&older, &base, &[base.join("runtime")]), None);
+    }
+
+    #[test]
+    fn a_runtime_linked_outside_the_base_is_never_reinstalled() {
+        let base = tmpdir("linkbase");
+        let staged = tmpdir("linkstaged");
+        let link = base.join("runtime");
+        make_dir_link(&staged, &link);
+        let why = reinstall_refusal("unstamped", &base, &[link]).expect("must refuse");
+        assert!(why.contains("hand-staged"), "{why}");
+        let _ = fs::remove_dir_all(&base);
+        let _ = fs::remove_dir_all(&staged);
+    }
+
+    /// A JUNCTION on Windows, like the real `dev-home\runtime` — needs no
+    /// symlink privilege, and it is the shape that actually failed.
+    #[cfg(windows)]
+    fn make_dir_link(target: &Path, link: &Path) {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(link)
+            .arg(target)
+            .output()
+            .expect("run mklink");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[cfg(unix)]
+    fn make_dir_link(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
     }
 }

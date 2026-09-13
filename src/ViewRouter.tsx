@@ -836,6 +836,7 @@ export function ViewRouter(props: ViewRouterProps) {
       {showSendModal && wallet && (
         <SendModal
           adapter={adapter}
+          usdPrice={pricesByTicker[adapter.ticker.toUpperCase()]}
           fromAddress={wallet.address}
           sendTo={sendTo}
           setSendTo={setSendTo}

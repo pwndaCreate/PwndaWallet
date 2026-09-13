@@ -9736,7 +9736,17 @@ pub async fn swap_sidecar_install_bundled(app: AppHandle) -> Result<bool, String
 ///   still does not identify as the expected engine, that is an error with
 ///   both ids in it, not a shrug.
 ///
-/// Returns `Some(message)` when it actually replaced the engine.
+/// Returns `Some(message)` when it installed or replaced the engine.
+///
+/// # First install is this function's job (2026-09-13)
+///
+/// It used to return `Ok(None)` for `NoRuntime`, commented "first-install, which
+/// the setup path already owns". Nothing owned it: `swap_sidecar_install_bundled`
+/// has no caller in the renderer. So on a machine that has only ever had the
+/// installer (found on a Linux `.deb` of 0.6.3) every start failed with "the swap
+/// runtime is not installed" while a correct `grove.enc` sat in the resources.
+/// The start path calls this before anything spawns, so installing here fixes it
+/// with no extra UI step. Evidence: `pwnda-grove-firstrun-fix/`.
 pub async fn reconcile_bundled_engine(
     app: &AppHandle,
     running: bool,
@@ -9744,45 +9754,106 @@ pub async fn reconcile_bundled_engine(
     if !read_optin(app).opted_in || running {
         return Ok(None);
     }
+    let base = sidecar_base_dir(app)?;
     let rt = runtime_dir(app)?;
-    let installed = python_exe(app).map(|p| p.is_file()).unwrap_or(false);
-    let before = crate::grove::identify(&rt, installed);
-    // `Ok` needs nothing; `NoRuntime` is first-install, which the setup path
-    // already owns. Only a stamped disagreement (or a tree whose level we
-    // cannot read) is ours.
-    let stamped_before = match &before {
-        crate::grove::EngineIdentity::Drift { stamped, .. } => stamped.clone(),
-        crate::grove::EngineIdentity::Unstamped => "unstamped".to_string(),
-        _ => return Ok(None),
-    };
-
+    let bin = bin_dir(app)?;
     let resource_dir = app
         .path()
         .resource_dir()
         .map_err(|e| format!("cannot resolve resource dir: {e}"))?;
-    if !crate::bundle::bundle_has(&resource_dir, "grove") {
-        // A dev checkout, or a build assembled without the payload. Either way
-        // there is nothing here to install FROM, and guessing is worse than the
-        // note the card already shows.
+    reconcile_engine_at(
+        &base,
+        &rt,
+        &bin,
+        &resource_dir,
+        &|| python_exe(app).map(|p| p.is_file()).unwrap_or(false),
+        &|msg: &str| supervisor_log(app, msg),
+    )
+}
+
+/// [`reconcile_bundled_engine`] without the `AppHandle`, so the transition that
+/// actually failed — an empty sidecar base in, an interpreter out — is a
+/// behavioural test (`a_fresh_install_gets_its_engine_from_the_bundle`), not a
+/// source grep. `python_present` is the app's own `python_exe` check, so a
+/// `PWNDA_SWAP_SIDECAR_PYTHON` override still reads as installed and never
+/// triggers a bundle install.
+pub(crate) fn reconcile_engine_at(
+    base: &std::path::Path,
+    rt: &std::path::Path,
+    bin: &std::path::Path,
+    resource_dir: &std::path::Path,
+    python_present: &dyn Fn() -> bool,
+    log: &dyn Fn(&str),
+) -> Result<Option<String>, String> {
+    let before = crate::grove::identify(rt, python_present());
+    let first_install = matches!(before, crate::grove::EngineIdentity::NoRuntime);
+    // `Ok` needs nothing. No engine, an unreadable level, or a stamped
+    // disagreement are all this function's to repair.
+    let stamped_before = match &before {
+        crate::grove::EngineIdentity::Ok { .. } => return Ok(None),
+        crate::grove::EngineIdentity::NoRuntime => "not installed".to_string(),
+        crate::grove::EngineIdentity::Unstamped => "unstamped".to_string(),
+        crate::grove::EngineIdentity::Drift { stamped, .. } => stamped.clone(),
+    };
+
+    if !crate::bundle::bundle_has(resource_dir, "grove") {
+        // A dev checkout, a build assembled without the payload, or a payload
+        // for another platform. Nothing here to install FROM; the start path
+        // reports the missing engine itself.
         return Ok(None);
     }
 
-    let base = sidecar_base_dir(app)?;
-    supervisor_log(
-        app,
-        &format!(
+    // Two reinstalls that must never happen, found 2026-09-12 when every start
+    // logged a p33 -> p32 "reinstall" that the untar then failed:
+    //   * a DOWNGRADE — the installed engine is ahead of this build's constant
+    //     (a stale constant, or an older app over a newer deploy);
+    //   * writing THROUGH a hand-staged tree — `runtime/` or `bin/` resolving
+    //     outside the sidecar base (the dev junctions into `.swap-sidecar-work`).
+    //     The tar crate's outside-destination guard is what refused it; this
+    //     function must not rely on a dependency's guard to protect that tree.
+    if let Some(reason) =
+        crate::grove::reinstall_refusal(&stamped_before, base, &[rt.to_path_buf(), bin.to_path_buf()])
+    {
+        log(&format!("engine: not reinstalling from the bundle — {reason}"));
+        return Ok(None);
+    }
+    if first_install {
+        log(&format!(
+            "engine: no swap engine installed — installing {} from the bundle",
+            crate::grove::expected_id()
+        ));
+    } else {
+        log(&format!(
             "engine: installed runtime is {}, this build expects {} — reinstalling from the bundle",
             stamped_before,
             crate::grove::expected_id()
-        ),
-    );
+        ));
+    }
     crate::bundle::extract_encrypted_bundle(&resource_dir, "grove", &base)?;
 
-    let installed_now = python_exe(app).map(|p| p.is_file()).unwrap_or(false);
-    match crate::grove::identify(&rt, installed_now) {
+    let installed_now = python_present();
+    match crate::grove::identify(rt, installed_now) {
         crate::grove::EngineIdentity::Ok { id } => {
-            let msg = format!("swap engine updated to {} (was {})", id, stamped_before);
-            supervisor_log(app, &format!("engine: {}", msg));
+            let msg = if first_install {
+                format!("swap engine installed: {id}")
+            } else {
+                format!("swap engine updated to {} (was {})", id, stamped_before)
+            };
+            log(&format!("engine: {msg}"));
+            Ok(Some(msg))
+        }
+        // A first install that produced an interpreter whose stamp disagrees
+        // with this build is STARTED, loudly. Refusing would recreate the exact
+        // failure this branch fixes — a node that cannot start at all — over a
+        // metadata disagreement the card's drift note already reports.
+        other if first_install && installed_now => {
+            let msg = format!(
+                "swap engine installed from the bundle, but it reports {:?} while this build \
+                 expects {} — starting it anyway",
+                other,
+                crate::grove::expected_id()
+            );
+            log(&format!("engine: {msg}"));
             Ok(Some(msg))
         }
         other => Err(format!(
@@ -9839,8 +9910,30 @@ pub async fn swap_sidecar_update_engine(
             );
         }
     }
+    // A refused reinstall (newer engine installed, or a hand-staged tree) makes
+    // the reconcile below return `None` too — which must not be reported as
+    // "already the one this build expects" when it demonstrably is not.
+    if let crate::grove::EngineIdentity::Drift { stamped, .. } =
+        crate::grove::identify(&rt, installed)
+    {
+        let base = sidecar_base_dir(&app)?;
+        if let Some(reason) =
+            crate::grove::reinstall_refusal(&stamped, &base, &[rt.clone(), bin_dir(&app)?])
+        {
+            return Ok(format!("the swap engine was left as it is: {reason}"));
+        }
+    }
     match reconcile_bundled_engine(&app, false).await? {
         Some(msg) => Ok(msg),
+        // `None` also means "nothing to install from" (no bundle for this
+        // platform). With no interpreter on disk that is NOT "already current":
+        // it was this button's false all-clear on a fresh install (2026-09-13,
+        // `pwnda-grove-firstrun-fix/`).
+        None if !python_exe(&app).map(|p| p.is_file()).unwrap_or(false) => Err(
+            "no swap engine is installed, and this build carries no engine bundle for this \
+             platform to install one from — reinstall PwndaWallet from its official installer"
+                .to_string(),
+        ),
         None => Ok("the swap engine is already the one this build expects".to_string()),
     }
 }
@@ -10742,14 +10835,24 @@ pub async fn swap_sidecar_start(
     // nothing has spawned yet, so no engine process holds the tree. A dev
     // checkout has no bundle and this is a no-op there. See
     // `reconcile_bundled_engine`.
-    match reconcile_bundled_engine(&app, false).await {
-        Ok(Some(msg)) => supervisor_log(&app, &format!("start: {}", msg)),
-        Ok(None) => {}
+    // Since 2026-09-13 this also performs the FIRST install on a machine that
+    // has only ever had the installer. The error is kept, not just logged, so
+    // the "not installed" refusal below can say why instead of pointing at a
+    // setup step that has no button.
+    let engine_install_error = match reconcile_bundled_engine(&app, false).await {
+        Ok(Some(msg)) => {
+            supervisor_log(&app, &format!("start: {}", msg));
+            None
+        }
+        Ok(None) => None,
         // A failed reinstall must not block a start: the engine that IS on
         // disk may well run. Loud in the log, and the card still shows the
         // drift note.
-        Err(e) => supervisor_log(&app, &format!("start: engine reinstall failed: {}", e)),
-    }
+        Err(e) => {
+            supervisor_log(&app, &format!("start: engine install failed: {}", e));
+            Some(e)
+        }
+    };
 
     // Phase timings. "Why is starting slow" previously needed the engine's own
     // log plus arithmetic across two files; the supervisor is the only thing
@@ -10948,10 +11051,22 @@ pub async fn swap_sidecar_start(
                 reason: "runtime missing".to_string(),
             },
         )?;
-        return Err(format!(
-            "the swap runtime is not installed ({} is missing) — run the setup step first",
-            python.display()
-        ));
+        // Until 2026-09-13 this told the user to go and run a setup step that no
+        // screen offers. The start has just tried to install the engine from
+        // the app's own bundle, so say what that attempt found.
+        return Err(match &engine_install_error {
+            Some(e) => format!(
+                "the swap engine is not installed ({} is missing), and installing it from \
+                 this app's bundle failed: {e}",
+                python.display()
+            ),
+            None => format!(
+                "the swap engine is not installed ({} is missing), and this build carries no \
+                 engine bundle for this platform — reinstall PwndaWallet from its official \
+                 installer",
+                python.display()
+            ),
+        });
     }
 
     // Everything from here — prepare, spawn, health poll — is
@@ -14283,6 +14398,114 @@ pub fn on_app_ready(").expect("gate end moved")];
             !body.contains("datadir"),
             "the reconcile must not name the datadir at all"
         );
+    }
+
+    // ── first install, behaviourally (2026-09-13) ──────────────────────
+    //
+    // The source-text test above passed throughout the first-install defect:
+    // it proves the call exists and precedes the spawn, not that the callee
+    // does anything. On a machine that had only ever had the installer every
+    // start failed with "the swap runtime is not installed" while `grove.enc`
+    // held the missing interpreter. These ask the question that matters:
+    // empty sidecar base in, interpreter out?
+
+    struct FirstRunFixture {
+        root: std::path::PathBuf,
+        base: std::path::PathBuf,
+        rt: std::path::PathBuf,
+        bin: std::path::PathBuf,
+        resource: std::path::PathBuf,
+        python: std::path::PathBuf,
+    }
+
+    fn first_run_fixture(tag: &str, stamp_id: Option<&str>) -> FirstRunFixture {
+        let root = std::env::temp_dir().join(format!("pwnda-firstrun-{}-{}", tag, std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let base = root.join("swap-sidecar");
+        std::fs::create_dir_all(&base).unwrap();
+        let rt = base.join("runtime");
+        let bin = base.join("bin");
+        let resource = root.join("resource");
+        let python = python_exe_under(&rt, cfg!(windows));
+        if let Some(id) = stamp_id {
+            let py_rel = if cfg!(windows) { "runtime/python.exe" } else { "runtime/bin/python" };
+            let stamp = format!(r#"{{"name":"Pwnda Grove","id":"{id}"}}"#);
+            crate::bundle::write_fixture_bundle(
+                &resource,
+                "grove",
+                &[
+                    (py_rel, b"not really python"),
+                    ("runtime/pwnda-grove.json", stamp.as_bytes()),
+                    ("bin/particl/particld", b"not really particld"),
+                ],
+            );
+        }
+        FirstRunFixture { root, base, rt, bin, resource, python }
+    }
+
+    fn run_reconcile(f: &FirstRunFixture) -> (Result<Option<String>, String>, Vec<String>) {
+        let logs = std::cell::RefCell::new(Vec::new());
+        let python = f.python.clone();
+        let got = reconcile_engine_at(
+            &f.base,
+            &f.rt,
+            &f.bin,
+            &f.resource,
+            &|| python.is_file(),
+            &|m: &str| logs.borrow_mut().push(m.to_string()),
+        );
+        (got, logs.into_inner())
+    }
+
+    #[test]
+    fn a_fresh_install_gets_its_engine_from_the_bundle() {
+        let f = first_run_fixture("fresh", Some(&crate::grove::expected_id()));
+        assert!(!f.python.is_file(), "precondition: nothing installed");
+
+        let (got, logs) = run_reconcile(&f);
+        let msg = got.expect("first install").expect("must report the install");
+        assert!(f.python.is_file(), "after a first-install reconcile the interpreter must exist");
+        assert!(f.bin.join("particl").join("particld").is_file(), "the coin daemons land too");
+        assert!(msg.contains("installed"), "{msg}");
+        assert!(
+            logs.iter().any(|l| l.contains("no swap engine installed")),
+            "a first install is logged as one, not as a reinstall: {logs:?}"
+        );
+
+        // Positive control: the second start has nothing to do.
+        let (again, _) = run_reconcile(&f);
+        assert_eq!(again, Ok(None), "an installed, matching engine is left alone");
+        let _ = std::fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_fresh_install_without_a_bundle_does_nothing_and_says_nothing_happened() {
+        let f = first_run_fixture("nobundle", None);
+        let (got, _) = run_reconcile(&f);
+        assert_eq!(got, Ok(None));
+        assert!(!f.python.is_file(), "nothing may be conjured without a payload");
+        let _ = std::fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn a_first_install_with_a_mismatched_stamp_still_starts() {
+        // Refusing here would recreate the defect: a node that cannot start at
+        // all, over a metadata disagreement the drift note already reports.
+        let f = first_run_fixture("stamp", Some("pwnda-grove 0.0.1+p1"));
+        let (got, _) = run_reconcile(&f);
+        let msg = got.expect("must not fail a first install").expect("must report it");
+        assert!(f.python.is_file());
+        assert!(msg.contains("starting it anyway"), "{msg}");
+        let _ = std::fs::remove_dir_all(&f.root);
+    }
+
+    #[test]
+    fn the_start_error_no_longer_names_a_setup_step_that_does_not_exist() {
+        let f: &str = include_str!("swap_sidecar.rs");
+        let start = &f[f.find("pub async fn swap_sidecar_start(").expect("start moved")..];
+        let start = &start[..start.find("start_node_core(").expect("core call moved")];
+        assert!(!start.contains("run the setup step first"), "the step has no button");
+        assert!(start.contains("engine_install_error"), "the refusal carries the install result");
     }
 
     /// running node, so keeping it out of `shared_envs` would disarm the

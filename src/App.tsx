@@ -60,9 +60,10 @@ import {
   useSidecarSwap,
   useSwapAutoSetup,
   useSwapSidecarOptIn,
+  checkSharedCoinSend,
+  sharedSendCoinFor,
 } from "./features/swap-sidecar";
 import {
-  swapSidecarSharedCoinWithdraw,
   swapSidecarStatus,
   swapSidecarXmrSharedInUse,
   swapSidecarCnSharedInUse,
@@ -355,13 +356,11 @@ function App() {
   // module learned the coin (2026-09-05). See that file's header.
   const deriveAccountKeys = useAccountKeyDeriver();
   // `.shared` names tickers this SESSION's auto-setup pass verified as
-  // sharing the wallet's own account (see the hook's own header) — the
-  // reactive flag `sendOverride` below reads to decide whether a BTC/LTC send
-  // should route through the swap engine instead of this wallet's adapter.
-  // Known gap: a coin turned on mid-session from Settings does not appear
-  // here until the node restarts and a fresh auto-setup pass runs — the same
-  // once-per-session latch this hook already applies to unlocking and adding
-  // coins, not a new limitation introduced here.
+  // sharing the wallet's own account (see the hook's own header). Sends no
+  // longer read it (2026-09-12 — a shared coin signs locally; see
+  // `sharedCoinSendGuard` below). The hook also re-runs its pass after any
+  // node restart it observes, so Grove comes back unlocked and keyed without
+  // the swap panel being opened.
   const swapAutoSetup = useSwapAutoSetup(
     swapOptedIn,
     deriveSwapMaterial,
@@ -1190,24 +1189,27 @@ function App() {
     }
   }, [xmrSyncState, refreshAllBalances]);
 
-  // C8 authority switch — the send half. A BTC/LTC wallet this session's
-  // auto-setup pass VERIFIED as sharing the wallet's own account routes
-  // through the swap engine instead of this wallet's single-address adapter,
-  // because the engine holds the coin's complete account and can see (and
-  // spend) UTXOs the adapter cannot — see `sharedCoinBalance.ts`'s header.
-  // `undefined` for every other chain, and for a shared chain not (yet)
-  // reflected in `swapAutoSetup.shared` — those keep sending exactly as
-  // before, unchanged.
-  const sharedCoinSendOverride = useMemo(():
-    | ((to: string, amount: string) => Promise<{ hash: string }>)
+  // Grove-shared coins (BTC / LTC / BCH) send like any other UTXO chain: the
+  // wallet's own account-wide signer builds, signs and broadcasts, whether or
+  // not Grove is running, unlocked, or keyed.
+  //
+  // CORRECTED 2026-09-12. This was C8's "send half": a verified-shared BTC/LTC
+  // send was routed INTO the swap engine (`swapSidecarSharedCoinWithdraw`), so
+  // an ordinary mainnet send failed whenever Grove was stopped, locked, or
+  // mid-restart — reported that day as an LTC send that silently did nothing
+  // while Grove was being restarted by the unpark watcher. The routing's two
+  // reasons no longer held: the adapter has spent the whole account since
+  // 2026-08-25, and a conflicting double-selection is rejected by the mempool,
+  // not paid twice. What is kept is the part with a real consequence — a swap
+  // in flight may be about to fund a lock from these coins — as a pre-send
+  // check that refuses only when Grove DEFINITELY answers "yes" and sends when
+  // Grove cannot answer. See `features/swap-sidecar/sharedCoinSendGuard.ts`.
+  const sharedCoinSendGuard = useMemo(():
+    | ((to: string, amount: string) => Promise<string | null>)
     | undefined => {
-    const ticker =
-      activeChain === "bitcoin" ? "BTC" : activeChain === "litecoin" ? "LTC" : null;
-    if (!ticker || !swapAutoSetup.shared.includes(ticker)) return undefined;
-    return async (to, amount) => ({
-      hash: await swapSidecarSharedCoinWithdraw(activeChain, to, amount),
-    });
-  }, [activeChain, swapAutoSetup.shared]);
+    if (swapOptedIn !== true || !sharedSendCoinFor(activeChain)) return undefined;
+    return () => checkSharedCoinSend(activeChain);
+  }, [activeChain, swapOptedIn]);
 
   /**
    * Dashboard Send for STELLAR / NEAR / SUI.
@@ -1287,7 +1289,8 @@ function App() {
     refreshTxHistory,
     setError,
     setSuccess,
-    sendOverride: sharedCoinSendOverride ?? sessionSignedSendOverride,
+    sendOverride: sessionSignedSendOverride,
+    sendGuard: sharedCoinSendGuard,
   });
 
   // Vault orchestration — owns pending seeds, the six auth-flow handlers
@@ -1975,6 +1978,9 @@ function App() {
         zphNodes={zphNodes}
         zanoNodes={zanoNodes}
         copyToClipboard={copyToClipboard}
+        error={error}
+        success={success}
+        setSuccess={setSuccess}
         setError={setError}
         openMoneroNodesView={openMoneroNodesView}
         openZephyrNodesView={openZephyrNodesView}

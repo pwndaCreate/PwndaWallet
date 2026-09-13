@@ -209,7 +209,8 @@ export function LandscapeRoot(props: {
   /** Optional Zephyr asset selector — sends ZSD/ZRS/ZYS instead of ZEPH. */
   openSendModal: (assetType?: string) => void;
   closeSendModal: () => void;
-  handleSend: () => Promise<void>;
+  /** `feeRate`: the Send modal's selected tier, per-(v)byte, for UTXO chains. */
+  handleSend: (feeRate?: number) => Promise<void>;
   /** The Zephyr asset currently being sent (ZSD/ZRS/ZYS) or undefined. Drives
    *  the SendModal's asset label. */
   sendAssetType: string | undefined;
@@ -293,6 +294,13 @@ export function LandscapeRoot(props: {
   xmrNodes: Parameters<typeof MoneroNodesView>[0]["nodes"];
   zphNodes: Parameters<typeof ZephyrNodesView>[0]["nodes"];
   copyToClipboard: (text: string, key?: string) => void;
+  /** The app-wide error / success lines (`useSend`'s "Transaction failed: …"
+   *  and "Transaction sent! Hash: …", balance-refresh failures, swap toasts).
+   *  Portrait renders them under its header; landscape rendered NEITHER until
+   *  2026-09-12, so a failed send left the modal open with no message. */
+  error?: string;
+  success?: string;
+  setSuccess?: (msg: string) => void;
   setError: (msg: string) => void;
   openMoneroNodesView: () => Promise<void>;
   openZephyrNodesView: () => Promise<void>;
@@ -444,6 +452,9 @@ export function LandscapeRoot(props: {
     xmrNodes,
     zphNodes,
     copyToClipboard,
+    error = "",
+    success = "",
+    setSuccess,
     setError,
     openMoneroNodesView,
     openZephyrNodesView,
@@ -786,10 +797,69 @@ export function LandscapeRoot(props: {
         </div>
       )}
 
+      {/* App-wide error / success lines. Fixed and above `.modal-overlay`
+          (z-index 2000) because the send that fails does so with its modal
+          still open — rendering in flow behind the backdrop would repeat the
+          2026-09-12 "Send does nothing" report. */}
+      {(error || success) && (
+        <div
+          data-landscape-alerts
+          style={{
+            position: "fixed",
+            top: 44,
+            left: "50%",
+            transform: "translateX(-50%)",
+            width: "min(640px, calc(100vw - 32px))",
+            zIndex: 2100,
+            display: "flex",
+            flexDirection: "column",
+            gap: 6,
+          }}
+        >
+          {error && (
+            <div
+              className="alert alert-error"
+              role="alert"
+              style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
+            >
+              <span style={{ flex: 1 }}>{error}</span>
+              <button
+                type="button"
+                aria-label="Dismiss"
+                onClick={() => setError("")}
+                style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
+              >
+                ×
+              </button>
+            </div>
+          )}
+          {success && (
+            <div
+              className="alert alert-success"
+              role="status"
+              style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
+            >
+              <span style={{ flex: 1 }}>{success}</span>
+              {setSuccess && (
+                <button
+                  type="button"
+                  aria-label="Dismiss"
+                  onClick={() => setSuccess("")}
+                  style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
+                >
+                  ×
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Modals still rendered on top */}
       {showSendModal && walletsByChain[activeChain] && (
         <SendModal
           adapter={getAdapter(activeChain)}
+          usdPrice={pricesByTicker[getAdapter(activeChain).ticker.toUpperCase()]}
           fromAddress={walletsByChain[activeChain]?.address}
           sendTo={sendTo}
           setSendTo={setSendTo}

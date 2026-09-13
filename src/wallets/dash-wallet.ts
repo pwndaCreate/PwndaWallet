@@ -489,8 +489,14 @@ export const dashAdapter: ChainAdapter = {
   },
 
   /** Account-wide send — see `sendDashFromAccount`. */
-  sendFromAccount(mnemonic: string, to: string, amount: string, fromAddress?: string) {
-    return sendDashFromAccount(mnemonic, to, amount, { fromAddress });
+  sendFromAccount(
+    mnemonic: string,
+    to: string,
+    amount: string,
+    fromAddress?: string,
+    opts?: { feeRate?: number },
+  ) {
+    return sendDashFromAccount(mnemonic, to, amount, { fromAddress, feeRateOverride: opts?.feeRate });
   },
   utxoAccounts: dashUtxoAccounts,
   chain: "dash",
@@ -644,13 +650,18 @@ export const dashAdapter: ChainAdapter = {
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {
-    const ratePerKb = await fetchFeeRateBlockcypher().catch(
-      () => MIN_RECOMMENDED_RATE_PER_KB
-    );
+    let isFallback = false;
+    const ratePerKb = await fetchFeeRateBlockcypher().catch(() => {
+      isFallback = true;
+      return MIN_RECOMMENDED_RATE_PER_KB;
+    });
     const satPerVb = (ratePerKb * 1e8) / 1000;
     return {
       normal: { value: satPerVb.toFixed(2) },
       unit: "duffs/vB",
+      // 1-in / 2-out P2PKH (10 + 148 + 2×34) — lets the modal show a total.
+      typicalTxVBytes: 226,
+      ...(isFallback ? { isFallback: true } : {}),
       fetchedAt: Date.now(),
     };
   },

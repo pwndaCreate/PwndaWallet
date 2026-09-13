@@ -114,6 +114,12 @@ import { recordSharePass } from "./sharePassLog";
  *  tick; cleared on settle and on unmount. */
 export const AUTO_SETUP_RETRY_MS = 15_000;
 
+/** How often a SETTLED pass checks whether the node has been through a restart
+ *  since it settled. A restart is never faster than ~40 s end to end (supervisor
+ *  log: `start total 40.9s`, plus the stop ladder), so a 10 s tick always sees
+ *  the node leave Healthy. One local IPC read per tick. */
+export const AUTO_SETUP_WATCH_MS = 10_000;
+
 export interface SwapAutoSetupState {
   /** Coins added by the automatic pass, if any. */
   added: string[];
@@ -282,6 +288,12 @@ export function useSwapAutoSetup(
    *  after it settled without waiting for a dependency change that may never
    *  come — which is the exact failure this file exists to prevent. */
   const runRef = useRef<(() => void) | null>(null);
+  /** When the watchdog last saw the node NOT healthy (ms epoch), and when the
+   *  attempt that last settled had STARTED. A down observation newer than the
+   *  settled attempt's start means the node restarted after the pass did its
+   *  work — so the keys it pushed are gone and the pass must run again. */
+  const lastDownAt = useRef(0);
+  const settledAfter = useRef(0);
 
   // ── the unpark doorbell (2026-09-04) ──────────────────────────────────
   //
@@ -324,6 +336,15 @@ export function useSwapAutoSetup(
           await swapSidecarSetWalletKey(material.walletKey);
           await swapSidecarStart();
           setUnparkNotice(null);
+          // The engine holds account keys in MEMORY only, so the restart just
+          // dropped every one the share pass pushed — and that pass had already
+          // latched `done`. Re-enter it. Without this, 2026-09-12: the unpark
+          // restart for ZANO (supervisor log 01:35:36Z) brought the node back
+          // unlocked but keyless for LTC (`PWNDA-PATCH-3: LTC expects a
+          // host-wallet account key; none pushed yet`, 21:39:08 local), while
+          // the app still believed LTC was shared.
+          done.current = false;
+          runRef.current?.();
         } catch (e) {
           console.error("[useSwapAutoSetup] unpark restart failed:", e);
           setUnparkNotice(
@@ -348,6 +369,51 @@ export function useSwapAutoSetup(
   }, [optedIn, deriveSwapMaterial]);
 
 
+
+  // ── the restart watchdog (2026-09-12) ─────────────────────────────────
+  //
+  // The pass latches `done` once it settles, and nothing re-opened it when the
+  // node restarted afterwards — every restart the hook did not perform itself
+  // (the unpark doorbell until today, Settings Stop/Start, a crash, a coin add)
+  // left the engine locked or keyless for the rest of the session, recoverable
+  // only by opening the swap panel. Watch the node instead: any tick that finds
+  // it not healthy is a restart in progress, and the first healthy tick after
+  // one that postdates the settled attempt re-enters the pass.
+  useEffect(() => {
+    if (optedIn !== true || !deriveSwapMaterial) return;
+    let cancelled = false;
+    const id = window.setInterval(() => {
+      void (async () => {
+        let healthy = false;
+        try {
+          const s = await swapSidecarStatus();
+          healthy = s.running && s.phase.phase === "healthy";
+        } catch {
+          healthy = false;
+        }
+        if (cancelled || !alive.current) return;
+        if (!healthy) {
+          lastDownAt.current = Date.now();
+          return;
+        }
+        if (
+          done.current &&
+          !inFlight.current &&
+          lastDownAt.current > settledAfter.current
+        ) {
+          console.warn(
+            "[useSwapAutoSetup] the swap node restarted since the last pass — re-pushing keys and unlocking",
+          );
+          done.current = false;
+          runRef.current?.();
+        }
+      })();
+    }, AUTO_SETUP_WATCH_MS);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [optedIn, deriveSwapMaterial]);
 
   useEffect(() => {
     alive.current = true;
@@ -381,6 +447,7 @@ export function useSwapAutoSetup(
      *  not yet possible — the whole reason this is a function on a clock. */
     async function attempt(): Promise<void> {
       if (done.current || inFlight.current || !alive.current) return;
+      const startedAt = Date.now();
       inFlight.current = true;
       let settled = false;
       try {
@@ -498,6 +565,7 @@ export function useSwapAutoSetup(
         inFlight.current = false;
         if (settled) {
           done.current = true;
+          settledAfter.current = startedAt;
         } else if (alive.current) {
           if (timer.current != null) window.clearTimeout(timer.current);
           timer.current = window.setTimeout(() => {

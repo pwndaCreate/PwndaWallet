@@ -452,100 +452,48 @@ export function SidecarSetupWizard({
 
       <Card title="SWAP XMR & ZEPH WITH OTHER USERS">
         <div style={muted}>
+          {/* Shortened 2026-09-13 at the operator's request ("too much and too
+              long winded"). Kept: everything `sharingDisclosure.test.ts` pins,
+              and the one safety fact a shorter version must not lose — closing
+              the app STOPS the node (`should_run_exit_ladder` asks only whether
+              a process is alive), so nothing watches a refund deadline until
+              the wallet is reopened. */}
           <p style={{ marginTop: 0 }}>
-            This is <strong>optional and off by default</strong>. Nothing is
-            downloaded, installed or started until you turn it on here. Enabling
-            it installs a <strong>BasicSwap</strong> node on this PC —{" "}
-            <strong>{SIDECAR_FOOTPRINT} downloaded and stored</strong> — which
-            is the only route this wallet has for <strong>XMR</strong> and{" "}
+            <strong>Optional, and off until you turn it on.</strong> Installs a{" "}
+            <strong>BasicSwap</strong> node on this PC ({SIDECAR_FOOTPRINT}) —
+            the route this wallet uses for <strong>XMR</strong> and{" "}
             <strong>ZEPH</strong> swaps.
           </p>
 
-          <ul style={{ margin: "10px 0 12px", paddingLeft: 18 }}>
+          <ul style={{ margin: "10px 0 0", paddingLeft: 18 }}>
             <li style={{ marginBottom: 6 }}>
               <strong>You swap with another user, on an open network.</strong>{" "}
-              The node joins a public peer-to-peer network and shows you offers
-              other people have posted. PwndaWallet is <em>not</em> the
-              counterparty, never holds your coins, and is not part of
-              settlement — every swap is signed by you, against funds only you
-              control.
+              PwndaWallet never holds your coins; you sign every swap.
             </li>
             <li style={{ marginBottom: 6 }}>
-              <strong>What gets installed.</strong> An embedded Python runtime,
-              the BasicSwap node, and the Particl daemon it uses to relay
-              offers. Bitcoin, Litecoin and Bitcoin Cash run in light
-              (Electrum) mode and Monero uses a remote node, so none of them
-              downloads its own blockchain.
+              {/* C8/C9 disclosure — the ONLY place wallet sharing is explained.
+                  Both consequences stay: Electrum address visibility and the
+                  mid-swap lock refusal. */}
+              <strong>The node uses your existing wallet</strong>, so there is
+              nothing to deposit. Light coins query public Electrum servers,
+              which can see those addresses, and locking the wallet is refused
+              while a swap is in flight. Turn sharing off per coin in{" "}
+              <strong>Settings ▸ DEX coins</strong>.
             </li>
             <li style={{ marginBottom: 6 }}>
-              {/* C8/C9 disclosure. This is the ONLY place wallet sharing is
-                  explained, by design: the per-coin confirmation that used to
-                  carry it was friction on top of a decision the user already
-                  made by opting in (2026-08-20). Removing that gate without
-                  moving the disclosure here would have left sharing
-                  undisclosed anywhere, which is why the two changes shipped
-                  together. Both consequences are stated — the Electrum
-                  address visibility, and the mid-swap lock refusal — because
-                  each surprises in a different place. */}
-              <strong>The node uses your existing wallet.</strong> Bitcoin,
-              Litecoin, Bitcoin Cash and Monero swap straight from the balances
-              you already hold, so there is nothing to deposit and nothing to
-              sweep back. Zephyr and Zano do the same through the wallet
-              processes this app already runs for them — the node shares your
-              Zephyr wallet-rpc, and spends Zano from a separate scratch
-              wallet next to your main one — and each only runs while that
-              wallet is open in this app.
-              Two consequences worth knowing: the public Electrum servers a
-              light coin uses can see that coin&apos;s addresses, and while a
-              swap is in flight, locking the wallet or removing Monero is
-              refused until it settles. You can turn sharing off per coin in{" "}
-              <strong>Settings ▸ DEX coins</strong> and fund the node by
-              deposit instead.
-            </li>
-            {/* Corrected 2026-08-21. This used to read "You can close the
-                wallet while one is in flight — the node keeps running and
-                resumes where it left off." The first half is false:
-                `on_exit_requested` runs the shutdown ladder on
-                `should_run_exit_ladder(running, pid)`, which asks only
-                whether a process is alive and never whether a swap is in
-                flight, so closing the app STOPS the node. The second half is
-                true — `loadFromDB` rehydrates any bid between BID_RECEIVED
-                and SWAP_COMPLETED — but only once the Particl wallet is
-                unlocked again, and a swap that is not running is not
-                watching its own refund deadline. Saying "keeps running"
-                invited exactly the behaviour that turns a timelock into a
-                loss. */}
-            <li style={{ marginBottom: 6 }}>
-              <strong>A swap takes roughly 30–90 minutes</strong> and is paced
-              by on-chain timelocks, not by us.{" "}
-              <strong>Leave the wallet open until it finishes.</strong> Closing
-              it stops the swap node — the swap is saved and picks up when you
-              reopen and unlock, but while it is stopped nothing is watching
-              the refund deadline for you.
+              <strong>Keep the wallet open until a swap finishes</strong>{" "}
+              (about 30–90 minutes). Closing it stops the node, and nothing
+              watches the refund deadline until you reopen.
             </li>
             <li style={{ marginBottom: 6 }}>
-              <strong>A refund is a normal outcome, not an error.</strong> If
-              the other side walks away, the timelock returns your coins to you.
-              Nothing is stuck, and nobody has to step in to release it.
-            </li>
-            <li style={{ marginBottom: 6 }}>
-              <strong>It runs locally.</strong> The node listens on loopback
-              only (127.0.0.1). Its API password is generated on this machine,
-              kept by the wallet, and never shown or sent anywhere.
+              <strong>A refund is a normal outcome</strong> — if the other side
+              walks away, the timelock returns your coins.
             </li>
             <li>
-              <strong>Fee: a per-use licence fee</strong> for the wallet
-              software, shown as its own line before you commit — never a
-              commission or a share of your trade. <strong>A swap runs and
-              settles identically whether or not that fee is ever paid</strong>;
-              nothing about your trade is gated on it.
+              A per-use licence fee is shown before you confirm; the swap never
+              depends on it being paid.
             </li>
           </ul>
-
-          <p style={{ marginBottom: 0, color: "var(--text-dim)", fontSize: 11 }}>
-            You can stop the node, or turn this off again, from Settings at any
-            time.
-          </p>
         </div>
 
         {(busy || progress) && !error && (

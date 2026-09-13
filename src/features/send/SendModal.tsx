@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import type { ChainAdapter, FeeEstimate, GasBudget } from "../../wallets/types";
+import { feeRateForSend, feeTotalFor } from "./feeDisplay";
+import { coinAmountFromUsd, usdTextFromCoin } from "../../lib/usdAmount";
 
 type Tier = "slow" | "normal" | "fast";
 
@@ -14,6 +16,7 @@ export function SendModal({
   onSend,
   onClose,
   assetLabel,
+  usdPrice,
 }: {
   adapter: ChainAdapter;
   /**
@@ -28,14 +31,48 @@ export function SendModal({
   sendAmount: string;
   setSendAmount: (v: string) => void;
   sending: boolean;
-  onSend: () => void;
+  /** `feeRate`: the selected tier as a per-(v)byte rate, when the chain's
+   *  estimate is one (`feeRateForSend`); otherwise undefined. */
+  onSend: (feeRate?: number) => void;
   onClose: () => void;
   /** Overrides the asset shown in the title/amount unit. Used when sending a
    *  Zephyr ecosystem asset (ZEPHUSD/ZEPHRSV/ZEPHYRS) where the adapter ticker
    *  (ZEPH) would otherwise mislabel the send. Defaults to `adapter.ticker`. */
   assetLabel?: string;
+  /** USD price of the coin that PAYS the fee (`adapter.ticker`), for the
+   *  fee total. Absent → the total is shown in the coin only. */
+  usdPrice?: number;
 }) {
   const sendTicker = assetLabel ?? adapter.ticker;
+
+  // ── USD entry (2026-09-12) ────────────────────────────────────────────────
+  //
+  // Typing dollars sets the coin amount at `usdPrice`, rounded DOWN to a
+  // precision the chain accepts (`coinAmountFromUsd`). Only when the asset
+  // being sent IS the adapter's own coin: a Zephyr ecosystem send
+  // (ZEPHUSD/ZEPHRSV/ZEPHYRS) reuses the ZEPH adapter, and `usdPrice` is
+  // ZEPH's — converting a ZEPHUSD amount at it would be wrong by the peg.
+  // The typed text is shown verbatim only while `sendAmount` is still what it
+  // produced; editing the coin field makes it stale and the USD field follows.
+  const amountUsdPrice =
+    (!assetLabel || assetLabel === adapter.ticker) && usdPrice != null && usdPrice > 0
+      ? usdPrice
+      : undefined;
+  const [usdEdit, setUsdEdit] = useState<{ text: string; forAmount: string } | null>(null);
+  const usdShown =
+    usdEdit && usdEdit.forAmount === sendAmount
+      ? usdEdit.text
+      : usdTextFromCoin(sendAmount, amountUsdPrice);
+  const onUsdChange = (text: string) => {
+    const amt = coinAmountFromUsd(text, amountUsdPrice, adapter.ticker);
+    if (amt === null) {
+      setUsdEdit({ text, forAmount: sendAmount });
+      return;
+    }
+    setUsdEdit({ text, forAmount: amt });
+    setSendAmount(amt);
+  };
+
   const [fee, setFee] = useState<FeeEstimate | null>(null);
   const [feeError, setFeeError] = useState<string | null>(null);
   const [feeLoading, setFeeLoading] = useState(false);
@@ -158,7 +195,9 @@ export function SendModal({
     });
   tiers.push({
     id: "normal",
-    label: tiers.length ? "Normal" : "Estimated",
+    // A fallback is the adapter's built-in default, not an estimate — say so.
+    // Until 2026-09-12 LTC's hardcoded 10 sat/vB rendered as "ESTIMATED".
+    label: fee?.isFallback ? "Default" : tiers.length ? "Normal" : "Estimated",
     eta: fee?.normal.eta,
     value: fee?.normal.value,
   });
@@ -169,6 +208,9 @@ export function SendModal({
       eta: fee.fast.eta,
       value: fee.fast.value,
     });
+
+  // Whether any tier can be priced as a total (per-byte rate + typical size).
+  const showsTotals = tiers.some((t) => feeTotalFor(fee, t.value, usdPrice) != null);
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -192,6 +234,34 @@ export function SendModal({
             onChange={(e) => setSendAmount(e.target.value)}
           />
         </div>
+
+        {amountUsdPrice != null && (
+          <div className="form-group" data-usd-entry>
+            <label>Amount in USD</label>
+            <input
+              type="text"
+              inputMode="decimal"
+              placeholder="0.00"
+              aria-label="Amount in USD"
+              value={usdShown}
+              onChange={(e) => onUsdChange(e.target.value)}
+            />
+            {sendAmount && usdShown && (
+              <div
+                style={{
+                  fontFamily: "var(--mono)",
+                  fontSize: 9,
+                  color: "var(--text-dim)",
+                  marginTop: 4,
+                }}
+              >
+                You're sending {sendAmount} {sendTicker} (≈ ${usdShown}) at $
+                {amountUsdPrice.toLocaleString(undefined, { maximumFractionDigits: 6 })} per{" "}
+                {sendTicker}.
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="form-group">
           <label>Network fee</label>
@@ -244,43 +314,111 @@ export function SendModal({
               </button>
             </div>
           ) : (
-            <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-              {tiers.map((t) => {
-                const active = t.id === tier;
-                return (
+            <>
+              <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                {tiers.map((t) => {
+                  const active = t.id === tier;
+                  const total = feeTotalFor(fee, t.value, usdPrice);
+                  return (
+                    <button
+                      key={t.id}
+                      type="button"
+                      data-fee-tier={t.id}
+                      onClick={() => setTier(t.id)}
+                      style={{
+                        flex: "1 1 0",
+                        padding: "6px 8px",
+                        background: active ? "rgba(242,242,242,0.9)" : "transparent",
+                        border: `1px solid ${
+                          active ? "rgba(242,242,242,0.9)" : "rgba(255,255,255,0.18)"
+                        }`,
+                        color: active ? "#0a0a0a" : "var(--text-dim)",
+                        cursor: tiers.length > 1 ? "pointer" : "default",
+                        fontFamily: "var(--mono)",
+                        fontSize: 10,
+                        lineHeight: 1.3,
+                        textAlign: "left",
+                      }}
+                    >
+                      <div style={{ fontSize: 9, letterSpacing: 0.6, opacity: 0.8 }}>
+                        {t.label.toUpperCase()}
+                      </div>
+                      {total ? (
+                        <>
+                          {/* The money first — a rate alone prices nothing. */}
+                          <div style={{ fontSize: 11 }} data-fee-total>
+                            ≈ {total.coin}{" "}
+                            <span style={{ fontSize: 9, opacity: 0.7 }}>{adapter.ticker}</span>
+                          </div>
+                          <div style={{ fontSize: 9, opacity: 0.75 }}>
+                            {total.usd ? `${total.usd} · ` : ""}
+                            {t.value} {fee?.unit}
+                          </div>
+                        </>
+                      ) : (
+                        <div style={{ fontSize: 11 }}>
+                          {t.value ?? "—"}{" "}
+                          <span style={{ fontSize: 9, opacity: 0.7 }}>{fee?.unit}</span>
+                        </div>
+                      )}
+                      {t.eta && (
+                        <div style={{ fontSize: 9, opacity: 0.6, marginTop: 1 }}>{t.eta}</div>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+              {fee?.isFallback && (
+                <div
+                  data-fee-fallback
+                  style={{
+                    fontFamily: "var(--mono)",
+                    fontSize: 10,
+                    color: "var(--warn)",
+                    display: "flex",
+                    alignItems: "baseline",
+                    gap: 8,
+                    flexWrap: "wrap",
+                    marginTop: 6,
+                  }}
+                >
+                  <span style={{ flex: "1 1 auto" }}>
+                    Live {adapter.ticker} fee rates are unreachable right now, so this is the
+                    wallet's built-in default rate — not a market estimate.
+                  </span>
                   <button
-                    key={t.id}
                     type="button"
-                    onClick={() => setTier(t.id)}
+                    onClick={() => void loadFee()}
+                    disabled={feeLoading}
                     style={{
-                      flex: "1 1 0",
-                      padding: "6px 8px",
-                      background: active ? "rgba(242,242,242,0.9)" : "transparent",
-                      border: `1px solid ${
-                        active ? "rgba(242,242,242,0.9)" : "rgba(255,255,255,0.18)"
-                      }`,
-                      color: active ? "#0a0a0a" : "var(--text-dim)",
-                      cursor: tiers.length > 1 ? "pointer" : "default",
+                      background: "transparent",
+                      border: "1px solid rgba(255,170,0,0.4)",
+                      color: "var(--warn)",
+                      cursor: "pointer",
                       fontFamily: "var(--mono)",
                       fontSize: 10,
-                      lineHeight: 1.3,
-                      textAlign: "left",
+                      padding: "2px 8px",
                     }}
                   >
-                    <div style={{ fontSize: 9, letterSpacing: 0.6, opacity: 0.8 }}>
-                      {t.label.toUpperCase()}
-                    </div>
-                    <div style={{ fontSize: 11 }}>
-                      {t.value ?? "—"}{" "}
-                      <span style={{ fontSize: 9, opacity: 0.7 }}>{fee?.unit}</span>
-                    </div>
-                    {t.eta && (
-                      <div style={{ fontSize: 9, opacity: 0.6, marginTop: 1 }}>{t.eta}</div>
-                    )}
+                    {feeLoading ? "Retrying…" : "Retry"}
                   </button>
-                );
-              })}
-            </div>
+                </div>
+              )}
+              {showsTotals && (
+                <div
+                  style={{
+                    fontFamily: "var(--mono)",
+                    fontSize: 9,
+                    color: "var(--text-dim)",
+                    marginTop: 6,
+                    lineHeight: 1.4,
+                  }}
+                >
+                  Totals are for a typical send (one input, two outputs). A send that combines
+                  several of your coins is larger and costs proportionally more.
+                </div>
+              )}
+            </>
           )}
         </div>
 
@@ -337,7 +475,10 @@ export function SendModal({
           </button>
           <button
             className="btn-primary"
-            onClick={onSend}
+            // The selected tier reaches the signer (2026-09-12). Wrapped in an
+            // arrow on purpose: `onClick={onSend}` would hand the MouseEvent to
+            // `handleSend` as its fee-rate argument.
+            onClick={() => onSend(feeRateForSend(fee, selectedTierFee ?? undefined))}
             // UXS-20260516-112 AC #3: block Send until we actually
             // have a fee number to charge against. Title attribute
             // gives keyboard / screen-reader users an explanation

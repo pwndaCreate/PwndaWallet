@@ -43,7 +43,41 @@ const KEY_FILE: &str = "bundle-key.bin";
 
 #[derive(Debug, Deserialize)]
 struct BundleManifest {
+    /// `"win32"` | `"linux"` — the platform the payloads were built FOR
+    /// (`scripts/bundle-binaries.mjs`'s `target`). Optional because manifests
+    /// that predate the field carry none; those are trusted as before.
+    ///
+    /// Read since 2026-09-12. Until then nothing on the consumer side looked at
+    /// it: `src-tauri/binaries/` is shared by the Windows and Linux builds, a
+    /// Linux release run rewrote it with `"target": "linux"`, `tauri dev` copied
+    /// it into `target/debug/binaries/`, and the Windows engine reconcile tried
+    /// to unpack a Linux Python runtime over the Windows one on every start.
+    #[serde(default)]
+    target: Option<String>,
     payloads: Vec<PayloadEntry>,
+}
+
+/// This binary's platform, in the manifest's vocabulary.
+pub fn platform_tag() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "win32"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else {
+        "unsupported"
+    }
+}
+
+/// `Err` naming both platforms when the manifest was built for another one.
+fn check_target(manifest: &BundleManifest) -> Result<(), String> {
+    match manifest.target.as_deref() {
+        Some(t) if t != platform_tag() => Err(format!(
+            "bundle: payloads were built for {t}, this is {} — refusing to unpack \
+             another platform's binaries",
+            platform_tag()
+        )),
+        _ => Ok(()),
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -54,6 +88,48 @@ struct PayloadEntry {
     enc_file: String,
     /// SHA256 (hex) of the DECOMPRESSED tar. The integrity gate.
     tar_sha256: String,
+}
+
+/// Write a real, encrypted, this-platform bundle holding `files` — the shape
+/// `scripts/bundle-binaries.mjs` produces — for tests OUTSIDE this module that
+/// need an installable payload (the engine first-install test in
+/// `swap_sidecar.rs`). Panics on any I/O error; test-only.
+#[cfg(test)]
+pub(crate) fn write_fixture_bundle(resource_dir: &Path, payload: &str, files: &[(&str, &[u8])]) {
+    use std::io::Write;
+    let bindir = bundle_dir(resource_dir);
+    std::fs::create_dir_all(&bindir).unwrap();
+    let mut tar_buf: Vec<u8> = Vec::new();
+    {
+        let mut builder = tar::Builder::new(&mut tar_buf);
+        for (name, data) in files {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o755);
+            header.set_cksum();
+            builder.append_data(&mut header, name, &data[..]).unwrap();
+        }
+        builder.finish().unwrap();
+    }
+    let tar_sha = hex::encode(Sha256::digest(&tar_buf));
+    let mut xz_buf: Vec<u8> = Vec::new();
+    lzma_rs::xz_compress(&mut &tar_buf[..], &mut xz_buf).unwrap();
+    let key = [9u8; KEY_LEN];
+    let nonce = [5u8; NONCE_LEN];
+    let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&key));
+    let ct = cipher.encrypt(Nonce::from_slice(&nonce), &xz_buf[..]).unwrap();
+    let mut enc = nonce.to_vec();
+    enc.extend_from_slice(&ct);
+    std::fs::write(bindir.join(format!("{payload}.enc")), &enc).unwrap();
+    std::fs::write(bindir.join(KEY_FILE), key).unwrap();
+    let manifest = format!(
+        r#"{{"target":"{}","payloads":[{{"name":"{payload}","enc_file":"{payload}.enc","tar_sha256":"{tar_sha}"}}]}}"#,
+        platform_tag()
+    );
+    std::fs::File::create(bindir.join(MANIFEST_FILE))
+        .unwrap()
+        .write_all(manifest.as_bytes())
+        .unwrap();
 }
 
 /// `<resource_dir>/binaries` — where the producer writes the `.enc` blobs, the
@@ -85,9 +161,14 @@ fn read_key(resource_dir: &Path) -> Result<[u8; KEY_LEN], String> {
 
 /// True iff an encrypted bundle exists in `resource_dir` and names `payload`.
 /// Cheap enough to gate a resolver tier on — reads only the small manifest.
+///
+/// A manifest built for another platform answers **false**: a payload this
+/// binary must not unpack is not a payload it has. Every caller (the engine
+/// reconcile, the setup install, the miners stage, `bundle_available`) gates on
+/// this, so one check covers all of them.
 pub fn bundle_has(resource_dir: &Path, payload: &str) -> bool {
     read_manifest(resource_dir)
-        .map(|m| m.payloads.iter().any(|p| p.name == payload))
+        .map(|m| check_target(&m).is_ok() && m.payloads.iter().any(|p| p.name == payload))
         .unwrap_or(false)
 }
 
@@ -104,6 +185,9 @@ pub fn extract_encrypted_bundle(
     dest_dir: &Path,
 ) -> Result<(), String> {
     let manifest = read_manifest(resource_dir)?;
+    // Before decrypting a byte: another platform's payload is refused outright,
+    // not unpacked and left to fail at exec time (see `BundleManifest::target`).
+    check_target(&manifest).map_err(|e| format!("{e} (payload {payload})"))?;
     let entry: PayloadEntry = manifest
         .payloads
         .iter()
@@ -318,6 +402,35 @@ mod tests {
         let f = write_bundle("demo4", &[("x", b"d")], Tamper::None);
         let err = extract_encrypted_bundle(&f.dir, "not-there", &f.dir.join("out")).unwrap_err();
         assert!(err.contains("no payload named"), "got: {err}");
+        let _ = std::fs::remove_dir_all(&f.dir);
+    }
+
+    /// 2026-09-12: `src-tauri/binaries/` carried a `"target": "linux"` manifest
+    /// (a Linux release run rewrote the shared dir), `tauri dev` copied it into
+    /// a Windows build's resources, and the engine reconcile tried to unpack a
+    /// Linux Python runtime over the Windows one on every start.
+    #[test]
+    fn another_platforms_bundle_is_neither_present_nor_extractable() {
+        let f = write_bundle("demo5", &[("x", b"d")], Tamper::None);
+        let mf = f.dir.join("binaries").join(MANIFEST_FILE);
+        let raw = std::fs::read_to_string(&mf).unwrap();
+        let with_target = |t: &str| raw.replacen('{', &format!(r#"{{"target":"{t}","#), 1);
+        let other = if platform_tag() == "linux" { "win32" } else { "linux" };
+
+        std::fs::write(&mf, with_target(other)).unwrap();
+        assert!(!bundle_has(&f.dir, "demo5"), "a foreign bundle must not count as present");
+        let dest = f.dir.join("out");
+        let err = extract_encrypted_bundle(&f.dir, "demo5", &dest).unwrap_err();
+        assert!(err.contains(&format!("built for {other}")), "got: {err}");
+        assert!(!dest.exists(), "nothing may be written for another platform");
+
+        // Positive control: this platform's own tag, and no tag at all (a
+        // manifest older than the field), both still extract.
+        std::fs::write(&mf, with_target(platform_tag())).unwrap();
+        assert!(bundle_has(&f.dir, "demo5"));
+        extract_encrypted_bundle(&f.dir, "demo5", &dest).expect("same platform extracts");
+        std::fs::write(&mf, &raw).unwrap();
+        assert!(bundle_has(&f.dir, "demo5"), "an untagged manifest is trusted as before");
         let _ = std::fs::remove_dir_all(&f.dir);
     }
 }
