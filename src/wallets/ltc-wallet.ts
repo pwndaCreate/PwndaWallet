@@ -37,6 +37,7 @@ import type {
   FeeEstimate,
 } from "./types";
 import { proxyGetJson, proxyPostJson, httpProxyCall } from "./_proxy";
+import { esploraTxToChainTx, type EsploraTx } from "./esplora-history";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   scanUtxoAccount,
@@ -672,6 +673,23 @@ interface BlockCypherChainInfo {
 // can rotate between BlockCypher (rich one-shot, but rate-limited) and
 // Blockchair (two-step dashboard + batched detail; same shape DOGE/BCH use).
 // -------------------------------------------------------------------------
+
+async function fetchHistoryEsplora(
+  address: string,
+  limit: number,
+  afterTxid: string | undefined
+): Promise<TxHistoryPage> {
+  const path = afterTxid
+    ? `/address/${address}/txs/chain/${afterTxid}`
+    : `/address/${address}/txs`;
+  const txs = await proxyGetJson<EsploraTx[]>(`${LITECOINSPACE_BASE}${path}`);
+  if (!Array.isArray(txs)) throw new Error("litecoinspace: history is not a list");
+  const items = txs.slice(0, limit).map((tx) => esploraTxToChainTx(tx, address, "litecoin"));
+  // Esplora pages confirmed history 25 at a time; a full page means more.
+  const lastConfirmed = [...txs].reverse().find((t) => t.status?.confirmed);
+  const cursor = txs.length >= 25 && lastConfirmed ? `ls:${lastConfirmed.txid}` : undefined;
+  return { items, cursor };
+}
 
 async function fetchHistoryBlockcypher(
   address: string,
@@ -1540,6 +1558,9 @@ export const ltcAdapter: ChainAdapter = {
     const cursor = opts?.cursor;
 
     // Cursor routing: if a previous page locked into a source, stay there.
+    if (cursor?.startsWith("ls:")) {
+      return fetchHistoryEsplora(address, limit, cursor.slice(3));
+    }
     if (cursor?.startsWith("bk:")) {
       return fetchHistoryBlockchair(address, limit, Number(cursor.slice(3)));
     }
@@ -1547,9 +1568,22 @@ export const ltcAdapter: ChainAdapter = {
       return fetchHistoryBlockcypher(address, limit, cursor.slice(3));
     }
 
-    // First page (no cursor) or legacy bare-number cursor → BlockCypher
-    // first, Blockchair fallback. Don't propagate the BlockCypher error
-    // up — silently fail over so a 429 is invisible to the user.
+    // First page: litecoinspace (Esplora) first, then BlockCypher, then
+    // Blockchair. Failures fail over silently so a 429 is invisible.
+    //
+    // 2026-09-17: this used to start at BlockCypher. The history hook polls
+    // EVERY address the account scan knows, every minute (nine for the
+    // operator's LTC account), against BlockCypher's keyless ~100/hour cap,
+    // so polls failed and "Recent" kept a stale cached list: a completed
+    // P2P swap payout and the fee spend after it never appeared. Esplora is
+    // the source the balance probe already leads with, for the same reason.
+    if (!cursor) {
+      try {
+        return await fetchHistoryEsplora(address, limit, undefined);
+      } catch {
+        /* fall through */
+      }
+    }
     try {
       return await fetchHistoryBlockcypher(address, limit, cursor);
     } catch {

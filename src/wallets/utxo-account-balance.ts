@@ -77,10 +77,12 @@ export const CHEAP_LOOKAHEAD_BATCH = 20;
 /**
  * Narrow on purpose. A per-address source pays one request per index every
  * minute, and DOGE/DASH share BlockCypher's ~100-requests-per-hour keyless
- * cap. Two is enough for the case this wallet can cause itself — its own
- * change goes to the LOWEST unused internal index, which is never past
- * `maxUsed + 1` — and for the engine's PATCH-9 allocator, which follows the
- * same rule. A stock MAX+1 allocator with a 20-wide pool can still land
+ * cap. Both change allocators this wallet meets (its own and the engine's
+ * PATCH-9) use the LOWEST unused internal index. That is `maxUsed + 1` only
+ * when the used range has no holes; `cheapCandidates` therefore also probes
+ * the first `lookahead` unused indexes below `maxUsed` (corrected
+ * 2026-09-17: this comment said the lowest unused index "is never past
+ * `maxUsed + 1`", which a hole makes false — see `cheapCandidates`). A stock MAX+1 allocator with a 20-wide pool can still land
  * beyond this window; the six-hourly deep walk is what catches that case.
  */
 export const CHEAP_LOOKAHEAD_SERIAL = 2;
@@ -278,6 +280,20 @@ export function cheapCandidates(
       push({ ...recv0, chainIndex: 0 });
     }
     for (const k of onChain) push(k);
+    // The lowest unused indexes, which may sit BELOW maxUsed. Both change
+    // allocators this wallet meets (its own, and the engine's PATCH-9) pick
+    // the first unused index, so after a hole (2026-08-22 left change/20 used
+    // while 3..19 were not) the next change lands inside it. 2026-09-17: the
+    // P2P fee spend sent 2.32 LTC to change/3 while this window probed only
+    // change/21-22, and the balance read 1.0079 against a real 3.3298.
+    const usedIdx = new Set(onChain.map((k) => k.index));
+    let holes = 0;
+    for (let i = 0; i < maxUsed && holes < lookahead; i++) {
+      if (usedIdx.has(i)) continue;
+      const [d] = deriveUtxoAddresses(mnemonic, spec, chainIndex, i, 1);
+      push({ ...d, chainIndex });
+      holes++;
+    }
     for (const d of deriveUtxoAddresses(mnemonic, spec, chainIndex, maxUsed + 1, lookahead)) {
       push({ ...d, chainIndex });
     }
