@@ -15,7 +15,7 @@
 //
 // Output: src/wallets/xmr-nodes-feather.ts (overwrites in place).
 
-import { writeFile } from "node:fs/promises";
+import { readFile, writeFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 
@@ -187,6 +187,21 @@ async function main() {
     return;
   }
   const rendered = renderTs(nodes);
+  // Leave the file alone when only the "Synced:" timestamp would change.
+  // Every `npm run build` runs this (prebuild), so rewriting the timestamp
+  // left the file dirty after every build, and the public replay refuses to
+  // release with uncommitted published files (2026-09-17).
+  const stamp = (t) => t.replace(/\r\n/g, "\n").replace(/^\/\/ Synced:.*$/m, "");
+  let current = null;
+  try {
+    current = await readFile(OUT_PATH, "utf8");
+  } catch {
+    /* first run: no file yet */
+  }
+  if (current !== null && stamp(current) === stamp(rendered)) {
+    console.log(`[sync-feather-nodes] ${nodes.length} nodes unchanged; ${OUT_PATH} left as is`);
+    return;
+  }
   await writeFile(OUT_PATH, rendered, "utf8");
   console.log(
     `[sync-feather-nodes] wrote ${nodes.length} nodes to ${OUT_PATH}`
