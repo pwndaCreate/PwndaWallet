@@ -70,6 +70,18 @@ pub fn updater_can_self_install() -> bool {
     tauri::utils::platform::bundle_type().is_some()
 }
 
+/// Restart the app so an installed update takes effect.
+///
+/// `request_restart`, not `restart`: `restart` skips `RunEvent::ExitRequested`
+/// when called off the main thread's event path, and that event is where
+/// `lib.rs` stops the miners (one of them elevated) and starts the swap node's
+/// shutdown ladder. Restarting past it would leave them running under the new
+/// process.
+#[tauri::command]
+pub fn restart_app(app: AppHandle) {
+    app.request_restart();
+}
+
 /// Return the on-disk paths the Settings card shows.
 #[tauri::command]
 pub fn get_data_locations(app: AppHandle) -> Result<DataLocations, String> {

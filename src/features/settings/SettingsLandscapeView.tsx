@@ -1,5 +1,7 @@
 import { useCallback, useMemo, useState } from "react";
 import { formatAppVersion } from "../../lib/appVersion";
+import { platformLabel } from "../../platform/os";
+import { AppUpdateRow } from "../../components/AppUpdateControls";
 import { Panel, Mono, ST } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { DataLocationsList } from "./DataLocationsCard";
@@ -221,7 +223,14 @@ export function SettingsLandscapeView({
               }}
             >
               <InfoRow label="Version" value={formatAppVersion()} />
-              <InfoRow label="Platform" value="Windows (Tauri)" />
+              <AppUpdateRow
+                label={
+                  <Mono size={9} color="var(--text-dim)" upper spacing={0.8}>
+                    Updates
+                  </Mono>
+                }
+              />
+              <InfoRow label="Platform" value={platformLabel()} />
               <InfoRow
                 label="Mode"
                 value={layout === "landscape" ? "Landscape" : "Portrait"}

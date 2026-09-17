@@ -80,16 +80,17 @@ function inTauri(): boolean {
 /**
  * Whether an in-place update can actually be applied on this install.
  *
- * Delegates to the Rust `updater_can_self_install` command, which checks the
- * `APPIMAGE` env var the AppImage runtime exports. That's the only reliable way
- * to tell an AppImage from a `.deb`/`.rpm` from inside the process, and it has
- * to be answered natively — the webview has no view of the process environment.
+ * Delegates to the Rust `updater_can_self_install` command, which reads the
+ * bundler's `__TAURI_BUNDLE_TYPE` stamp (see the header). It has to be answered
+ * natively: the webview cannot see which package the binary came from.
  *
  * Fails closed: if the command errors we report "not self-updatable", because
- * offering an install that silently no-ops (or worse, overwrites apt-owned
- * files) is a worse outcome than telling the user to run `apt upgrade`.
+ * offering an install that silently does nothing is worse than telling the
+ * user to reinstall from the release page.
  */
 export async function isUpdaterSupported(): Promise<boolean> {
+  // Sandbox-only: same guard as checkForUpdate, so the install button renders.
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_UPDATE) return true;
   if (!inTauri()) return false;
   try {
     return await invoke<boolean>("updater_can_self_install");
@@ -163,6 +164,15 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
 export async function installUpdate(
   onProgress?: (fraction: number) => void
 ): Promise<void> {
+  // Sandbox-only, same guard as checkForUpdate's: walk the progress states so
+  // the install UI can be looked at. Nothing is downloaded.
+  if (import.meta.env.DEV && import.meta.env.VITE_MOCK_UPDATE) {
+    for (const f of [-1, 0.25, 0.6, 1]) {
+      onProgress?.(f);
+      await new Promise((r) => setTimeout(r, 400));
+    }
+    return;
+  }
   if (!cachedUpdate) {
     throw new Error("No update available — call checkForUpdate() first.");
   }
@@ -181,4 +191,15 @@ export async function installUpdate(
       onProgress?.(1);
     }
   });
+}
+
+/**
+ * Restart into the installed version.
+ *
+ * The backend uses `request_restart`, so the restart goes through the same
+ * exit path as closing the window: the miners are stopped and the swap node's
+ * shutdown ladder starts. Only call this after the user asked for it.
+ */
+export async function restartApp(): Promise<void> {
+  await invoke("restart_app");
 }

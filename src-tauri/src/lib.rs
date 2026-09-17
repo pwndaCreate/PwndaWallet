@@ -279,6 +279,7 @@ pub fn run() {
             mem_watch::mem_frontend_log,
             data_paths::get_data_locations,
             data_paths::updater_can_self_install,
+            data_paths::restart_app,
             data_paths::open_data_location,
             miners::set_miner_window_visible,
             miners::get_miner_window_visible,
