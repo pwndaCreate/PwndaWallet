@@ -1,9 +1,10 @@
 {
   "name": "tauri-eth-wallet",
   "private": true,
-  "version": "0.6.3",
+  "version": "0.6.4",
   "type": "module",
   "scripts": {
+    "predev": "node scripts/check-sidecar-payloads.mjs --warn",
     "dev": "vite",
     "dev:sandbox": "vite --port 1421 --strictPort --mode sandbox",
     "dev:lite": "node scripts/run-lite.mjs vite",
@@ -51,6 +52,7 @@
     "fetch-sidecars": "node scripts/fetch-sidecars.mjs",
     "fetch-sidecars:win": "node scripts/fetch-sidecars.mjs win32",
     "fetch-sidecars:linux": "node scripts/fetch-sidecars.mjs linux",
+    "check-sidecars": "node scripts/check-sidecar-payloads.mjs",
     "build:linux": "node scripts/fetch-miners.mjs linux && node scripts/fetch-sidecars.mjs linux && npm run bundle:linux && npm run check-bundle:linux && tauri build --bundles deb,appimage,rpm",
     "build:linux:lite": "tauri build --config src-tauri/tauri-lite.conf.json --features lite --bundles deb,appimage,rpm",
     "release:local": "powershell -ExecutionPolicy Bypass -File scripts/release-local.ps1",
@@ -65,8 +67,8 @@
     "tauri:dev:noswap": "node scripts/run-with-env.mjs tauri dev",
     "bundle:win": "node scripts/bundle-binaries.mjs win32",
     "bundle:linux": "node scripts/assemble-linux-grove.mjs && node scripts/bundle-binaries.mjs linux --runtime-src=.swap-sidecar-work/linux-runtime --grove-bin=.swap-sidecar-work/linux-grove/bin",
-    "check-bundle:win": "node scripts/check-bundle-payloads.mjs win32 && node scripts/verify-bundle-deep.mjs win32",
-    "check-bundle:linux": "node scripts/check-bundle-payloads.mjs linux && node scripts/verify-bundle-deep.mjs linux",
+    "check-bundle:win": "node scripts/check-sidecar-payloads.mjs win32 && node scripts/check-bundle-payloads.mjs win32 && node scripts/verify-bundle-deep.mjs win32",
+    "check-bundle:linux": "node scripts/check-sidecar-payloads.mjs linux && node scripts/check-bundle-payloads.mjs linux && node scripts/verify-bundle-deep.mjs linux",
     "check-bundle:deep": "node scripts/verify-bundle-deep.mjs win32",
     "check-bundle:deep:linux": "node scripts/verify-bundle-deep.mjs linux"
   },

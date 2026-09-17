@@ -85,8 +85,13 @@ export async function startZanoRpc(
   });
 }
 
-export async function stopZanoRpc(): Promise<void> {
-  await invoke<void>("zano_stop_rpc");
+/**
+ * Stop Main. `lock: true` is the app's Lock: while the swap node is using Main
+ * (it holds a claim, `zano_rpc.rs::set_engine_claim`), Rust only stores the
+ * wallet and leaves it serving. Every other caller stops Main as before.
+ */
+export async function stopZanoRpc(opts?: { lock?: boolean }): Promise<void> {
+  await invoke<void>("zano_stop_rpc", { lock: opts?.lock === true });
 }
 
 export async function isZanoRpcRunning(): Promise<boolean> {

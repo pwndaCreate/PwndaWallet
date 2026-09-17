@@ -3,6 +3,8 @@ import { ST } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
+import { txDisplayTicker, txFeeTicker, txUsdPrice } from "../../wallets/tx-display";
+import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { explorerTxUrl } from "../../wallets/explorers";
 import type { ChainTx, ChainType } from "../../wallets";
 import { fmtRelative } from "../../utils/format";
@@ -53,6 +55,9 @@ export interface ActivityLandscapeViewProps {
   chainsOwned: ChainType[];
   addressByChain: Record<string, string>;
   pricesByTicker: Record<string, number>;
+  /** Zephyr oracle prices, for ZEPHUSD/ZEPHRSV/ZEPHYRS rows. Absent → those
+   *  rows show no USD value (never ZEPH's price). */
+  zphStats?: ZphLiveStats | null;
 }
 
 export function ActivityLandscapeView({
@@ -62,6 +67,7 @@ export function ActivityLandscapeView({
   chainsOwned,
   addressByChain,
   pricesByTicker,
+  zphStats,
 }: ActivityLandscapeViewProps) {
   const [filter, setFilter] = useState<Filter>("all");
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -111,7 +117,9 @@ export function ActivityLandscapeView({
     let outU = 0;
     for (const tx of allTxs) {
       const a = getAdapter(tx.chain);
-      const price = pricesByTicker[a.ticker.toUpperCase()];
+      // A ZEPHUSD/ZEPHRSV/ZEPHYRS row is priced from the Zephyr oracle or not
+      // at all, never at ZEPH's price (2026-09-15, `txUsdPrice`).
+      const price = txUsdPrice(tx, a.ticker, pricesByTicker, zphStats);
       if (!price) continue;
       const amount = parseFloat(tx.amount);
       if (!Number.isFinite(amount) || amount <= 0) continue;
@@ -121,7 +129,7 @@ export function ActivityLandscapeView({
         outU += usd;
     }
     return { inflowUsd: inU, outflowUsd: outU };
-  }, [allTxs, pricesByTicker]);
+  }, [allTxs, pricesByTicker, zphStats]);
 
   const errorChains = useMemo(
     () =>
@@ -374,7 +382,10 @@ export function ActivityLandscapeView({
                 : isIn
                   ? "var(--accent)"
                   : "var(--warn)";
-              const price = pricesByTicker[adapter.ticker.toUpperCase()];
+              // The asset this row moved, priced as that asset: a ZEPHUSD row
+              // is neither labelled nor valued as ZEPH (2026-09-15).
+              const rowTicker = txDisplayTicker(tx, adapter.ticker);
+              const price = txUsdPrice(tx, adapter.ticker, pricesByTicker, zphStats);
               const amountNum = parseFloat(tx.amount);
               const usd =
                 price && Number.isFinite(amountNum) ? amountNum * price : null;
@@ -401,7 +412,7 @@ export function ActivityLandscapeView({
                     fontFamily: "var(--font-mono)",
                   }}
                 >
-                  <CoinIcon sym={adapter.ticker} size={22} glow={false} />
+                  <CoinIcon sym={rowTicker} size={22} glow={false} />
                   <span
                     style={{
                       fontSize: 10,
@@ -436,7 +447,7 @@ export function ActivityLandscapeView({
                     }}
                   >
                     {failed ? "" : isIn ? "+" : "−"}
-                    {tx.amount} {adapter.ticker}
+                    {tx.amount} {rowTicker}
                   </span>
                   <span
                     className="tnum"
@@ -511,6 +522,8 @@ export function ActivityLandscapeView({
 
 function DetailPanel({ detail }: { detail: ChainTx }) {
   const adapter = getAdapter(detail.chain);
+  const ticker = txDisplayTicker(detail, adapter.ticker);
+  const feeTicker = txFeeTicker(detail, adapter.ticker);
   const isIn = detail.direction === "in";
   const failed = detail.direction === "failed";
   const dirLabel = failed
@@ -538,7 +551,7 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
   return (
     <>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <CoinIcon sym={adapter.ticker} size={42} accent={adapter.color} />
+        <CoinIcon sym={ticker} size={42} accent={adapter.color} />
         <div style={{ minWidth: 0 }}>
           <div
             style={{
@@ -569,7 +582,7 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
             {failed ? "" : isIn ? "+" : "−"}
             {detail.amount}{" "}
             <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
-              {adapter.ticker}
+              {ticker}
             </span>
           </div>
           <div
@@ -614,7 +627,13 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
         <DetailRow k="confirmations" v={`${conf}`} />
         <DetailRow
           k="fee"
-          v={detail.fee ? `${detail.fee} ${adapter.ticker}` : "—"}
+          v={
+            detail.fee
+              ? feeTicker
+                ? `${detail.fee} ${feeTicker}`
+                : `${detail.fee} (paid by the sender)`
+              : "—"
+          }
         />
         <DetailRow
           k="status"

@@ -51,8 +51,15 @@ export function ZanoImportPanel({
     React.SetStateAction<Partial<Record<ChainType, WalletInfo>>>
   >;
   setZanoSeedLoaded: (seed: string | null) => void;
-  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<void>;
-  startZanoSync: (seed: string, masterPassword: string, passphrase?: string) => void;
+  /** Resolves the saved entry's sidecar wallet file, or null when nothing was
+   *  saved (the vault hook has already reported why). */
+  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<string | null>;
+  startZanoSync: (
+    seed: string,
+    masterPassword: string,
+    passphrase?: string,
+    walletFile?: string
+  ) => void;
 }) {
   const [importValue, setImportValue] = useState("");
   const [passphrase, setPassphrase] = useState("");
@@ -134,6 +141,23 @@ export function ZanoImportPanel({
         return;
       }
 
+      /**
+       * Save FIRST, because the saved entry is what names the wallet file this
+       * session has to open, and nothing else can answer that.
+       *
+       * Until 2026-09-15 this called `startZanoSync` with no file. Zano is the
+       * one chain where that is not a type error but a silent wrong answer:
+       * Rust resolves an absent name to `ZANO_WALLET_FILE_NAME` ("pwnda.zan",
+       * `zano_rpc.rs::get_wallet_file`), the migrated primary wallet's file. So
+       * the first session after an import opened a wallet the vault entry did
+       * not name — and because `ensure_wallet_file` leaves an existing file
+       * alone, an import made while that file held a funded wallet reached
+       * `initZanoSession`'s address cross-check, whose self-heal DELETES the
+       * file it opened and restores the pasted seed into it. See log.md.
+       */
+      const walletFile = await saveZanoSeedToVault(seed, passphrase);
+      if (!walletFile) return; // nothing saved; the vault hook said why
+
       // Address derived offline immediately (fast, no sidecar needed) so
       // the dashboard has something to show while the sidecar spins up.
       // NOT `zanoAdapter.deriveFromOwnSeed` — that throws by design for
@@ -151,8 +175,7 @@ export function ZanoImportPanel({
       setImportValue("");
       setPassphrase("");
 
-      await saveZanoSeedToVault(seed, passphrase);
-      startZanoSync(seed, sessionPassword, passphrase);
+      startZanoSync(seed, sessionPassword, passphrase, walletFile);
     } catch (e: any) {
       console.error("[ZanoImportPanel] import threw:", e);
       setError("Zano import failed: " + (e?.message || String(e)));

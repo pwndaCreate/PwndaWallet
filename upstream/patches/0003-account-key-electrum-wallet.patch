@@ -41,18 +41,63 @@ Spending legacy inputs needs PATCH 6 (the signer is witness-only upstream);
 the transport is PATCH 4. Not an upstream-PR candidate: who owns the wallet's
 keys, and in which encoding, is an embedder's question.
 
-Applies to: basicswap v0.18.7 (079a0d43ed16590eecda2f3d6a3481f847360175)
+Applies to: basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4)
 Marker in patched source: PWNDA-PATCH-3
 ---
  basicswap/wallet_manager.py | 151 ++++++++++
  basicswap/basicswap.py      |  32 ++++++++++--
  2 files changed, 181 insertions(+), 2 deletions(-)
 
+Rebased 2026-09-17 onto basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4): the context moved with upstream's typing cleanup (`Optional[str]` -> `str | None`). The diff below is regenerated; the change it makes is the same.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 48f5a5d..27806a2 100644
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -3322,8 +3322,36 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+             return False
+ 
+         try:
+-            root_key = self.getWalletKey(coin_type, 1)
+-            self._wallet_manager.initialize(coin_type, root_key)
++            # PWNDA-PATCH-3: an account-level key pushed by the host wallet wins
++            # over the engine's own derivation, so the electrum-mode wallet IS
++            # the user's wallet. Absent a push this is upstream's path exactly.
++            #
++            # FAIL CLOSED: when BSX_PWNDA_ACCOUNT_KEY_COINS names this coin the
++            # host intends to own its keys, so initialising from the engine's
++            # own seed would quietly hand back a DIFFERENT wallet -- addresses
++            # the user does not hold, reported as theirs. Refuse instead; the
++            # caller retries after the push.
++            _pwnda_entry = getattr(self, "_pwnda_account_keys", {}).get(coin_type)
++            if _pwnda_entry is None:
++                _pwnda_want = [
++                    x.strip().lower()
++                    for x in os.getenv("BSX_PWNDA_ACCOUNT_KEY_COINS", "").split(",")
++                    if x.strip()
++                ]
++                if Coins(coin_type).name.lower() in _pwnda_want:
++                    self.log.warning(
++                        f"PWNDA-PATCH-3: {Coins(coin_type).name} expects a host-wallet "
++                        "account key; none pushed yet, not initialising from the "
++                        "engine seed."
++                    )
++                    return False
++                root_key = self.getWalletKey(coin_type, 1)
++                self._wallet_manager.initialize(coin_type, root_key)
++            else:
++                _pwnda_key, _pwnda_addr_type = _pwnda_entry
++                self._wallet_manager.initializeFromAccountKey(
++                    coin_type, _pwnda_key, _pwnda_addr_type
++                )
+             self.log.info(f"WalletManager initialized for {Coins(coin_type).name}")
+             return True
+         except Exception as e:
 diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
-index 2f51fa8..9f06bf2 100644
+index 6f53f68..9948e44 100644
 --- a/basicswap/wallet_manager.py
 +++ b/basicswap/wallet_manager.py
-@@ -105,6 +105,141 @@ class WalletManager:
+@@ -104,6 +104,141 @@ class WalletManager:
  
          self._log.debug(f"WalletManager: {Coins(coin_type).name} initialized")
  
@@ -191,10 +236,10 @@ index 2f51fa8..9f06bf2 100644
 +        finally:
 +            conn.close()
 +
-     def getDepositAddress(self, coin_type: Coins) -> Optional[str]:
+     def getDepositAddress(self, coin_type: Coins) -> str | None:
          return self.getAddress(coin_type, index=0, internal=False)
  
-@@ -128,6 +263,22 @@ class WalletManager:
+@@ -127,6 +262,22 @@ class WalletManager:
          key = self._deriveKey(coin_type, index, internal)
          pubkey = PublicKey.from_secret(key).format()
          pkh = hash160(pubkey)
@@ -217,46 +262,3 @@ index 2f51fa8..9f06bf2 100644
          address = segwit_addr.encode(self._getHRP(coin_type), 0, pkh)
          scripthash = sha256(bytes([0x00, 0x14]) + pkh)[::-1].hex()
          return address, scripthash, pubkey
-diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
-index 989c1fe..165a8fd 100644
---- a/basicswap/basicswap.py
-+++ b/basicswap/basicswap.py
-@@ -3284,8 +3284,36 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
-             return False
- 
-         try:
--            root_key = self.getWalletKey(coin_type, 1)
--            self._wallet_manager.initialize(coin_type, root_key)
-+            # PWNDA-PATCH-3: an account-level key pushed by the host wallet wins
-+            # over the engine's own derivation, so the electrum-mode wallet IS
-+            # the user's wallet. Absent a push this is upstream's path exactly.
-+            #
-+            # FAIL CLOSED: when BSX_PWNDA_ACCOUNT_KEY_COINS names this coin the
-+            # host intends to own its keys, so initialising from the engine's
-+            # own seed would quietly hand back a DIFFERENT wallet -- addresses
-+            # the user does not hold, reported as theirs. Refuse instead; the
-+            # caller retries after the push.
-+            _pwnda_entry = getattr(self, "_pwnda_account_keys", {}).get(coin_type)
-+            if _pwnda_entry is None:
-+                _pwnda_want = [
-+                    x.strip().lower()
-+                    for x in os.getenv("BSX_PWNDA_ACCOUNT_KEY_COINS", "").split(",")
-+                    if x.strip()
-+                ]
-+                if Coins(coin_type).name.lower() in _pwnda_want:
-+                    self.log.warning(
-+                        f"PWNDA-PATCH-3: {Coins(coin_type).name} expects a host-wallet "
-+                        "account key; none pushed yet, not initialising from the "
-+                        "engine seed."
-+                    )
-+                    return False
-+                root_key = self.getWalletKey(coin_type, 1)
-+                self._wallet_manager.initialize(coin_type, root_key)
-+            else:
-+                _pwnda_key, _pwnda_addr_type = _pwnda_entry
-+                self._wallet_manager.initializeFromAccountKey(
-+                    coin_type, _pwnda_key, _pwnda_addr_type
-+                )
-             self.log.info(f"WalletManager initialized for {Coins(coin_type).name}")
-             return True
-         except Exception as e:

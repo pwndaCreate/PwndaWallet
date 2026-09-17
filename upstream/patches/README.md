@@ -9,8 +9,8 @@
 > node. The applier is idempotent and refuses ambiguous context rather than
 > guessing; see its header for why fuzzy patching is banned here.
 
-~~Nineteen patches, in five groups.~~ **Thirty-three as of 2026-09-11**, and the
-group prose below stops at 12. It has been drifting since 0020 and this note is
+~~Nineteen patches, in five groups.~~ ~~Thirty-three as of 2026-09-11~~ **Thirty-seven
+files as of 2026-09-15 (`+p36`)**, and the group prose below stops at 12. It has been drifting since 0020 and this note is
 not a fix for that — it is a pointer to the authority, which is the series itself:
 
 ```
@@ -24,7 +24,32 @@ does not ship), so thirty-three files yield `+p32`. `src-tauri/src/grove.rs`'s
 `grove::tests::expected_patch_level_matches_the_series`, which recomputes it from
 this directory — so the number cannot drift silently even while this prose does.
 
-The newest is **0033-zano-scratch-wallet-identity.patch**: ZANO's half of upstream
+The newest is **0037-host-wallet-pin-across-restarts.patch**: the host wallet's
+identity (XMR, ZEPH, ZANO) is kept in `kv_string`, and while that coin has a swap
+in progress a restarted node refuses to confirm a DIFFERENT wallet. Before it, the
+first confirmation after any restart trusted whatever wallet the app had open, so
+a wallet switch plus a restart could fund or redeem a swap from the wrong wallet.
+Every DB read and write is in `BasicSwap.pwndaSyncHostWalletPins`, never under an
+interface's `_mx_wallet` (that could deadlock against the bid loop).
+`verify-host-wallet-pin.py` drives the real interfaces and methods, with negative
+controls.
+
+Before it, **0036-defer-activation-for-inactive-coin.patch**: a coin that is
+not active this session (a Grove host-wallet coin parks while the vault is locked)
+now DEFERS a bid instead of killing it. `loadFromDB` no longer runs `deactivateBid`
+on `InactiveCoin` — that `DELETE FROM actions` retired the 2026-09-13 swap's queued
+ZANO-lock retry for good — and `checkQueuedActions` keeps an action whose coin is
+parked instead of erroring its bid. `verify-redeem-recovery-patches.py`'s PATCH-36
+section drives both real methods against stub cursors, with `ValueError` controls.
+
+Before it, **0035-zano-main-wallet-identity-at-unlock.patch**: PATCH-17's
+wrong-wallet guard confirmed ZANO's host-wallet identity only inside
+`initialiseWallet`, which a running node never calls, so every ZANO spend from a
+shared wallet refused with `expected confirmed identity None` (the first funded
+ZANO<>LTC swap, 2026-09-13). It now confirms at `unlockWallet` and on the periodic
+wallet read; `verify-zano-interface.py` section 10 is the restart-path proof.
+
+Before it, **0033-zano-scratch-wallet-identity.patch**: ZANO's half of upstream
 `10ee0843`'s wrong-wallet guard, which ZEPH inherits from `XMRInterface` and
 `ZanoInterface` — a sibling of `CoinInterface` — inherits nothing of. See
 `scripts/swap/verify-xmr-security-inheritance.py`, which is what will catch the
@@ -105,7 +130,7 @@ gitignored workspace.
 | 27 | `0027-settle-redeemed-bid-error.patch` | `pwndaRecoverStalledBid` settles a `BID_ERROR` bid whose chain-A redeem is already confirmed (≥ 1 confirmation via the electrum backend or the node/wallet RPC): `SCRIPT_TX_REDEEMED` → `SWAP_COMPLETED` for the redeeming side, deactivated, `settled: true` in the reply. The 2026-08-23 mainnet bid sat "in progress" for twelve days because PATCH-11 could only re-queue a redeem the chain had already accepted. Called by the supervisor's bid janitor | `PWNDA-PATCH-27` | no — upstream's exit is `manualBidUpdate` (arbitrary state); this takes none |
 | 28 | `0028-zephyr-coingecko-id.patch` | `getExchangeName` returns `zephyr-protocol` for ZEPH instead of its chain name `zephyr`, which is a DIFFERENT CoinGecko asset trading at ~4% of ZEPH's price — 67.27 ZEPH read $1.19 in the console against the wallet's $27.08. Same shape as the BCH and FIRO exceptions already in that function. `lookupFiatRates` also feeds the offer book's rate columns and the AMM page | `PWNDA-PATCH-28` | yes, if Zephyr lands upstream — a one-line id correction of a shape already present twice |
 
-Applies to: **basicswap `v0.18.7`** (`079a0d43ed16590eecda2f3d6a3481f847360175`).
+Applies to: **basicswap `v0.18.9`** (`5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4`), since 2026-09-17. 0003, 0018, 0019, 0023, 0024 and 0027 were regenerated for upstream's type-hint refactor, and 0035 was regenerated so `git apply` accepts it; each says so in its header. Previously `v0.18.7` (`079a0d43ed16590eecda2f3d6a3481f847360175`).
 Rebased from `v0.17.9` on 2026-08-26 — only **0006** needed a change, and only its
 first hunk's context (upstream reshaped the `basicswap_util` import into a
 parenthesized multi-import). 1–12 verified by `git apply` AND by

@@ -40,14 +40,22 @@ type Phase =
  * re-derived from the seed, which is never touched. An earlier date costs
  * scanning time and nothing else — 0 is always correct, just slowest. That
  * asymmetry is why the guidance below says to go earlier than you think.
+ *
+ * "Safe" assumes the cache deleted is THIS wallet's. Until 2026-09-16 the
+ * rescan was given no file name, and the helpers defaulted to the primary
+ * wallet's — so rescanning any other Monero or Zephyr wallet deleted Main's
+ * scan cache and rebuilt it with the wrong seed. The saved entry now names the
+ * file, and the helpers have no default to fall back to.
  */
 export function ScanDateCard(props: {
   xmrSeed: string | null;
   zphSeed: string | null;
   sessionPassword: string | null;
-  /** Persist the new height so the next unlock uses it too. */
-  saveXmrSeedToVault: (seed: string, restoreHeight: number | null) => Promise<void>;
-  saveZphSeedToVault: (seed: string, restoreHeight: number | null) => Promise<void>;
+  /** Persist the new height so the next unlock uses it too. Each resolves the
+   *  wallet file of the entry it saved — the file the rescan rebuilds — or
+   *  null when nothing was saved. */
+  saveXmrSeedToVault: (seed: string, restoreHeight: number | null) => Promise<string | null>;
+  saveZphSeedToVault: (seed: string, restoreHeight: number | null) => Promise<string | null>;
   /** Current heights from the vault, when known. */
   xmrRestoreHeight?: number | null;
   zphRestoreHeight?: number | null;
@@ -93,8 +101,14 @@ export function ScanDateCard(props: {
           dateToHeight={dateStringToMoneroHeight}
           disabled={!sessionPassword}
           onRescan={async (height) => {
-            await saveXmrSeedToVault(xmrSeed, height);
-            await rescanXmrFromHeight(xmrSeed, sessionPassword!, height);
+            // A rescan DELETES a wallet file before rebuilding it, so it must
+            // be told which: the one the saved entry names. Given no name it
+            // deleted the primary wallet's `pwnda-active` (2026-09-16).
+            const file = await saveXmrSeedToVault(xmrSeed, height);
+            if (!file) {
+              throw new Error("The new scan date was not saved, so nothing was rescanned.");
+            }
+            await rescanXmrFromHeight(xmrSeed, sessionPassword!, height, file);
           }}
         />
       )}
@@ -107,8 +121,12 @@ export function ScanDateCard(props: {
           dateToHeight={dateStringToZephyrHeight}
           disabled={!sessionPassword}
           onRescan={async (height) => {
-            await saveZphSeedToVault(zphSeed, height);
-            await rescanZphFromHeight(zphSeed, sessionPassword!, height);
+            // See the Monero row: the file to rebuild is the saved entry's.
+            const file = await saveZphSeedToVault(zphSeed, height);
+            if (!file) {
+              throw new Error("The new scan date was not saved, so nothing was rescanned.");
+            }
+            await rescanZphFromHeight(zphSeed, sessionPassword!, height, file);
           }}
         />
       )}

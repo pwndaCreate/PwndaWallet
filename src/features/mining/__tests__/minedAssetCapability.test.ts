@@ -23,7 +23,7 @@ import { MINING_COINS } from "../miningCoins";
 describe("capability tiers", () => {
   it("only XMR may project an asset balance today", () => {
     expect(canProjectAsset("monero")).toBe(true);
-    for (const c of ["zephyr", "zano", "ravencoin", "conflux", "ergo"] as const) {
+    for (const c of ["zephyr", "zano", "ravencoin", "conflux", "ergo", "xelis"] as const) {
       expect(canProjectAsset(c)).toBe(false);
     }
   });
@@ -38,8 +38,8 @@ describe("capability tiers", () => {
     }
   });
 
-  it("RVN, CFX and ERG have no route and fall back to daily revenue", () => {
-    for (const c of ["ravencoin", "conflux", "ergo"] as const) {
+  it("RVN, CFX, ERG and XEL have no route and fall back to daily revenue", () => {
+    for (const c of ["ravencoin", "conflux", "ergo", "xelis"] as const) {
       const cap = capabilityFor(c);
       expect(cap.kind).toBe("unavailable");
       expect(cap.kind === "unavailable" && cap.note).toMatch(/daily revenue/i);

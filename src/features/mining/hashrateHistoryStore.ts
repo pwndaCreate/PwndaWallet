@@ -68,13 +68,36 @@ export interface HashrateBucket {
  * `randomx` for CPU; `kawpow`/`octopus`/`autolykos` for GPU. We don't
  * key by hardware kind because the chain implies it.
  */
-export type SeriesKey = `${ChainType}/${CpuAlgorithm | GpuAlgorithm}`;
+/**
+ * The lane suffix a dual-lane coin's key carries. Spelled out locally rather
+ * than imported so this key type stays a self-contained string contract.
+ */
+type Lane = "cpu" | "gpu";
+
+/**
+ * `<chain>/<algorithm>`, plus the LANE for a coin that mines on both
+ * (`xelis/xelishashv3/cpu`).
+ *
+ * Added 2026-09-15: XEL is the first coin where one (chain, algorithm) pair
+ * names two different measurements — a CPU session around 12–20 kH/s and a GPU
+ * session around 11 kH/s. Folding both into one series would draw a 24-hour
+ * chart that steps between two lanes as the user toggles, and call it one
+ * coin's history. Single-lane coins keep their original key, so history
+ * recorded before this change still loads.
+ */
+export type SeriesKey =
+  | `${ChainType}/${CpuAlgorithm | GpuAlgorithm}`
+  | `${ChainType}/${CpuAlgorithm | GpuAlgorithm}/${Lane}`;
 
 export function makeSeriesKey(
   chain: ChainType,
   algorithm: CpuAlgorithm | GpuAlgorithm,
+  /** Pass the lane ONLY for a coin that mines on both (see `isDualLaneCoin`). */
+  hardware?: Lane,
 ): SeriesKey {
-  return `${chain}/${algorithm}` as SeriesKey;
+  return (
+    hardware ? `${chain}/${algorithm}/${hardware}` : `${chain}/${algorithm}`
+  ) as SeriesKey;
 }
 
 export interface HashrateHistoryFile {

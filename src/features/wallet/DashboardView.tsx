@@ -26,13 +26,25 @@ import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { DerivationInfoCard } from "./DerivationInfoCard";
 
 import { Card, MiniSpark } from "../../components/PrimitivesV2";
-import { CoinIcon } from "../../components/CoinIcon";
-import { SwapBalanceSubline } from "./SwapBalanceSubline";
 import {
   classifyBalance,
   formatMissingLabel,
   isMissingFromTotal,
 } from "./balance-status";
+import {
+  assetUsdValue,
+  displayedReceiveAddress,
+  importableChains,
+  isAlwaysListed,
+  parseBalanceNumber,
+  priceFor,
+  receiveBlockedReason,
+  sendBlockedReason,
+  swapAssetKeyFor,
+  swapBlockedReason,
+} from "./wallet-surface";
+import { AssetRow, ImportableAssetRow } from "./AssetRow";
+import { WalletActionRow } from "./WalletActionRow";
 import {
   useSidecarBalances,
   useSwapSidecarOptIn,
@@ -52,6 +64,7 @@ import { ZanoImportPanel } from "../zano/ZanoImportPanel";
 import { ZanoSyncCard } from "../zano/ZanoSyncCard";
 import { ZanoAssetsCard } from "../zano/ZanoAssetsCard";
 import { ZanoTxHistoryCard } from "../zano/ZanoTxHistoryCard";
+import { XelisImportPanel, XelisSyncCard, type XelisSessionApi } from "../xelis";
 import type { XmrTransfer } from "../../wallets/xmr-wallet";
 import type {
   ZphAssetBalance,
@@ -204,35 +217,51 @@ export function DashboardView(props: {
   setXmrSeedLoaded: (v: string | null) => void;
   setZphSeedLoaded: (v: string | null) => void;
   setZanoSeedLoaded: (v: string | null) => void;
+  /** Each resolves the saved entry's wallet file, or null when nothing was
+   *  saved; the import panels open that file (2026-09-16). */
   saveXmrSeedToVault: (
     seed: string,
     restoreHeight: number | null
-  ) => Promise<void>;
+  ) => Promise<string | null>;
   saveZphSeedToVault: (
     seed: string,
     restoreHeight: number | null
-  ) => Promise<void>;
-  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<void>;
+  ) => Promise<string | null>;
+  /** Resolves the saved entry's sidecar wallet file, or null when nothing was
+   *  saved. `ZanoImportPanel` passes it to `startZanoSync` so the session opens
+   *  the file the vault names rather than Zano's legacy one (2026-09-15). */
+  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<string | null>;
   startXmrSync: (
     seed: string,
     masterPassword: string,
-    restoreHeight?: number
+    restoreHeight?: number,
+    walletFilename?: string
   ) => void;
   startZphSync: (
     seed: string,
     masterPassword: string,
-    restoreHeight?: number
+    restoreHeight?: number,
+    walletFilename?: string
   ) => void;
   startZanoSync: (
     seed: string,
     masterPassword: string,
-    passphrase?: string
+    passphrase?: string,
+    walletFile?: string
   ) => void;
 
   // Per-chain sync sessions (XMR + ZPH + Zano)
   xmrSession: XmrSessionForDashboard;
   zphSession: ZphSessionForDashboard;
   zanoSession: ZanoSessionForDashboard;
+
+  // Xelis (2026-09-15): the whole `useXelisSession` return, not a hand-picked
+  // copy of its fields, so the dashboard and landscape read one shape.
+  xelisSeedLoaded: string | null;
+  setXelisSeedLoaded: (v: string | null) => void;
+  /** Resolves the saved entry's wallet directory, or null when nothing was saved. */
+  saveXelisSeedToVault: (seed: string) => Promise<string | null>;
+  xelisSession: XelisSessionApi;
 
   // Generic per-chain tx history (every chain except Monero)
   chainTxByKey: Record<string, ChainTx[]>;
@@ -241,7 +270,10 @@ export function DashboardView(props: {
   addressByChain: Record<string, string>;
 
   // Bottom action button (send / swap)
-  onOpenSendModal: () => void;
+  /** Open the Send modal. `assetType` selects a Zephyr ecosystem asset
+   *  (ZSD/ZRS/ZYS, from the ZEPHYR ECOSYSTEM card); the dashboard's own Send
+   *  button passes nothing. */
+  onOpenSendModal: (assetType?: string) => void;
   onOpenZephyrSwapModal: (source?: ZphAssetType) => void;
   /** Open the Swap tab with this asset pre-selected on AUTO. */
   onOpenSwapForAsset?: (ticker: string) => void;
@@ -302,6 +334,9 @@ export function DashboardView(props: {
     xmrSession,
     zphSession,
     zanoSession,
+    setXelisSeedLoaded,
+    saveXelisSeedToVault,
+    xelisSession,
     chainTxByKey,
     chainTxLoading,
     chainTxErrors,
@@ -343,6 +378,26 @@ export function DashboardView(props: {
    */
   const [utxoShowPrimary, setUtxoShowPrimary] = useState(false);
   const utxoReceiveAddress = useUtxoReceiveAddress(activeChain, wallet?.mnemonic);
+
+  // What Receive copies: the address AccountCard is DISPLAYING, by the same
+  // rule landscape uses (`displayedReceiveAddress`), and the copy-feedback key
+  // AccountCard lights for that address.
+  const receiveAddress = wallet
+    ? displayedReceiveAddress({
+        chain: activeChain,
+        walletAddress: wallet.address,
+        xmrReceiveAddress: xmrSession.receiveAddress,
+        xmrShowPrimary: xmrSession.showPrimary,
+        utxoReceiveAddress,
+        utxoShowPrimary,
+      })
+    : "";
+  const receiveCopyKey =
+    !wallet || receiveAddress === wallet.address
+      ? "address"
+      : activeChain === "monero"
+        ? "xmr-receive"
+        : "utxo-receive";
 
   const [walletSubview, setWalletSubview] = useState<
     "dashboard" | "tx-history"
@@ -399,6 +454,7 @@ export function DashboardView(props: {
         activeChain={activeChain}
         xmrSession={xmrSession}
         zanoSession={zanoSession}
+        xelisSession={xelisSession}
         chainTxByKey={chainTxByKey}
         chainTxLoading={chainTxLoading}
         chainTxErrors={chainTxErrors}
@@ -423,48 +479,49 @@ export function DashboardView(props: {
         priceHistoryByTicker={priceHistoryByTicker}
       />
 
-      {/* v2 action row: 3-up Send / Receive / Swap. Sits above the focal
-          asset card per the design reference. Receive copies the focal
-          address; Swap is enabled only on Zephyr. */}
+      {/* Send / Receive / Swap — landscape's action row, `compact`. Sits
+          above the focal asset card per the design reference. All three gates
+          come from `wallet-surface.ts`, so they match landscape's: until
+          2026-09-16 this Send gated Monero only (an unsynced Zephyr or Xelis
+          wallet could open it), Receive copied `wallet.address` — the reused
+          primary, not the fresh address the card below displays — and copied
+          "" for a Xelis wallet whose address was not known yet. */}
       {wallet && (
-        <div style={{
-          display: "grid",
-          gridTemplateColumns: "repeat(3, 1fr)",
-          gap: 8,
-          margin: "0 0 14px",
-        }}>
-          <button
-            className="qbtn"
+        <WalletActionRow
+          compact
+          send={{
             // Called with NO arguments on purpose. `onClick={onOpenSendModal}`
             // hands React's SyntheticEvent to the first parameter, which is
             // `assetType` — see the 2026-08-25 entry in the vault log.
-            onClick={() => onOpenSendModal()}
-            disabled={activeChain === "monero" && xmrSession.syncState !== "synced"}
-          >
-            <span style={{ marginRight: 6 }}>▲</span>
-            <span>Send</span>
-          </button>
-          <button
-            className="qbtn"
-            onClick={() => wallet && onCopy(wallet.address, "address")}
-          >
-            <span style={{ marginRight: 6 }}>▼</span>
-            <span>Receive</span>
-          </button>
-          {/* Every asset, not just Zephyr. Portrait had the same
-              `disabled={activeChain !== "zephyr"}` gate as landscape, and the
-              same consequence: a dead control on every other coin. Both now
-              open the Swap tab with this asset pre-selected on AUTO. */}
-          <button
-            className="qbtn accent"
-            onClick={() => onOpenSwapForAsset?.(getAdapter(activeChain).ticker)}
-            disabled={!onOpenSwapForAsset}
-            title={`Swap ${getAdapter(activeChain).ticker} in the Swap tab`}
-          >
-            <span style={{ marginRight: 6 }}>⇄</span>
-            <span>Swap</span>
-          </button>
-        </div>
+            onClick: () => onOpenSendModal(),
+            blockedReason: sendBlockedReason(activeChain, {
+              monero: xmrSession.syncState === "synced",
+              zephyr: zphSession.syncState === "synced",
+              // Zano's session is binary: `ready` = the wallet is open.
+              zano: zanoSession.syncState === "ready",
+              xelis: xelisSession.syncState === "synced",
+            }),
+          }}
+          receive={{
+            onClick: () => onCopy(receiveAddress, receiveCopyKey),
+            blockedReason: receiveBlockedReason(receiveAddress),
+            title: "Copy the receive address",
+          }}
+          // Swap opens the Swap tab with this asset pre-selected on AUTO, for
+          // every asset a venue carries (it was once Zephyr-only), and says why
+          // when none does. Seeded with the asset's registry KEY, not its
+          // ticker: a USDC leg is `USDC-ARB`, and "ETH" is mainnet only.
+          swap={{
+            onClick: () => {
+              const key = swapAssetKeyFor(activeChain);
+              if (key) onOpenSwapForAsset?.(key);
+            },
+            blockedReason: swapBlockedReason(activeChain, !!onOpenSwapForAsset),
+            // The display name, as landscape does: "USDC" alone does not say
+            // which of eight networks the Swap tab will open on.
+            title: `Swap ${getAdapter(activeChain).displayName} in the Swap tab`,
+          }}
+        />
       )}
 
       {/* XMR import panel: shown when Monero is active but no seed is loaded */}
@@ -494,6 +551,15 @@ export function DashboardView(props: {
           setZanoSeedLoaded={setZanoSeedLoaded}
           saveZanoSeedToVault={saveZanoSeedToVault}
           startZanoSync={startZanoSync}
+        />
+      ) : activeChain === "xelis" && !walletsByChain.xelis ? (
+        <XelisImportPanel
+          sessionPassword={sessionPassword}
+          setError={setError}
+          setWalletsByChain={setWalletsByChain}
+          setXelisSeedLoaded={setXelisSeedLoaded}
+          saveXelisSeedToVault={saveXelisSeedToVault}
+          startXelisSync={xelisSession.start}
         />
       ) : wallet ? (
         <>
@@ -641,6 +707,10 @@ export function DashboardView(props: {
               assetBalances={zphSession.assetBalances}
               liveStats={zphSession.reserveStats}
               onOpenSwap={onOpenZephyrSwapModal}
+              // Portrait asset Send (2026-09-15): the same `openSendModal(asset)`
+              // landscape's focal Send makes, so one modal, one hook, one relay.
+              onSendAsset={(asset) => onOpenSendModal(asset)}
+              sendDisabled={zphSession.syncState !== "synced"}
             />
           )}
 
@@ -729,6 +799,27 @@ export function DashboardView(props: {
                 onRetry={zanoSession.onRetry}
               />
             )}
+
+          {/* Xelis connection, scan progress and balance. Unlike the cards
+              above it stays up once synced: it carries the scanned topoheight
+              and how much of the balance can be sent now, which the account
+              card does not show. Same component landscape mounts. */}
+          {activeChain === "xelis" && xelisSession.syncState !== "idle" && (
+            <XelisSyncCard
+              syncState={xelisSession.syncState}
+              syncError={xelisSession.syncError}
+              syncStatus={xelisSession.syncStatus}
+              syncStatusError={xelisSession.syncStatusError}
+              balance={xelisSession.balance}
+              balanceError={xelisSession.balanceError}
+              binaryReady={xelisSession.binaryReady}
+              downloading={xelisSession.downloading}
+              downloadProgress={xelisSession.downloadProgress}
+              accentColor={adapter.color}
+              onDownloadBinary={() => void xelisSession.downloadBinary()}
+              onRetry={xelisSession.retry}
+            />
+          )}
 
           {/* "View transaction history" button — replaces the inline
               tx-history cards (2026-05-16). Opens a per-asset sub-
@@ -1015,30 +1106,27 @@ function PortfolioHeader({
 }
 
 /* ──────────────────────────────────────────────────────────────────
-   AssetsList — vertical list of every chain the user has a wallet
-   for, plus the two independent-seed chains (Monero, Zephyr) which
-   show even before they are imported so the user can navigate to
-   their import panel. Sorted by USD value desc; the active chain is
-   highlighted with the chain's accent color.
+   AssetsList — portrait's asset list. Every row is the shared
+   `AssetRow` (compact) and every not-yet-imported independent-seed
+   chain the shared `ImportableAssetRow`, from the same helpers the
+   landscape rail uses. Sorted by USD value desc; the active chain is
+   highlighted with the chain's own colour.
    ────────────────────────────────────────────────────────────────── */
 /**
- * AssetsList v2 (2026-05-16) — per-asset card-style rows.
+ * What stays portrait-only is the COLLAPSE: the narrow column shows held
+ * chains with a balance, the active chain, and every independent-seed chain,
+ * behind a "show all N chains" toggle (T3.4). Landscape's rail has the height
+ * to list everything.
  *
- * Each row is a self-contained card with:
- *   - LEFT  : the chain's `CoinIcon` framed in a square outline box
- *   - MID   : chain display name (white, bold) above the human-formatted
- *             balance + ticker (dim, smaller)
- *   - RIGHT : USD value (white, bold) above the 24h delta (green up /
- *             warn down / dim em-dash while history is loading)
- *
- * Sort order: USD-desc (same as legacy). Active chain row gets an
- * accent-tinted border + soft background tint so the active state is
- * preserved without recoloring the chain glyph (user constraint —
- * "Don't modify or change the current icons").
- *
- * Reverting: see the import-swap note at the call site above. The
- * legacy single-row implementation lives at
- * `./AssetsListLegacy.tsx`.
+ * The always-shown rule used to be a hand-kept ticker set,
+ * `CANONICAL_DEFAULTS`. That set is what shipped Zano invisible on 2026-08-28:
+ * Zano's import panel gates on `activeChain === "zano"`, this list is the only
+ * way to make it active, and ZANO was not in the set. The chains the set
+ * existed to keep reachable are exactly the independent-seed ones, which the
+ * adapter already declares (`isAlwaysListed`); a not-yet-imported one is now an
+ * `ImportableAssetRow`, never collapsed, exactly as in landscape
+ * (2026-09-16). The set's other members (BTC/ETH/SOL/ADA) only padded a fresh
+ * vault's list; they now sit behind "show all" like every other empty chain.
  */
 function AssetsList({
   activeChain,
@@ -1060,9 +1148,7 @@ function AssetsList({
    *  firing in lockstep every mount; see the parent's `dexSwapRows`. */
   swapRows: Record<string, SidecarBalanceRow>;
 }) {
-  // T3.4 — default to meaningful chains only (positive balance, or the
-  // currently-active chain, or one of the canonical defaults). Keeps the
-  // ASSETS card scannable on a fresh vault. localStorage-persisted.
+  // T3.4 — collapsed by default; localStorage-persisted.
   const [showAll, setShowAll] = useState<boolean>(() => {
     try {
       return localStorage.getItem("pwnda-wallet-chains-show-all") === "true";
@@ -1070,11 +1156,6 @@ function AssetsList({
       return false;
     }
   });
-  // C0.1 — swap-node balances (see the `swapRows` prop doc above for why
-  // this no longer calls useSidecarBalances directly). Portrait inherits
-  // the landscape treatment (see WalletLandscapeView): a subordinate
-  // sub-line under the wallet amount, and nothing at all when the sidecar
-  // is off or the coin's balance is zero.
   const toggleShowAll = () => {
     setShowAll((prev) => {
       const next = !prev;
@@ -1089,23 +1170,14 @@ function AssetsList({
       return next;
     });
   };
+
   const allRows = useMemo(() => {
-    const list = ALL_CHAINS.map((chain) => {
+    const list = ALL_CHAINS.filter(
+      (chain) => !!walletsByChain[chain] && !isStablecoinChain(chain)
+    ).map((chain) => {
       const a = getAdapter(chain);
-      const hasWallet = !!walletsByChain[chain];
-      const independent = !!a.usesIndependentSeed;
-      const selectable = hasWallet || independent;
       const bal = balancesByChain[chain];
-      const numeric =
-        bal && bal !== "—" && bal !== "Not initialized"
-          ? parseFloat(bal.replace(/,/g, ""))
-          : NaN;
       const tickerUpper = a.ticker.toUpperCase();
-      const price = pricesByTicker[tickerUpper];
-      const usd =
-        Number.isFinite(numeric) && price && Number.isFinite(price)
-          ? numeric * price
-          : 0;
       // 24h delta % from first-vs-last of the per-ticker price
       // history. `null` when we don't have at least two points yet.
       const history = priceHistoryByTicker?.[tickerUpper];
@@ -1117,9 +1189,19 @@ function AssetsList({
           delta24hPct = ((last - first) / first) * 100;
         }
       }
-      const positiveBalance = Number.isFinite(numeric) && numeric > 0;
-      return { chain, adapter: a, selectable, bal, usd, delta24hPct, positiveBalance };
-    }).filter((r) => r.selectable && !isStablecoinChain(r.chain));
+      return {
+        key: chain as string,
+        chain,
+        name: a.displayName,
+        ticker: a.ticker,
+        color: a.color,
+        bal,
+        usd: assetUsdValue(bal, priceFor(a.ticker, pricesByTicker)),
+        delta24hPct,
+        positiveBalance: (parseBalanceNumber(bal) ?? 0) > 0,
+        alwaysListed: isAlwaysListed(chain),
+      };
+    });
 
     // Stablecoins are STACKED here too, from the same `groupStablecoins` the
     // landscape rail uses — one row per symbol rather than seven "USDC (Base)"
@@ -1139,95 +1221,48 @@ function AssetsList({
       const target = isActiveFamily
         ? g.rows.find((r) => r.chain === activeChain)!.chain
         : best.chain;
-      const a = getAdapter(target);
-      const price = pricesByTicker[g.symbol.toUpperCase()];
+      const price = priceFor(g.symbol, pricesByTicker);
       list.push({
+        key: `stable-${g.symbol}`,
         chain: target,
-        adapter: { ...a, displayName: g.displayName, ticker: g.symbol },
-        selectable: true,
+        name: g.displayName,
+        ticker: g.symbol,
+        color: g.color,
         bal: g.total == null ? undefined : String(g.total),
-        usd:
-          g.total != null && price && Number.isFinite(price)
-            ? g.total * price
-            : 0,
+        usd: g.total != null && price != null ? g.total * price : null,
         delta24hPct: null,
         positiveBalance: held,
+        alwaysListed: false,
       });
     }
     // "Smart" order: holdings value descending, then the canonical
     // market-cap rank for zero / unpriced rows, then name — consistent
     // with the landscape wallet + the swap pickers.
     list.sort((a, b) => {
-      const va = a.usd > 0 ? a.usd : -1;
-      const vb = b.usd > 0 ? b.usd : -1;
+      const va = a.usd != null && a.usd > 0 ? a.usd : -1;
+      const vb = b.usd != null && b.usd > 0 ? b.usd : -1;
       if (va !== vb) return vb - va;
-      const ra = assetRank(a.adapter.ticker);
-      const rb = assetRank(b.adapter.ticker);
+      const ra = assetRank(a.ticker);
+      const rb = assetRank(b.ticker);
       if (ra !== rb) return ra - rb;
-      return a.adapter.displayName.localeCompare(b.adapter.displayName);
+      return a.name.localeCompare(b.name);
     });
     return list;
-  }, [walletsByChain, balancesByChain, pricesByTicker, priceHistoryByTicker]);
+  }, [activeChain, walletsByChain, balancesByChain, pricesByTicker, priceHistoryByTicker]);
 
-  // T3.4 — canonical defaults always render even at zero balance so a
-  // fresh wallet shows a non-empty list. Tickers are intentionally a
-  // small set; everything else is collapsed behind "show all".
-  // Chains always shown, even at zero balance. The independent-seed chains
-  // (XMR / ZEPH / ZANO) MUST be here: their import panel is gated on
-  // `activeChain === <chain>`, and this list is the only way to make that
-  // chain active — so a missing entry doesn't just hide a row, it makes the
-  // whole chain unreachable behind "show all N chains".
-  //
-  // 2026-08-28: ZANO was missing. Monero and Zephyr seeds are generated
-  // during onboarding, so those chains are in `walletsByChain` from creation
-  // and would have shown anyway; Zano is import-only, so it had zero balance,
-  // was never the active chain, and was filtered out of its own entry point.
-  // The Zano feature had been complete and shipped for a day and was
-  // invisible in the UI. See PwndaWalletVault/log.md 2026-08-28.
-  const CANONICAL_DEFAULTS = new Set<string>([
-    "BTC",
-    "ETH",
-    "SOL",
-    "ADA",
-    "XMR",
-    "ZEPH",
-    "ZANO",
-  ]);
+  const importable = useMemo(() => importableChains(walletsByChain), [walletsByChain]);
+
   const meaningfulRows = useMemo(
     () =>
       allRows.filter(
-        (r) =>
-          r.positiveBalance ||
-          r.chain === activeChain ||
-          CANONICAL_DEFAULTS.has(r.adapter.ticker.toUpperCase())
+        (r) => r.positiveBalance || r.chain === activeChain || r.alwaysListed
       ),
     [allRows, activeChain]
   );
   const rows = showAll ? allRows : meaningfulRows;
   const hiddenCount = allRows.length - meaningfulRows.length;
 
-  if (allRows.length === 0) return null;
-
-  const formatBalanceForRow = (raw: string | undefined, ticker: string): string => {
-    if (!raw || raw === "—" || raw === "Not initialized") return `— ${ticker}`;
-    // Trim trailing zeros beyond 6dp for visual density — matches the
-    // reference design ("2.481900 XMR", "0.182300 ETH"). If the raw
-    // string already has fewer decimals we leave it alone.
-    const n = parseFloat(raw.replace(/,/g, ""));
-    if (!Number.isFinite(n)) return `${raw} ${ticker}`;
-    // Pick a decimal-place count that mirrors the reference: high-
-    // precision for sub-1 amounts (more decimals), fewer for >1.
-    const dp = n >= 100 ? 2 : n >= 1 ? 4 : 6;
-    return `${n.toFixed(dp)} ${ticker}`;
-  };
-
-  const formatUsd = (usd: number): string => {
-    if (usd === 0) return "—";
-    if (usd >= 100) return `$${usd.toFixed(2)}`;
-    if (usd >= 1) return `$${usd.toFixed(2)}`;
-    if (usd >= 0.01) return `$${usd.toFixed(3)}`;
-    return `$${usd.toFixed(4)}`;
-  };
+  if (allRows.length === 0 && importable.length === 0) return null;
 
   return (
     <Card title="ASSETS">
@@ -1239,156 +1274,38 @@ function AssetsList({
           marginTop: -2,
         }}
       >
-        {rows.map(({ chain, adapter, bal, usd, delta24hPct }) => {
-          const active = chain === activeChain;
-          const positive = delta24hPct !== null && delta24hPct >= 0;
-          const deltaColor =
-            delta24hPct === null
-              ? "var(--text-dim)"
-              : positive
-                ? "var(--accent)"
-                : "var(--warn, #ff6b6b)";
-          const deltaText =
-            delta24hPct === null
-              ? "—"
-              : `${positive ? "+" : ""}${delta24hPct.toFixed(1)}%`;
+        {rows.map((r) => (
+          <AssetRow
+            compact
+            key={r.key}
+            name={r.name}
+            ticker={r.ticker}
+            color={r.color}
+            active={r.chain === activeChain}
+            onSelect={() => onSelect(r.chain)}
+            balanceRaw={r.bal}
+            usd={r.usd}
+            // Swap-node holding, when there is one: below the wallet amount,
+            // never merged into the wallet's own figures.
+            swapBalanceRaw={swapRows[r.ticker.toUpperCase()]?.balance}
+            delta24hPct={r.delta24hPct}
+          />
+        ))}
+        {/* Independent-seed chains with no wallet yet: the entry point to
+            their import panels, never collapsed and never in a total. The
+            same rows, from the same helper, as the landscape rail. */}
+        {importable.map((chain) => {
+          const a = getAdapter(chain);
           return (
-            <button
-              key={chain}
-              onClick={() => onSelect(chain)}
-              style={{
-                display: "flex",
-                alignItems: "center",
-                gap: 12,
-                padding: "12px 14px",
-                // Focus is the coin's OWN colour glowing, not a generic accent
-                // border — the icon is coloured at rest now, so selection has
-                // to be signalled by something other than gaining colour.
-                background: active
-                  ? `${adapter.color}12`
-                  : "rgba(255,255,255,0.02)",
-                border: active
-                  ? `1px solid ${adapter.color}`
-                  : "1px solid var(--border)",
-                boxShadow: active ? `0 0 14px -4px ${adapter.color}` : "none",
-                cursor: "pointer",
-                textAlign: "left",
-                fontFamily: "var(--font-mono)",
-                color: "var(--text)",
-                transition:
-                  "background .12s ease, border-color .12s ease, box-shadow .12s ease",
-                width: "100%",
-              }}
-            >
-              {/* Icon framed in a square outline — preserves the
-                  user's "don't modify the icons" constraint while
-                  matching the reference design's framed glyphs. */}
-              <div
-                style={{
-                  flex: "0 0 auto",
-                  width: 36,
-                  height: 36,
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  border: active
-                    ? `1px solid ${adapter.color}`
-                    : "1px solid var(--border-soft, rgba(255,255,255,0.18))",
-                  background: "rgba(0,0,0,0.25)",
-                  transition: "border-color .12s ease",
-                }}
-              >
-                <CoinIcon
-                  sym={adapter.ticker}
-                  size={20}
-                  color={adapter.color}
-                  glow={active ? "accent" : false}
-                />
-              </div>
-
-              {/* Name + amount column */}
-              <div
-                style={{
-                  flex: 1,
-                  display: "flex",
-                  flexDirection: "column",
-                  minWidth: 0,
-                  gap: 2,
-                }}
-              >
-                <span
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 500,
-                    color: "var(--text)",
-                    letterSpacing: 0.2,
-                    overflow: "hidden",
-                    textOverflow: "ellipsis",
-                    whiteSpace: "nowrap",
-                  }}
-                >
-                  {adapter.displayName}
-                </span>
-                <span
-                  className="tnum"
-                  style={{
-                    fontSize: 10.5,
-                    color: "var(--text-dim)",
-                    letterSpacing: 0.2,
-                  }}
-                >
-                  {formatBalanceForRow(bal, adapter.ticker)}
-                </span>
-                {/* Swap-node holding, when there is one. Below the wallet
-                    amount and smaller than it, in the name column rather than
-                    the USD column — see SwapBalanceSubline for why it must
-                    never merge into the wallet's own figures. */}
-                <SwapBalanceSubline
-                  raw={swapRows[adapter.ticker.toUpperCase()]?.balance}
-                  ticker={adapter.ticker}
-                  size={9.5}
-                />
-              </div>
-
-              {/* USD value + 24h delta column (right-aligned) */}
-              <div
-                style={{
-                  flex: "0 0 auto",
-                  display: "flex",
-                  flexDirection: "column",
-                  alignItems: "flex-end",
-                  gap: 2,
-                  minWidth: 72,
-                }}
-              >
-                <span
-                  className="tnum"
-                  style={{
-                    fontSize: 13,
-                    fontWeight: 500,
-                    color: usd > 0 ? "var(--text)" : "var(--text-dim)",
-                    letterSpacing: 0.2,
-                  }}
-                >
-                  {formatUsd(usd)}
-                </span>
-                <span
-                  className="tnum"
-                  style={{
-                    fontSize: 10.5,
-                    color: deltaColor,
-                    letterSpacing: 0.2,
-                  }}
-                  title={
-                    delta24hPct === null
-                      ? "24h delta — fetching price history."
-                      : "24h price change for this asset."
-                  }
-                >
-                  {deltaText}
-                </span>
-              </div>
-            </button>
+            <ImportableAssetRow
+              compact
+              key={`import-${chain}`}
+              name={a.displayName}
+              ticker={a.ticker}
+              color={a.color}
+              active={chain === activeChain}
+              onSelect={() => onSelect(chain)}
+            />
           );
         })}
         {/* T3.4 — show-all toggle. Only render when there are hidden

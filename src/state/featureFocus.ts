@@ -21,13 +21,38 @@ export type FeatureFocus =
   | "swap";
 
 /**
+ * Node-manager sub-views, one per sidecar chain. In landscape each opens under
+ * the Settings tab, and leaving that tab closes it (`useLayout`).
+ *
+ * ONE list, read by `deriveFeatureFocus` below and by both view-sync effects in
+ * `useLayout`. Until 2026-09-15 those three places each kept a literal list,
+ * and none of the three had gained `"zano-nodes"` when Zano was added. Pinned
+ * by `featureFocus.test.ts`, which also fails when `View` gains a `*-nodes` id
+ * this set does not hold.
+ */
+export const NODE_MANAGER_VIEWS: ReadonlySet<View> = new Set<View>([
+  "monero-nodes",
+  "zephyr-nodes",
+  "zano-nodes",
+  "xelis-nodes",
+]);
+
+/** Every view that renders as a sub-view of the landscape Settings tab. */
+export const LANDSCAPE_SETTINGS_SUBVIEWS: ReadonlySet<View> = new Set<View>([
+  ...NODE_MANAGER_VIEWS,
+  "wallet-details",
+  "miner-setup",
+]);
+
+/**
  * Derive the current focus from the three pieces of layout state that
  * App.tsx owns: `layout` (portrait vs landscape), `view` (the portrait
  * route enum), and `landscapeTab` (the landscape sidebar selection).
  *
  * - **Portrait** is 1:1 with `view`. Nothing else to consult.
- * - **Landscape** lets sub-views (monero/zephyr nodes, wallet-details,
- *   miner-setup) override the tab when the user drills into them, then
+ * - **Landscape** lets sub-views (`LANDSCAPE_SETTINGS_SUBVIEWS`: the node
+ *   managers, wallet-details, miner-setup) override the tab when the user
+ *   drills into them, then
  *   falls back to a tab → focus mapping. The mapping makes `wallet`,
  *   `swap`, `activity` all imply the user is on the wallet view (focus
  *   = `dashboard`) for hook-gating purposes — none of the
@@ -45,12 +70,7 @@ export function deriveFeatureFocus(args: {
   }
 
   // Landscape sub-views override the tab when active.
-  if (
-    args.view === "monero-nodes" ||
-    args.view === "zephyr-nodes" ||
-    args.view === "wallet-details" ||
-    args.view === "miner-setup"
-  ) {
+  if (LANDSCAPE_SETTINGS_SUBVIEWS.has(args.view)) {
     return args.view;
   }
 

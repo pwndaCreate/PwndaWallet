@@ -84,6 +84,9 @@ export interface VaultPayload {
  * A wallet's kind:
  *  - "bip39"      — a 12/24-word seed covering all HD chains (an index-0 account).
  *  - "xmr" / "zph"— an independent Monero / Zephyr seed (own sidecar file).
+ *  - "zano"       — an independent Zano seed (own sidecar file).
+ *  - "xelis"      — an independent Xelis seed (own wallet directory). Never
+ *                   projected into the flat v2 shape; see `mergeFlatIntoV3`.
  *  - "privateKey" — a single-chain account imported from a raw key (holds the
  *                   key in `seed`; `chain` names its network). Can sign/send.
  *  - "watch"      — a single-chain VIEW-ONLY address (`address` + `chain`, no
@@ -99,6 +102,10 @@ export type WalletKind =
   // across by hand, and there was no `removeWallet` path for it at all. It now
   // behaves exactly like xmr/zph: one entry per context, its own sidecar file.
   | "zano"
+  // 2026-09-15: Xelis is an entry from its first release. There was never a
+  // vault-wide Xelis seed, so there is no legacy field and no fallback to read:
+  // the entry, with its own `sidecarFile`, is the only place the seed lives.
+  | "xelis"
   | "privateKey"
   | "watch";
 
@@ -135,7 +142,8 @@ export interface WalletEntry {
   xmrSeedFormat?: "polyseed" | "legacy";
   /** xmr/zph — restore height. */
   restoreHeight?: number | null;
-  /** xmr/zph/zano — on-disk sidecar wallet filename (see § 5). */
+  /** xmr/zph/zano — on-disk sidecar wallet filename (see § 5). xelis — the
+   *  wallet's own directory name, set when the entry is created. */
   sidecarFile?: string;
   /** zano only — Secured-Seed passphrase, when the seed is password-protected.
    *  Held per-entry (not vault-wide) because two Zano wallets can differ in
@@ -199,6 +207,10 @@ export function newSidecarFile(kind: WalletKind, id: string): string | undefined
   // Zano's sidecar opens the file by name and writes siblings beside it, so
   // the extension is part of the name (unlike xmr/zph, which are extensionless).
   if (kind === "zano") return `pwnda-zano-${id}.zan`;
+  // `xelis_wallet` keeps a wallet in a directory, so this names a directory
+  // (no extension). Every Xelis entry gets one when it is created; unlike the
+  // other three there is no legacy fixed name for any entry to fall back to.
+  if (kind === "xelis") return `pwnda-xelis-${id}`;
   return undefined;
 }
 
@@ -208,10 +220,162 @@ export function newSidecarFile(kind: WalletKind, id: string): string | undefined
  * else derive a per-wallet name. bip39 entries have no sidecar file.
  */
 export function sidecarFileForEntry(entry: WalletEntry): string | undefined {
-  if (entry.kind !== "xmr" && entry.kind !== "zph" && entry.kind !== "zano") {
+  if (
+    entry.kind !== "xmr" &&
+    entry.kind !== "zph" &&
+    entry.kind !== "zano" &&
+    entry.kind !== "xelis"
+  ) {
     return undefined;
   }
   return entry.sidecarFile ?? newSidecarFile(entry.kind, entry.id);
+}
+
+/**
+ * The file a NEW xmr/zph entry written through the flat save path gets
+ * (`mergeFlatIntoV3`). An entry that already exists is never renamed.
+ *
+ * The legacy fixed name belongs to whichever wallet claimed it first — the
+ * migrated primary, on every upgraded vault. Until 2026-09-16 every new flat
+ * entry took it unconditionally, so a Monero or Zephyr wallet imported from
+ * the dashboard of a SECOND wallet context was named after Main's file. Both
+ * entries then opened one wallet, and the address-mismatch self-heal in
+ * `xmr-wallet.ts` / `zph-wallet.ts` deletes the file it opened.
+ *
+ * So the legacy name is claimed only while no entry holds it — a first import
+ * still lands on it exactly as before, and nobody's existing file moves — and
+ * any later wallet gets its own, the name `addWalletEntry` would give it.
+ */
+function flatSidecarFileFor(
+  kind: "xmr" | "zph",
+  id: string,
+  existing: VaultPayloadV3 | null
+): string {
+  const legacy = kind === "xmr" ? LEGACY_XMR_SIDECAR_FILE : LEGACY_ZPH_SIDECAR_FILE;
+  const held = (existing?.wallets ?? []).some(
+    (w) => w.kind === kind && sidecarFileForEntry(w) === legacy
+  );
+  // `newSidecarFile` names every xmr/zph id; it is undefined only for kinds
+  // that have no file, which this function never receives.
+  return held ? newSidecarFile(kind, id)! : legacy;
+}
+
+/* ══════ Wallet-file safety (2026-09-16) ═══════════════════════════════ */
+
+/** Why a flat import save must not go ahead (`flatSeedRefusal`). */
+export type FlatSeedRefusal = "different-seed" | "different-passphrase";
+
+/**
+ * The guard in front of the flat import saves (`saveXmrSeedToVault`,
+ * `saveZphSeedToVault`, `saveZanoSeedToVault` in `useVault`).
+ *
+ * The flat path writes `xmrSeed` / `zphSeed` / `zanoSeed` over whatever the
+ * open context already holds, and `mergeFlatIntoV3` keeps that entry's id and
+ * file while swapping its seed. So a DIFFERENT seed saved there silently
+ * replaced the only stored copy of the old one, and the next session's
+ * address check then deleted the old wallet's file. Seen in the sandbox on
+ * 2026-09-16; `addXelisWalletToContext` has always refused the same thing.
+ *
+ * Re-saving the SAME seed stays allowed — the scan-date card does exactly that
+ * to store a new restore height. For Zano the Secured-Seed passphrase is part
+ * of the wallet, so the same words under a different passphrase are a
+ * different wallet as well.
+ *
+ * `current` is the flat projection of the context the save writes into.
+ */
+export function flatSeedRefusal(
+  current: VaultPayload,
+  kind: "xmr" | "zph" | "zano",
+  seed: string,
+  zanoPassphrase = ""
+): FlatSeedRefusal | null {
+  const stored =
+    kind === "xmr" ? current.xmrSeed : kind === "zph" ? current.zphSeed : current.zanoSeed;
+  if (!stored || !normalizeSeed(stored)) return null; // nothing there to replace
+  if (normalizeSeed(stored) !== normalizeSeed(seed)) return "different-seed";
+  if (kind === "zano" && (current.zanoSeedPassphrase ?? "") !== zanoPassphrase) {
+    return "different-passphrase";
+  }
+  return null;
+}
+
+/** One entry `repairSharedSidecarFiles` moved to a file of its own. */
+export interface SidecarFileRepair {
+  id: string;
+  name: string;
+  kind: WalletKind;
+  from: string;
+  to: string;
+}
+
+/**
+ * Give every sidecar wallet its own file again.
+ *
+ * Until 2026-09-16 a Monero or Zephyr wallet imported from a second context's
+ * dashboard was stored under Main's legacy file name (see
+ * `flatSidecarFileFor`). Two entries on one file open one wallet, and each
+ * session's address check deletes the file when the other wallet is in it, so
+ * a vault written before that fix can still hold such a pair. This finds
+ * entries of one kind that resolve to the same file and moves all but one of
+ * them to `newSidecarFile(kind, id)` — the name `addWalletEntry` gives.
+ *
+ * Which entry keeps the file: the one in the PRIMARY group (the migrated
+ * wallet the legacy name exists for, and the one a swap node shares), else the
+ * oldest. Nothing is deleted and no seed changes. A moved entry's new file
+ * does not exist yet, so its next session restores it from its seed at its
+ * stored restore height — the path every newly added wallet already takes.
+ *
+ * Pure. Returns the SAME object, and no repairs, when nothing collides.
+ */
+export function repairSharedSidecarFiles(v3: VaultPayloadV3): {
+  v3: VaultPayloadV3;
+  repairs: SidecarFileRepair[];
+} {
+  const primaryGid = primaryGroupId(v3);
+  const sharing = new Map<string, WalletEntry[]>();
+  const used = new Set<string>();
+  for (const w of v3.wallets) {
+    const file = sidecarFileForEntry(w);
+    if (!file) continue;
+    // Each kind keeps its wallets in its own directory, so a name only
+    // collides with the same kind.
+    const key = `${w.kind}/${file}`;
+    used.add(key);
+    sharing.set(key, [...(sharing.get(key) ?? []), w]);
+  }
+
+  const moveTo = new Map<string, string>();
+  const repairs: SidecarFileRepair[] = [];
+  for (const entries of sharing.values()) {
+    if (entries.length < 2) continue;
+    const [keeper, ...others] = [...entries].sort(
+      (a, b) =>
+        Number(groupKey(a) !== primaryGid) - Number(groupKey(b) !== primaryGid) ||
+        a.createdAt - b.createdAt ||
+        a.id.localeCompare(b.id)
+    );
+    const from = sidecarFileForEntry(keeper)!;
+    for (const w of others) {
+      const to = newSidecarFile(w.kind, w.id)!;
+      // Ids are unique, so this is only reachable through a hand-edited vault.
+      // Leave such an entry alone rather than trade one collision for another.
+      if (used.has(`${w.kind}/${to}`)) continue;
+      used.add(`${w.kind}/${to}`);
+      moveTo.set(w.id, to);
+      repairs.push({ id: w.id, name: w.name, kind: w.kind, from, to });
+    }
+  }
+
+  if (repairs.length === 0) return { v3, repairs };
+  return {
+    v3: {
+      ...v3,
+      wallets: v3.wallets.map((w) =>
+        moveTo.has(w.id) ? { ...w, sidecarFile: moveTo.get(w.id)! } : w
+      ),
+    },
+    repairs,
+  };
 }
 
 export interface SchemaOpts {
@@ -457,6 +621,12 @@ export function projectV3ToV2(
  *   - `flat.xmrSeed` falsy  → no xmr entry  (this is how "forget XMR" works)
  *   - `flat.xmrSeed` truthy → xmr entry created/updated
  *   (same for zph)
+ *
+ * Xelis is the exception: the flat shape has no Xelis field, so a flat payload
+ * cannot say anything about a Xelis wallet, and the target group's Xelis
+ * entries are carried through untouched. Add, switch and remove a Xelis wallet
+ * through the v3 CRUD helpers (`addWalletEntry`, `addXelisWalletToContext`,
+ * `removeWalletEntry`), never through here.
  */
 export function mergeFlatIntoV3(
   flat: VaultPayload,
@@ -491,8 +661,9 @@ export function mergeFlatIntoV3(
   });
 
   if (flat.xmrSeed) {
+    const id = prevXmr?.id ?? genId();
     wallets.push({
-      id: prevXmr?.id ?? genId(),
+      id,
       name: prevXmr?.name ?? "Main · Monero",
       kind: "xmr",
       seed: flat.xmrSeed,
@@ -500,20 +671,27 @@ export function mergeFlatIntoV3(
       groupId: gid,
       xmrSeedFormat: flat.xmrSeedFormat,
       restoreHeight: flat.xmrRestoreHeight ?? null,
-      sidecarFile: prevXmr?.sidecarFile ?? LEGACY_XMR_SIDECAR_FILE,
+      // An entry that exists keeps what it stores, whatever that is. Only a
+      // NEW one is named here — see `flatSidecarFileFor`.
+      sidecarFile: prevXmr
+        ? prevXmr.sidecarFile ?? LEGACY_XMR_SIDECAR_FILE
+        : flatSidecarFileFor("xmr", id, existing),
     });
   }
 
   if (flat.zphSeed) {
+    const id = prevZph?.id ?? genId();
     wallets.push({
-      id: prevZph?.id ?? genId(),
+      id,
       name: prevZph?.name ?? "Main · Zephyr",
       kind: "zph",
       seed: flat.zphSeed,
       createdAt: prevZph?.createdAt ?? now,
       groupId: gid,
       restoreHeight: flat.zphRestoreHeight ?? null,
-      sidecarFile: prevZph?.sidecarFile ?? LEGACY_ZPH_SIDECAR_FILE,
+      sidecarFile: prevZph
+        ? prevZph.sidecarFile ?? LEGACY_ZPH_SIDECAR_FILE
+        : flatSidecarFileFor("zph", id, existing),
     });
   }
 
@@ -543,12 +721,22 @@ export function mergeFlatIntoV3(
   // Preserve every wallet outside the target group untouched.
   const others = (existing?.wallets ?? []).filter((w) => !inTarget(w));
 
+  // Xelis entries INSIDE the target group, carried through untouched
+  // (2026-09-15). The group above is rebuilt only from what the flat payload
+  // describes, and the flat payload has no Xelis field, so without this any
+  // flat save made while a Xelis wallet sits in the open context (a Solana
+  // derivation change, a Monero import) would rebuild the group without it
+  // and write a vault that no longer holds the Xelis seed.
+  const carried = (existing?.wallets ?? []).filter(
+    (w) => inTarget(w) && w.kind === "xelis"
+  );
+
   // ORDER MATTERS. `primaryGroupId` picks the FIRST bip39 entry, so emitting
   // the rebuilt target group at the front would silently PROMOTE whichever
   // wallet was just written to — saving a derivation change while on an
   // imported wallet would make that wallet "Main". Restore the original
   // ordering; entries that did not exist before keep their position at the end.
-  const merged = [...wallets, ...others];
+  const merged = [...wallets, ...carried, ...others];
   if (existing) {
     const orderOf = new Map(existing.wallets.map((w, i) => [w.id, i]));
     merged.sort(
@@ -656,7 +844,12 @@ export interface NewWalletSpec {
  * dashboard panel (which writes into the open group), was unaffected.
  */
 export function primaryGroupSlotFor(v3: VaultPayloadV3, kind: WalletKind): string | undefined {
-  if (kind !== "xmr" && kind !== "zph" && kind !== "zano") return undefined;
+  // Xelis joined 2026-09-15 for the same reason: unlock opens the primary
+  // group, so a Xelis wallet added in Settings ▸ Wallets as a standalone would
+  // not be open until the user switched to it.
+  if (kind !== "xmr" && kind !== "zph" && kind !== "zano" && kind !== "xelis") {
+    return undefined;
+  }
   const gid = primaryGroupId(v3);
   if (gid === undefined) return undefined;
   if (v3.wallets.some((w) => w.kind === kind && groupKey(w) === gid)) return undefined;
@@ -720,12 +913,77 @@ export function addWalletEntry(
     // No restore height: a Zano seed self-encodes its creation date.
     entry.sidecarFile = newSidecarFile(spec.kind, id);
     if (spec.zanoSeedPassphrase) entry.zanoSeedPassphrase = spec.zanoSeedPassphrase;
+  } else if (spec.kind === "xelis") {
+    // Its own wallet directory from the first release: two Xelis wallets can
+    // never open one directory. No restore height; `ensureXelisWallet` takes none.
+    entry.sidecarFile = newSidecarFile(spec.kind, id);
   } else {
     // privateKey / watch — single-chain accounts.
     entry.chain = spec.chain;
     entry.address = spec.address;
   }
   return { v3: { ...v3, wallets: [...v3.wallets, entry] }, entry };
+}
+
+/**
+ * Put a Xelis wallet into the context `activeWalletId` belongs to: the write
+ * behind the dashboard's Xelis import panel (Settings ▸ Wallets uses
+ * `addWalletEntry` directly).
+ *
+ * Unlike Zano's panel, this does not go through the flat `saveVault` path: the
+ * flat shape has no Xelis field (see `mergeFlatIntoV3`). It is a v3 edit:
+ *
+ *  - the same seed already in that context: nothing changes (`created: false`),
+ *    so a repeated save is harmless;
+ *  - a DIFFERENT Xelis seed already in that context: throws. Replacing it would
+ *    delete the old seed from the vault, and nothing on the import screen says
+ *    that is what the user asked for;
+ *  - the words already saved as any other wallet: throws. A Xelis seed and a
+ *    Monero or Zephyr legacy seed use the same English wordlist and checksum,
+ *    so a Monero seed pasted here passes every Xelis check and would open an
+ *    empty Xelis wallet.
+ *
+ * `created` entries get their own `sidecarFile`, as `addWalletEntry` gives them.
+ */
+export function addXelisWalletToContext(
+  v3: VaultPayloadV3,
+  seed: string,
+  opts: SchemaOpts & { activeWalletId?: string } = {}
+): { v3: VaultPayloadV3; entry: WalletEntry; created: boolean } {
+  const gid = groupIdForWallet(v3, opts.activeWalletId);
+  const inContext = (w: WalletEntry) => gid !== undefined && groupKey(w) === gid;
+
+  const present = v3.wallets.find((w) => w.kind === "xelis" && inContext(w));
+  if (present) {
+    if (normalizeSeed(present.seed) === normalizeSeed(seed)) {
+      return { v3, entry: present, created: false };
+    }
+    throw new Error(
+      "This wallet already has a Xelis wallet. Remove it in Settings ▸ Wallets " +
+        "before importing a different Xelis seed."
+    );
+  }
+
+  const duplicate = findDuplicateSeed(v3, seed);
+  if (duplicate) {
+    throw new Error(
+      `These words are already saved as "${duplicate.name}". The same 25 words ` +
+        "open a different wallet on each coin, so they are not imported again as Xelis."
+    );
+  }
+
+  const ctx = gid === undefined ? undefined : listContexts(v3).find((c) => c.groupId === gid);
+  const { v3: next, entry } = addWalletEntry(
+    v3,
+    {
+      kind: "xelis",
+      seed,
+      name: ctx ? `${ctx.name} · Xelis` : "Xelis wallet",
+      groupId: gid,
+    },
+    opts
+  );
+  return { v3: next, entry, created: true };
 }
 
 /** Rename an entry by id (no-op if not found). */

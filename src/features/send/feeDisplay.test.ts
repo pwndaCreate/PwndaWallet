@@ -5,7 +5,24 @@
  */
 import { describe, it, expect } from "vitest";
 import type { FeeEstimate } from "../../wallets";
-import { feeRateForSend, feeTotalFor, isPerByteRate } from "./feeDisplay";
+import { feeNoteText, feeRateForSend, feeTotalFor, isPerByteRate } from "./feeDisplay";
+
+describe("feeNoteText", () => {
+  // 2026-09-15: a quote may carry one sentence about its fee (Xelis: the fee
+  // includes 0.001 XEL for a recipient account not yet on chain).
+  it("shows a quote's note, trimmed", () => {
+    expect(
+      feeNoteText({ feeNote: "  Includes 0.001 XEL for a new recipient account.  " }),
+    ).toBe("Includes 0.001 XEL for a new recipient account.");
+  });
+
+  it("says nothing when there is no note, rather than an empty line", () => {
+    expect(feeNoteText({})).toBeNull();
+    expect(feeNoteText({ feeNote: "   " })).toBeNull();
+    expect(feeNoteText(null)).toBeNull();
+    expect(feeNoteText(undefined)).toBeNull();
+  });
+});
 
 const ltc = (over: Partial<FeeEstimate> = {}): FeeEstimate => ({
   slow: { value: "1" },

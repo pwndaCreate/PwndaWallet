@@ -1,7 +1,9 @@
 import { useCallback, useMemo, useState } from "react";
+import { formatAppVersion } from "../../lib/appVersion";
 import { Panel, Mono, ST } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { DataLocationsList } from "./DataLocationsCard";
+import { SidecarUpdateList } from "./SidecarUpdateCard";
 import { WalletsCard } from "./WalletsCard";
 import {
   SidecarSetupWizard,
@@ -10,6 +12,8 @@ import {
 } from "../swap-sidecar";
 import { DexCoinsSection } from "./DexCoinsSection";
 import { SwapNodeExtras } from "./SwapNodeExtras";
+import { NodeEntryList } from "./NodeEntryList";
+import { miningSoftwareLineup } from "./miningSoftware";
 import type { AddWalletOpts, WalletKind } from "../../vault-schema";
 import type { ChainType } from "../../wallets";
 import { useAppState } from "../../state/AppStateContext";
@@ -73,6 +77,8 @@ export function SettingsLandscapeView({
   onOpenMoneroNodes,
   onOpenZephyrNodes,
   onOpenZanoNodes,
+  xelisSeedLoaded,
+  onOpenXelisNodes,
   onOpenMinerSetup,
   onOpenWalletDetails,
   onAddWallet,
@@ -97,6 +103,9 @@ export function SettingsLandscapeView({
   onOpenMoneroNodes: () => void;
   onOpenZephyrNodes: () => void;
   onOpenZanoNodes: () => void;
+  /** Xelis (2026-09-15): its row shows once a Xelis wallet is open. */
+  xelisSeedLoaded: string | null;
+  onOpenXelisNodes: () => void;
   onOpenMinerSetup: () => void;
   onOpenWalletDetails: () => void;
   onAddWallet: (
@@ -211,7 +220,7 @@ export function SettingsLandscapeView({
                 gap: 10,
               }}
             >
-              <InfoRow label="Version" value="v2.0.1" />
+              <InfoRow label="Version" value={formatAppVersion()} />
               <InfoRow label="Platform" value="Windows (Tauri)" />
               <InfoRow
                 label="Mode"
@@ -321,16 +330,16 @@ export function SettingsLandscapeView({
         {/* Inner flowing column — scrolls instead of compressing the Panels;
             see the left column note above. */}
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-        {/* Mining Software */}
+        {/* Mining Software — derived from the launcher's own tables
+            (`miningSoftwareLineup`). The hand-written three lines this
+            replaced had missed SRBMiner's CPU lane (XelisHash v3) and its
+            Autolykos2 / ProgPowZ GPU algorithms. */}
         <Panel label={<PanelTitle delay={95}>Mining Software</PanelTitle>} pad={14}>
           <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            {[
-              { name: "XMRig", algo: "RandomX (CPU)", desc: "Monero CPU mining" },
-              { name: "SRBMiner-MULTI", algo: "KawPow (GPU)", desc: "Ravencoin GPU mining" },
-              { name: "lolMiner", algo: "Octopus (GPU)", desc: "Conflux GPU mining" },
-            ].map((sw) => (
+            {miningSoftwareLineup().map((sw) => (
               <div
                 key={sw.name}
+                data-miner-software={sw.name}
                 style={{
                   display: "flex",
                   alignItems: "center",
@@ -343,17 +352,17 @@ export function SettingsLandscapeView({
                   <Mono size={10} color="var(--text)">
                     {sw.name}
                   </Mono>
-                  <Mono
-                    size={8}
-                    color="var(--text-dim)"
-                    style={{ display: "block", marginTop: 2 }}
-                  >
-                    {sw.algo} · {sw.desc}
-                  </Mono>
+                  {sw.lanes.map((l) => (
+                    <Mono
+                      key={l.lane}
+                      size={8}
+                      color="var(--text-dim)"
+                      style={{ display: "block", marginTop: 2, lineHeight: 1.45 }}
+                    >
+                      {l.lane} · {l.algorithms.join(" · ")}
+                    </Mono>
+                  ))}
                 </div>
-                <div
-                  style={{ width: 6, height: 6, background: "var(--text-dim)", flexShrink: 0 }}
-                />
               </div>
             ))}
             <Btn variant="ghost" full onClick={onOpenMinerSetup}>
@@ -362,35 +371,32 @@ export function SettingsLandscapeView({
           </div>
         </Panel>
 
-        {/* Privacy Wallets — Monero + Zephyr + Zano folded into one panel;
-            an absent chain renders a compact "not imported" chip rather than
-            a whole half-empty box (the old layout's headline waste). Zano
-            row only appears once a seed is loaded, matching the portrait
-            SettingsView button's `zanoSeedLoaded &&` gate — PrivacyNodeRow
-            already handles the "not loaded" case for the other two chains,
-            but Zano has no unmanaged-state affordance yet (no import entry
-            point from this panel), so hiding the row entirely avoids a
-            dead-end "Manage" link. */}
+        {/* Privacy Wallets — node management for every sidecar chain, from
+            the list portrait renders too (`NodeEntryList`). An absent chain
+            shows a "not imported" chip rather than a Manage button. Until
+            2026-09-16 this panel hid Zano/Xelis when absent but showed
+            Monero/Zephyr, and portrait hid all four. */}
         <Panel label={<PanelTitle delay={150}>Privacy Wallets</PanelTitle>} pad={14}>
-          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-            <PrivacyNodeRow
-              chain="Monero"
-              loaded={!!xmrSeedLoaded}
-              onManage={onOpenMoneroNodes}
-            />
-            <PrivacyNodeRow
-              chain="Zephyr"
-              loaded={!!zphSeedLoaded}
-              onManage={onOpenZephyrNodes}
-            />
-            {zanoSeedLoaded && (
-              <PrivacyNodeRow
-                chain="Zano"
-                loaded={!!zanoSeedLoaded}
-                onManage={onOpenZanoNodes}
-              />
-            )}
-          </div>
+          <NodeEntryList
+            xmrSeedLoaded={xmrSeedLoaded}
+            zphSeedLoaded={zphSeedLoaded}
+            zanoSeedLoaded={zanoSeedLoaded}
+            xelisSeedLoaded={xelisSeedLoaded}
+            onOpenMoneroNodes={onOpenMoneroNodes}
+            onOpenZephyrNodes={onOpenZephyrNodes}
+            onOpenZanoNodes={onOpenZanoNodes}
+            onOpenXelisNodes={onOpenXelisNodes}
+          />
+        </Panel>
+
+        {/* Wallet Binaries — the four bundled wallet programs, whether each is
+            unpacked, and Unpack/Download for one that is not. Portrait has had
+            this card (Monero/Zephyr only) since 2026-07-07; landscape never
+            mounted it, so the "Download it from Settings" the Zano and Xelis
+            wallets used to say had nothing to point at here (2026-09-16).
+            Same list portrait renders (`SidecarUpdateList`). */}
+        <Panel label={<PanelTitle delay={165}>Wallet Binaries</PanelTitle>} pad={14}>
+          <SidecarUpdateList />
         </Panel>
 
         {/* Files on Disk — where the XMR/ZPH wallet + scanned-chain cache and
@@ -509,60 +515,6 @@ function PanelTitle({ children, delay = 0 }: { children: string; delay?: number 
     <ST delay={delay} speed={22}>
       {children}
     </ST>
-  );
-}
-
-/** One compact row per privacy chain inside the folded "Privacy Wallets"
- *  panel. A loaded chain shows a Manage button; an absent chain shows a
- *  muted "not imported" chip instead of an entire half-empty panel. */
-function PrivacyNodeRow({
-  chain,
-  loaded,
-  onManage,
-}: {
-  chain: string;
-  loaded: boolean;
-  onManage: () => void;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        alignItems: "center",
-        gap: 10,
-        padding: "8px 10px",
-        border: "1px solid var(--border-soft)",
-        background: "var(--surface-2)",
-      }}
-    >
-      <Mono size={10} color="var(--text)" style={{ width: 64 }}>
-        {chain}
-      </Mono>
-      <div style={{ flex: 1 }} />
-      {loaded ? (
-        <button
-          type="button"
-          onClick={onManage}
-          style={{
-            fontFamily: "var(--mono)",
-            fontSize: 9,
-            letterSpacing: 0.6,
-            padding: "5px 10px",
-            textTransform: "uppercase",
-            background: "transparent",
-            border: "1px solid var(--border)",
-            color: "var(--text)",
-            cursor: "pointer",
-          }}
-        >
-          Manage Nodes
-        </button>
-      ) : (
-        <Mono size={9} color="var(--text-dim)" upper spacing={0.6}>
-          not imported
-        </Mono>
-      )}
-    </div>
   );
 }
 

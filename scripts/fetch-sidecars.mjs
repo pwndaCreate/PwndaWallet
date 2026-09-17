@@ -1,9 +1,12 @@
 #!/usr/bin/env node
 // scripts/fetch-sidecars.mjs
 //
-// RELEASE-TIME fetch + repack of the Monero / Zephyr wallet-rpc sidecars into
-// the compressed archives that `tauri.conf.json > bundle.resources` embeds in
-// the installer.
+// RELEASE-TIME fetch + repack of the four wallet binaries (Monero and Zephyr
+// wallet-rpc, Zano simplewallet, Xelis xelis_wallet) into the compressed
+// archives that `tauri.conf.json > bundle.resources` embeds in the installer.
+// The list lives in scripts/lib/sidecar-payloads.mjs, and
+// scripts/check-sidecar-payloads.mjs fails a build whose staged set is
+// incomplete, unverifiable, or for the other platform.
 //
 // Why bundle these when miners are download-on-demand? Because they are a
 // different risk class. A miner binary trips coin-miner AV heuristics; a
@@ -27,6 +30,7 @@
 //   src-tauri/binaries/monero-wallet-rpc.gz
 //   src-tauri/binaries/zephyr-wallet-rpc.gz
 //   src-tauri/binaries/zano-simplewallet.gz   <- both platforms (linux: 2026-09-11)
+//   src-tauri/binaries/xelis-wallet.gz        <- both platforms (2026-09-15)
 //   src-tauri/binaries/sidecars.json   <- manifest: platform, versions, sha256
 //
 // The manifest is what makes this safe + updatable at runtime:
@@ -76,6 +80,24 @@ const ZPH_SHA256 =
   TARGET === "win32"
     ? "1139bde911980ff6f93e8540bf1b9d0b67370f33daf15f6b78d47360947d6726"
     : "d60a94d187e288de0ea76d26ecba26c850cdec0500bba84699c7abe85d1a6f91";
+
+// ── XELIS pins — MUST stay in sync with src-tauri/src/xelis_rpc.rs ───────────
+// (XELIS_RELEASE_TAG / XELIS_ARCHIVE_NAME / XELIS_ARCHIVE_SHA256) — bump both
+// together. XELIS cuts releases roughly monthly and consensus forks have forced
+// upgrades before, so this pin goes stale faster than the others.
+//
+// Unlike Zano, upstream publishes BOTH platforms on GitHub as extractable
+// archives, so there is no locally-built arm here. The archive also carries
+// `xelis_daemon` (67 MB) and `xelis_miner`; only `xelis_wallet` is extracted —
+// this app uses remote daemons and SRBMiner.
+const XELIS_TAG = "v1.25.0";
+const XELIS_ARCHIVE =
+  TARGET === "win32" ? "x86_64-pc-windows-msvc.zip" : "x86_64-unknown-linux-gnu.tar.gz";
+const XELIS_URL = `https://github.com/xelis-project/xelis-blockchain/releases/download/${XELIS_TAG}/${XELIS_ARCHIVE}`;
+const XELIS_ARCHIVE_SHA256 =
+  TARGET === "win32"
+    ? "c1c3494793bc492da84d6c1b82bda4bf225bc9e71198e91e5bd70fd1bcc26127"
+    : "424ac65de320a835b4cbe2c2a8b9140b12e8bab86cf5ebda89ffee024947135e";
 
 // ── Zano pins — MUST stay in sync with src-tauri/src/zano_rpc.rs ─────────────
 // (ZANO_ZIP_URL / ZANO_ZIP_SHA256). The in-zip binary is simplewallet.exe but the
@@ -191,6 +213,12 @@ async function extractArchive(archivePath, outDir) {
   if (archivePath.endsWith(".tar.bz2")) {
     // `tar` handles bzip2 on every Linux base install and on Win10+ tar.exe.
     await execFileP("tar", ["-xjf", archivePath, "-C", outDir]);
+  } else if (archivePath.endsWith(".tar.gz")) {
+    // XELIS's Linux asset (2026-09-15). Without this branch it fell through to
+    // `unzip`, which cannot read a gzipped tar — and the failure would only
+    // ever appear on a Linux release build, never on the Windows dev machine
+    // where this script is normally run.
+    await execFileP("tar", ["-xzf", archivePath, "-C", outDir]);
   } else if (TARGET === "win32") {
     await execFileP("powershell", [
       "-NoProfile",
@@ -406,6 +434,21 @@ async function main() {
     });
   }
 
+  // XELIS — one provenance for both platforms, unlike Zano.
+  const xelisEntry = await processOne({
+    label: "xelis-wallet",
+    binaryBase: "xelis-wallet",
+    // The in-zip binary is `xelis_wallet` (UNDERSCORE) while the bundle is
+    // `xelis-wallet.gz` (hyphen). Same asymmetry as Zano, and mirrored in
+    // `wallet_rpc_common::sidecar_naming` — the two must agree or the extracted
+    // file is looked for under a name nothing wrote.
+    findName: `xelis_wallet${EXE}`,
+    url: XELIS_URL,
+    filename: XELIS_ARCHIVE,
+    sha256: XELIS_ARCHIVE_SHA256,
+    version: XELIS_TAG,
+  });
+
   if (CHECK_ONLY) {
     console.log("[sidecars] check complete — upstream assets reachable and pinned.");
     return;
@@ -417,6 +460,7 @@ async function main() {
     monero: monEntry,
     zephyr: zphEntry,
     zano: zanoEntry,
+    xelis: xelisEntry,
   };
   await writeFile(
     path.join(OUT_DIR, "sidecars.json"),

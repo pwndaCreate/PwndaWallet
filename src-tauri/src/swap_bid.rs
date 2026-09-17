@@ -1003,7 +1003,16 @@ pub fn spawn_bid_janitor(app: &AppHandle) {
         let mut healthy_since: Option<Instant> = None;
         let mut last_sweep: Option<Instant> = None;
         let mut requeues: HashMap<String, u32> = HashMap::new();
-        let mut unpark_attempts: HashMap<String, u32> = HashMap::new();
+        let mut unpark_backoff: HashMap<String, UnparkBackoff> = HashMap::new();
+        let mut unlock_gen = unpark_unlock_gen();
+        // The swaps-in-progress reading a locked app shows
+        // (`swap_sidecar::SwapsLastSeen`): read every 2 minutes while healthy,
+        // written when it changes and at least every 15 minutes, so its time
+        // stays honest.
+        const SWAPS_LAST_SEEN_PERIOD: Duration = Duration::from_secs(120);
+        const SWAPS_LAST_SEEN_REFRESH: Duration = Duration::from_secs(900);
+        let mut swaps_read_at: Option<Instant> = None;
+        let mut swaps_written: Option<(u32, Instant)> = None;
         supervisor_log(&app, "janitor: watcher started");
         loop {
             tokio::time::sleep(JANITOR_IDLE_POLL).await;
@@ -1012,9 +1021,21 @@ pub fn spawn_bid_janitor(app: &AppHandle) {
                 api_context(&state).is_ok()
             };
             if !healthy {
+                // A restart request that was out when the node went down was
+                // acted on.
+                for b in unpark_backoff.values_mut() {
+                    b.on_node_down();
+                }
                 healthy_since = None;
                 last_sweep = None;
                 continue;
+            }
+            let gen = unpark_unlock_gen();
+            if gen != unlock_gen {
+                unlock_gen = gen;
+                for b in unpark_backoff.values_mut() {
+                    b.on_unlock();
+                }
             }
             if healthy_since.is_none() {
                 // Diagnostics (2026-09-05): a run whose node was healthy for
@@ -1035,17 +1056,37 @@ pub fn spawn_bid_janitor(app: &AppHandle) {
             // a parked host-wallet coin whose wallet is now up gets the node
             // restarted (through the frontend, which holds the wallet key).
             if since.elapsed() >= UNPARK_SETTLE {
-                match unpark_tick(&app, &mut unpark_attempts).await {
-                    Ok(Some(coin)) => {
-                        // A restart is on its way; the phase will leave Healthy
-                        // and this loop resets itself on the next poll.
-                        supervisor_log(&app, &format!("unpark: restart requested for {coin}"));
-                        healthy_since = None;
-                        last_sweep = None;
+                match unpark_tick(&app, &mut unpark_backoff).await {
+                    Ok(Some(_)) => {
+                        // Skip this round's sweep. If the app acts on the
+                        // request, the node leaves Healthy and this loop resets
+                        // itself. Nothing is reset here: a locked app never
+                        // acts, and resetting after every unheard request would
+                        // re-log "node healthy" and re-run the first sweep each
+                        // time. `unpark_tick` has already logged the request.
                         continue;
                     }
                     Ok(None) => {}
                     Err(e) => supervisor_log(&app, &format!("unpark: check skipped — {e}")),
+                }
+            }
+            // The reading a locked app shows. A failed read (the engine is
+            // locked, or slow) keeps the previous reading: a count that could
+            // not be read is not zero.
+            if swaps_read_at.map_or(true, |t| t.elapsed() >= SWAPS_LAST_SEEN_PERIOD) {
+                swaps_read_at = Some(Instant::now());
+                let count = {
+                    let state = app.state::<SwapSidecarState>();
+                    crate::swap_sidecar::swaps_in_progress_now(&state).await
+                };
+                if let Ok(n) = count {
+                    let n = u32::try_from(n).unwrap_or(u32::MAX);
+                    let due = swaps_written.map_or(true, |(last, at)| {
+                        last != n || at.elapsed() >= SWAPS_LAST_SEEN_REFRESH
+                    });
+                    if due && crate::swap_sidecar::write_swaps_last_seen(&app, n).is_ok() {
+                        swaps_written = Some((n, Instant::now()));
+                    }
                 }
             }
             if since.elapsed() < JANITOR_FIRST_DELAY {
@@ -1110,6 +1151,7 @@ mod janitor_tests {
 
     #[test]
     fn candidates_are_error_rows_with_a_real_bid_id() {
+        // Pins D-36 (defect register): the janitor re-examines Error bids.
         let rows = vec![
             json!({"bid_id": ID, "bid_state": "Error"}),
             json!({"bid_id": ID, "bid_state": "Completed"}),
@@ -1167,6 +1209,7 @@ mod janitor_tests {
     /// would be run often enough to catch it.
     #[test]
     fn the_janitor_recovers_through_the_trusted_call_not_the_allow_list() {
+        // Pins D-58 (defect register): recovery bypasses the renderer allow-list.
         let body = &SOURCE[SOURCE
             .find("pub async fn run_bid_janitor_once(")
             .expect("janitor moved")..];
@@ -1224,20 +1267,146 @@ mod janitor_tests {
 // consented AND its wallet is now answering AND the engine has no swap in
 // flight, the watcher asks the FRONTEND to restart the node — the frontend,
 // not Rust, because the wallet key is cleared at every stop (C5 hygiene) and
-// only the unlocked app can supply it again. At most `UNPARK_MAX_RESTARTS`
-// per coin per app session, so a wallet that keeps failing cannot turn into a
-// restart loop; after that the DEX-coins row's reason stands and the user
-// restarts by hand.
+// only the unlocked app can supply it again.
+//
+// 2026-09-15: requests back off instead of stopping at a cap. The first cut
+// allowed two per coin per app session, never reset the count, and counted a
+// request the moment it was emitted, whether or not anything listened. The
+// listener only exists while the vault is unlocked, so a locked app spent both
+// requests on nothing, and the coin then stayed parked until the app itself
+// restarted, however long its wallet had been back — with any PATCH-36
+// deferred bid on it waiting the whole time. Now only a restart that actually
+// happened and still left the coin parked counts ([`UnparkBackoff`]); those
+// back off to a 30-minute ceiling, and an unheard request is simply repeated.
 // ═══════════════════════════════════════════════════════════════════════════
 
 /// Emitted with `{ coin, attempt, max }` when a restart is warranted. The
 /// listener (`useSwapAutoSetup`) stops the node, re-supplies the wallet key
-/// and starts it again.
+/// and starts it again. `max` is always 0: requests back off, they are not
+/// capped (see [`UnparkBackoff`]).
 pub const UNPARK_EVENT: &str = "swap-sidecar-unpark";
-pub const UNPARK_MAX_RESTARTS: u32 = 2;
 /// Do not judge a start for this long after it turned healthy: the engine is
 /// still loading, and the warm-up wait may just have ended.
 const UNPARK_SETTLE: Duration = Duration::from_secs(60);
+/// A request the node has not acted on within this long went unheard.
+const UNPARK_UNHEARD_AFTER: Duration = Duration::from_secs(90);
+/// How soon an unheard request is repeated. Nothing listens while the vault
+/// is locked, and an unlock cuts this short ([`UnparkBackoff::on_unlock`]).
+const UNPARK_UNHEARD_RETRY: Duration = Duration::from_secs(300);
+
+/// Wait after `failures` restarts that left the coin parked. Pure. Grows to a
+/// 30-minute ceiling and stays there, because there is no number of failures
+/// after which giving up is right: a wallet that failed four times can work
+/// the fifth, and a parked coin can have a bid waiting on it (PATCH-36).
+pub fn unpark_delay(failures: u32) -> Duration {
+    const SCHEDULE_SECS: [u64; 5] = [0, 120, 300, 600, 1200];
+    const CEILING_SECS: u64 = 1800;
+    Duration::from_secs(
+        SCHEDULE_SECS
+            .get(failures as usize)
+            .copied()
+            .unwrap_or(CEILING_SECS),
+    )
+}
+
+/// One parked coin's place in the retry schedule. Every method is pure, so the
+/// schedule is tested without a node.
+///
+/// Only a restart that HAPPENED counts as a failure. A request goes out, and
+/// if the node goes down afterwards the app acted on it; if the coin is still
+/// parked when the node is back, that was a real failed attempt. If the node
+/// never goes down, nothing was listening (the vault was locked) and the
+/// request is simply repeated later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UnparkBackoff {
+    /// Restarts that were acted on and still left the coin parked.
+    pub failures: u32,
+    /// No request before this instant.
+    pub not_before: Option<Instant>,
+    /// When the request not yet accounted for went out.
+    pub pending: Option<Instant>,
+    /// The node went down after `pending` went out.
+    pub acted_on: bool,
+    /// The last request went unheard, so `not_before` is only a polling
+    /// interval and an unlock may cut it short.
+    pub unheard: bool,
+}
+
+/// What settling a pending request found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UnparkSettled {
+    /// Nothing was pending.
+    Nothing,
+    /// Still inside the window in which the app could act on it.
+    Waiting,
+    /// The node restarted and the coin is still parked.
+    Failed,
+    /// Nothing restarted the node.
+    Unheard,
+}
+
+impl UnparkBackoff {
+    /// The node went down: a pending request was acted on.
+    pub fn on_node_down(&mut self) {
+        if self.pending.is_some() {
+            self.acted_on = true;
+        }
+    }
+
+    /// The vault was unlocked: the listener exists again, so an unheard
+    /// request's polling wait no longer applies. A failure's wait stays.
+    pub fn on_unlock(&mut self) {
+        if self.unheard {
+            self.not_before = None;
+        }
+    }
+
+    /// Account for a pending request, as seen at `now` with the coin still
+    /// parked.
+    pub fn settle(&mut self, now: Instant) -> UnparkSettled {
+        let Some(sent) = self.pending else {
+            return UnparkSettled::Nothing;
+        };
+        if self.acted_on {
+            self.failures = self.failures.saturating_add(1);
+            self.not_before = Some(now + unpark_delay(self.failures));
+            self.pending = None;
+            self.acted_on = false;
+            self.unheard = false;
+            UnparkSettled::Failed
+        } else if now.saturating_duration_since(sent) >= UNPARK_UNHEARD_AFTER {
+            self.not_before = Some(now + UNPARK_UNHEARD_RETRY);
+            self.pending = None;
+            self.unheard = true;
+            UnparkSettled::Unheard
+        } else {
+            UnparkSettled::Waiting
+        }
+    }
+
+    /// May a request go out at `now`? Call [`Self::settle`] first.
+    pub fn due(&self, now: Instant) -> bool {
+        self.pending.is_none() && self.not_before.map_or(true, |t| now >= t)
+    }
+
+    pub fn on_request(&mut self, now: Instant) {
+        self.pending = Some(now);
+        self.acted_on = false;
+    }
+}
+
+/// Bumped each time the app pushes the wallet key, which is what an unlock
+/// does. The janitor turns a change into [`UnparkBackoff::on_unlock`].
+static UNPARK_UNLOCK_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called from `swap_sidecar::swap_sidecar_set_wallet_key`.
+pub fn note_wallet_key_pushed() {
+    UNPARK_UNLOCK_GEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn unpark_unlock_gen() -> u64 {
+    UNPARK_UNLOCK_GEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1266,14 +1435,6 @@ pub fn parked_consented_coins(config_json: &str, rec: &OptInRecord) -> Vec<Strin
         .collect()
 }
 
-async fn host_wallet_up(app: &AppHandle, coin: &str) -> bool {
-    match coin {
-        "zano" => crate::zano_rpc::zano_rpc_is_running(app.clone()).await.unwrap_or(false),
-        "zephyr" => crate::zph_rpc::zph_rpc_is_running(app.clone()).await.unwrap_or(false),
-        _ => false,
-    }
-}
-
 fn read_config_text(app: &AppHandle) -> Result<String, String> {
     let dd = datadir(app)?;
     let raw = std::fs::read(dd.join("basicswap.json"))
@@ -1285,18 +1446,48 @@ fn read_config_text(app: &AppHandle) -> Result<String, String> {
 /// One check. `Ok(Some(coin))` means a restart was requested for that coin.
 pub async fn unpark_tick(
     app: &AppHandle,
-    attempts: &mut HashMap<String, u32>,
+    backoff: &mut HashMap<String, UnparkBackoff>,
 ) -> Result<Option<String>, String> {
     let state = app.state::<SwapSidecarState>();
     let (port, password) = api_context(&state)?;
     let cfg = read_config_text(app)?;
     let rec = read_optin(app);
-    for coin in parked_consented_coins(&cfg, &rec) {
-        let n = attempts.get(&coin).copied().unwrap_or(0);
-        if n >= UNPARK_MAX_RESTARTS {
+    let parked = parked_consented_coins(&cfg, &rec);
+    // A coin that is active again was added. If it ever parks again, its
+    // schedule starts from nothing.
+    backoff.retain(|coin, _| parked.contains(coin));
+    let now = Instant::now();
+    for coin in parked {
+        let mut entry = backoff.get(&coin).copied().unwrap_or_default();
+        let was_unheard = entry.unheard;
+        match entry.settle(now) {
+            UnparkSettled::Failed => supervisor_log(
+                app,
+                &format!(
+                    "unpark: {coin} is still parked after the restart (failed attempt {}); \
+                     the next attempt is in {}s",
+                    entry.failures,
+                    unpark_delay(entry.failures).as_secs()
+                ),
+            ),
+            UnparkSettled::Unheard if !was_unheard => supervisor_log(
+                app,
+                &format!(
+                    "unpark: nothing restarted the node for {coin} (the app is probably locked); \
+                     asking again every {}s, and at once after an unlock",
+                    UNPARK_UNHEARD_RETRY.as_secs()
+                ),
+            ),
+            _ => {}
+        }
+        backoff.insert(coin.clone(), entry);
+        if !entry.due(now) {
             continue;
         }
-        if !host_wallet_up(app, &coin).await {
+        // ANSWERING, not merely spawned. Zephyr's old check was
+        // `child.is_some()`, which is true long before the wallet serves a
+        // request.
+        if !crate::swap_sidecar::host_wallet_answering(app, &coin).await {
             continue;
         }
         // The one thing that must never be interrupted: a swap in flight.
@@ -1317,18 +1508,25 @@ pub async fn unpark_tick(
             );
             return Ok(None);
         }
-        let attempt = n + 1;
-        attempts.insert(coin.clone(), attempt);
-        supervisor_log(
-            app,
-            &format!(
-                "unpark: the {coin} wallet is up and no swap is in flight — asking the app to \
-                 restart the swap node so it is added (attempt {attempt} of {UNPARK_MAX_RESTARTS})"
-            ),
-        );
+        // A locked app hears nothing, and the same line every five minutes for
+        // hours says nothing new: while requests go unheard they are not logged
+        // (the first unheard one was, in the settle above).
+        let quiet = entry.unheard;
+        entry.on_request(now);
+        backoff.insert(coin.clone(), entry);
+        let attempt = entry.failures + 1;
+        if !quiet {
+            supervisor_log(
+                app,
+                &format!(
+                    "unpark: the {coin} wallet is up and no swap is in flight — asking the app to \
+                     restart the swap node so it is added (attempt {attempt})"
+                ),
+            );
+        }
         let _ = app.emit(
             UNPARK_EVENT,
-            &UnparkRequest { coin: coin.clone(), attempt, max: UNPARK_MAX_RESTARTS },
+            &UnparkRequest { coin: coin.clone(), attempt, max: 0 },
         );
         return Ok(Some(coin));
     }
@@ -1371,8 +1569,89 @@ mod unpark_tests {
     }
 
     #[test]
-    fn restart_cap_and_settle_are_sane() {
-        assert!(UNPARK_MAX_RESTARTS >= 1 && UNPARK_MAX_RESTARTS <= 3);
+    fn settle_and_windows_are_sane() {
         assert!(UNPARK_SETTLE >= Duration::from_secs(30));
+        assert!(
+            UNPARK_UNHEARD_AFTER > JANITOR_IDLE_POLL * 2,
+            "the janitor must get to see the node go down before a request counts as unheard"
+        );
+    }
+
+    /// Failures back off to a ceiling and never stop.
+    #[test]
+    fn unpark_delay_grows_to_a_ceiling_and_never_stops() {
+        // Pins D-43 (defect register): the unpark watcher keeps retrying a parked coin.
+        assert_eq!(unpark_delay(1), Duration::from_secs(120));
+        let mut prev = Duration::ZERO;
+        for n in 1..64 {
+            let d = unpark_delay(n);
+            assert!(d >= prev, "the delay shrank at failure {n}");
+            prev = d;
+        }
+        assert_eq!(unpark_delay(u32::MAX), Duration::from_secs(1800), "a ceiling, not a cap");
+    }
+
+    /// 2026-09-15: a locked app spent both of the old capped attempts on
+    /// nothing. A request the node never acted on is not a failure. It is
+    /// repeated on a polling interval, and an unlock cuts that short.
+    #[test]
+    fn an_unheard_request_is_not_a_failure() {
+        let t0 = Instant::now();
+        let mut b = UnparkBackoff::default();
+        assert!(b.due(t0));
+        b.on_request(t0);
+        assert!(!b.due(t0), "one request at a time");
+        assert_eq!(b.settle(t0 + Duration::from_secs(30)), UnparkSettled::Waiting);
+        let t1 = t0 + UNPARK_UNHEARD_AFTER;
+        assert_eq!(b.settle(t1), UnparkSettled::Unheard);
+        assert_eq!(b.failures, 0, "nothing restarted, so nothing failed");
+        assert!(!b.due(t1 + Duration::from_secs(10)));
+        assert!(b.due(t1 + UNPARK_UNHEARD_RETRY));
+        b.on_unlock();
+        assert!(b.due(t1 + Duration::from_secs(10)), "an unlock ends the polling wait");
+    }
+
+    /// A restart that happened and still left the coin parked counts, and its
+    /// wait survives an unlock. Every unpark restart pushes the wallet key,
+    /// which is the unlock signal, so if an unlock cut a failure's wait short a
+    /// failing wallet would become a restart loop.
+    #[test]
+    fn a_restart_that_left_the_coin_parked_backs_off() {
+        let t0 = Instant::now();
+        let mut b = UnparkBackoff::default();
+        b.on_request(t0);
+        b.on_node_down();
+        let back = t0 + Duration::from_secs(70);
+        assert_eq!(b.settle(back), UnparkSettled::Failed);
+        assert_eq!(b.failures, 1);
+        assert!(!b.due(back + Duration::from_secs(119)));
+        b.on_unlock();
+        assert!(
+            !b.due(back + Duration::from_secs(119)),
+            "an unlock must not cut a failure's wait"
+        );
+        assert!(b.due(back + Duration::from_secs(120)));
+    }
+
+    /// The node going down with nothing pending (a manual stop) marks nothing.
+    #[test]
+    fn a_node_down_with_nothing_pending_changes_nothing() {
+        let mut b = UnparkBackoff::default();
+        b.on_node_down();
+        assert_eq!(b, UnparkBackoff::default());
+    }
+
+    /// Structural: the wallet-key push is what the janitor reads as an unlock.
+    #[test]
+    fn the_wallet_key_push_is_the_unlock_signal() {
+        let src = include_str!("swap_sidecar.rs");
+        let f = &src[src
+            .find("pub async fn swap_sidecar_set_wallet_key(")
+            .expect("key push moved")..];
+        let f = &f[..f.find("\n}\n").expect("key push end")];
+        assert!(f.contains("crate::swap_bid::note_wallet_key_pushed()"));
+        let before = unpark_unlock_gen();
+        note_wallet_key_pushed();
+        assert!(unpark_unlock_gen() > before);
     }
 }

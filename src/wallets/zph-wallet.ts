@@ -1,13 +1,21 @@
 /**
  * Zephyr Protocol (ZEPH) ChainAdapter — sidecar-backed implementation.
  *
- * Structural parallel to `xmr-wallet.ts`. Differences for the
- * functional-minimum v1:
+ * Structural parallel to `xmr-wallet.ts`. Differences:
  *   - 25-word seeds only (Zephyr doesn't support polyseed).
- *   - Single-asset UI surface: `getBalance` returns the ZPH balance only.
- *     The other three assets (ZSD/ZRS/ZYS) are readable through
- *     `zph-rpc.ts::getAllBalances` but not shown in v1 — add Exchange panel
- *     later.
+ *   - Four assets at one address. `getBalance` is the ZPH total (the
+ *     `zephyr` chain row); ZSD/ZRS/ZYS come from `zph-rpc.ts::getAllBalances`
+ *     via `useZphSession.assetBalances` (landscape asset rows, the portrait
+ *     ZEPHYR ECOSYSTEM card) and are sent with `sendTransaction`'s `assetType`.
+ *     (Corrected 2026-09-15: this said the other three were "not shown in v1".)
+ *   - Every asset is received at the same addresses: the asset is a tag on
+ *     each OUTPUT (`txout_zephyr_tagged_key`, cryptonote_basic.h:80-93 at
+ *     Zephyr v2.3.0) and there is no per-asset address prefix
+ *     (cryptonote_config.h:226-228).
+ *   - A same-asset send pays its network fee in the SENT asset, not ZEPH
+ *     (rctSigs.cpp:1861-1862, wallet2.cpp:9593/9673-9674, tx_pool.cpp:367).
+ *     Fees are priced per send with a dry-run `transfer` (`quoteSend`);
+ *     wallet-rpc has no `get_fee_estimate`.
  *   - Separate sidecar on loopback port 18083, separate wallet-dir,
  *     separate node pool (`zph-nodes.ts`).
  *
@@ -24,7 +32,11 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendQuote,
+  SendableBalance,
 } from "./types";
+import { SEND_QUOTE_MAX_AGE_MS, SendQuoteError } from "./send-quote";
+import { errorText } from "../lib/errorText";
 import {
   generateZephyrSeed,
   validateZephyrSeed,
@@ -66,9 +78,13 @@ import {
   downloadZphWalletRpc,
   checkZphDefenderExclusion,
   addZphDefenderExclusion,
-  getZphFeeEstimate,
+  quoteAssetTransfer,
+  relayTransfer,
+  parseZphAssetSelector,
+  ZPH_UI_TICKER,
   type ZphTransfer,
   type ZphAssetType,
+  type ZphValidateAddressResult,
 } from "./zph-rpc";
 
 // =========================================================================
@@ -84,10 +100,184 @@ interface ZphSession {
   restoreHeight: number;
   /** On-disk wallet filename this session opened (per-wallet, multi-wallet). */
   walletFilename: string;
+  /**
+   * Which session this is. A quote's ticket records it, so a transaction built
+   * by one session is never relayed by a later one (2026-09-15). A number
+   * rather than the session object: the object holds the seed and wallet
+   * password, and tickets live in React state.
+   */
+  epoch: number;
 }
 
 let session: ZphSession | null = null;
+let sessionEpoch = 0;
 let healthUnsubscribe: (() => void) | null = null;
+
+// =========================================================================
+// Send helpers (2026-09-15)
+// =========================================================================
+
+/** What a Zephyr quote carries for `sendQuoted`. Never shown in the UI. */
+interface ZphQuoteTicket {
+  /** `transfer`'s `tx_metadata`: the signed transaction, not yet relayed. */
+  txMetadata: string;
+  txHash: string;
+  epoch: number;
+}
+
+const sentListeners = new Set<() => void>();
+
+/**
+ * Subscribe to "this app just broadcast a Zephyr transaction".
+ * `useZphSession` refreshes the ZSD/ZRS/ZYS balances on it; before 2026-09-15
+ * they refreshed only on swap success, so an asset row kept showing what had
+ * just been sent.
+ */
+export function onZphSent(listener: () => void): () => void {
+  sentListeners.add(listener);
+  return () => {
+    sentListeners.delete(listener);
+  };
+}
+
+function notifyZphSent(): void {
+  for (const l of sentListeners) {
+    try {
+      l();
+    } catch (e) {
+      console.warn("[zph-wallet] send listener failed:", e);
+    }
+  }
+}
+
+interface ZphSyncStatus {
+  walletHeight: number;
+  daemonHeight: number;
+  synced: boolean;
+  percent: number;
+  daemonOk: boolean;
+}
+
+/**
+ * Why a send must wait, or `null` when the wallet is synced.
+ *
+ * 2026-09-15: a failed daemon probe (`zph-rpc.ts::getSyncStatus` sets
+ * `daemonOk: false`, `daemonHeight: 0`) used to read "Zephyr wallet not fully
+ * synced (0.0% — N / 0)", blaming the wallet for a node it could not reach.
+ */
+export function zphSyncRefusal(status: ZphSyncStatus | null): string | null {
+  if (!status) {
+    return "The Zephyr wallet is not ready yet. Please wait for it to finish opening.";
+  }
+  if (status.synced) return null;
+  if (!status.daemonOk) {
+    return (
+      `Could not reach a Zephyr node to confirm the wallet is synced (wallet at block ${status.walletHeight}). ` +
+      "Check the Zephyr node in Settings, then try again."
+    );
+  }
+  return (
+    `Zephyr wallet not fully synced (${status.percent.toFixed(1)}% — ${status.walletHeight} / ${status.daemonHeight}). ` +
+    "Please wait for sync to complete before sending."
+  );
+}
+
+/** A `validate_address` answer that rules the recipient out, or null. */
+export function zphRecipientProblem(v: ZphValidateAddressResult): SendQuoteError | null {
+  if (!v.valid) return new SendQuoteError("invalid-address", "Invalid Zephyr address.");
+  if (v.nettype !== "mainnet") {
+    return new SendQuoteError("invalid-address", `Address is for ${v.nettype}, not mainnet.`);
+  }
+  return null;
+}
+
+/**
+ * Ask the wallet whether `to` is a mainnet Zephyr address.
+ *
+ * A failing `validate_address` CALL is not a verdict: the transfer checks the
+ * address again and fails with its own error. Until 2026-09-15 this catch read
+ * `e.message.startsWith(...)`; Tauri rejects with a plain string, so the catch
+ * itself threw a TypeError and replaced the RPC error with
+ * "Cannot read properties of undefined (reading 'startsWith')".
+ */
+async function checkZphRecipient(to: string): Promise<SendQuoteError | null> {
+  let v: ZphValidateAddressResult;
+  try {
+    v = await validateAddress(to);
+  } catch (e) {
+    console.warn(
+      "[zph-wallet] validate_address failed; the transfer will check the address itself:",
+      errorText(e)
+    );
+    return null;
+  }
+  return zphRecipientProblem(v);
+}
+
+/**
+ * A zephyr-wallet-rpc `transfer` failure, classified for the Send modal.
+ *
+ * Codes and messages are zephyr v2.3.0's (`wallet_rpc_server.cpp`
+ * `handle_rpc_exception` 3588-3672, `wallet_errors.h`), as
+ * `wallet_rpc_common.rs` formats them: `RPC error <code>: <message>`. Only the
+ * two definitive kinds block a send; the raw text is kept in every message so
+ * the exact string stays searchable.
+ */
+export function classifyZphTransferError(e: unknown, asset: ZphAssetType): SendQuoteError {
+  if (e instanceof SendQuoteError) return e;
+  const raw = errorText(e, "The Zephyr wallet returned no error message.");
+  const m = /^RPC error (-?\d+):\s*([\s\S]*)$/.exec(raw.trim());
+  const code = m ? Number(m[1]) : null;
+  const msg = m ? m[2] : raw;
+  const ticker = ZPH_UI_TICKER[asset];
+  if (code === -37 || /not enough unlocked money/i.test(msg)) {
+    return new SendQuoteError(
+      "insufficient-funds",
+      `Not enough unlocked ${ticker} for this amount plus the network fee. Received funds and ` +
+        `change unlock after 10 blocks (about 20 minutes). (${raw})`
+    );
+  }
+  if (
+    code === -17 ||
+    /not enough money/i.test(msg) ||
+    (code === -16 && /^Transaction not possible/i.test(msg))
+  ) {
+    return new SendQuoteError(
+      "insufficient-funds",
+      `Not enough ${ticker} for this amount plus the network fee. (${raw})`
+    );
+  }
+  if (code === -2 || /WALLET_RPC_ERROR_CODE_WRONG_ADDRESS/.test(msg)) {
+    return new SendQuoteError("invalid-address", `That is not a valid Zephyr address. (${raw})`);
+  }
+  if (
+    code === -38 ||
+    code === -3 ||
+    /TCP connect|actively refused|Connection refused|RPC request failed|RPC returned 401|No wallet file/i.test(raw)
+  ) {
+    return new SendQuoteError(
+      "not-ready",
+      `The Zephyr wallet cannot reach its node, or the node is busy. Try again shortly. (${raw})`
+    );
+  }
+  return new SendQuoteError("other", raw);
+}
+
+/**
+ * A `relay_tx` failure. `-4 Failed to commit tx.` drops the daemon's reason
+ * (`wallet_rpc_server.cpp:1817-1821`) and can be raised after the broadcast, so
+ * the message must not claim that nothing was sent.
+ */
+export function describeZphRelayError(e: unknown): Error {
+  const raw = errorText(e, "The Zephyr wallet returned no error message.");
+  if (/^RPC error -4:/.test(raw.trim())) {
+    return new Error(
+      `The prepared transaction was not accepted (${raw}). The wallet does not report why, ` +
+        "or whether the network saw it: check Activity before sending again."
+    );
+  }
+  return new Error(raw);
+}
 
 // =========================================================================
 // Helpers
@@ -408,8 +598,11 @@ export async function initZphSession(
     /* non-fatal */
   }
 
-  // 6. Generate a receive subaddress (begins with "ZEPHi", Zephyr's
-  //    subaddress prefix). Fallback to primary address if this fails.
+  // 6. Generate a receive subaddress. Fallback to primary address if this fails.
+  //    Not displayed today: receive panels show the primary address, which
+  //    receives all four assets (the asset is a tag on each output).
+  //    (Corrected 2026-09-15: this called "ZEPHi" the subaddress prefix; see
+  //    the subaddress prefix note in the adapter's `addressPlaceholder`.)
   let currentReceiveAddress: string | null = null;
   try {
     const result = await createAddress(0, "receive");
@@ -426,6 +619,7 @@ export async function initZphSession(
     currentReceiveAddress,
     restoreHeight,
     walletFilename,
+    epoch: ++sessionEpoch,
   };
 
   // 7. Kick off the health loop for hot-swap + settings UI freshness.
@@ -449,6 +643,34 @@ export async function closeZphWallet(): Promise<void> {
   } catch {
     /* ignore */
   }
+  try {
+    await stopZphRpc();
+  } catch {
+    /* ignore */
+  }
+}
+
+/**
+ * Lock: end this app's Zephyr session without closing the wallet under the
+ * swap node. Releases only the app's `Session` lease. While the node holds its
+ * `SwapEngine` lease the process keeps the wallet open; when no other lease is
+ * held, Rust closes the wallet and stops the process itself
+ * (`zph_rpc.rs::zph_stop_rpc_internal`), so nothing is left open by accident.
+ * An unlock reopens the same file in the running process (`initZphSession`).
+ *
+ * 2026-09-15: Lock used `closeZphWallet`, which sends `close_wallet` before
+ * releasing the lease, so the process the node keeps served no wallet and the
+ * engine's main-wallet calls failed under any swap in flight. A wallet switch
+ * and wallet removal still use `closeZphWallet`.
+ */
+export async function lockZphWallet(): Promise<void> {
+  if (!session) return;
+  session = null;
+  if (healthUnsubscribe) {
+    healthUnsubscribe();
+    healthUnsubscribe = null;
+  }
+  stopHealthLoop();
   try {
     await stopZphRpc();
   } catch {
@@ -534,7 +756,10 @@ export const zphAdapter: ChainAdapter = {
   displayName: "Zephyr",
   ticker: "ZEPH",
   color: "#3ab0ff",
-  addressPlaceholder: "ZEPHYR... or ZEPHi...",
+  // Mainnet prefixes at Zephyr v2.3.0 (cryptonote_config.h:226-228), checked
+  // 2026-09-15 by base58-encoding each varint prefix: standard "ZEPHYR",
+  // subaddress "ZEPHs", integrated "ZEPHii". This used to offer "ZEPHi...".
+  addressPlaceholder: "ZEPHYR..., ZEPHs... or ZEPHii...",
   derivation: {
     kind: "independent-seed",
     note:
@@ -613,48 +838,139 @@ export const zphAdapter: ChainAdapter = {
     if (!session) {
       throw new Error("Zephyr session not initialized. Please wait for sync.");
     }
-    // Require sync to be within 2 blocks of tip before sending.
-    const status = await getZphSyncProgress();
-    if (!status || !status.synced) {
-      const pct = status?.percent.toFixed(1) ?? "?";
-      throw new Error(
-        `Zephyr wallet not fully synced (${pct}% — ${status?.walletHeight ?? 0} / ${
-          status?.daemonHeight ?? 0
-        }). Please wait for sync to complete before sending.`
-      );
-    }
-    // Validate address via sidecar before attempting the transfer.
-    try {
-      const validation = await validateAddress(to);
-      if (!validation.valid) {
-        throw new Error("Invalid Zephyr address.");
-      }
-      if (validation.nettype !== "mainnet") {
-        throw new Error(`Address is for ${validation.nettype}, not mainnet.`);
-      }
-    } catch (e: any) {
-      if (e.message.startsWith("Invalid") || e.message.startsWith("Address is"))
-        throw e;
-      // If validate_address itself fails (RPC error), proceed without
-      // client-side validation — don't block sends on a transient RPC issue.
-    }
     // Plain send of a single asset: source === destination so wallet-rpc does a
     // normal transfer, NOT a protocol mint/redeem (those go through the Zephyr
     // swap modal). `assetType` selects which held asset to send — ZPH for the
     // focal ZEPH panel, or ZSD/ZRS/ZYS when sending one of the ecosystem assets
     // surfaced as their own rows. `amount` is in the SOURCE asset's units
-    // (12 decimals, same for every Zephyr asset).
-    const asset: ZphAssetType =
-      assetType === "ZSD" || assetType === "ZRS" || assetType === "ZYS"
-        ? assetType
-        : "ZPH";
-    const result = await transferAsset({
-      destination: to,
-      amountZph: amount,
-      sourceAsset: asset,
-      destinationAsset: asset,
-    });
+    // (12 decimals, same for every Zephyr asset), and so is the network fee.
+    // An unknown selector throws here, before anything reaches the wallet.
+    const asset = parseZphAssetSelector(assetType);
+    // Require sync to be within 2 blocks of tip before sending.
+    const refusal = zphSyncRefusal(await getZphSyncProgress());
+    if (refusal) throw new Error(refusal);
+    const recipient = to.trim();
+    const badRecipient = await checkZphRecipient(recipient);
+    if (badRecipient) throw badRecipient;
+    let result;
+    try {
+      result = await transferAsset({
+        destination: recipient,
+        amountZph: amount.trim(),
+        sourceAsset: asset,
+        destinationAsset: asset,
+      });
+    } catch (e) {
+      throw classifyZphTransferError(e, asset);
+    }
+    notifyZphSent();
     return { hash: result.tx_hash };
+  },
+
+  /**
+   * Price this exact send by building it without broadcasting (2026-09-15).
+   *
+   * `transfer` with `do_not_relay` + `get_tx_metadata` never reaches
+   * `commit_tx` (wallet_rpc_server.cpp:1093-1094 at v2.3.0), and `commit_tx`
+   * is the only place wallet2 marks outputs spent or records a pending tx
+   * (wallet2.cpp:7187-7273): a quote spends, locks and lists nothing. The
+   * returned `fee` is in the SENT asset's atomic units
+   * (wallet_rpc_server.cpp:1051), so `feeTicker` is that asset's ticker.
+   */
+  async quoteSend({ to, amount, assetType }): Promise<SendQuote> {
+    if (!session) {
+      throw new SendQuoteError("not-ready", "The Zephyr wallet is not open yet.");
+    }
+    const epoch = session.epoch;
+    const asset = parseZphAssetSelector(assetType);
+    // A wallet short of the tip can answer "not enough money" for funds it has
+    // not scanned yet. That must never become a Send-blocking verdict, so
+    // pricing waits for sync exactly as sending does.
+    const refusal = zphSyncRefusal(await getZphSyncProgress());
+    if (refusal) throw new SendQuoteError("not-ready", refusal);
+    const recipient = to.trim();
+    const priced = amount.trim();
+    const badRecipient = await checkZphRecipient(recipient);
+    if (badRecipient) throw badRecipient;
+    let r;
+    try {
+      r = await quoteAssetTransfer({
+        destination: recipient,
+        amountZph: priced,
+        sourceAsset: asset,
+        destinationAsset: asset,
+      });
+    } catch (e) {
+      throw classifyZphTransferError(e, asset);
+    }
+    if (!r.tx_metadata) {
+      throw new SendQuoteError(
+        "other",
+        "The wallet priced this send but returned no transaction to broadcast (no tx_metadata)."
+      );
+    }
+    if (!Number.isSafeInteger(r.fee) || r.fee < 0) {
+      throw new SendQuoteError("other", "The wallet returned no usable fee for this send.");
+    }
+    const ticket: ZphQuoteTicket = { txMetadata: r.tx_metadata, txHash: r.tx_hash, epoch };
+    return {
+      to: recipient,
+      amount: priced,
+      ...(assetType === undefined ? {} : { assetType }),
+      fee: atomicToZph(r.fee),
+      feeTicker: ZPH_UI_TICKER[asset],
+      quotedAt: Date.now(),
+      ticket,
+    };
+  },
+
+  /**
+   * Broadcast the transaction `quoteSend` built (`relay_tx`, param `hex`).
+   *
+   * `useSend` calls this only for a quote that matches the send and is under
+   * 90 s old. The adapter re-checks what only it can see: a ticket from an
+   * earlier wallet session, or one that aged out in between, is not relayed;
+   * the same send is built fresh instead.
+   */
+  async sendQuoted(quote: SendQuote): Promise<TxResult> {
+    if (!session) {
+      throw new Error("Zephyr session not initialized. Please wait for sync.");
+    }
+    const t = quote.ticket as Partial<ZphQuoteTicket> | null | undefined;
+    const age = Date.now() - quote.quotedAt;
+    const relayable =
+      !!t &&
+      typeof t.txMetadata === "string" &&
+      t.txMetadata.length > 0 &&
+      t.epoch === session.epoch &&
+      age >= 0 &&
+      age < SEND_QUOTE_MAX_AGE_MS;
+    if (!relayable) {
+      return zphAdapter.sendTransaction("", quote.to, quote.amount, quote.assetType);
+    }
+    let r: { tx_hash: string };
+    try {
+      r = await relayTransfer(t.txMetadata as string);
+    } catch (e) {
+      throw describeZphRelayError(e);
+    }
+    notifyZphSent();
+    return { hash: r.tx_hash || t.txHash || "" };
+  },
+
+  /** Unlocked and total balance of the asset a send draws on (2026-09-15). */
+  async getSendableBalance(assetType?: string): Promise<SendableBalance> {
+    if (!session) {
+      throw new Error("Zephyr session not initialized");
+    }
+    const asset = parseZphAssetSelector(assetType);
+    // No entry means none held: wallet-rpc omits zero balances
+    // (wallet_rpc_server.cpp:483-484).
+    const bal = await getBalanceForAsset(asset);
+    return {
+      unlocked: atomicToZph(bal?.unlocked_balance ?? 0),
+      total: atomicToZph(bal?.balance ?? 0),
+    };
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -699,36 +1015,56 @@ export const zphAdapter: ChainAdapter = {
     return { items };
   },
 
+  /**
+   * zephyr-wallet-rpc sets the fee itself from `priority`, exactly as
+   * monero-wallet-rpc does, so a missing estimate must not block Send.
+   *
+   * 2026-09-15 (operator): "RPC error -32601: Method not found Send is disabled
+   * until a fee is available." on Send ZEPH. The Monero half of this was fixed
+   * 2026-08-29 (see `WalletAdapter.networkComputesFee`); Zephyr is a Monero fork
+   * with the same wallet-rpc surface and the same `get_fee_estimate` call below,
+   * which is a DAEMON method the wallet-rpc does not have — and only Monero's
+   * adapter got the flag.
+   */
+  networkComputesFee: true,
+
+  /**
+   * No fee estimate exists without building the transaction.
+   *
+   * This called `get_fee_estimate`, a DAEMON method that zephyr-wallet-rpc does
+   * not have (absent from its method map, wallet_rpc_server.h:70-162 at
+   * v2.3.0), so every call failed with `RPC error -32601: Method not found`.
+   * A response without `fee`/`fees` would also have produced an estimate with
+   * no `normal` tier, which `SendModal` dereferences. Since 2026-09-15 the Send
+   * modal prices Zephyr sends with `quoteSend` and never calls this; any other
+   * caller gets a readable reason instead of a broken tier.
+   */
   async getFeeEstimate(): Promise<FeeEstimate> {
-    if (!session) {
-      throw new Error("Zephyr session not initialized");
-    }
-    const r = await getZphFeeEstimate(10);
-    const fees = r.fees && r.fees.length > 0 ? r.fees : [r.fee];
-    const tier = (i: number) =>
-      fees[i] !== undefined ? { value: atomicToZph(fees[i] * 1024) } : undefined;
-    const slow = tier(0);
-    const normal = tier(1) ?? tier(0)!;
-    const fast = tier(2) ?? tier(1) ?? normal;
-    return {
-      slow,
-      normal,
-      fast,
-      unit: "ZEPH/kB",
-      fetchedAt: Date.now(),
-      raw: r,
-    };
+    throw new Error(
+      "Zephyr fees are priced per send: enter a recipient and an amount to see the exact fee."
+    );
   },
 };
 
-function zphTransferToChainTx(t: ZphTransfer): ChainTx {
+/**
+ * One wallet-rpc transfer as a unified history row. Exported for tests.
+ *
+ * `pool` is INCOMING money seen in the mempool; `pending` is the OUTGOING
+ * unconfirmed one (wallet-rpc `get_transfers` categories). Until 2026-09-15
+ * `pool` mapped to direction "pending", which every renderer and the Sent
+ * filter treat as outgoing, so an unconfirmed receipt read "▲ sent". It is now
+ * "in" with 0 confirmations, which the renderers already show as a pending
+ * receipt. (`xmr-wallet.ts` still maps Monero's `pool` the old way; that file
+ * is not changed here.)
+ */
+export function zphTransferToChainTx(t: ZphTransfer): ChainTx {
   let direction: ChainTx["direction"];
   switch (t.type) {
     case "in":
       direction = "in";
       break;
     case "pool":
-      direction = "pending";
+      direction = "in";
       break;
     case "out":
       direction = "out";
@@ -751,7 +1087,9 @@ function zphTransferToChainTx(t: ZphTransfer): ChainTx {
     amount: atomicToZph(t.amount),
     fee: t.fee ? atomicToZph(t.fee) : undefined,
     timestamp: t.timestamp || undefined,
-    confirmations: t.confirmations,
+    // A mempool receipt has no confirmations by definition; set it explicitly
+    // rather than trusting the field, since "0" is what marks the row pending.
+    confirmations: t.type === "pool" ? 0 : t.confirmations,
     height: t.height || undefined,
     counterparty,
     meta: {
@@ -800,7 +1138,9 @@ export async function rescanZphFromHeight(
   seed: string,
   masterPassword: string,
   newHeight: number,
-  walletFilename: string = ZPH_WALLET_FILENAME
+  // REQUIRED — see `rescanXmrFromHeight`: this deletes the file first, and an
+  // omitted name deleted the primary wallet's `pwnda-zph-active` (2026-09-16).
+  walletFilename: string
 ): Promise<void> {
   try {
     await closeZphWallet();

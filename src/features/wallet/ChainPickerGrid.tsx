@@ -1,17 +1,22 @@
 import type { CSSProperties } from "react";
 import type { ChainAdapter, ChainType, WalletInfo } from "../../wallets/types";
 import { getAdapter } from "../../wallets";
-import { PIXEL_ICONS, PixelCoin } from "../../components/PixelCoin";
+import { CoinIcon } from "../../components/CoinIcon";
 
 /**
  * Portrait-mode chain selector — replaces the old horizontal chip strip
  * + native `<select>` combo with a tile grid that matches the design
  * vocabulary used in the Zephyr swap modal:
- *   - Color-coded badge per asset (the chain's brand color, with the
- *     pixel-art coin if available, ticker letters as fallback).
+ *   - The coin's own mark per asset: the shared `CoinIcon` ring + glyph in
+ *     the chain's colour, the same icon the assets rail and swap picker draw.
  *   - Ticker + balance stacked, mono font.
  *   - Active state: tinted background, brand-color border, glowing icon.
  *   - Disabled state: half-opacity, no hover.
+ *
+ * Until 2026-09-15 the icon was the legacy 16x16 `PixelCoin`, which had art
+ * for six coins (XMR ETH BTC SOL RVN CFX) and drew every other tile as a
+ * three-letter badge. `CoinIcon` has a glyph for every ticker in
+ * `COIN_METADATA`, and `CoinIcon.coverage.test.ts` keeps it that way.
  *
  * Independent-seed chains (Monero, Zephyr) are always selectable so the
  * dashboard can render their import panel for users who haven't loaded
@@ -96,7 +101,6 @@ function ChainTile({
   onClick: () => void;
 }) {
   const color = adapter.color;
-  const hasPixelIcon = !!PIXEL_ICONS[adapter.ticker];
 
   const baseStyle: CSSProperties = {
     display: "flex",
@@ -159,33 +163,15 @@ function ChainTile({
     >
       {accentStrip && <div style={accentStrip} />}
 
-      {/* Icon: pixel-art coin if available, else colored letter badge */}
-      {hasPixelIcon ? (
-        <PixelCoin
-          sym={adapter.ticker}
-          size={26}
-          color={active ? color : "rgba(242,242,242,0.85)"}
-          glow={active}
-        />
-      ) : (
-        <span
-          style={{
-            display: "inline-flex",
-            alignItems: "center",
-            justifyContent: "center",
-            width: 26,
-            height: 26,
-            background: active ? color : `${color}80`,
-            color: "#0a0a0a",
-            borderRadius: 13,
-            fontSize: 10,
-            fontWeight: 700,
-            letterSpacing: 0.3,
-          }}
-        >
-          {adapter.ticker.slice(0, 3)}
-        </span>
-      )}
+      {/* The coin's mark, coloured at rest as on the assets rail. Colour says
+          WHICH coin; the accent glow says which tile is active (see the
+          coin-colour-rules wiki page). Same 26px box the old icon used. */}
+      <CoinIcon
+        sym={adapter.ticker}
+        size={26}
+        color={color}
+        glow={active ? "accent" : false}
+      />
 
       <span style={tickerStyle}>{adapter.ticker}</span>
 

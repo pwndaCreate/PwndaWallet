@@ -376,9 +376,14 @@ pub async fn port_is_bound(port: u16) -> bool {
 /// immediately and hand the number to the sidecar. There is a benign race — the
 /// port could be taken in the gap — but the sidecar's own bind failure surfaces
 /// as a normal spawn error, and the window is microseconds.
+///
+/// `preferred == 0` means "any free port". Until 2026-09-16 it returned 0
+/// itself, because binding port 0 always succeeds: `xelis_start_rpc`'s retry
+/// attempts then launched the wallet on a random port and polled port 0 for the
+/// whole readiness budget (found by `xelis_rpc::live_bundled_light_client`).
 pub fn pick_free_port(preferred: u16) -> u16 {
     use std::net::TcpListener;
-    if TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
+    if preferred != 0 && TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
         return preferred;
     }
     TcpListener::bind(("127.0.0.1", 0))
@@ -433,19 +438,10 @@ pub fn delete_creds_file(path: &PathBuf) {
     let _ = std::fs::remove_file(path);
 }
 
-/// Force-kill a specific PID by number, no image filter. Used by the
-/// netstat fallback path. Returns the taskkill exit code.
-#[cfg(target_os = "windows")]
-pub async fn kill_pid_force(pid: u32) -> Result<i32, String> {
-    let mut cmd = tokio::process::Command::new("taskkill");
-    cmd.args(["/PID", &pid.to_string(), "/F"]);
-    cmd.creation_flags(CREATE_NO_WINDOW);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("taskkill /PID spawn failed: {}", e))?;
-    Ok(output.status.code().unwrap_or(-1))
-}
+// `kill_pid_force` lived here as a Windows-only taskkill wrapper. Its last
+// caller was a swap_sidecar itest, which broke the Linux test build (the item
+// is configured out there) and left a dead-code warning on Windows. Removed
+// 2026-09-16; use the cross-platform `crate::platform::kill_pid_force`.
 
 // =========================================================================
 // Log tail (for surfacing sidecar bind errors etc. to the user)
@@ -589,12 +585,37 @@ mod tests {
             sidecar_naming("zephyr").unwrap(),
             ("zephyr-wallet-rpc".to_string(), "zephyr-wallet-rpc".to_string())
         );
-        // The asymmetric one: bundle name != binary name.
+        // The asymmetric ones: bundle name != binary name.
         assert_eq!(
             sidecar_naming("zano").unwrap(),
             ("zano-simplewallet".to_string(), "simplewallet".to_string())
         );
+        // XELIS, 2026-09-15. Note the UNDERSCORE in the binary name: a
+        // `format!("{id}-wallet")` would produce "xelis-wallet" and the lookup
+        // for the extracted file would miss by one character.
+        assert_eq!(
+            sidecar_naming("xelis").unwrap(),
+            ("xelis-wallet".to_string(), "xelis_wallet".to_string())
+        );
         assert!(sidecar_naming("dogecoin").is_err());
+    }
+
+    /// Two of the four ids now have a binary name that is NOT derivable from
+    /// the id, so pin the property rather than only the values: every id must
+    /// resolve, and no two ids may resolve to the same binary.
+    #[test]
+    fn every_sidecar_id_resolves_to_a_distinct_binary() {
+        let ids = ["monero", "zephyr", "zano", "xelis"];
+        let mut binaries = Vec::new();
+        for id in ids {
+            let (gz, bin) = sidecar_naming(id).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert!(!gz.is_empty() && !bin.is_empty(), "{id} resolved to an empty name");
+            binaries.push(bin);
+        }
+        binaries.sort();
+        let before = binaries.len();
+        binaries.dedup();
+        assert_eq!(before, binaries.len(), "two sidecar ids share one binary name");
     }
 
     /// End-to-end proof of the bundled Zano path against a REAL fixture.
@@ -617,6 +638,41 @@ mod tests {
             "extracted simplewallet is too small"
         );
         println!("live zano bundle extract OK -> {}", out.display());
+        let _ = std::fs::remove_dir_all(&dest);
+    }
+
+    /// The bundled Xelis path against the REAL staged payload (2026-09-16).
+    /// Needs `xelis-wallet.gz` + a `sidecars.json` with a `xelis` entry for
+    /// THIS platform under `<DIR>/binaries/` (`node scripts/fetch-sidecars.mjs`
+    /// stages both into `src-tauri/binaries/`, so `<DIR>` is `src-tauri`):
+    ///   PWNDA_XELIS_BUNDLE_RES=<DIR> cargo test --lib \
+    ///     wallet_rpc_common::tests::live_xelis_bundle_extract -- --ignored --nocapture
+    #[test]
+    #[ignore = "needs a real xelis-wallet.gz + sidecars.json; set PWNDA_XELIS_BUNDLE_RES"]
+    fn live_xelis_bundle_extract() {
+        let resource = std::path::PathBuf::from(
+            std::env::var("PWNDA_XELIS_BUNDLE_RES").expect("PWNDA_XELIS_BUNDLE_RES"),
+        );
+        let dest = std::env::temp_dir().join(format!("pwnda-xelis-x-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dest);
+        let out = extract_bundled_sidecar(&resource, &dest, "xelis").expect("extract xelis");
+        assert_eq!(
+            out.file_name().and_then(|n| n.to_str()),
+            sidecar_binary_file_name("xelis").as_deref()
+        );
+        assert!(
+            std::fs::metadata(&out).map(|m| m.len() >= 5 * 1024 * 1024).unwrap_or(false),
+            "extracted xelis_wallet is too small"
+        );
+        let marker = std::fs::read_to_string(dest.join(".sidecar-version")).expect("marker");
+        assert_eq!(Some(marker), bundled_sidecar_version(&resource, "xelis"));
+        // The wallet binary, and nothing else, lands in the destination.
+        let names: Vec<String> = std::fs::read_dir(&dest)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 2, "expected the binary and its marker, got {names:?}");
+        println!("live xelis bundle extract OK -> {}", out.display());
         let _ = std::fs::remove_dir_all(&dest);
     }
 
@@ -762,6 +818,17 @@ mod tests {
         drop(hog);
     }
 
+    /// `pick_free_port(0)` is "any free port", never the unusable 0 — the
+    /// value `xelis_start_rpc` passes on every retry (2026-09-16).
+    #[test]
+    fn pick_free_port_zero_means_any_port() {
+        for _ in 0..3 {
+            let picked = pick_free_port(0);
+            assert_ne!(picked, 0, "0 is not a port a sidecar can be told to bind");
+            assert!(std::net::TcpListener::bind(("127.0.0.1", picked)).is_ok());
+        }
+    }
+
     /// TCP-level port check: nothing listening on 127.0.0.1:1 (reserved).
     #[tokio::test]
     #[ignore]
@@ -839,6 +906,9 @@ pub struct SidecarManifest {
     /// blocked network at import does not strand it (2026-08-28). Unlike the
     /// other two it is NOT a `-wallet-rpc` binary; see `sidecar_naming`.
     pub zano: Option<SidecarEntry>,
+    /// XELIS's `xelis_wallet` (2026-09-15). Third binary whose name breaks the
+    /// `<id>-wallet-rpc` pattern — underscore, and no "rpc" in it at all.
+    pub xelis: Option<SidecarEntry>,
 }
 
 /// Map a sidecar id to its `(gz basename, binary basename)`.
@@ -853,8 +923,21 @@ fn sidecar_naming(which: &str) -> Result<(String, String), String> {
             Ok((format!("{which}-wallet-rpc"), format!("{which}-wallet-rpc")))
         }
         "zano" => Ok(("zano-simplewallet".to_string(), "simplewallet".to_string())),
+        // XELIS ships `xelis_wallet` (underscore, no "rpc"), so the bundle name
+        // and the binary name differ here too — the second instance of the
+        // asymmetry Zano introduced, which is why this is a lookup.
+        "xelis" => Ok(("xelis-wallet".to_string(), "xelis_wallet".to_string())),
         other => Err(format!("unknown sidecar '{other}'")),
     }
+}
+
+/// File name of `which`'s binary on this platform (`xelis_wallet.exe`,
+/// `simplewallet`, …), or `None` for an unknown id. For callers outside this
+/// module that need to find an unpacked copy without extracting anything.
+pub fn sidecar_binary_file_name(which: &str) -> Option<String> {
+    sidecar_naming(which)
+        .ok()
+        .map(|(_, bin)| format!("{}{}", bin, crate::platform::EXE_SUFFIX))
 }
 
 /// Platform tag as written by the fetch script.
@@ -893,6 +976,7 @@ fn bundled_sidecar_entry(
         "monero" => manifest.monero,
         "zephyr" => manifest.zephyr,
         "zano" => manifest.zano,
+        "xelis" => manifest.xelis,
         other => return Err(format!("unknown sidecar '{}'", other)),
     }
     .ok_or_else(|| format!("no bundled '{}' sidecar in manifest", which))?;

@@ -98,6 +98,41 @@ async function fetchErgo(): Promise<number | null> {
   }
 }
 
+/** XELIS consensus block-time target (5 s since the V3 fork at height 3,282,150). */
+const XELIS_BLOCK_TIME_TARGET_SECS = 5;
+
+async function fetchXelis(): Promise<number | null> {
+  // XELIS daemon JSON-RPC `get_info`. Verified 2026-09-15 against
+  // node.xelis.io (daemon 1.25.0): the POST answers with
+  // `Access-Control-Allow-Origin: *`, and the CORS preflight for a JSON body
+  // returns 204 allowing `Content-Type`. Fields used:
+  //   difficulty: "249508910"  — a decimal STRING, not a number
+  //   block_time_target: 5000  — milliseconds
+  // Network hashrate = difficulty / target seconds, the same figure K1Pool
+  // reported as `networkSpeed` that minute (49.9 vs 51.6 MH/s).
+  try {
+    const r = await fetch("https://node.xelis.io/json_rpc", {
+      method: "POST",
+      headers: { accept: "application/json", "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "get_info" }),
+    });
+    if (!r.ok) return null;
+    const j = (await r.json()) as {
+      result?: { difficulty?: string | number; block_time_target?: number };
+    };
+    const diff = Number(j.result?.difficulty);
+    if (!Number.isFinite(diff) || diff <= 0) return null;
+    const targetMs = j.result?.block_time_target;
+    const targetSecs =
+      typeof targetMs === "number" && targetMs > 0
+        ? targetMs / 1000
+        : XELIS_BLOCK_TIME_TARGET_SECS;
+    return diff / targetSecs;
+  } catch {
+    return null;
+  }
+}
+
 async function fetchOne(chain: ChainType): Promise<number | null> {
   switch (chain) {
     case "monero":
@@ -106,6 +141,8 @@ async function fetchOne(chain: ChainType): Promise<number | null> {
       return fetchRavencoin();
     case "ergo":
       return fetchErgo();
+    case "xelis":
+      return fetchXelis();
     case "zephyr":
     case "conflux":
     default:

@@ -89,6 +89,11 @@ enum PayoutKind {
     /// `status: false` → user not registered, return Ok(None) so the
     /// frontend uses the static fallback.
     NanopoolUserSettingsJson,
+    /// K1Pool account endpoint `GET /api/miner/<coin>/<address>`:
+    /// `miner.payoutThreshold` in whole coins (3 for XEL, 2026-09-15). The
+    /// account is keyed by the address WITHOUT its `xel:` prefix; the
+    /// threshold comes back even for an address that has never mined.
+    K1poolMinerJson,
 }
 
 const ENDPOINTS: &[PayoutEndpoint] = &[
@@ -204,6 +209,31 @@ const ENDPOINTS: &[PayoutEndpoint] = &[
         ticker: "ERG",
         requires_address: true,
     },
+    // Xelis (XEL) — K1Pool's account endpoint carries the account's own
+    // `payoutThreshold`. Verified live 2026-09-15 (3 XEL for both a real active
+    // account and a never-used one). Three ports, one account backend. The
+    // `xel:` prefix is stripped before substitution — see `api_address`.
+    PayoutEndpoint {
+        id: "k1pool-xelis-cpu",
+        url_template: "https://k1pool.com/api/miner/xel/{addr}",
+        kind: PayoutKind::K1poolMinerJson,
+        ticker: "XEL",
+        requires_address: true,
+    },
+    PayoutEndpoint {
+        id: "k1pool-xelis-gpu",
+        url_template: "https://k1pool.com/api/miner/xel/{addr}",
+        kind: PayoutKind::K1poolMinerJson,
+        ticker: "XEL",
+        requires_address: true,
+    },
+    PayoutEndpoint {
+        id: "k1pool-xelis-ssl",
+        url_template: "https://k1pool.com/api/miner/xel/{addr}",
+        kind: PayoutKind::K1poolMinerJson,
+        ticker: "XEL",
+        requires_address: true,
+    },
 ];
 
 /// Bare hosts these endpoints can reach. Defense in depth — if someone
@@ -217,6 +247,8 @@ const ALLOWED_HOSTS: &[&str] = &[
     "ergo.herominers.com",
     "api.woolypooly.com",
     "api.nanopool.org",
+    // K1Pool account API (Xelis, 2026-09-15).
+    "k1pool.com",
 ];
 
 fn is_host_allowed(host: &str) -> bool {
@@ -250,7 +282,9 @@ pub async fn fetch_pool_min_payout(
         let Some(addr) = address.as_deref().filter(|s| !s.is_empty()) else {
             return Ok(None);
         };
-        endpoint.url_template.replace("{addr}", addr)
+        endpoint
+            .url_template
+            .replace("{addr}", api_address(endpoint.kind, addr))
     } else {
         endpoint.url_template.to_string()
     };
@@ -285,6 +319,7 @@ pub async fn fetch_pool_min_payout(
         PayoutKind::HerominersJson => Some(parse_herominers(&body, endpoint.ticker)?),
         PayoutKind::WoolypoolyJson => Some(parse_woolypooly(&body, endpoint.ticker)?),
         PayoutKind::NanopoolUserSettingsJson => parse_nanopool_user_settings(&body, endpoint.ticker)?,
+        PayoutKind::K1poolMinerJson => Some(parse_k1pool_payout_threshold(&body, endpoint.ticker)?),
     };
 
     Ok(display_opt.map(|display| PoolPayoutInfo {
@@ -390,10 +425,73 @@ fn format_amount(amount: f64, ticker: &str) -> String {
     format!("{} {}", s, ticker)
 }
 
+/// The address in the form the endpoint expects for `{addr}`. K1Pool keys a
+/// Xelis account by the address WITHOUT its `xel:` prefix (verified
+/// 2026-09-15 — see `pool_stats::api_address` for the evidence); every other
+/// endpoint takes the address as given.
+fn api_address(kind: PayoutKind, address: &str) -> &str {
+    match kind {
+        PayoutKind::K1poolMinerJson => {
+            let trimmed = address.trim();
+            trimmed.strip_prefix("xel:").unwrap_or(trimmed)
+        }
+        _ => address,
+    }
+}
+
+/// K1Pool `/api/miner/<coin>/<address>` → `miner.payoutThreshold`, in whole
+/// coins (`3` for XEL on 2026-09-15). Present even for an address the pool
+/// has never seen, so a missing field is a shape change worth surfacing.
+fn parse_k1pool_payout_threshold(v: &serde_json::Value, ticker: &str) -> Result<String, String> {
+    let amount = v
+        .get("miner")
+        .and_then(|m| m.get("payoutThreshold"))
+        .and_then(|x| {
+            x.as_f64()
+                .or_else(|| x.as_str().and_then(|s| s.parse::<f64>().ok()))
+        })
+        .ok_or_else(|| "k1pool: miner.payoutThreshold missing or not a number".to_string())?;
+    Ok(format_amount(amount, ticker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn k1pool_payout_threshold_parses_the_live_shape() {
+        // Shape of `/api/miner/xel/<address>` on 2026-09-15 (trimmed).
+        let body = json!({ "miner": { "payoutThreshold": 3, "pendingBalance": 0 } });
+        assert_eq!(parse_k1pool_payout_threshold(&body, "XEL").unwrap(), "3 XEL");
+    }
+
+    #[test]
+    fn k1pool_payout_without_threshold_is_an_error() {
+        let body = json!({ "miner": { "pendingBalance": 0 } });
+        assert!(parse_k1pool_payout_threshold(&body, "XEL").is_err());
+    }
+
+    #[test]
+    fn k1pool_address_prefix_is_stripped_and_nothing_else_is() {
+        assert_eq!(api_address(PayoutKind::K1poolMinerJson, "xel:nm46abc"), "nm46abc");
+        assert_eq!(api_address(PayoutKind::HerominersJson, "xel:nm46abc"), "xel:nm46abc");
+    }
+
+    #[test]
+    fn every_xel_k1pool_payout_endpoint_is_allowlisted_and_needs_an_address() {
+        let xel: Vec<_> = ENDPOINTS
+            .iter()
+            .filter(|e| e.id.starts_with("k1pool-xelis"))
+            .collect();
+        assert_eq!(xel.len(), 3);
+        for e in xel {
+            assert!(e.requires_address, "{}", e.id);
+            let url = e.url_template.replace("{addr}", api_address(e.kind, "xel:abc"));
+            assert_eq!(url, "https://k1pool.com/api/miner/xel/abc");
+            assert!(is_host_allowed(host_of(&url).unwrap()), "{}", e.id);
+        }
+    }
 
     #[test]
     fn herominers_cfx_parses() {

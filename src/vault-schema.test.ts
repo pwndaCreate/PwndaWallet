@@ -27,6 +27,9 @@ import {
   type VaultPayloadV3,
   type WalletEntry,
   legacyZanoSeedFor,
+  addXelisWalletToContext,
+  flatSeedRefusal,
+  repairSharedSidecarFiles,
 } from "./vault-schema";
 
 /** A full vault + a standalone "Trading" bip39 + a standalone "Cold" xmr.
@@ -854,5 +857,571 @@ describe("the legacy vault-wide zanoSeed is scoped to its own context", () => {
     const v3 = legacyTopLevelZano();
     expect(legacyZanoSeedFor(v3, undefined)).not.toBeNull();
     expect(legacyZanoSeedFor({ ...v3, zanoSeed: null }, undefined)).toBeNull();
+  });
+});
+
+/**
+ * Xelis as a WalletKind (2026-09-15).
+ *
+ * Xelis is an entry from its first release, so it has none of Zano's history:
+ * no vault-wide seed field, no legacy fixed filename, nothing to migrate. It
+ * meets one hazard Zano never did, because Zano is in the flat projection and
+ * Xelis is not: `saveVault(flat)` rebuilds the open context's group from
+ * bip39/xmr/zph/zano, so an entry the flat shape cannot describe would be
+ * dropped by the next unrelated save (a Solana derivation change, a Monero
+ * import). The first test failed against `mergeFlatIntoV3` as it stood before
+ * this change.
+ */
+const XELIS_SEED = "a twenty-five word xelis seed …";
+
+/** Counter-based ids with a prefix, so two generators in one test never collide. */
+function prefixedGen(prefix: string): () => string {
+  let n = 0;
+  return () => `${prefix}-${++n}`;
+}
+
+describe("xelis as a WalletKind (2026-09-15)", () => {
+  /**
+   * Main (bip39 + xmr + zph + zano) with a Xelis wallet in the same group.
+   *
+   * The group is named explicitly, NOT taken from `primaryGroupSlotFor`. The
+   * first version of this helper used the slot, which returned undefined for
+   * `xelis` before this change, so the entry landed in a group of its own and
+   * the flat-save test below passed against the very merge that drops it.
+   */
+  function mainWithXelis(): { v3: VaultPayloadV3; xelis: WalletEntry } {
+    const gen = idGen();
+    const base = migrateV2ToV3(fullV2(), { now: NOW, genId: gen });
+    const primaryGid = base.wallets.find((w) => w.kind === "bip39")!.groupId;
+    const { v3, entry } = addWalletEntry(
+      base,
+      { kind: "xelis", seed: XELIS_SEED, name: "Main · Xelis", groupId: primaryGid },
+      { now: NOW + 1, genId: gen },
+    );
+    return { v3, xelis: entry };
+  }
+
+  it("a flat save keeps the open context's Xelis wallet in the vault", () => {
+    const { v3, xelis } = mainWithXelis();
+    // Precondition: the Xelis wallet is in the group the save rebuilds.
+    expect(isInActiveContext(v3, xelis)).toBe(true);
+    // A derivation change: the kind of save that knows nothing about Xelis.
+    const flat: VaultPayload = {
+      ...projectV3ToV2(v3),
+      derivationChoice: { bitcoin: "bip44", solana: "standard", cardano: "cip1852" },
+    };
+    const after = mergeFlatIntoV3(flat, v3, { now: NOW + 2, genId: idGen() });
+    expect(after.wallets.find((w) => w.id === xelis.id)).toEqual(xelis);
+    expect(after.wallets).toHaveLength(v3.wallets.length);
+  });
+
+  it("the same holds for a save into a context that is not primary", () => {
+    const gen = prefixedGen("t");
+    let v3 = multiV3();
+    const trading = listContexts(v3).find((c) => c.name === "Trading")!;
+    const added = addWalletEntry(
+      v3,
+      { kind: "xelis", seed: XELIS_SEED, name: "Trading · Xelis", groupId: trading.groupId },
+      { now: NOW + 40, genId: gen },
+    );
+    v3 = added.v3;
+    const flat = { ...projectV3ToV2(v3, trading.id), bip39: NEW_SEED };
+    const after = mergeFlatIntoV3(flat, v3, { activeWalletId: trading.id, genId: gen });
+    expect(after.wallets.find((w) => w.id === added.entry.id)).toEqual(added.entry);
+    expect(after.wallets).toHaveLength(v3.wallets.length);
+  });
+
+  it("adding Xelis needs no migration: v stays 3 and nothing else changes", () => {
+    const before = migrateV2ToV3(fullV2(), det());
+    const { v3: after } = addWalletEntry(
+      before,
+      { kind: "xelis", seed: XELIS_SEED, name: "Xelis wallet" },
+      { now: NOW + 1, genId: prefixedGen("x") },
+    );
+    expect(after.v).toBe(3);
+    expect(after.wallets.slice(0, before.wallets.length)).toEqual(before.wallets);
+    // The flat working shape has no Xelis field, so every existing reader of
+    // it sees exactly what it saw before.
+    expect(projectV3ToV2(after)).toEqual(projectV3ToV2(before));
+    expect(Object.keys(projectV3ToV2(after)).some((k) => /xelis/i.test(k))).toBe(false);
+    // The store persists `JSON.stringify(v3)`; the entry survives that as-is.
+    expect(JSON.parse(JSON.stringify(after))).toEqual(after);
+    // No top-level seed field was introduced for it.
+    expect(Object.keys(after).some((k) => /xelis/i.test(k))).toBe(false);
+  });
+
+  it("every Xelis wallet gets its own wallet directory, and two never share one", () => {
+    const gen = idGen();
+    const v3 = migrateV2ToV3(fullV2(), { now: NOW, genId: gen });
+    const a = addWalletEntry(v3, { kind: "xelis", seed: "xelis seed a", name: "A" }, { now: NOW + 1, genId: gen });
+    const b = addWalletEntry(a.v3, { kind: "xelis", seed: "xelis seed b", name: "B" }, { now: NOW + 2, genId: gen });
+    expect(a.entry.sidecarFile).toBe(`pwnda-xelis-${a.entry.id}`);
+    expect(b.entry.sidecarFile).toBe(`pwnda-xelis-${b.entry.id}`);
+    expect(a.entry.sidecarFile).not.toBe(b.entry.sidecarFile);
+    // A directory name, so no extension (Zano's is a `.zan` file).
+    expect(a.entry.sidecarFile).not.toContain(".");
+    expect(sidecarFileForEntry(a.entry)).toBe(a.entry.sidecarFile);
+    expect(sidecarFileForEntry({ ...a.entry, sidecarFile: undefined })).toBe(
+      newSidecarFile("xelis", a.entry.id),
+    );
+    // A seed wallet, not the single-chain branch.
+    expect(a.entry.chain).toBeUndefined();
+    expect(a.entry.address).toBeUndefined();
+  });
+
+  it("offers the primary group's empty Xelis slot, and no slot once it is filled", () => {
+    const base = migrateV2ToV3(fullV2(), det());
+    const primaryGid = base.wallets.find((w) => w.kind === "bip39")!.groupId;
+    expect(primaryGroupSlotFor(base, "xelis")).toBe(primaryGid);
+    const { v3, xelis } = mainWithXelis();
+    expect(xelis.groupId).toBe(v3.wallets.find((w) => w.kind === "bip39")!.groupId);
+    expect(primaryGroupSlotFor(v3, "xelis")).toBeUndefined();
+  });
+
+  it("switch: the Xelis wallet belongs to its own context only", () => {
+    const { v3: withMain, xelis } = mainWithXelis();
+    const v3 = addWalletEntry(
+      withMain,
+      { kind: "bip39", seed: "trading seed", name: "Trading" },
+      { now: NOW + 3, genId: prefixedGen("t") },
+    ).v3;
+    expect(memberOfKind(contextForWallet(v3, "all"), "xelis")?.id).toBe(xelis.id);
+    const trading = listContexts(v3).find((c) => c.name === "Trading")!;
+    expect(memberOfKind(trading, "xelis")).toBeUndefined();
+  });
+
+  it("remove: drops the entry, returns it for teardown, and says whether it was open", () => {
+    const { v3, xelis } = mainWithXelis();
+    expect(isInActiveContext(v3, xelis)).toBe(true);
+    const { v3: next, removed, wasLast } = removeWalletEntry(v3, xelis.id);
+    expect(removed).toEqual(xelis);
+    expect(wasLast).toBe(false);
+    expect(next.wallets.some((w) => w.kind === "xelis")).toBe(false);
+    expect(next.wallets).toHaveLength(v3.wallets.length - 1);
+  });
+
+  describe("addXelisWalletToContext (the dashboard import panel's write)", () => {
+    it("adds into the context the user is on, with its own directory", () => {
+      const v3 = multiV3();
+      const trading = listContexts(v3).find((c) => c.name === "Trading")!;
+      const { v3: next, entry, created } = addXelisWalletToContext(v3, XELIS_SEED, {
+        activeWalletId: trading.id,
+        now: NOW + 30,
+        genId: prefixedGen("x"),
+      });
+      expect(created).toBe(true);
+      expect(entry.kind).toBe("xelis");
+      expect(entry.groupId).toBe(trading.groupId);
+      expect(entry.name).toBe("Trading · Xelis");
+      expect(entry.sidecarFile).toBe(`pwnda-xelis-${entry.id}`);
+      const tradingAfter = listContexts(next).find((c) => c.name === "Trading")!;
+      expect(memberOfKind(tradingAfter, "xelis")?.id).toBe(entry.id);
+      // Main is untouched.
+      expect(memberOfKind(listContexts(next)[0], "xelis")).toBeUndefined();
+    });
+
+    it("with no context selected, adds to Main", () => {
+      const v3 = migrateV2ToV3(fullV2(), det());
+      const { entry } = addXelisWalletToContext(v3, XELIS_SEED, { genId: prefixedGen("x") });
+      expect(entry.groupId).toBe(listContexts(v3)[0].groupId);
+      expect(entry.name).toBe("Main · Xelis");
+    });
+
+    it("saving the same seed again changes nothing (a double click saves once)", () => {
+      const { v3, xelis } = mainWithXelis();
+      const again = addXelisWalletToContext(v3, `  ${XELIS_SEED.toUpperCase()} `, {
+        genId: prefixedGen("x"),
+      });
+      expect(again.created).toBe(false);
+      expect(again.entry).toEqual(xelis);
+      expect(again.v3).toBe(v3);
+    });
+
+    it("refuses to replace a different Xelis seed in that context", () => {
+      const { v3 } = mainWithXelis();
+      expect(() =>
+        addXelisWalletToContext(v3, "a different xelis seed", { genId: prefixedGen("x") }),
+      ).toThrow(/already has a Xelis wallet/);
+    });
+
+    it("refuses words already saved as another wallet, such as a Monero seed", () => {
+      // A Xelis seed and a Monero legacy seed use the same English list and
+      // checksum, so the words alone cannot say which coin they are for.
+      const v3 = multiV3();
+      expect(() =>
+        addXelisWalletToContext(v3, "cold seed", { genId: prefixedGen("x") }),
+      ).toThrow(/already saved as "Cold"/);
+    });
+  });
+});
+
+/**
+ * A Monero or Zephyr wallet imported from the dashboard of a SECOND wallet
+ * context (2026-09-16).
+ *
+ * `mergeFlatIntoV3` named every new flat xmr/zph entry after the legacy fixed
+ * file, so an import into "Trading" was stored as `pwnda-active` /
+ * `pwnda-zph-active` — Main's files. Both entries then opened one wallet, and
+ * the address-mismatch self-heal in xmr-wallet.ts / zph-wallet.ts deletes the
+ * file it opened. The first two tests failed against the merge as it stood.
+ */
+describe("flat xmr/zph import into a second context (2026-09-16)", () => {
+  /** Main (upgraded, so it holds the legacy names) plus a bip39-only
+   *  "Trading" context, then an XMR + ZPH import written into Trading through
+   *  the flat path, the way `XmrImportPanel` / `ZphImportPanel` save. */
+  function importIntoTrading() {
+    const gen = prefixedGen("m");
+    const base = migrateV2ToV3(fullV2(), { now: NOW, genId: gen });
+    const trading = addWalletEntry(
+      base,
+      { kind: "bip39", seed: "trading seed", name: "Trading" },
+      { now: NOW + 10, genId: gen },
+    );
+    const before = trading.v3;
+    const flat: VaultPayload = {
+      ...projectV3ToV2(before, trading.entry.id),
+      xmrSeed: "trading xmr seed",
+      zphSeed: "trading zph seed",
+    };
+    const after = mergeFlatIntoV3(flat, before, {
+      activeWalletId: trading.entry.id,
+      now: NOW + 20,
+      genId: gen,
+    });
+    return {
+      before,
+      after,
+      main: contextForWallet(after, "all"),
+      trading: contextForWallet(after, trading.entry.id),
+    };
+  }
+
+  it("gives the imported wallets their own files, not Main's", () => {
+    const { main, trading } = importIntoTrading();
+    // Positive control: both contexts really hold both kinds, and they are
+    // two different contexts.
+    expect(main?.groupId).not.toBe(trading?.groupId);
+    for (const kind of ["xmr", "zph"] as const) {
+      expect(memberOfKind(main, kind)).toBeDefined();
+      expect(memberOfKind(trading, kind)).toBeDefined();
+    }
+    expect(sidecarFileForEntry(memberOfKind(main, "xmr")!)).toBe(LEGACY_XMR_SIDECAR_FILE);
+    expect(sidecarFileForEntry(memberOfKind(main, "zph")!)).toBe(LEGACY_ZPH_SIDECAR_FILE);
+    const tXmr = memberOfKind(trading, "xmr")!;
+    const tZph = memberOfKind(trading, "zph")!;
+    expect(tXmr.sidecarFile).toBe(newSidecarFile("xmr", tXmr.id));
+    expect(tZph.sidecarFile).toBe(newSidecarFile("zph", tZph.id));
+  });
+
+  it("leaves no two wallets of one kind on the same file", () => {
+    const { after } = importIntoTrading();
+    for (const kind of ["xmr", "zph"] as const) {
+      const files = after.wallets
+        .filter((w) => w.kind === kind)
+        .map((w) => sidecarFileForEntry(w));
+      expect(files.length).toBe(2); // Main's and Trading's
+      expect(new Set(files).size).toBe(files.length);
+    }
+  });
+
+  it("leaves Main's entries exactly as they were", () => {
+    const { before, after } = importIntoTrading();
+    const mainMembers = contextForWallet(before, "all")!.members;
+    expect(mainMembers.length).toBeGreaterThan(0);
+    for (const w of mainMembers) {
+      expect(after.wallets.find((x) => x.id === w.id)).toEqual(w);
+    }
+  });
+
+  it("a first-ever import still claims the legacy names, so nobody rescans", () => {
+    const existing = migrateV2ToV3({ v: 2, bip39: "m", xmrSeed: null }, det());
+    const flat: VaultPayload = {
+      ...projectV3ToV2(existing),
+      xmrSeed: "first xmr",
+      zphSeed: "first zph",
+    };
+    const next = mergeFlatIntoV3(flat, existing, { now: NOW + 1, genId: idGen() });
+    expect(xmrOf(next)!.sidecarFile).toBe(LEGACY_XMR_SIDECAR_FILE);
+    expect(zphOf(next)!.sidecarFile).toBe(LEGACY_ZPH_SIDECAR_FILE);
+  });
+
+  it("an entry that already exists keeps the name it stores, even a colliding one", () => {
+    // What a vault written before this fix can already hold: Trading's XMR
+    // stored under Main's name. Renaming it here would quietly point that
+    // wallet at another file; repairing such a vault is a separate decision.
+    const { after, trading } = importIntoTrading();
+    const xmrId = memberOfKind(trading, "xmr")!.id;
+    const collided: VaultPayloadV3 = {
+      ...after,
+      wallets: after.wallets.map((w) =>
+        w.id === xmrId ? { ...w, sidecarFile: LEGACY_XMR_SIDECAR_FILE } : w,
+      ),
+    };
+    const flat: VaultPayload = {
+      ...projectV3ToV2(collided, xmrId),
+      xmrRestoreHeight: 3_000_000,
+    };
+    const next = mergeFlatIntoV3(flat, collided, {
+      activeWalletId: xmrId,
+      now: NOW + 30,
+      genId: prefixedGen("n"),
+    });
+    const xmr = next.wallets.find((w) => w.id === xmrId)!;
+    expect(xmr.restoreHeight).toBe(3_000_000); // the save really landed
+    expect(xmr.sidecarFile).toBe(LEGACY_XMR_SIDECAR_FILE);
+  });
+});
+
+/**
+ * The flat import saves' guard (2026-09-16).
+ *
+ * Found by the verification of the naming fix above: in the sandbox, an import
+ * into a context that already held Monero kept the entry's id and file and
+ * REPLACED its seed — the only stored copy. `flatSeedRefusal` is what
+ * `saveXmrSeedToVault` / `saveZphSeedToVault` / `saveZanoSeedToVault` now ask
+ * before they write (their wiring is pinned in
+ * `src/features/vault/walletFileGuardAndRepair.test.ts`).
+ */
+describe("flatSeedRefusal (2026-09-16)", () => {
+  const flatWith = (over: Partial<VaultPayload>): VaultPayload =>
+    ({ v: 2, bip39: "m", xmrSeed: null, ...over }) as VaultPayload;
+
+  it("lets a first import through: there is nothing to replace", () => {
+    expect(flatSeedRefusal(flatWith({}), "xmr", "new words")).toBeNull();
+    expect(flatSeedRefusal(flatWith({ xmrSeed: null }), "xmr", "new words")).toBeNull();
+    expect(flatSeedRefusal(flatWith({ zphSeed: "  " }), "zph", "new words")).toBeNull();
+    expect(flatSeedRefusal(flatWith({ zanoSeed: null }), "zano", "new words")).toBeNull();
+  });
+
+  it("lets the SAME seed through however it is spaced or cased (the scan-date re-save)", () => {
+    expect(flatSeedRefusal(flatWith({ xmrSeed: "alpha beta gamma" }), "xmr", "  Alpha  beta\ngamma ")).toBeNull();
+    expect(flatSeedRefusal(flatWith({ zphSeed: "alpha beta" }), "zph", "alpha beta")).toBeNull();
+    expect(flatSeedRefusal(flatWith({ zanoSeed: "alpha beta" }), "zano", "alpha beta")).toBeNull();
+  });
+
+  it("refuses a different seed, for each kind", () => {
+    expect(flatSeedRefusal(flatWith({ xmrSeed: "old words" }), "xmr", "new words")).toBe("different-seed");
+    expect(flatSeedRefusal(flatWith({ zphSeed: "old words" }), "zph", "new words")).toBe("different-seed");
+    expect(flatSeedRefusal(flatWith({ zanoSeed: "old words" }), "zano", "new words")).toBe("different-seed");
+  });
+
+  it("reads only the kind it is asked about", () => {
+    const current = flatWith({ xmrSeed: "monero words" });
+    expect(flatSeedRefusal(current, "zph", "zephyr words")).toBeNull();
+    expect(flatSeedRefusal(current, "zano", "zano words")).toBeNull();
+  });
+
+  it("treats a Zano seed under another passphrase as another wallet", () => {
+    const current = flatWith({ zanoSeed: "zano words", zanoSeedPassphrase: "pass-a" });
+    expect(flatSeedRefusal(current, "zano", "zano words", "pass-b")).toBe("different-passphrase");
+    expect(flatSeedRefusal(current, "zano", "zano words", "")).toBe("different-passphrase");
+    expect(flatSeedRefusal(current, "zano", "zano words", "pass-a")).toBeNull();
+    // Stored with no passphrase: the save leaves the field out when it is empty.
+    expect(flatSeedRefusal(flatWith({ zanoSeed: "zano words" }), "zano", "zano words")).toBeNull();
+    expect(flatSeedRefusal(flatWith({ zanoSeed: "zano words" }), "zano", "zano words", "p")).toBe(
+      "different-passphrase",
+    );
+  });
+
+  it("answers for the context being written, not for Main", () => {
+    const v3 = multiV3(); // Main holds Monero; Trading holds none
+    const trading = listContexts(v3).find((c) => c.name === "Trading")!;
+    expect(flatSeedRefusal(projectV3ToV2(v3, trading.id), "xmr", "new words")).toBeNull();
+    expect(flatSeedRefusal(projectV3ToV2(v3), "xmr", "new words")).toBe("different-seed");
+  });
+
+  it("guards a real hazard: the flat merge swaps the seed and keeps the id and file", () => {
+    // Why the guard exists, pinned so a future merge that stops doing this
+    // can revisit whether the guard is still the right place.
+    const v3 = migrateV2ToV3(fullV2(), det());
+    const before = xmrOf(v3)!;
+    const flat: VaultPayload = { ...projectV3ToV2(v3), xmrSeed: "a different wallet" };
+    const merged = mergeFlatIntoV3(flat, v3, { now: NOW + 1, genId: idGen() });
+    const after = xmrOf(merged)!;
+    expect(after.id).toBe(before.id);
+    expect(after.sidecarFile).toBe(before.sidecarFile);
+    expect(after.seed).toBe("a different wallet");
+    expect(findDuplicateSeed(merged, before.seed)).toBeUndefined(); // the old seed is gone
+  });
+});
+
+/**
+ * The repair for vaults written before the naming fix (2026-09-16).
+ *
+ * Such a vault can hold a second context's Monero/Zephyr entry stored under
+ * Main's file name. `useVault` runs this at unlock (persisting the result) and
+ * again on every wallet switch, before any session opens a file.
+ */
+describe("repairSharedSidecarFiles (2026-09-16)", () => {
+  const filesOf = (v3: VaultPayloadV3, kind: string) =>
+    v3.wallets.filter((w) => w.kind === kind).map((w) => sidecarFileForEntry(w));
+
+  /** Main (legacy names) plus "Trading", whose Monero and Zephyr came in
+   *  through its dashboard and were stored under Main's names — what the
+   *  pre-fix merge wrote. Built from today's import and then collided by hand,
+   *  because the fixed merge no longer produces it. */
+  function collidedVault() {
+    const gen = prefixedGen("c");
+    const base = migrateV2ToV3(fullV2(), { now: NOW, genId: gen });
+    const trading = addWalletEntry(
+      base,
+      { kind: "bip39", seed: "trading seed", name: "Trading" },
+      { now: NOW + 10, genId: gen },
+    );
+    const flat: VaultPayload = {
+      ...projectV3ToV2(trading.v3, trading.entry.id),
+      xmrSeed: "trading xmr",
+      zphSeed: "trading zph",
+    };
+    const imported = mergeFlatIntoV3(flat, trading.v3, {
+      activeWalletId: trading.entry.id,
+      now: NOW + 20,
+      genId: gen,
+    });
+    const legacy: Record<string, string> = {
+      xmr: LEGACY_XMR_SIDECAR_FILE,
+      zph: LEGACY_ZPH_SIDECAR_FILE,
+    };
+    const movedIds = new Set(
+      contextForWallet(imported, trading.entry.id)!
+        .members.filter((m) => m.kind === "xmr" || m.kind === "zph")
+        .map((m) => m.id),
+    );
+    const v3: VaultPayloadV3 = {
+      ...imported,
+      wallets: imported.wallets.map((w) =>
+        movedIds.has(w.id) ? { ...w, sidecarFile: legacy[w.kind] } : w,
+      ),
+    };
+    return { v3, tradingId: trading.entry.id, movedIds };
+  }
+
+  it("positive control: the fixture really puts two wallets on each file", () => {
+    const { v3, movedIds } = collidedVault();
+    expect(movedIds.size).toBe(2);
+    expect(filesOf(v3, "xmr")).toEqual([LEGACY_XMR_SIDECAR_FILE, LEGACY_XMR_SIDECAR_FILE]);
+    expect(filesOf(v3, "zph")).toEqual([LEGACY_ZPH_SIDECAR_FILE, LEGACY_ZPH_SIDECAR_FILE]);
+  });
+
+  it("Main keeps the legacy names; the second context's wallets get their own", () => {
+    const { v3, tradingId } = collidedVault();
+    const { v3: fixed, repairs } = repairSharedSidecarFiles(v3);
+    const main = contextForWallet(fixed, "all");
+    const trading = contextForWallet(fixed, tradingId);
+    expect(sidecarFileForEntry(memberOfKind(main, "xmr")!)).toBe(LEGACY_XMR_SIDECAR_FILE);
+    expect(sidecarFileForEntry(memberOfKind(main, "zph")!)).toBe(LEGACY_ZPH_SIDECAR_FILE);
+    const tXmr = memberOfKind(trading, "xmr")!;
+    const tZph = memberOfKind(trading, "zph")!;
+    expect(tXmr.sidecarFile).toBe(newSidecarFile("xmr", tXmr.id));
+    expect(tZph.sidecarFile).toBe(newSidecarFile("zph", tZph.id));
+    expect(repairs).toEqual([
+      { id: tXmr.id, name: tXmr.name, kind: "xmr", from: LEGACY_XMR_SIDECAR_FILE, to: tXmr.sidecarFile },
+      { id: tZph.id, name: tZph.name, kind: "zph", from: LEGACY_ZPH_SIDECAR_FILE, to: tZph.sidecarFile },
+    ]);
+  });
+
+  it("changes nothing else: no seed, id, height or other entry moves", () => {
+    const { v3, movedIds } = collidedVault();
+    const { v3: fixed } = repairSharedSidecarFiles(v3);
+    expect(fixed.wallets).toHaveLength(v3.wallets.length);
+    v3.wallets.forEach((w, i) => {
+      const f = fixed.wallets[i];
+      if (movedIds.has(w.id)) expect({ ...f, sidecarFile: w.sidecarFile }).toEqual(w);
+      else expect(f).toBe(w);
+    });
+    expect({ ...fixed, wallets: v3.wallets }).toEqual(v3);
+  });
+
+  it("is idempotent, and hands back the same object when nothing is shared", () => {
+    const { v3 } = collidedVault();
+    const once = repairSharedSidecarFiles(v3).v3;
+    const twice = repairSharedSidecarFiles(once);
+    expect(twice.repairs).toEqual([]);
+    expect(twice.v3).toBe(once);
+    const clean = multiV3();
+    expect(repairSharedSidecarFiles(clean).v3).toBe(clean);
+    expect(repairSharedSidecarFiles(migrateV2ToV3(fullV2(), det())).repairs).toEqual([]);
+  });
+
+  it("finds nothing to repair in a vault the fixed import wrote", () => {
+    const gen = prefixedGen("f");
+    const base = migrateV2ToV3(fullV2(), { now: NOW, genId: gen });
+    const trading = addWalletEntry(
+      base,
+      { kind: "bip39", seed: "trading seed", name: "Trading" },
+      { now: NOW + 10, genId: gen },
+    );
+    const flat: VaultPayload = {
+      ...projectV3ToV2(trading.v3, trading.entry.id),
+      xmrSeed: "trading xmr",
+      zphSeed: "trading zph",
+    };
+    const imported = mergeFlatIntoV3(flat, trading.v3, {
+      activeWalletId: trading.entry.id,
+      now: NOW + 20,
+      genId: gen,
+    });
+    expect(repairSharedSidecarFiles(imported).repairs).toEqual([]);
+  });
+
+  it("with no primary wallet in the pair, the older one keeps the file", () => {
+    const gen = prefixedGen("s");
+    const base = migrateV2ToV3({ v: 2, bip39: "m", xmrSeed: null }, { now: NOW, genId: gen });
+    const older = addWalletEntry(
+      base,
+      { kind: "xmr", seed: "older seed", name: "Older", xmrSeedFormat: "legacy" },
+      { now: NOW + 1, genId: gen },
+    );
+    const newer = addWalletEntry(
+      older.v3,
+      { kind: "xmr", seed: "newer seed", name: "Newer", xmrSeedFormat: "legacy" },
+      { now: NOW + 2, genId: gen },
+    );
+    // Hand-shaped: the newer wallet stored under the older one's file.
+    const v3: VaultPayloadV3 = {
+      ...newer.v3,
+      wallets: newer.v3.wallets.map((w) =>
+        w.id === newer.entry.id ? { ...w, sidecarFile: older.entry.sidecarFile } : w,
+      ),
+    };
+    expect(filesOf(v3, "xmr")).toEqual([older.entry.sidecarFile, older.entry.sidecarFile]); // control
+    const { v3: fixed, repairs } = repairSharedSidecarFiles(v3);
+    expect(fixed.wallets.find((w) => w.id === older.entry.id)!.sidecarFile).toBe(older.entry.sidecarFile);
+    expect(repairs.map((r) => r.id)).toEqual([newer.entry.id]);
+    expect(fixed.wallets.find((w) => w.id === newer.entry.id)!.sidecarFile).toBe(
+      newSidecarFile("xmr", newer.entry.id),
+    );
+  });
+
+  it("covers Zano too, with three wallets on one file", () => {
+    const gen = prefixedGen("z");
+    const base = migrateV2ToV3(fullV2(), { now: NOW, genId: gen });
+    const second = addWalletEntry(
+      base,
+      { kind: "zano", seed: "second zano", name: "Second Zano" },
+      { now: NOW + 5, genId: gen },
+    );
+    const third = addWalletEntry(
+      second.v3,
+      { kind: "zano", seed: "third zano", name: "Third Zano" },
+      { now: NOW + 6, genId: gen },
+    );
+    const shared = new Set([second.entry.id, third.entry.id]);
+    const v3: VaultPayloadV3 = {
+      ...third.v3,
+      wallets: third.v3.wallets.map((w) =>
+        shared.has(w.id) ? { ...w, sidecarFile: LEGACY_ZANO_SIDECAR_FILE } : w,
+      ),
+    };
+    expect(filesOf(v3, "zano")).toEqual([
+      LEGACY_ZANO_SIDECAR_FILE,
+      LEGACY_ZANO_SIDECAR_FILE,
+      LEGACY_ZANO_SIDECAR_FILE,
+    ]); // control
+    const { v3: fixed, repairs } = repairSharedSidecarFiles(v3);
+    const mainZano = memberOfKind(contextForWallet(fixed, "all"), "zano")!;
+    expect(sidecarFileForEntry(mainZano)).toBe(LEGACY_ZANO_SIDECAR_FILE);
+    expect(repairs.map((r) => r.id).sort()).toEqual([...shared].sort());
+    expect(new Set(filesOf(fixed, "zano")).size).toBe(3);
   });
 });

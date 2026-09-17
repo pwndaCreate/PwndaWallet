@@ -12,10 +12,13 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { initOsDetection } from "./platform/os";
 import {
   getAdapter,
+  type ChainTx,
   type ChainType,
   type WalletInfo,
   type NetworkInfo,
 } from "./wallets";
+import { zanoTransfersToChainTx } from "./wallets/zano-wallet";
+import { xelisTransfersToChainTx } from "./wallets/xelis-wallet";
 import { hasSavedWallet, saveVaultV3, getStore, type WalletEntry } from "./store";
 import type { EncryptedData } from "./crypto";
 import { DEFAULT_DERIVATION_CHOICE } from "./features/onboarding/derivation-detector";
@@ -49,6 +52,7 @@ import { useXmrNodes } from "./features/monero/useXmrNodes";
 import { useZphNodes } from "./features/zephyr/useZphNodes";
 import { useZanoSession } from "./features/zano/useZanoSession";
 import { useZanoNodes } from "./features/zano/useZanoNodes";
+import { useXelisSession, useXelisNodes } from "./features/xelis";
 import { useMiner } from "./features/mining/useMiner";
 import { useMiningOptIn } from "./features/mining/miningOptIn";
 import { useMemoryTracker, usePeriodicGc } from "./features/mining/useMemoryTrace";
@@ -93,6 +97,7 @@ import { useTxHistory } from "./features/activity/useTxHistory";
 import { XmrImportPanel } from "./features/monero/XmrImportPanel";
 import { ZphImportPanel } from "./features/zephyr/ZphImportPanel";
 import { AuthRouter, AUTH_VIEWS } from "./features/auth/AuthRouter";
+import type { SwapsWaiting } from "./features/auth/swapsWaitingNotice";
 import { ScanDateCard } from "./features/settings/ScanDateCard";
 import { TitleBar } from "./components/PrimitivesV2";
 import { ViewRouter } from "./ViewRouter";
@@ -121,6 +126,12 @@ import {
   clearUtxoAccountSummaries,
   useUtxoAccountSummaries,
 } from "./lib/utxoAccountRegistry";
+
+/**
+ * Chains whose history comes from their own wallet session, not from the
+ * generic `useTxHistory` poll (2026-09-16). See `polledTxPairs` in `App`.
+ */
+const SESSION_FED_HISTORY: ReadonlySet<ChainType> = new Set<ChainType>(["zano", "xelis"]);
 
 function App() {
   const {
@@ -194,6 +205,9 @@ function App() {
   /** The Secured-Seed passphrase this Zano seed needs, mirrored out of the
    *  vault so Wallet Details can show it. Null for ordinary seeds. */
   const [zanoSeedPassphrase, setZanoSeedPassphrase] = useState<string | null>(null);
+  /** The open context's Xelis seed (2026-09-15): an in-memory mirror of its
+   *  `xelis` vault entry, for Wallet Details and the session's retry. */
+  const [xelisSeedLoaded, setXelisSeedLoaded] = useState<string | null>(null);
 
   // XMR-specific UI state
   const [xmrImportValue, setXmrImportValue] = useState("");
@@ -223,6 +237,7 @@ function App() {
   // ZEPH Zephyr seed display toggle in wallet-details
   const [showZphSeed, setShowZphSeed] = useState(false);
   const [showZanoSeed, setShowZanoSeed] = useState(false);
+  const [showXelisSeed, setShowXelisSeed] = useState(false);
 
   const wallet = walletsByChain[activeChain] ?? null;
   const adapter = getAdapter(activeChain);
@@ -334,6 +349,26 @@ function App() {
       alive = false;
     };
   }, [deriveSwapMaterial, activeWalletId]);
+
+  // The lock screen's "swaps waiting" note (2026-09-15). The swap node keeps
+  // its last in-progress reading on disk (`SwapsLastSeen`) because a locked
+  // engine answers nothing. Read each time the login view shows; no node (or
+  // the browser sandbox) just means no note.
+  const [swapsWaiting, setSwapsWaiting] = useState<SwapsWaiting | null>(null);
+  useEffect(() => {
+    if (view !== "login") return;
+    let alive = true;
+    swapSidecarStatus()
+      .then((s) => {
+        if (alive) setSwapsWaiting(s.swapsLastSeen ?? null);
+      })
+      .catch(() => {
+        if (alive) setSwapsWaiting(null);
+      });
+    return () => {
+      alive = false;
+    };
+  }, [view]);
 
   // C8 — the account nodes that make a LEAN swap coin's wallet the user's own
   // wallet. Derived here, in the app layer, for the same reason
@@ -498,12 +533,21 @@ function App() {
     }
     return pairs;
   }, [walletsByChain, utxoAccountSummaries]);
+  // Zano and Xelis are NOT polled here (2026-09-16). Their sessions already
+  // read history from the same sidecar on their own ready poll, so this hook
+  // was a second reader of the same data; their rows are merged in below,
+  // after the sessions, from the sessions' `txHistory`. Monero stays: its
+  // session polls only while Monero is on screen, and Activity needs it always.
+  const polledTxPairs = useMemo(
+    () => txPairs.filter((p) => !SESSION_FED_HISTORY.has(p.chain)),
+    [txPairs]
+  );
   const {
-    txByChain: chainTxByKey,
-    loading: chainTxLoading,
-    errors: chainTxErrors,
-    refresh: refreshTxHistory,
-  } = useTxHistory(txPairs, { pollMs: 60_000, limit: 50 });
+    txByChain: polledTxByKey,
+    loading: polledTxLoading,
+    errors: polledTxErrors,
+    refresh: refreshPolledTxHistory,
+  } = useTxHistory(polledTxPairs, { pollMs: 60_000, limit: 50 });
   const ownedChains = useMemo(
     () => txPairs.map((p) => p.chain),
     [txPairs]
@@ -620,6 +664,16 @@ function App() {
       { id: "demo-main-bip39", name: "Main", kind: "bip39", seed: TEST_MNEMONIC, createdAt: 1, groupId: "demo-main" },
       { id: "demo-main-xmr", name: "Main · Monero", kind: "xmr", seed: "demo", createdAt: 1, groupId: "demo-main", xmrSeedFormat: "polyseed", restoreHeight: null, sidecarFile: "pwnda-active" },
       { id: "demo-main-zph", name: "Main · Zephyr", kind: "zph", seed: "demo", createdAt: 1, groupId: "demo-main", restoreHeight: null, sidecarFile: "pwnda-zph-active" },
+      // A REAL 25-word seed (vector 1 of `xelis-vectors.ts`, produced by
+      // xelis_wallet v1.25.0 itself), not the "demo" placeholder the XMR and
+      // ZPH entries use. Those two never validate a seed in TypeScript, so a
+      // placeholder is invisible to them; Xelis has a real codec and checks
+      // before it spawns anything, so "demo" failed `verifyXelisSeedIntegrity`
+      // and the sync card showed "Invalid Xelis seed phrase." — wording meant
+      // for a phrase the user just typed, about a fixture they never saw.
+      // Seen in the landscape rail on 2026-09-15. A fixture that cannot pass
+      // the code it is meant to exercise tests nothing.
+      { id: "demo-main-xelis", name: "Main · Xelis", kind: "xelis", seed: "gutter slug fancy iguana drowning fewest bemused buckets pouch down ribbon bumper payment newt aztec gearbox fewest point hounded oncoming ongoing soapy tacit thaw thaw", createdAt: 1, groupId: "demo-main", sidecarFile: "pwnda-xelis-demo-main-xelis" },
       { id: "demo-trading", name: "Trading", kind: "bip39", seed: TRADING_MNEMONIC, createdAt: 2, groupId: "demo-trading" },
       { id: "demo-cold-xmr", name: "Cold Storage", kind: "xmr", seed: "demo", createdAt: 3, groupId: "demo-cold", xmrSeedFormat: "legacy", restoreHeight: null, sidecarFile: "pwnda-xmr-demo-cold-xmr" },
       { id: "demo-pk", name: "Solana Hot", kind: "privateKey", seed: "demo-private-key-material", createdAt: 4, groupId: "demo-pk", chain: "solana", address: "HAgk14JpMQLg8auGCVn4qXt4WMPuT3DKpqk" },
@@ -1006,8 +1060,12 @@ function App() {
     if (tickers.length === 0) return;
     const next = await fetchUsdPrices(tickers);
     // Don't blank the portfolio on a transient empty/blocked price fetch —
-    // keep the last-known prices instead of dropping to "—"/$0.
-    if (Object.keys(next).length > 0) setPricesByTicker(next);
+    // keep the last-known prices instead of dropping to "—"/$0. MERGED, not
+    // replaced (2026-09-16): the answer covers what the price module has
+    // fetched, and anything else already in this map (the sandbox demo seed
+    // above, or a ticker the module has not been asked for yet) must survive
+    // it. Replacing it blanked the whole portfolio after a wallet switch.
+    if (Object.keys(next).length > 0) setPricesByTicker((prev) => ({ ...prev, ...next }));
     // History fetch is independent + slower (one API call per ticker
     // staggered ~200ms); fire and forget so the spot prices land first
     // and the sparklines fill in as the calls complete.
@@ -1124,6 +1182,7 @@ function App() {
     downloadBinary: handleZphDownloadBinary,
     addDefender: handleZphAddDefenderExclusion,
     forget: forgetZphSession,
+    lock: lockZphSession,
   } = useZphSession({
     activeChain,
     focus: featureFocus,
@@ -1146,8 +1205,10 @@ function App() {
     start: startZanoSync,
     retry: retryZanoSync,
     forget: forgetZanoSession,
+    lock: lockZanoSession,
     downloadBinary: handleZanoDownloadBinary,
     refreshAssetBalances: refreshZanoAssetBalances,
+    refreshTxHistory: refreshZanoTxHistory,
   } = useZanoSession({
     activeChain,
     focus: featureFocus,
@@ -1157,9 +1218,82 @@ function App() {
     refreshBalance,
   });
 
+  // Xelis (2026-09-15). When this build cannot derive a Xelis address offline
+  // the in-memory wallet starts with "", and the running wallet reports the
+  // address once it opens.
+  const handleXelisAddress = useCallback(
+    (address: string) => {
+      setWalletsByChain((prev) =>
+        prev.xelis && prev.xelis.address !== address
+          ? { ...prev, xelis: { ...prev.xelis, address } }
+          : prev
+      );
+    },
+    [setWalletsByChain]
+  );
+  const xelisSession = useXelisSession({
+    activeChain,
+    focus: featureFocus,
+    seedLoaded: xelisSeedLoaded,
+    sessionPassword,
+    refreshBalance,
+    onAddress: handleXelisAddress,
+  });
+
+  // The per-chain history Activity and the wallet views read: the polled
+  // chains, plus Zano and Xelis from their sessions (see `polledTxPairs`),
+  // mapped by the same function each adapter's `getTransactionHistory` uses
+  // and keyed `chain:address` like every other entry.
+  const zanoTxKey = walletsByChain.zano ? `zano:${walletsByChain.zano.address}` : null;
+  const xelisTxKey = walletsByChain.xelis ? `xelis:${walletsByChain.xelis.address}` : null;
+  const xelisTxHistory = xelisSession.txHistory;
+  const xelisTxLoading = xelisSession.txLoading;
+  const xelisTxError = xelisSession.txError;
+  const chainTxByKey = useMemo(() => {
+    const out: Record<string, ChainTx[]> = { ...polledTxByKey };
+    if (zanoTxKey) out[zanoTxKey] = zanoTransfersToChainTx(zanoTxHistory);
+    // `null` = not read yet; leave the key out rather than claim "no transfers".
+    if (xelisTxKey && xelisTxHistory) out[xelisTxKey] = xelisTransfersToChainTx(xelisTxHistory);
+    return out;
+  }, [polledTxByKey, zanoTxKey, zanoTxHistory, xelisTxKey, xelisTxHistory]);
+  const chainTxLoading = useMemo(() => {
+    const out: Record<string, boolean> = { ...polledTxLoading };
+    if (zanoTxKey) out[zanoTxKey] = zanoTxLoading;
+    if (xelisTxKey) out[xelisTxKey] = xelisTxLoading;
+    return out;
+  }, [polledTxLoading, zanoTxKey, zanoTxLoading, xelisTxKey, xelisTxLoading]);
+  const chainTxErrors = useMemo(() => {
+    const out: Record<string, string | null> = { ...polledTxErrors };
+    if (xelisTxKey) out[xelisTxKey] = xelisTxError;
+    return out;
+  }, [polledTxErrors, xelisTxKey, xelisTxError]);
+  const refreshXelisTxHistory = xelisSession.refreshTxHistory;
+  // A session is asked only once its wallet is open: before that the read can
+  // only fail, and Xelis would surface the failure as a history error.
+  const zanoHistoryReadable = zanoSyncState === "ready";
+  const xelisHistoryReadable = xelisSession.syncState === "synced";
+  const refreshTxHistory = useCallback(
+    async (chain?: ChainType) => {
+      const zano = () => (zanoHistoryReadable ? refreshZanoTxHistory() : undefined);
+      const xelis = () => (xelisHistoryReadable ? refreshXelisTxHistory() : undefined);
+      if (chain === "zano") return void (await zano());
+      if (chain === "xelis") return void (await xelis());
+      if (chain) return refreshPolledTxHistory(chain);
+      await Promise.all([refreshPolledTxHistory(), zano(), xelis()]);
+    },
+    [
+      refreshPolledTxHistory,
+      refreshZanoTxHistory,
+      refreshXelisTxHistory,
+      zanoHistoryReadable,
+      xelisHistoryReadable,
+    ]
+  );
+
   const xmrNodes = useXmrNodes({ focus: featureFocus, onError: setError, onSuccess: setSuccess });
   const zphNodes = useZphNodes({ focus: featureFocus, onError: setError, onSuccess: setSuccess });
   const zanoNodes = useZanoNodes({ focus: featureFocus, onError: setError, onSuccess: setSuccess });
+  const xelisNodes = useXelisNodes({ focus: featureFocus, onError: setError, onSuccess: setSuccess });
 
   // Live Zephyr protocol stats (reserve ratio, asset prices, APY) from
   // the scanner API. Only polled while the user is actually viewing the
@@ -1188,6 +1322,13 @@ function App() {
       void refreshAllBalances();
     }
   }, [xmrSyncState, refreshAllBalances]);
+  // Xelis likewise: its balance is unreadable until the wallet has scanned, so
+  // the asset list's XEL row stays "—" until this runs.
+  useEffect(() => {
+    if (xelisSession.syncState === "synced") {
+      void refreshAllBalances();
+    }
+  }, [xelisSession.syncState, refreshAllBalances]);
 
   // Grove-shared coins (BTC / LTC / BCH) send like any other UTXO chain: the
   // wallet's own account-wide signer builds, signs and broadcasts, whether or
@@ -1310,6 +1451,7 @@ function App() {
     saveXmrSeedToVault,
     saveZphSeedToVault,
     saveZanoSeedToVault,
+    saveXelisSeedToVault,
     addWallet,
     renameWallet,
     removeWallet,
@@ -1346,7 +1488,16 @@ function App() {
     lockXmrSession,
     forgetXmrSession,
     forgetZphSession,
+    lockZphSession,
     forgetZanoSession,
+    lockZanoSession,
+    // Xelis (2026-09-15): one session hook, four entry points into it. Every
+    // caller passes the entry's own wallet directory — Xelis has no legacy
+    // fixed filename to fall back to.
+    setXelisSeedLoaded,
+    startXelisSync: xelisSession.start,
+    forgetXelisSession: xelisSession.forget,
+    lockXelisSession: xelisSession.lock,
     hasSaved,
     setHasSaved,
     setBalance,
@@ -1465,6 +1616,14 @@ function App() {
     setView("zano-nodes");
     await zanoNodes.openView();
   }, [zanoNodes, layout, setError, setSuccess, setView]);
+
+  const openXelisNodesView = useCallback(async () => {
+    setError("");
+    setSuccess("");
+    if (layout === "landscape") setLandscapeTab("settings");
+    setView("xelis-nodes");
+    await xelisNodes.openView();
+  }, [xelisNodes, layout, setError, setSuccess, setView]);
 
   const handleChainSwitch = (chain: ChainType) => {
     setActiveChain(chain);
@@ -1799,6 +1958,7 @@ function App() {
         <AuthRouter
           view={view}
           setView={setView}
+          swapsWaiting={swapsWaiting}
           activeChain={activeChain}
           setActiveChain={setActiveChain}
           pendingBip39={pendingBip39}
@@ -1923,6 +2083,10 @@ function App() {
         retryZanoSync={retryZanoSync}
         handleZanoDownloadBinary={handleZanoDownloadBinary}
         refreshZanoAssetBalances={refreshZanoAssetBalances}
+        xelisSeedLoaded={xelisSeedLoaded}
+        setXelisSeedLoaded={setXelisSeedLoaded}
+        saveXelisSeedToVault={saveXelisSeedToVault}
+        xelisSession={xelisSession}
         chainTxByKey={chainTxByKey}
         chainTxLoading={chainTxLoading}
         chainTxErrors={chainTxErrors}
@@ -1953,6 +2117,8 @@ function App() {
         zanoSeedPassphrase={zanoSeedPassphrase}
         showZanoSeed={showZanoSeed}
         setShowZanoSeed={setShowZanoSeed}
+        showXelisSeed={showXelisSeed}
+        setShowXelisSeed={setShowXelisSeed}
         setShowZphSeed={setShowZphSeed}
         handleLogout={handleLogout}
         addWallet={addWallet}
@@ -1977,6 +2143,7 @@ function App() {
         xmrNodes={xmrNodes}
         zphNodes={zphNodes}
         zanoNodes={zanoNodes}
+        xelisNodes={xelisNodes}
         copyToClipboard={copyToClipboard}
         error={error}
         success={success}
@@ -1985,6 +2152,7 @@ function App() {
         openMoneroNodesView={openMoneroNodesView}
         openZephyrNodesView={openZephyrNodesView}
         openZanoNodesView={openZanoNodesView}
+        openXelisNodesView={openXelisNodesView}
         handleMinimize={handleMinimize}
         handleClose={handleClose}
         sessionPassword={sessionPassword}
@@ -2048,6 +2216,8 @@ function App() {
       zanoSeedPassphrase={zanoSeedPassphrase}
       showZanoSeed={showZanoSeed}
       setShowZanoSeed={setShowZanoSeed}
+      showXelisSeed={showXelisSeed}
+      setShowXelisSeed={setShowXelisSeed}
       setShowZphSeed={setShowZphSeed}
       sharedMnemonic={sharedMnemonic}
       sessionPassword={sessionPassword}
@@ -2079,6 +2249,7 @@ function App() {
       handleXmrAddDefenderExclusion={handleXmrAddDefenderExclusion}
       handleXmrDownloadBinary={handleXmrDownloadBinary}
       startXmrSync={startXmrSync}
+      retryXmrSync={retryXmrSync}
       zphSyncState={zphSyncState}
       zphSyncPercent={zphSyncPercent}
       zphSyncWalletHeight={zphSyncWalletHeight}
@@ -2090,6 +2261,7 @@ function App() {
       zphDownloadProgress={zphDownloadProgress}
       zphAssetBalances={zphAssetBalances}
       refreshZphAssetBalances={refreshZphAssetBalances}
+      retryZphSync={retryZphSync}
       handleZphAddDefenderExclusion={handleZphAddDefenderExclusion}
       handleZphDownloadBinary={handleZphDownloadBinary}
       startZphSync={startZphSync}
@@ -2109,6 +2281,12 @@ function App() {
       retryZanoSync={retryZanoSync}
       handleZanoDownloadBinary={handleZanoDownloadBinary}
       refreshZanoAssetBalances={refreshZanoAssetBalances}
+      xelisSeedLoaded={xelisSeedLoaded}
+      setXelisSeedLoaded={setXelisSeedLoaded}
+      saveXelisSeedToVault={saveXelisSeedToVault}
+      xelisSession={xelisSession}
+      xelisNodes={xelisNodes}
+      openXelisNodesView={openXelisNodesView}
       chainTxByKey={chainTxByKey}
       chainTxLoading={chainTxLoading}
       chainTxErrors={chainTxErrors}

@@ -14,6 +14,7 @@ import {
   projectV3ToV2,
   deleteWallet,
   type VaultPayload,
+  type VaultPayloadV3,
   type WalletEntry,
 } from "../../store";
 import {
@@ -33,7 +34,13 @@ import {
   type NewWalletSpec,
   type WalletKind,
   legacyZanoSeedFor,
+  addXelisWalletToContext,
+  flatSeedRefusal,
+  repairSharedSidecarFiles,
+  type FlatSeedRefusal,
+  type SidecarFileRepair,
 } from "../../vault-schema";
+import { checkXelisSeed, xelisWalletInfo } from "../xelis";
 
 /** Fallback label when the user doesn't name an added wallet. */
 function defaultWalletName(kind: WalletKind): string {
@@ -43,11 +50,51 @@ function defaultWalletName(kind: WalletKind): string {
     ? "Zephyr wallet"
     : kind === "zano"
     ? "Zano wallet"
+    : kind === "xelis"
+    ? "Xelis wallet"
     : kind === "privateKey"
     ? "Imported key"
     : kind === "watch"
     ? "Watched address"
     : "Wallet";
+}
+
+/**
+ * The wallet file of the `kind` entry in `activeWalletId`'s context, read back
+ * from a vault that was just written. The flat save helpers return it so their
+ * caller opens — or rebuilds — the file the entry names: `mergeFlatIntoV3`
+ * decides that name, and nothing upstream of the write can know it
+ * (2026-09-16; see log.md).
+ */
+function savedSidecarFile(
+  v3: VaultPayloadV3,
+  activeWalletId: string,
+  kind: WalletKind
+): string | null {
+  const entry = memberOfKind(contextForWallet(v3, activeWalletId), kind);
+  return entry ? sidecarFileForEntry(entry) ?? null : null;
+}
+
+/** What an import panel shows when `flatSeedRefusal` stops its save. */
+function replaceRefusedMessage(coin: string, refusal: FlatSeedRefusal): string {
+  const keepBoth = "To keep both, use Add wallet in Settings ▸ Wallets.";
+  return refusal === "different-passphrase"
+    ? `This wallet already has this ${coin} seed under a different Secured Seed ` +
+        `passphrase. A different passphrase is a different wallet, so saving it ` +
+        `here would replace the one you have. ${keepBoth}`
+    : `This wallet already has a different ${coin} seed. Saving this one here ` +
+        `would replace it, and the old seed would no longer be in the vault. ${keepBoth}`;
+}
+
+/** The notice after `repairSharedSidecarFiles` gave wallets files of their own. */
+function describeRepairs(repairs: SidecarFileRepair[]): string {
+  const names = repairs.map((r) => `"${r.name}"`).join(", ");
+  const one = repairs.length === 1;
+  return (
+    `${names} ${one ? "was" : "were"} sharing a wallet file with another wallet ` +
+    `and now ${one ? "has its" : "have their"} own. Expect ` +
+    `${one ? "one rescan" : "one rescan each"}; no seed was changed.`
+  );
 }
 
 /**
@@ -116,6 +163,21 @@ import { fingerprintProfile, schemeFor, type ProfileId } from "../onboarding/der
  * Every vault write goes through `{...payload, v: 2, ...}` spread so
  * cross-chain fields (BIP39 + XMR + ZPH) are never silently clobbered
  * when one chain's seed is updated.
+ *
+ * ── Wallet context and dependency arrays ─────────────────────────────
+ * Every read-modify-write helper below passes `activeWalletId` to
+ * `loadVault`/`saveVault`, so the write lands in the wallet the switcher
+ * shows (the 2026-08-29 wrong-address report). That only holds while each
+ * callback also DEPENDS on `activeWalletId`: its other dependencies are
+ * stable — `setError`/`setSuccess` are `useCallback(…, [])` in
+ * `AppStateContext`, and `sessionPassword` changes only at unlock — so a
+ * callback that omits it keeps the context of the render that created it
+ * and writes there after a switch. Nine callbacks omitted it until
+ * 2026-09-15; `walletContextDeps.test.ts` fails when a new one does.
+ *
+ * Xelis is the exception to the flat-payload rule above: it is not in the
+ * flat v2 shape at all (`vault-schema.ts`), so its save, add, switch and
+ * remove paths go through the v3 CRUD helpers.
  */
 export function useVault(args: {
   // Identity / shared cross-feature state
@@ -183,8 +245,24 @@ export function useVault(args: {
   forgetXmrSession: () => Promise<void>;
   forgetZphSession: () => Promise<void>;
   /** From `useZanoSession`. Stops the sidecar + resets in-memory sync
-   *  state — mirrors `forgetZphSession`'s role on logout. */
+   *  state. The hard stop: wallet switch and removal. */
   forgetZanoSession: () => Promise<void>;
+  /** Lock-time close for Zano (2026-09-15): a swap node using Main keeps it
+   *  running under its claim (`zano_rpc.rs::set_engine_claim`). */
+  lockZanoSession: () => Promise<void>;
+  /** Lock-time close for Zephyr (2026-09-15): releases only this app's lease,
+   *  so a swap node using the wallet keeps it open (`lockZphWallet`). */
+  lockZphSession: () => Promise<void>;
+  /** Xelis (2026-09-15): the seed of the open context's `xelis` entry, or null. */
+  setXelisSeedLoaded: (v: string | null) => void;
+  /** From `useXelisSession`. Every caller passes the entry's own wallet
+   *  directory (`sidecarFileForEntry`): unlike Zano there is no legacy fixed
+   *  name an undefined file could fall back to. */
+  startXelisSync: (seed: string, masterPassword: string, walletFile?: string) => void;
+  /** Wallet switch and removal: save and stop (`closeXelisWallet`). */
+  forgetXelisSession: () => Promise<void>;
+  /** Lock (`lockXelisWallet`). Xelis has no swap engine, so nothing keeps it open. */
+  lockXelisSession: () => Promise<void>;
 
   // Saved-wallet flag — set true after first vault save, false on remove
   hasSaved: boolean;
@@ -246,6 +324,12 @@ export function useVault(args: {
     forgetXmrSession,
     forgetZphSession,
     forgetZanoSession,
+    lockZanoSession,
+    lockZphSession,
+    setXelisSeedLoaded,
+    startXelisSync,
+    forgetXelisSession,
+    lockXelisSession,
     hasSaved,
     setHasSaved,
     setBalance,
@@ -598,7 +682,28 @@ export function useVault(args: {
         // Load the full v3 vault (migrates v2→v3 on disk on first unlock),
         // then project the primary group to the flat shape the rest of this
         // handler consumes. `v3.wallets` seeds the multi-wallet spine.
-        const v3 = await loadVaultV3(loginPassword);
+        //
+        // Repair first, before anything below resolves a wallet file: a vault
+        // written before 2026-09-16 can hold two entries on one file, and the
+        // sessions started here would open it for both
+        // (`repairSharedSidecarFiles`).
+        const loaded = await loadVaultV3(loginPassword);
+        const { v3, repairs } = repairSharedSidecarFiles(loaded);
+        if (repairs.length > 0) {
+          console.warn(
+            "[useVault] unlock: gave shared wallet files back to their own wallets:",
+            repairs.map(({ id, kind, from, to }) => ({ id, kind, from, to }))
+          );
+          // Its own try: a failed write must not reach this handler's catch,
+          // which reports "Incorrect password". This session already uses the
+          // repaired names, and the next unlock repeats the repair.
+          try {
+            await saveVaultV3(v3, loginPassword);
+          } catch (e) {
+            console.warn("[useVault] unlock: saving the repaired vault failed:", e);
+          }
+          setSuccess(describeRepairs(repairs));
+        }
         // Project the context the user was LAST ON, not the primary group.
         // Restoring `lastActiveWalletId` into the switcher while deriving from
         // Main's seed is exactly the reported bug: the chip, breadcrumb and tick
@@ -712,6 +817,19 @@ export function useVault(args: {
           setZanoSeedPassphrase?.(null);
         }
 
+        // Xelis seed + session (2026-09-15). Read from the restored context's
+        // ENTRY: the flat payload above has no Xelis field. The session opens
+        // that entry's own wallet directory. Nothing here can block unlock; a
+        // wallet that fails to open shows its error on the Xelis sync card.
+        const xelisEntry = memberOfKind(restoredCtx, "xelis");
+        if (xelisEntry) {
+          newWallets.xelis = xelisWalletInfo(xelisEntry.seed);
+          setXelisSeedLoaded(xelisEntry.seed);
+          startXelisSync(xelisEntry.seed, loginPassword, sidecarFileForEntry(xelisEntry));
+        } else {
+          setXelisSeedLoaded(null);
+        }
+
         setWalletsByChain(newWallets);
         // Retain the password in session state for subsequent vault saves
         // (XMR seed import, "forget monero", etc.) without re-prompting.
@@ -726,6 +844,7 @@ export function useVault(args: {
     [
       deriveAllChains,
       setError,
+      setSuccess,
       setSessionPassword,
       setView,
       setWalletsByChain,
@@ -734,9 +853,11 @@ export function useVault(args: {
       setXmrSeedLoaded,
       setZphSeedLoaded,
       setZanoSeedLoaded,
+      setXelisSeedLoaded,
       startXmrSync,
       startZphSync,
       startZanoSync,
+      startXelisSync,
     ]
   );
 
@@ -752,40 +873,38 @@ export function useVault(args: {
   }, [setError, setHasSaved, setView]);
 
   const handleLogout = useCallback(async () => {
-    // C9 safety gate. Best-effort: a failed CHECK must not itself block
-    // logout (that would trade a swap-corruption risk for a
-    // cannot-lock-my-wallet complaint on every transient error) — only an
-    // explicit `true` answer refuses.
+    // Which shared wallets a swap is using right now.
+    //
+    // Until 2026-09-15 a "yes" here REFUSED the lock ("finish or abandon it
+    // before locking, or the swap will be corrupted"), because locking closed
+    // those wallets under the swap. It no longer does:
+    //   - Monero's wallet-rpc stays open under the swap node's lease;
+    //   - Zephyr's lock releases only this app's lease, and the node keeps the
+    //     process AND the open wallet;
+    //   - Zano Main stays up under the node's claim
+    //     (`zano_rpc.rs::set_engine_claim`).
+    // So the lock goes ahead and the answer becomes a note on the lock screen.
+    // The refusal also protected less than it seemed: a swap can take hours, and
+    // an offer can take a bid AFTER the lock, which no check at lock time sees.
+    // Forget/remove still refuses (`removeWallet`), because it deletes wallet
+    // files. Best-effort as before: a check that throws says nothing.
+    const keptOpen: string[] = [];
     if (checkXmrHostWalletInUse) {
       try {
-        if (await checkXmrHostWalletInUse()) {
-          setError(
-            "A swap is using the Monero wallet the swap node shares with this app right now — " +
-              "finish or abandon it before locking, or the swap will be corrupted.",
-          );
-          return;
-        }
+        if (await checkXmrHostWalletInUse()) keptOpen.push("Monero");
       } catch {
-        /* best-effort — proceed as if not in use */
+        /* best-effort */
       }
     }
-    // Same gate for the two CryptoNote followers the node can share
-    // (2026-09-04). Checked one at a time so the message names the coin.
     if (checkCnHostWalletInUse) {
       for (const [coin, name] of [
         ["zephyr", "Zephyr"],
         ["zano", "Zano"],
       ] as const) {
         try {
-          if (await checkCnHostWalletInUse(coin)) {
-            setError(
-              `A swap is using the ${name} wallet the swap node shares with this app right now — ` +
-                "finish or abandon it before locking, or the swap will be corrupted.",
-            );
-            return;
-          }
+          if (await checkCnHostWalletInUse(coin)) keptOpen.push(name);
         } catch {
-          /* best-effort — proceed as if not in use */
+          /* best-effort */
         }
       }
     }
@@ -806,10 +925,25 @@ export function useVault(args: {
     setPendingXmrSeed("");
     setXmrImportValue("");
     void lockXmrSession();
-    void forgetZphSession();
+    // Lock, not forget (see the note at the top).
+    void lockZphSession();
     setZphSeedLoaded(null);
-    void forgetZanoSession();
+    void lockZanoSession();
     setZanoSeedLoaded(null);
+    // Xelis has no swap engine, so nothing keeps its wallet open: Lock saves
+    // and stops it (`lockXelisWallet`).
+    void lockXelisSession();
+    setXelisSeedLoaded(null);
+    if (keptOpen.length > 0) {
+      const names =
+        keptOpen.length === 1
+          ? keptOpen[0]
+          : `${keptOpen.slice(0, -1).join(", ")} and ${keptOpen[keptOpen.length - 1]}`;
+      setSuccess(
+        `Locked. A swap is in progress, and the swap node keeps your ${names} ` +
+          `wallet${keptOpen.length === 1 ? "" : "s"} open so it can finish.`,
+      );
+    }
     if (hasSaved) {
       setView("login");
     } else {
@@ -817,9 +951,13 @@ export function useVault(args: {
     }
   }, [
     checkXmrHostWalletInUse,
+    checkCnHostWalletInUse,
     lockXmrSession,
+    lockZphSession,
     forgetZphSession,
-    forgetZanoSession,
+    lockZanoSession,
+    lockXelisSession,
+    setXelisSeedLoaded,
     hasSaved,
     setBalance,
     setError,
@@ -840,16 +978,31 @@ export function useVault(args: {
     setZanoSeedLoaded,
   ]);
 
+  /** Resolves the saved entry's wallet file — the file the caller must open
+   *  (import) or rebuild (rescan) — or null when nothing was saved; the reason
+   *  is already on screen. The same contract as `saveZanoSeedToVault`. Added
+   *  2026-09-16: `XmrImportPanel` and `ScanDateCard` had no name to pass, and
+   *  an absent name means the primary wallet's `pwnda-active`. */
   const saveXmrSeedToVault = useCallback(
-    async (xmrSeed: string, xmrRestoreHeight: number | null = null) => {
+    async (
+      xmrSeed: string,
+      xmrRestoreHeight: number | null = null
+    ): Promise<string | null> => {
       if (!sessionPassword) {
         setError(
           "Session password missing — please lock and unlock the wallet, then try again."
         );
-        return;
+        return null;
       }
       try {
         const payload = await loadVault(sessionPassword, activeWalletId);
+        // Never replace a DIFFERENT Monero seed this context already holds
+        // (`flatSeedRefusal`). The scan-date card re-saves the same seed.
+        const refusal = flatSeedRefusal(payload, "xmr", xmrSeed);
+        if (refusal) {
+          setError(replaceRefusedMessage("Monero", refusal));
+          return null;
+        }
         const xmrSeedFormat = detectXmrSeedFormat(xmrSeed) ?? undefined;
         const updated: VaultPayload = {
           ...payload,
@@ -860,26 +1013,53 @@ export function useVault(args: {
         };
         await saveVault(updated, sessionPassword, activeWalletId);
         setSuccess("Monero wallet saved to vault.");
+        const file = savedSidecarFile(
+          await loadVaultV3(sessionPassword),
+          activeWalletId,
+          "xmr"
+        );
+        if (!file) {
+          // Refusing beats handing back undefined, which the sidecar reads as
+          // the primary wallet's file.
+          setError(
+            "Monero wallet saved, but the vault did not report a wallet file " +
+              "for it. Lock and unlock to open it."
+          );
+        }
+        return file;
       } catch (e: any) {
         console.error("[useVault] saveXmrSeedToVault failed:", e);
         setError(
           "Failed to save Monero wallet to vault: " + (e?.message || String(e))
         );
+        return null;
       }
     },
-    [sessionPassword, setError, setSuccess]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess]
   );
 
+  /** Resolves the saved entry's wallet file, or null when nothing was saved —
+   *  see `saveXmrSeedToVault`. An absent name means `pwnda-zph-active`. */
   const saveZphSeedToVault = useCallback(
-    async (zphSeed: string, zphRestoreHeight: number | null = null) => {
+    async (
+      zphSeed: string,
+      zphRestoreHeight: number | null = null
+    ): Promise<string | null> => {
       if (!sessionPassword) {
         setError(
           "Session password missing — please lock and unlock the wallet, then try again."
         );
-        return;
+        return null;
       }
       try {
         const payload = await loadVault(sessionPassword, activeWalletId);
+        const refusal = flatSeedRefusal(payload, "zph", zphSeed);
+        if (refusal) {
+          setError(replaceRefusedMessage("Zephyr", refusal));
+          return null;
+        }
         const updated: VaultPayload = {
           ...payload,
           v: 2,
@@ -888,31 +1068,62 @@ export function useVault(args: {
         };
         await saveVault(updated, sessionPassword, activeWalletId);
         setSuccess("Zephyr wallet saved to vault.");
+        const file = savedSidecarFile(
+          await loadVaultV3(sessionPassword),
+          activeWalletId,
+          "zph"
+        );
+        if (!file) {
+          setError(
+            "Zephyr wallet saved, but the vault did not report a wallet file " +
+              "for it. Lock and unlock to open it."
+          );
+        }
+        return file;
       } catch (e: any) {
         console.error("[useVault] saveZphSeedToVault failed:", e);
         setError(
           "Failed to save Zephyr wallet to vault: " + (e?.message || String(e))
         );
+        return null;
       }
     },
-    [sessionPassword, setError, setSuccess]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess]
   );
 
   /** No restore-height param — Zano's seed self-encodes its own creation
    *  date, unlike XMR/ZPH. `zanoSeedPassphrase` defaults to "" (ordinary,
    *  non-Secured-Seed) rather than undefined so a re-save that clears a
    *  previously-set passphrase actually clears it (an `undefined` write
-   *  would leave the old value in place via the `{...payload}` spread). */
+   *  would leave the old value in place via the `{...payload}` spread).
+   *
+   *  Resolves the saved entry's sidecar wallet file, which the caller hands to
+   *  `startZanoSync`, or null when nothing was saved (the reason is already on
+   *  screen) — the same contract as `saveXelisSeedToVault`. Added 2026-09-15:
+   *  `ZanoImportPanel` had nothing to pass, so it started the session with no
+   *  file at all and Rust opened the legacy `pwnda.zan`. See log.md. */
   const saveZanoSeedToVault = useCallback(
-    async (zanoSeed: string, zanoSeedPassphrase: string = "") => {
+    async (
+      zanoSeed: string,
+      zanoSeedPassphrase: string = ""
+    ): Promise<string | null> => {
       if (!sessionPassword) {
         setError(
           "Session password missing — please lock and unlock the wallet, then try again."
         );
-        return;
+        return null;
       }
       try {
         const payload = await loadVault(sessionPassword, activeWalletId);
+        // The passphrase counts: the same words under another passphrase are
+        // another wallet.
+        const refusal = flatSeedRefusal(payload, "zano", zanoSeed, zanoSeedPassphrase);
+        if (refusal) {
+          setError(replaceRefusedMessage("Zano", refusal));
+          return null;
+        }
         const updated: VaultPayload = {
           ...payload,
           v: 2,
@@ -922,14 +1133,80 @@ export function useVault(args: {
         await saveVault(updated, sessionPassword, activeWalletId);
         setZanoSeedPassphrase?.(zanoSeedPassphrase || null);
         setSuccess("Zano wallet saved to vault.");
+        // Read back the entry this write produced. `mergeFlatIntoV3` is what
+        // decides the name — a vault upgraded in place keeps `pwnda.zan`, any
+        // later context gets its own `pwnda-zano-<id>.zan` — so asking it is
+        // the only way to know which file the caller must open. The read costs
+        // one extra decrypt, on an import.
+        const v3 = await loadVaultV3(sessionPassword);
+        const entry = memberOfKind(contextForWallet(v3, activeWalletId), "zano");
+        const file = entry ? sidecarFileForEntry(entry) ?? null : null;
+        if (!file) {
+          // Never reached by a normal save (the write above puts a `zano`
+          // entry in this context). Refusing beats handing back `undefined`,
+          // which Rust would resolve to the legacy filename — the 2026-09-15
+          // defect this return value exists to close.
+          setError(
+            "Zano wallet saved, but the vault did not report a wallet file for " +
+              "it. Lock and unlock to open it."
+          );
+        }
+        return file;
       } catch (e: any) {
         console.error("[useVault] saveZanoSeedToVault failed:", e);
         setError(
           "Failed to save Zano wallet to vault: " + (e?.message || String(e))
         );
+        return null;
       }
     },
-    [sessionPassword, setError, setSuccess]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess]
+  );
+
+  /**
+   * Save a Xelis seed into the context the user is on: the write behind the
+   * dashboard's Xelis import panel (2026-09-15). Resolves the new entry's
+   * wallet directory, which the panel hands to `startXelisSync`, or null when
+   * nothing was saved (the reason is already on screen).
+   *
+   * A v3 edit through `addXelisWalletToContext`, not the flat `saveVault` path
+   * the three helpers above use: the flat shape has no Xelis field. That helper
+   * refuses to replace a different Xelis seed in the context and refuses words
+   * already saved as another wallet.
+   */
+  const saveXelisSeedToVault = useCallback(
+    async (xelisSeed: string): Promise<string | null> => {
+      if (!sessionPassword) {
+        setError(
+          "Session password missing — please lock and unlock the wallet, then try again."
+        );
+        return null;
+      }
+      const verdict = checkXelisSeed(xelisSeed);
+      if (verdict.status !== "valid") {
+        setError(verdict.message);
+        return null;
+      }
+      try {
+        const v3 = await loadVaultV3(sessionPassword);
+        const { v3: next, entry, created } = addXelisWalletToContext(v3, verdict.seed, {
+          activeWalletId,
+        });
+        if (created) {
+          await saveVaultV3(next, sessionPassword);
+          setWalletEntries(next.wallets);
+        }
+        setSuccess("Xelis wallet saved to vault.");
+        return sidecarFileForEntry(entry) ?? null;
+      } catch (e: any) {
+        console.error("[useVault] saveXelisSeedToVault failed:", e?.message || String(e));
+        setError("Failed to save Xelis wallet to vault: " + (e?.message || String(e)));
+        return null;
+      }
+    },
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletEntries]
   );
 
   /**
@@ -975,7 +1252,9 @@ export function useVault(args: {
         throw e;
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletsByChain]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletsByChain]
   );
 
   /**
@@ -1017,7 +1296,9 @@ export function useVault(args: {
         throw e;
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletsByChain]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletsByChain]
   );
 
   /**
@@ -1061,7 +1342,9 @@ export function useVault(args: {
         throw e;
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletsByChain]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletsByChain]
   );
 
   /**
@@ -1103,7 +1386,9 @@ export function useVault(args: {
         throw e;
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletsByChain]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletsByChain]
   );
 
   /**
@@ -1134,7 +1419,9 @@ export function useVault(args: {
         throw e;
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletsByChain]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletsByChain]
   );
 
   /**
@@ -1194,7 +1481,9 @@ export function useVault(args: {
         throw e;
       }
     },
-    [sessionPassword, setError, setSuccess, setWalletsByChain]
+    // `activeWalletId` is READ in the body, so it belongs here: see the
+    // wallet-context note in this hook's header.
+    [sessionPassword, activeWalletId, setError, setSuccess, setWalletsByChain]
   );
 
   /* ─── Multi-wallet CRUD (Phase 2) ─────────────────────────────────────
@@ -1227,8 +1516,28 @@ export function useVault(args: {
           setError("Pick a network for this account.");
           return false;
         }
-        if (chain === "monero" || chain === "zephyr" || chain === "zano") {
-          setError("Monero / Zephyr / Zano can't be imported this way — add their seed instead.");
+        if (
+          chain === "monero" ||
+          chain === "zephyr" ||
+          chain === "zano" ||
+          chain === "xelis"
+        ) {
+          setError(
+            "Monero / Zephyr / Zano / Xelis can't be imported this way — add their seed instead."
+          );
+          return false;
+        }
+      }
+
+      // Xelis (2026-09-15): the same check the import panel runs, and for a
+      // sharper reason than Zano's. A Xelis seed uses Monero's wordlist and
+      // checksum, so a Monero seed pasted here passes every Xelis check and
+      // would open an empty Xelis wallet. `addXelisWalletToContext` refuses
+      // words already saved as another wallet; this refuses malformed ones.
+      if (kind === "xelis") {
+        const verdict = checkXelisSeed(value);
+        if (verdict.status !== "valid") {
+          setError(verdict.message);
           return false;
         }
       }
@@ -1328,7 +1637,14 @@ export function useVault(args: {
         // Seed kinds (bip39 / xmr / zph / zano).
         // Zano matches words exactly, so store the normalised form the
         // validator above checked — the same form `ZanoImportPanel` saves.
-        const seedValue = kind === "zano" ? normalizeZanoSeed(value) : value;
+        const seedValue =
+          kind === "zano"
+            ? normalizeZanoSeed(value)
+            : kind === "xelis"
+              ? // Store the normalised form the check above accepted, as the
+                // import panel does: Xelis matches whole words, lower-cased.
+                checkXelisSeed(value).seed
+              : value;
         if (findDuplicateSeed(v3, seedValue)) {
           setError("That seed is already one of your wallets.");
           return false;
@@ -1423,6 +1739,13 @@ export function useVault(args: {
               setZanoSeedLoaded(entry.seed);
               setZanoSeedPassphrase?.(passphrase || null);
               startZanoSync(entry.seed, sessionPassword, passphrase, file);
+            } else if (kind === "xelis") {
+              setWalletsByChain((prev) => ({
+                ...prev,
+                xelis: xelisWalletInfo(entry.seed),
+              }));
+              setXelisSeedLoaded(entry.seed);
+              startXelisSync(entry.seed, sessionPassword, file);
             }
           } catch (e) {
             console.warn("[useVault] addWallet: opening the added wallet failed:", e);
@@ -1447,9 +1770,11 @@ export function useVault(args: {
       setZphSeedLoaded,
       setZanoSeedLoaded,
       setZanoSeedPassphrase,
+      setXelisSeedLoaded,
       startXmrSync,
       startZphSync,
       startZanoSync,
+      startXelisSync,
     ]
   );
 
@@ -1518,6 +1843,9 @@ export function useVault(args: {
         // route at all — "forgetting" it meant logging out (which closed the
         // sidecar but left the seed in the vault) or overwriting the field.
         const isPrimaryZano = live && target?.kind === "zano";
+        // Xelis (2026-09-15). No swap-engine check below it: no swap venue
+        // carries XEL, so no node can be sharing this wallet.
+        const isPrimaryXelis = live && target?.kind === "xelis";
         if (isPrimaryXmr && checkXmrHostWalletInUse) {
           try {
             if (await checkXmrHostWalletInUse()) {
@@ -1589,6 +1917,14 @@ export function useVault(args: {
           setZanoSeedLoaded(null);
           setZanoSeedPassphrase?.(null);
           await forgetZanoSession();
+        } else if (isPrimaryXelis) {
+          setWalletsByChain((prev) => {
+            const nextChains = { ...prev };
+            delete nextChains.xelis;
+            return nextChains;
+          });
+          setXelisSeedLoaded(null);
+          await forgetXelisSession();
         }
         // An xmr/zph/zano wallet in a context that is NOT open has no live
         // session to tear down. Its wallet files (if it was ever switched to)
@@ -1614,9 +1950,11 @@ export function useVault(args: {
       setZphSeedLoaded,
       setZanoSeedLoaded,
       setZanoSeedPassphrase,
+      setXelisSeedLoaded,
       forgetXmrSession,
       forgetZphSession,
       forgetZanoSession,
+      forgetXelisSession,
     ]
   );
 
@@ -1635,10 +1973,19 @@ export function useVault(args: {
         return;
       }
       try {
-        const v3 = await loadVaultV3(sessionPassword);
+        // The unlock repair, applied again on read: if unlock could not save
+        // it, the entries this switch opens must still not share a file. The
+        // save below persists it together with the new active context.
+        const { v3, repairs } = repairSharedSidecarFiles(await loadVaultV3(sessionPassword));
         const ctx = contextForWallet(v3, walletId);
         if (!ctx) return;
         await saveVaultV3({ ...v3, lastActiveWalletId: walletId }, sessionPassword);
+        if (repairs.length > 0) {
+          console.warn(
+            "[useVault] switchWallet: gave shared wallet files back to their own wallets:",
+            repairs.map(({ id, kind, from, to }) => ({ id, kind, from, to }))
+          );
+        }
         setActiveWalletId(walletId);
 
         // BIP39 chains from this context's bip39 member (empty for a pure
@@ -1776,8 +2123,37 @@ export function useVault(args: {
           void forgetZanoSession();
         }
 
+        // Xelis, like the three above: open the TARGET context's own wallet
+        // directory, or stop the one the previous context had open. Per-coin
+        // failures stay isolated so a bad entry cannot block the whole switch.
+        const xelisEntry = memberOfKind(ctx, "xelis");
+        if (xelisEntry) {
+          try {
+            newWallets.xelis = xelisWalletInfo(xelisEntry.seed);
+            setXelisSeedLoaded(xelisEntry.seed);
+            startXelisSync(
+              xelisEntry.seed,
+              sessionPassword,
+              sidecarFileForEntry(xelisEntry)
+            );
+          } catch (e) {
+            console.warn("[useVault] switchWallet: Xelis re-point failed:", e);
+            setXelisSeedLoaded(null);
+          }
+        } else {
+          setXelisSeedLoaded(null);
+          void forgetXelisSession();
+        }
+
         setWalletsByChain(newWallets);
-        setSuccess(`Switched to "${ctx.name}".`);
+        // One notice for both. A separate repair notice set earlier was
+        // overwritten right here, so a repair on switch went unreported
+        // (caught in the sandbox, 2026-09-16).
+        setSuccess(
+          repairs.length > 0
+            ? `Switched to "${ctx.name}". ${describeRepairs(repairs)}`
+            : `Switched to "${ctx.name}".`
+        );
       } catch (e: any) {
         setError("Failed to switch wallet: " + (e?.message || String(e)));
       }
@@ -1794,12 +2170,15 @@ export function useVault(args: {
       setZphSeedLoaded,
       setZanoSeedLoaded,
       setZanoSeedPassphrase,
+      setXelisSeedLoaded,
       startXmrSync,
       startZphSync,
       startZanoSync,
+      startXelisSync,
       lockXmrSession,
       forgetZphSession,
       forgetZanoSession,
+      forgetXelisSession,
     ]
   );
 
@@ -1831,6 +2210,9 @@ export function useVault(args: {
     saveXmrSeedToVault,
     saveZphSeedToVault,
     saveZanoSeedToVault,
+    // Xelis (2026-09-15) writes through the v3 CRUD instead, and resolves the
+    // new entry's wallet directory for the caller's `startXelisSync`.
+    saveXelisSeedToVault,
 
     // Multi-wallet CRUD (Phase 2) — drives Settings ▸ Wallets
     addWallet,

@@ -329,6 +329,16 @@ export const COIN_METADATA: Record<ChainType, CoinMeta> = {
     color: "#3ba0f5",
     addressPlaceholder: "Zx...",
   },
+  xelis: {
+    ticker: "XEL",
+    displayName: "Xelis",
+    // XELIS's own mint, the fill of the official logo (xelis-assets
+    // `green.svg`). Unlike Zano's near-black it reads on #0a0a0a as-is. It
+    // sits close to the app accent #00ff66; that was chosen deliberately
+    // (2026-09-15) over inventing an off-brand teal. See [[coin-colour-rules]].
+    color: "#02FFCF",
+    addressPlaceholder: "xel:...",
+  },
 };
 
 export function getCoinMeta(chain: ChainType): CoinMeta {
@@ -361,7 +371,7 @@ export const CANONICAL_ASSET_ORDER: readonly string[] = [
   // Long-tail L1s Pwnda surfaces.
   "RVN", "CFX", "HBAR", "ALGO", "ERG",
   // Privacy + Pwnda-native Zephyr ecosystem.
-  "XMR", "ZEPH", "ZEPHUSD", "ZEPHRSV", "ZEPHYRS", "ZANO",
+  "XMR", "ZEPH", "ZEPHUSD", "ZEPHRSV", "ZEPHYRS", "ZANO", "XEL",
   // Stablecoins grouped last.
   "USDC", "USDT", "DAI",
 ];

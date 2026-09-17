@@ -3,7 +3,26 @@ import {
   cpuThreadArgsForIntensity,
   cpuThreadsPreLaunchLabel,
   gpuIntensityValue,
+  srbCpuThreadsPreLaunchLabel,
 } from "./devicePower";
+
+describe("srbCpuThreadsPreLaunchLabel (SRBMiner CPU lane, XEL)", () => {
+  it("low is 2 threads regardless of the core count", () => {
+    expect(srbCpuThreadsPreLaunchLabel("low", 32)).toBe("2 threads");
+    expect(srbCpuThreadsPreLaunchLabel("low", 0)).toBe("2 threads");
+  });
+
+  it("medium is half the logical processors, never zero", () => {
+    expect(srbCpuThreadsPreLaunchLabel("medium", 32)).toBe("16 threads");
+    expect(srbCpuThreadsPreLaunchLabel("medium", 1)).toBe("1 threads");
+    expect(srbCpuThreadsPreLaunchLabel("medium", 0)).toBe("half the threads");
+  });
+
+  it("high is every logical processor", () => {
+    expect(srbCpuThreadsPreLaunchLabel("high", 32)).toBe("32 threads");
+    expect(srbCpuThreadsPreLaunchLabel("high", 0)).toBe("all threads");
+  });
+});
 
 describe("cpuThreadArgsForIntensity", () => {
   it("low: literal 2 threads, no hint, priority 1 — agnostic of cpuThreadCount", () => {

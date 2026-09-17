@@ -5,17 +5,22 @@ import type { FeatureFocus } from "../../state/featureFocus";
 import {
   initZphSession,
   closeZphWallet,
+  lockZphWallet,
   getZphSyncProgress,
   checkZphWalletRpcExists,
   downloadZphWalletRpc,
   checkZphDefenderExclusion,
   addZphDefenderExclusion,
+  onZphSent,
 } from "../../wallets/zph-wallet";
 import {
   storeWallet as storeZphWallet,
   getAllBalances,
   type ZphAssetBalance,
 } from "../../wallets/zph-rpc";
+
+/** How often ZSD/ZRS/ZYS balances are re-read while synced (2026-09-15). */
+const ASSET_BALANCE_REFRESH_MS = 45_000;
 
 export type ZphSyncState =
   | "idle"
@@ -33,9 +38,12 @@ export interface ZphDownloadProgressPayload {
 
 /**
  * Zephyr counterpart to `useXmrSession`. Structurally identical minus
- * the transaction-history polling path — ZPH's `get_transfers` is wired
- * at the adapter level but not surfaced in the UI yet, so no history
- * poller here.
+ * the transaction-history polling path: Zephyr history reaches the UI through
+ * the generic `useTxHistory` hook (`zphAdapter.getTransactionHistory`, shown in
+ * Activity and the wallet "Recent" lists), so this hook does not poll it.
+ *
+ * (Corrected 2026-09-15: this said `get_transfers` was "not surfaced in the UI
+ * yet", which stopped being true when the generic history feed landed.)
  */
 export function useZphSession(args: {
   activeChain: ChainType;
@@ -53,6 +61,16 @@ export function useZphSession(args: {
   const [syncDaemonHeight, setSyncDaemonHeight] = useState(0);
   const [syncError, setSyncError] = useState("");
   const syncPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  /**
+   * What `start` was last given besides the seed, so `retry` reopens the SAME
+   * wallet file at the SAME restore height. `initZphSession` defaults an absent
+   * name to the PRIMARY wallet's `pwnda-zph-active` and self-heals an address
+   * mismatch by deleting the file it opened, so the old two-argument `retry` —
+   * and the automatic retry below — reopened Main's file for every other Zephyr
+   * wallet (2026-09-16). See `useXmrSession`'s `startArgsRef`.
+   */
+  const startArgsRef = useRef<{ restoreHeight: number; walletFilename?: string } | null>(null);
 
   // Sync-rate estimator — see useXmrSession for the long version.
   const syncSamplesRef = useRef<Array<{ t: number; h: number }>>([]);
@@ -86,6 +104,7 @@ export function useZphSession(args: {
 
   const start = useCallback(
     (seed: string, masterPassword: string, restoreHeight: number = 0, walletFilename?: string) => {
+      startArgsRef.current = { restoreHeight, walletFilename };
       setSyncState("starting");
       setSyncPercent(0);
       setSyncWalletHeight(0);
@@ -105,10 +124,16 @@ export function useZphSession(args: {
     []
   );
 
+  /** Reopens the SAME wallet file at the SAME height — see `startArgsRef`.
+   *  With nothing remembered it does nothing rather than guess. */
   const retry = useCallback(() => {
-    if (seedLoaded && sessionPassword) {
-      start(seedLoaded, sessionPassword);
+    if (!seedLoaded || !sessionPassword) return;
+    const args = startArgsRef.current;
+    if (!args) {
+      console.warn("[useZphSession] retry skipped: no session to reopen");
+      return;
     }
+    start(seedLoaded, sessionPassword, args.restoreHeight, args.walletFilename);
   }, [seedLoaded, sessionPassword, start]);
 
   const checkBinaryStatus = useCallback(async () => {
@@ -149,7 +174,10 @@ export function useZphSession(args: {
     }
   }, []);
 
+  // Only `lock` and `forget` reach here, and both end the session, so what
+  // `retry` would replay ends with it.
   const resetState = useCallback(() => {
+    startArgsRef.current = null;
     setSyncState("idle");
     setSyncPercent(0);
     setSyncWalletHeight(0);
@@ -165,6 +193,18 @@ export function useZphSession(args: {
       await closeZphWallet();
     } catch (e) {
       console.warn("[useZphSession] forget cleanup failed:", e);
+    }
+    resetState();
+  }, [resetState]);
+
+  /** Lock: like `forget`, except a swap node that is using the Zephyr wallet
+   *  keeps it open (see `lockZphWallet`). `forget` stays the hard close for a
+   *  wallet switch and for removal. */
+  const lock = useCallback(async () => {
+    try {
+      await lockZphWallet();
+    } catch (e) {
+      console.warn("[useZphSession] lock cleanup failed:", e);
     }
     resetState();
   }, [resetState]);
@@ -328,12 +368,34 @@ export function useZphSession(args: {
   // swap modal + multi-asset dashboard card a fresh snapshot. Held out of
   // the sync-poll body so it doesn't run every 3-second tick (which would
   // contend with other wallet-rpc calls and risk starving the sync poll
-  // itself). Subsequent refreshes happen on swap-success and on explicit
-  // user refresh.
+  // itself).
   useEffect(() => {
     if (syncState !== "synced") return;
     void refreshAssetBalances();
   }, [syncState, refreshAssetBalances]);
+
+  // 2026-09-15: the snapshot above used to be refreshed only on swap success,
+  // so a ZEPHUSD send, or any incoming ZSD/ZRS/ZYS, left the asset rows showing
+  // the old balance until the next sync-state change. Two refresh paths, both
+  // well clear of the 3-second sync poll:
+  //   - every ASSET_BALANCE_REFRESH_MS while synced (incoming funds, unlocks);
+  //   - right after this app broadcasts a Zephyr send (`onZphSent`), whichever
+  //     layout, asset or path (fresh build or relayed quote) sent it.
+  useEffect(() => {
+    if (syncState !== "synced") return;
+    const id = setInterval(() => {
+      void refreshAssetBalances();
+    }, ASSET_BALANCE_REFRESH_MS);
+    return () => clearInterval(id);
+  }, [syncState, refreshAssetBalances]);
+
+  useEffect(
+    () =>
+      onZphSent(() => {
+        void refreshAssetBalances();
+      }),
+    [refreshAssetBalances]
+  );
 
   useEffect(() => {
     let off: (() => void) | null = null;
@@ -371,6 +433,7 @@ export function useZphSession(args: {
     addDefender,
     resetState,
     forget,
+    lock,
     setSyncState,
     setSyncError,
   };

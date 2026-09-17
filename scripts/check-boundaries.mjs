@@ -99,6 +99,7 @@ const RULES = {
         path.join(FEATURES, "swap-sidecar"),
         path.join(FEATURES, "vault"),
         path.join(FEATURES, "wallet"),
+        path.join(FEATURES, "xelis"),
         path.join(FEATURES, "zano"),
         path.join(FEATURES, "zephyr"),
         // App-level state context
@@ -171,6 +172,7 @@ const RULES = {
         path.join(FEATURES, "swap-sidecar"),
         path.join(FEATURES, "vault"),
         path.join(FEATURES, "wallet"),
+        path.join(FEATURES, "xelis"),
         path.join(FEATURES, "zano"),
         path.join(FEATURES, "zephyr"),
         // App-level state context — Lite has its own AppStateLite
@@ -228,6 +230,7 @@ const RULES = {
         path.join(FEATURES, "swap-sidecar"),
         path.join(FEATURES, "vault"),
         path.join(FEATURES, "wallet"),
+        path.join(FEATURES, "xelis"),
         path.join(FEATURES, "zano"),
         path.join(FEATURES, "zephyr"),
         path.join(SRC, "state"),
@@ -241,7 +244,78 @@ const RULES = {
     // Narrow exception — see BOUNDARIES.md "design" row.
     exempt: [path.join(DESIGN, "catalog", "compositions")],
   },
+  // Added 2026-09-16. The wallet row was documentation only, and it had
+  // drifted: it said sibling features were reached "via their index.ts" while
+  // the wallet imported monero/zephyr/zano/onboarding files directly (those
+  // folders have no barrel), and `wallet-surface.ts` imported swap's PRIVATE
+  // `asset-capabilities.ts` — the kind of reach-in the barrel exists to stop,
+  // which nothing checked. This rule enforces the row as it now reads:
+  // barrels where a feature has one, named files where it does not.
+  wallet: {
+    label: "src/features/wallet",
+    folder: path.join(FEATURES, "wallet"),
+    // Tests may cross-check another feature's internals on purpose
+    // (`wallet-surface.test.ts` asks every router whether it routes XEL).
+    exemptTests: true,
+    allow: {
+      under: [
+        path.join(FEATURES, "wallet"),
+        path.join(SRC, "components"),
+        DESIGN,
+        path.join(SRC, "lib"),
+        path.join(SRC, "utils"),
+        path.join(SRC, "platform"),
+        path.join(SRC, "types"),
+        path.join(SRC, "wallets"),
+        path.join(SRC, "state"),
+        // The independent-seed chains' panels and cards, mounted by both
+        // wallet layouts. No barrel exists for these folders yet.
+        path.join(FEATURES, "monero"),
+        path.join(FEATURES, "zephyr"),
+        path.join(FEATURES, "zano"),
+        // Derivation detection, shared with the import flow.
+        path.join(FEATURES, "onboarding"),
+      ],
+      equals: [
+        path.join(SRC, "store"),
+        path.join(SRC, "crypto"),
+        path.join(SRC, "secure-random"),
+        // Public barrels — the ONLY way into these three features.
+        path.join(FEATURES, "swap"),
+        path.join(FEATURES, "swap", "index"),
+        path.join(FEATURES, "swap-sidecar"),
+        path.join(FEATURES, "swap-sidecar", "index"),
+        path.join(FEATURES, "xelis"),
+        path.join(FEATURES, "xelis", "index"),
+        // Two named files from folders with no barrel.
+        path.join(FEATURES, "activity", "useTxHistory"),
+        path.join(FEATURES, "landscape", "SyncStatusPanel"),
+      ],
+    },
+    ban: {
+      under: [
+        // Internals of features that HAVE a barrel (the barrel itself is
+        // allowed above; `allow.equals` is checked before these).
+        path.join(FEATURES, "swap"),
+        path.join(FEATURES, "swap-sidecar"),
+        path.join(FEATURES, "xelis"),
+        // Everything else from these, apart from the named files above.
+        path.join(FEATURES, "activity"),
+        path.join(FEATURES, "landscape"),
+        // No wallet dependency on these at all. vault/send would need a
+        // barrel first (BOUNDARIES.md).
+        path.join(FEATURES, "auth"),
+        path.join(FEATURES, "mining"),
+        path.join(FEATURES, "send"),
+        path.join(FEATURES, "settings"),
+        path.join(FEATURES, "vault"),
+      ],
+      equals: [path.join(SRC, "App")],
+    },
+  },
 };
+
+const TEST_FILE_RE = /(\.test\.tsx?$)|([\\/]__tests__[\\/])/;
 
 const IMPORT_RE = /(?:^|\n)\s*import(?:\s+type)?\s+[^"']*from\s+["']([^"']+)["']/g;
 const REQUIRE_RE = /\brequire\s*\(\s*["']([^"']+)["']\s*\)/g;
@@ -276,6 +350,14 @@ function classify(absSpec, rule) {
   for (const eq of rule.ban.equals) {
     if (absSpec === eq) return "banned";
   }
+  // Exact allows win over prefix bans, so a rule can allow a feature's barrel
+  // (`features/swap`, `features/swap/index`) while banning everything else
+  // under it. (Moved ahead of the prefix bans 2026-09-16 for the wallet rule;
+  // no allow.equals entry of the mining/lite/design rules sits under one of
+  // their own ban prefixes, so their verdicts are unchanged.)
+  for (const eq of rule.allow.equals) {
+    if (absSpec === eq) return "ok";
+  }
   for (const prefix of rule.ban.under) {
     if (absSpec === prefix || absSpec.startsWith(prefix + path.sep)) {
       // Don't flag a "ban under src/features/X" hit if the same path
@@ -289,9 +371,6 @@ function classify(absSpec, rule) {
       }
       return "banned";
     }
-  }
-  for (const eq of rule.allow.equals) {
-    if (absSpec === eq) return "ok";
   }
   for (const prefix of rule.allow.under) {
     if (absSpec === prefix || absSpec.startsWith(prefix + path.sep)) {
@@ -316,6 +395,7 @@ function checkFeature(feature) {
   const exempt = rule.exempt ?? [];
   for (const file of files) {
     if (exempt.some((p) => file.startsWith(p + path.sep) || file === p)) continue;
+    if (rule.exemptTests && TEST_FILE_RE.test(file)) continue;
     const src = readFileSync(file, "utf8");
     const seen = new Set();
     for (const re of [IMPORT_RE, REQUIRE_RE]) {

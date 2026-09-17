@@ -5,9 +5,10 @@ import type { FeatureFocus } from "../../state/featureFocus";
 import {
   initZanoSession,
   closeZanoWallet,
+  lockZanoWallet,
   isZanoSessionActive,
   getZanoAllAssetBalances,
-  getZanoTransactionHistory,
+  readZanoTransactionHistory,
 } from "../../wallets/zano-wallet";
 import {
   isZanoRpcRunning,
@@ -69,6 +70,19 @@ export function useZanoSession(args: {
 
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /**
+   * The wallet file the running session was started with, so `retry` reopens
+   * THAT file rather than Zano's legacy fixed name.
+   *
+   * Zano is the one chain where an absent filename is not an error: Rust falls
+   * back to `ZANO_WALLET_FILE_NAME` ("pwnda.zan",
+   * `zano_rpc.rs::get_wallet_file`), which belongs to the migrated primary
+   * wallet. So a `retry` that dropped the file opened a different wallet than
+   * the vault entry names, with no error anywhere (2026-09-15).
+   * `useXelisSession` keeps the same ref, for the same reason.
+   */
+  const walletFileRef = useRef<string | undefined>(undefined);
+
   const refreshAssetBalances = useCallback(async () => {
     try {
       const balances = await getZanoAllAssetBalances();
@@ -81,10 +95,12 @@ export function useZanoSession(args: {
   const refreshTxHistory = useCallback(async () => {
     setTxLoading(true);
     try {
-      const history = await getZanoTransactionHistory();
+      // The THROWING read: a failed read keeps the list already shown instead
+      // of replacing it with `[]` ("no transfers").
+      const history = await readZanoTransactionHistory();
       setTxHistory(history);
     } catch (e) {
-      console.warn("[useZanoSession] getZanoTransactionHistory failed:", e);
+      console.warn("[useZanoSession] readZanoTransactionHistory failed:", e);
     } finally {
       setTxLoading(false);
     }
@@ -99,6 +115,7 @@ export function useZanoSession(args: {
       // Zano's original single fixed filename (the migrated primary wallet).
       walletFile?: string,
     ) => {
+      walletFileRef.current = walletFile;
       setSyncState("starting");
       setSyncError("");
       (async () => {
@@ -118,9 +135,10 @@ export function useZanoSession(args: {
     [refreshBalance, refreshAssetBalances, refreshTxHistory]
   );
 
+  /** Reopens the SAME wallet file `start` was given — see `walletFileRef`. */
   const retry = useCallback(() => {
     if (seedLoaded && sessionPassword) {
-      start(seedLoaded, sessionPassword, seedPassphrase ?? "");
+      start(seedLoaded, sessionPassword, seedPassphrase ?? "", walletFileRef.current);
     }
   }, [seedLoaded, sessionPassword, seedPassphrase, start]);
 
@@ -154,7 +172,10 @@ export function useZanoSession(args: {
     }
   }, [checkBinaryStatus]);
 
+  // Only `forget` and `lock` reach here, and both end the session, so the
+  // remembered wallet file ends with it: the next `start` brings its own.
   const resetState = useCallback(() => {
+    walletFileRef.current = undefined;
     setSyncState("idle");
     setSyncError("");
     setAssetBalances(null);
@@ -166,6 +187,18 @@ export function useZanoSession(args: {
       await closeZanoWallet();
     } catch (e) {
       console.warn("[useZanoSession] forget cleanup failed:", e);
+    }
+    resetState();
+  }, [resetState]);
+
+  /** Lock: like `forget`, except a swap node that is using the Zano wallet
+   *  keeps it (see `lockZanoWallet`). `forget` stays the hard stop for a
+   *  wallet switch and for removal. */
+  const lock = useCallback(async () => {
+    try {
+      await lockZanoWallet();
+    } catch (e) {
+      console.warn("[useZanoSession] lock cleanup failed:", e);
     }
     resetState();
   }, [resetState]);
@@ -189,6 +222,12 @@ export function useZanoSession(args: {
   // confirms the sidecar is still responding and keeps balances/history
   // fresh. 30s cadence: cheap enough to run continuously, frequent enough
   // that a balance change from an incoming transfer shows up promptly.
+  //
+  // CORRECTED 2026-09-16: the comment above said "history", but the tick only
+  // refreshed balances; history was read once, at start. The Zano history card
+  // stayed frozen at unlock time while Activity (fed by a second, adapter-level
+  // poll in App.tsx) moved on. This tick is now the ONE Zano history reader,
+  // and App.tsx feeds Activity from `txHistory`.
   useEffect(() => {
     if (pollRef.current) {
       clearInterval(pollRef.current);
@@ -205,6 +244,7 @@ export function useZanoSession(args: {
       }
       refreshBalance();
       void refreshAssetBalances();
+      void refreshTxHistory();
     };
     pollRef.current = setInterval(() => void tick(), 30_000);
     return () => {
@@ -213,7 +253,7 @@ export function useZanoSession(args: {
         pollRef.current = null;
       }
     };
-  }, [syncState, refreshBalance, refreshAssetBalances]);
+  }, [syncState, refreshBalance, refreshAssetBalances, refreshTxHistory]);
 
   useEffect(() => {
     let off: (() => void) | null = null;
@@ -244,6 +284,7 @@ export function useZanoSession(args: {
     start,
     retry,
     forget,
+    lock,
     downloadBinary,
     checkBinaryStatus,
     refreshAssetBalances,

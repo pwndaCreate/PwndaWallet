@@ -1,5 +1,8 @@
 import { useCallback, useState } from "react";
 import { shouldUseAccountSend } from "./accountSend";
+import { sendFailureText } from "./sendErrors";
+import { setSendAssetType, useSendAssetType } from "./sendAssetStore";
+import { quoteMatchesSend } from "../../wallets/send-quote";
 import type {
   ChainAdapter,
   ChainType,
@@ -87,7 +90,12 @@ export function useSend(args: {
   // Optional per-chain asset selector — only Zephyr uses it (ZSD/ZRS/ZYS).
   // `undefined` means "the chain's native asset" (the default for every other
   // chain and for the focal ZEPH send).
-  const [sendAssetType, setSendAssetType] = useState<string | undefined>(undefined);
+  //
+  // Held in `sendAssetStore`, not `useState` (2026-09-15): portrait's
+  // `ViewRouter` mounts the same SendModal and must label it with the SAME
+  // value this hook sends with, while App.tsx hands this hook's return value
+  // to the landscape root only. `setSendAssetType` below is the store's setter.
+  const sendAssetType = useSendAssetType();
 
   const openSendModal = useCallback((assetType?: string) => {
     // Coerce anything that is not a string to `undefined`. React passes its
@@ -115,8 +123,13 @@ export function useSend(args: {
    * Coerced: anything that is not a positive finite number is dropped, because
    * a handler wired as `onClick={handleSend}` receives a MouseEvent here — the
    * same shape as the `openSendModal` event bug documented above.
+   *
+   * `quoteArg` (2026-09-15) is the Send modal's priced quote, for adapters
+   * with `quoteSend` (Zephyr). Also `unknown`, for the same reason: it is
+   * relayed only if `quoteMatchesSend` recognises it as a quote for exactly
+   * this send.
    */
-  const handleSend = useCallback(async (feeRateArg?: unknown) => {
+  const handleSend = useCallback(async (feeRateArg?: unknown, quoteArg?: unknown) => {
     if (!wallet) return;
     const feeRate =
       typeof feeRateArg === "number" && Number.isFinite(feeRateArg) && feeRateArg > 0
@@ -175,6 +188,20 @@ export function useSend(args: {
         if (refusal) throw new Error(refusal);
       }
 
+      // A priced quote (2026-09-15, Zephyr) is broadcast AS BUILT only when it
+      // is exactly this send — same recipient, amount and asset — and recent
+      // (`quoteMatchesSend`, 90 s). Otherwise the adapter builds the send fresh,
+      // exactly as before quotes existed. Never relayed for other inputs.
+      const quote =
+        adapter.sendQuoted &&
+        quoteMatchesSend(
+          quoteArg,
+          { to: sendTo, amount: sendAmount, assetType: sendAssetType },
+          Date.now()
+        )
+          ? quoteArg
+          : null;
+
       const result = sendOverride
         ? await sendOverride(sendTo, sendAmount)
         : useAccountSend
@@ -185,12 +212,14 @@ export function useSend(args: {
               wallet.address,
               { feeRate }
             )
-          : await adapter.sendTransaction(
-              keyMaterial,
-              sendTo,
-              sendAmount,
-              sendAssetType
-            );
+          : quote
+            ? await adapter.sendQuoted!(quote)
+            : await adapter.sendTransaction(
+                keyMaterial,
+                sendTo,
+                sendAmount,
+                sendAssetType
+              );
       setSuccess(`Transaction sent! Hash: ${result.hash}`);
       setSendTo("");
       setSendAmount("");
@@ -201,8 +230,10 @@ export function useSend(args: {
       // the new (pending) transaction shows up in Activity within seconds
       // instead of waiting for the next 60s poll.
       void refreshTxHistory(activeChain);
-    } catch (e: any) {
-      setError("Transaction failed: " + e.message);
+    } catch (e) {
+      // Not `e.message`: wallet-rpc failures arrive as plain strings (Tauri's
+      // `Err(String)`), which printed "Transaction failed: undefined".
+      setError(sendFailureText(e));
     } finally {
       setSending(false);
     }

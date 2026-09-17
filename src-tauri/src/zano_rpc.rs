@@ -7,6 +7,11 @@
 //! which exists only because the atomic-swap engine can co-own the Monero
 //! wallet).
 //!
+//! **Corrected 2026-09-15:** C-RX (below) made the swap engine read and spend
+//! from Main, so something else does share it. There is still no lease SET,
+//! but the supervisor holds a claim while the node shares Main, and a lock
+//! leaves Main running under it. See "The swap node's claim on Main".
+//!
 //! # Grove expansion plan, Phase C, unit C-RX — a SECOND instance, not a
 //! # lease on the first
 //!
@@ -199,9 +204,14 @@ pub struct ZanoDownloadProgress {
 pub struct ZanoRpcInner {
     pub child: Option<tokio::process::Child>,
     /// Per-session HS256 secret handed to the sidecar via `--jwt-secret`.
-    /// Regenerated on every start; mirrored beside the pidfile only so a
+    /// Regenerated on every start unless the swap node holds its claim (see
+    /// [`set_engine_claim`]); mirrored beside the pidfile only so a
     /// crash-recovery reattach can still authenticate.
     pub jwt_secret: Option<String>,
+    /// The wallet file the running child was started with. A start for a
+    /// different file restarts Main instead of returning early and leaving
+    /// the previous wallet serving the new session.
+    pub wallet_file: Option<PathBuf>,
 }
 
 impl Default for ZanoRpcInner {
@@ -209,6 +219,7 @@ impl Default for ZanoRpcInner {
         Self {
             child: None,
             jwt_secret: None,
+            wallet_file: None,
         }
     }
 }
@@ -219,6 +230,56 @@ impl Default for ZanoRpcChild {
     fn default() -> Self {
         Self(Mutex::new(ZanoRpcInner::default()))
     }
+}
+
+// =========================================================================
+// The swap node's claim on Main (2026-09-15)
+// =========================================================================
+//
+// The module doc above says nothing else shares Main, so it has no lease. C-RX
+// made that untrue: the engine reads and spends from Main for every ZANO swap.
+// Lock called `zano_stop_rpc`, which killed Main unconditionally, so locking
+// the app mid-swap took the engine's wallet away, and an offer that took a bid
+// while the app was locked had no wallet to fund or receive it.
+//
+// The supervisor now holds a claim while the node shares Main. A stop that is
+// a LOCK (`lock: true`) stores the wallet and leaves Main serving; every other
+// stop (a wallet switch, a daemon switch, the address self-heal) behaves as
+// before. While the claim is held, Main's JWT secret also survives a restart
+// of Main: the engine's `basicswap.json` carries that secret for the life of
+// the node, and a fresh one would shut the engine out of Main until the node
+// restarted.
+
+static ENGINE_CLAIM: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Claim Main for the swap node with the JWT secret written into the node's
+/// config (`Some`), or release the claim (`None`).
+pub fn set_engine_claim(secret: Option<String>) {
+    if let Ok(mut claim) = ENGINE_CLAIM.lock() {
+        *claim = secret;
+    }
+}
+
+/// Is Main claimed by the swap node?
+pub fn engine_claim_held() -> bool {
+    ENGINE_CLAIM.lock().map(|c| c.is_some()).unwrap_or(false)
+}
+
+/// The secret a restart of Main reuses while the swap node holds its claim.
+fn engine_claim_secret() -> Option<String> {
+    ENGINE_CLAIM.lock().ok().and_then(|c| c.clone())
+}
+
+/// Does this stop leave Main running? Only a lock, and only under a claim.
+/// Pure.
+pub fn stop_keeps_main(lock: bool, claim_held: bool) -> bool {
+    lock && claim_held
+}
+
+/// Must a start restart the running child? Only when it serves a different
+/// wallet file from the one requested. Pure.
+pub fn start_needs_restart(running: Option<&std::path::Path>, requested: &std::path::Path) -> bool {
+    matches!(running, Some(r) if r != requested)
 }
 
 // =========================================================================
@@ -673,6 +734,9 @@ pub async fn ensure_wallet_file(
 
     let binary = resolve_rpc_binary(app)?;
     let mut cmd = tokio::process::Command::new(&binary);
+    // Never the app's inherited working directory — see
+    // `zano_scratch_start` for what landed there when this was unset.
+    cmd.current_dir(get_wallet_dir(app)?);
     cmd.arg("--password")
         .arg(wallet_password)
         .arg("--offline-mode");
@@ -753,12 +817,23 @@ pub async fn zano_start_rpc(
     wallet_file: Option<String>,
 ) -> Result<(), String> {
     let state = app.state::<ZanoRpcChild>();
+    let requested_file = get_wallet_file(&app, wallet_file.as_deref())?;
 
     {
         let inner = state.0.lock().await;
-        if inner.child.is_some() {
+        if inner.child.is_some()
+            && !start_needs_restart(inner.wallet_file.as_deref(), &requested_file)
+        {
             return Ok(());
         }
+    }
+    // A child serving a DIFFERENT wallet. This used to return early too, which
+    // was harmless only because every caller stopped Main first. A lock that
+    // leaves Main up for the swap node (`set_engine_claim`) makes it reachable:
+    // the next session would have read the previous wallet's address and
+    // balance.
+    if state.0.lock().await.child.is_some() {
+        stop_main(&app).await;
     }
 
     reap_stale_process(&app).await;
@@ -776,16 +851,19 @@ pub async fn zano_start_rpc(
         ));
     }
 
-    let wallet_file = get_wallet_file(&app, wallet_file.as_deref())?;
+    let wallet_file = requested_file;
     if !wallet_file.exists() {
         return Err("No Zano wallet file. Run the import/create flow first.".into());
     }
 
     let binary = resolve_rpc_binary(&app)?;
     let log_file = get_log_file(&app)?;
-    let jwt_secret = random_hex(32);
+    // Under the swap node's claim, keep the secret its config already holds.
+    let jwt_secret = engine_claim_secret().unwrap_or_else(|| random_hex(32));
 
     let mut cmd = tokio::process::Command::new(&binary);
+    // Never the app's inherited working directory — see `zano_scratch_start`.
+    cmd.current_dir(get_wallet_dir(&app)?);
     cmd.arg("--wallet-file")
         .arg(&wallet_file)
         .arg("--password")
@@ -844,6 +922,7 @@ pub async fn zano_start_rpc(
         let mut inner = state.0.lock().await;
         inner.child = Some(child);
         inner.jwt_secret = Some(jwt_secret.clone());
+        inner.wallet_file = Some(wallet_file.clone());
     }
 
     // Readiness: poll a cheap AUTHENTICATED method, so we prove both that the
@@ -887,7 +966,7 @@ pub async fn zano_start_rpc(
             let tail = get_log_file(&app)
                 .map(|p| read_log_tail(&p, 4096))
                 .unwrap_or_default();
-            let _ = zano_stop_rpc(app.clone()).await;
+            stop_main(&app).await;
             return Err(format!(
                 "Zano wallet-rpc did not become ready in {} ms. Log tail:\n{}",
                 READY_BUDGET_MS, tail
@@ -919,8 +998,38 @@ pub async fn zano_rpc_call(
     do_rpc_call_jwt(ZANO_RPC_URL, &secret, &method, params, std::time::Duration::from_secs(120)).await
 }
 
+/// Stop Main, or, when this is a lock and the swap node holds its claim, only
+/// store the wallet and leave Main serving.
+///
+/// `lock` is `true` only from the app's Lock path (`zano-wallet.ts`,
+/// `lockZanoWallet`). A wallet switch, a daemon switch and the address
+/// self-heal stop Main exactly as before. See [`set_engine_claim`].
 #[tauri::command]
-pub async fn zano_stop_rpc(app: AppHandle) -> Result<(), String> {
+pub async fn zano_stop_rpc(app: AppHandle, lock: Option<bool>) -> Result<(), String> {
+    if stop_keeps_main(lock.unwrap_or(false), engine_claim_held()) {
+        let secret = {
+            let state = app.state::<ZanoRpcChild>();
+            let inner = state.0.lock().await;
+            inner.jwt_secret.clone()
+        };
+        if let Some(secret) = secret {
+            let _ = do_rpc_call_jwt(
+                ZANO_RPC_URL,
+                &secret,
+                "store",
+                serde_json::json!({}),
+                std::time::Duration::from_millis(5_000),
+            )
+            .await;
+        }
+        eprintln!("[zano-rpc] lock: Main stays up because the swap node is using it");
+        return Ok(());
+    }
+    stop_main(&app).await;
+    Ok(())
+}
+
+async fn stop_main(app: &AppHandle) {
     let state = app.state::<ZanoRpcChild>();
 
     // Ask it to persist and close cleanly before killing: an abrupt kill during
@@ -948,16 +1057,16 @@ pub async fn zano_stop_rpc(app: AppHandle) -> Result<(), String> {
             let _ = child.kill().await;
         }
         inner.jwt_secret = None;
+        inner.wallet_file = None;
     }
 
-    if let Ok(p) = get_pidfile(&app) {
+    if let Ok(p) = get_pidfile(app) {
         delete_pidfile(&p);
     }
-    if let Ok(p) = get_secretfile(&app) {
+    if let Ok(p) = get_secretfile(app) {
         let _ = std::fs::remove_file(p);
     }
     wait_for_port_free(ZANO_RPC_PORT, 5_000).await;
-    Ok(())
 }
 
 /// Thin command wrapper over [`ensure_wallet_file`].
@@ -1500,6 +1609,8 @@ async fn ensure_scratch_wallet_file(
     let wallet_password = random_hex(ZANO_SCRATCH_PASSWORD_BYTES);
 
     let mut cmd = tokio::process::Command::new(binary);
+    // Never the app's inherited working directory — see `zano_scratch_start`.
+    cmd.current_dir(get_scratch_wallet_dir(app)?);
     cmd.arg("--password")
         .arg(&wallet_password)
         .arg("--offline-mode")
@@ -1664,6 +1775,20 @@ pub async fn zano_scratch_start(
     let jwt_secret = random_hex(32);
 
     let mut cmd = tokio::process::Command::new(&binary);
+    // The working directory is where the swap engine's per-swap wallets land.
+    // The engine names them by address alone (`"filename": address_b58`, and
+    // `address_b58 + "_spend"` for a claim) — relative paths, which
+    // simplewallet resolves against ITS working directory. Unset, that was
+    // whatever directory the app was launched from: `src-tauri/` under
+    // `tauri dev`, the user's home under a Linux desktop launcher.
+    //
+    // 2026-09-13: every watch-only wallet the engine generated for an active
+    // ZANO bid was written into `src-tauri/`, which `tauri dev` watches — six
+    // app relaunches came 2-3 s after a `Generated watch-only Zano wallet` log
+    // line (operator: "the windows dev wallet keeps closing and re-opening").
+    // A `_spend` wallet written there would have been a swap key in a source
+    // tree. See PwndaWalletVault/log.md 2026-09-15.
+    cmd.current_dir(get_scratch_wallet_dir(app)?);
     cmd.arg("--wallet-file")
         .arg(&wallet_file)
         .arg("--password")
@@ -1893,6 +2018,62 @@ pub async fn main_instance_jwt(app: &AppHandle) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-15: Lock killed Zano Main under the swap node. Only a lock
+    /// under the node's claim keeps Main. A lock with no claim, and every stop
+    /// that is not a lock (wallet switch, daemon switch, self-heal), still stop
+    /// it.
+    #[test]
+    fn only_a_lock_under_the_swap_node_claim_keeps_main() {
+        assert!(stop_keeps_main(true, true));
+        assert!(!stop_keeps_main(true, false), "nothing shares Main: a lock stops it as before");
+        assert!(!stop_keeps_main(false, true), "a wallet or daemon switch must still restart Main");
+        assert!(!stop_keeps_main(false, false));
+    }
+
+    /// Once a lock can leave Main running, a start for a different wallet must
+    /// not be answered by the old child.
+    #[test]
+    fn a_start_for_another_wallet_file_restarts_main() {
+        let a = std::path::Path::new("/w/zano_wallet_a");
+        let b = std::path::Path::new("/w/zano_wallet_b");
+        assert!(!start_needs_restart(Some(a), a), "same wallet: reuse the running child");
+        assert!(start_needs_restart(Some(a), b), "another wallet: restart");
+        assert!(!start_needs_restart(None, a));
+    }
+
+    #[test]
+    fn the_engine_claim_carries_its_secret_until_released() {
+        set_engine_claim(Some("claimed-secret".into()));
+        assert!(engine_claim_held());
+        assert_eq!(engine_claim_secret().as_deref(), Some("claimed-secret"));
+        set_engine_claim(None);
+        assert!(!engine_claim_held());
+        assert_eq!(engine_claim_secret(), None);
+    }
+
+    /// Structural: the supervisor claims Main where Zano sharing activates, and
+    /// releases it where the node stops and at the top of every start.
+    #[test]
+    fn the_supervisor_claims_and_releases_main() {
+        let src = include_str!("swap_sidecar.rs");
+        let act = &src[src
+            .find("async fn maybe_activate_zano_host_wallet(")
+            .expect("activation moved")..];
+        let act = &act[..act.find("\n}\n").expect("activation end")];
+        assert!(act.contains("crate::zano_rpc::set_engine_claim(Some(main_jwt.clone()))"));
+        let stop = &src[src.find("pub async fn swap_sidecar_stop(").expect("stop moved")..];
+        let stop = &stop[..stop.find("\n}\n").expect("stop end")];
+        assert!(stop.contains("crate::zano_rpc::set_engine_claim(None)"));
+        let start = &src[src.find("pub async fn swap_sidecar_start(").expect("start moved")..];
+        let start = &start[..start
+            .find("maybe_activate_xmr_host_wallet(&app)")
+            .expect("activation call moved")];
+        assert!(
+            start.contains("crate::zano_rpc::set_engine_claim(None)"),
+            "a claim must not outlive the node that took it"
+        );
+    }
 
     #[test]
     fn jwt_has_three_parts() {
@@ -2178,5 +2359,47 @@ mod tests {
             HOLD_MS,
             ZANO_SCRATCH_RPC_PORT
         );
+    }
+}
+
+/// Every `simplewallet` this module launches must set its working directory.
+///
+/// STRUCTURAL, not behavioural: it reads this file's source, because the
+/// spawns need a real `AppHandle` and binary. What it guards is a structural
+/// property — "no spawn inherits the app's working directory" — which a new
+/// spawn site added later would silently break. The behaviour it protects is
+/// written up at `zano_scratch_start` (engine per-swap wallets written into
+/// `src-tauri/`, relaunching `tauri dev`, 2026-09-13).
+#[cfg(test)]
+mod spawn_cwd_tests {
+    #[test]
+    fn every_simplewallet_spawn_sets_its_working_directory() {
+        let src = include_str!("zano_rpc.rs");
+        // Only the non-test part of the file: the needles below also appear
+        // in this module's own text.
+        let body = &src[..src.find("mod spawn_cwd_tests").expect("this module")];
+        let spawn_needle = ["Command::new(", "binary)"];
+        let mut spawns = 0;
+        let mut rest = body;
+        while let Some(at) = rest.find(spawn_needle[0]) {
+            let tail = &rest[at..];
+            let line_end = tail.find('\n').unwrap_or(tail.len());
+            if !tail[..line_end].contains(spawn_needle[1]) {
+                rest = &tail[spawn_needle[0].len()..];
+                continue;
+            }
+            spawns += 1;
+            let segment = &tail[..tail.find(".spawn()").expect("a spawn after Command::new")];
+            assert!(
+                segment.contains(".current_dir("),
+                "a simplewallet spawn does not set current_dir:\n{}",
+                &tail[..line_end]
+            );
+            rest = &tail[spawn_needle[0].len()..];
+        }
+        // Positive control: Main generate, Main RPC, Scratch generate, Scratch
+        // RPC. A count that drops means the scan stopped seeing spawns, not
+        // that they all comply.
+        assert_eq!(spawns, 4, "expected the four simplewallet spawn sites");
     }
 }

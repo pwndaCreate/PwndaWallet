@@ -57,6 +57,20 @@ export function useXmrSession(args: {
   const [syncError, setSyncError] = useState("");
   const syncPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
+  /**
+   * What `start` was last given besides the seed, so `retry` reopens the SAME
+   * wallet file at the SAME restore height.
+   *
+   * An absent filename is not an error here: `initXmrSession` defaults it to
+   * the PRIMARY wallet's `pwnda-active`, and an address mismatch there makes it
+   * delete that file and restore this seed into it. `retry` used to call
+   * `start(seed, password)` — no file, no height — so Retry on any other Monero
+   * wallet reopened Main's file, and so did the automatic retry further down,
+   * with no click at all (2026-09-16). `useZanoSession` and `useXelisSession`
+   * keep the same kind of ref for the same reason.
+   */
+  const startArgsRef = useRef<{ restoreHeight: number; walletFilename?: string } | null>(null);
+
   // Rolling-window sync-rate estimator. Each sample is (timestamp_ms,
   // walletHeight). `syncBlocksPerSec` comes from the oldest vs newest sample
   // in the window — a longer window smooths over the stop-and-go behavior
@@ -87,6 +101,7 @@ export function useXmrSession(args: {
 
   const start = useCallback(
     (seed: string, masterPassword: string, restoreHeight: number = 0, walletFilename?: string) => {
+      startArgsRef.current = { restoreHeight, walletFilename };
       setSyncState("starting");
       setSyncPercent(0);
       setSyncWalletHeight(0);
@@ -106,10 +121,17 @@ export function useXmrSession(args: {
     []
   );
 
+  /** Reopens the SAME wallet file at the SAME height — see `startArgsRef`.
+   *  With nothing remembered it does nothing: the only guess available is the
+   *  primary wallet's file. */
   const retry = useCallback(() => {
-    if (seedLoaded && sessionPassword) {
-      start(seedLoaded, sessionPassword);
+    if (!seedLoaded || !sessionPassword) return;
+    const args = startArgsRef.current;
+    if (!args) {
+      console.warn("[useXmrSession] retry skipped: no session to reopen");
+      return;
     }
+    start(seedLoaded, sessionPassword, args.restoreHeight, args.walletFilename);
   }, [seedLoaded, sessionPassword, start]);
 
   const checkBinaryStatus = useCallback(async () => {
@@ -161,7 +183,10 @@ export function useXmrSession(args: {
     }
   }, []);
 
+  // Only `lock` and `forget` reach here, and both end the session, so what
+  // `retry` would replay ends with it.
   const resetState = useCallback(() => {
+    startArgsRef.current = null;
     setSyncState("idle");
     setSyncPercent(0);
     setSyncWalletHeight(0);

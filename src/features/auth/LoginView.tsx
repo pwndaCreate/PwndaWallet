@@ -1,8 +1,10 @@
 import { useState } from "react";
+import { formatAppVersion } from "../../lib/appVersion";
 import { Glow } from "../../components/Primitives";
 import { Btn, Card } from "../../components/PrimitivesV2";
 import { BtnPrimary, BtnGhost } from "../../components/Buttons";
 import { AuthSplash } from "./AuthSplash";
+import { swapsWaitingLines, type SwapsWaiting } from "./swapsWaitingNotice";
 
 /**
  * Unlock screen for users with a saved vault. Two actions: enter the
@@ -10,18 +12,23 @@ import { AuthSplash } from "./AuthSplash";
  * the saved vault and start fresh.
  *
  * Owns its own `loginPassword`, `unlocking`, and `showRemoveConfirm`
- * state. `onUnlock` and `onRemoveWallet` are vault actions.
+ * state. `onUnlock` and `onRemoveWallet` are vault actions. `swapsWaiting`
+ * is the swap node's last in-progress reading, shown when swaps are waiting
+ * for this unlock (see `swapsWaitingNotice.ts`).
  */
 export function LoginView({
   onUnlock,
   onRemoveWallet,
+  swapsWaiting,
 }: {
   onUnlock: (password: string) => Promise<void>;
   onRemoveWallet: () => Promise<void>;
+  swapsWaiting?: SwapsWaiting | null;
 }) {
   const [loginPassword, setLoginPassword] = useState("");
   const [unlocking, setUnlocking] = useState(false);
   const [showRemoveConfirm, setShowRemoveConfirm] = useState(false);
+  const waitingLines = swapsWaitingLines(swapsWaiting);
 
   const handleUnlockClick = async () => {
     if (!loginPassword) return;
@@ -56,7 +63,7 @@ export function LoginView({
             marginBottom: 10,
           }}
         >
-          <Glow>Welcome to PWNDA — Wallet Terminal v2.0.1</Glow>
+          <Glow>Welcome to PWNDA — Wallet Terminal {formatAppVersion()}</Glow>
         </div>
         <div
           style={{
@@ -91,6 +98,25 @@ export function LoginView({
           → Awaiting passphrase…
         </div>
       </Card>
+      {waitingLines && (
+        <Card title="SWAPS" style={{ width: "100%", marginBottom: 14 }}>
+          {waitingLines.map((line, i) => (
+            <div
+              key={i}
+              data-swaps-waiting
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 10,
+                color: i === 0 ? "var(--warn, #ffaa00)" : "#a0a0a0",
+                display: "block",
+                marginBottom: i === waitingLines.length - 1 ? 0 : 3,
+              }}
+            >
+              {line}
+            </div>
+          ))}
+        </Card>
+      )}
       <Card title="UNLOCK" style={{ width: "100%", marginBottom: 12 }}>
         <div
           style={{

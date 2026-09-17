@@ -1,0 +1,290 @@
+Grove PATCH-37: a host wallet stays pinned across restarts while its swaps are in progress
+
+XMR and ZEPH (PATCH-5/8) and ZANO (PATCH-17/35) run their main wallet in the
+app's own wallet-rpc. Each node session confirms that wallet's address once and
+then refuses any spend from a different one. The confirmation itself trusted
+whatever wallet was open.
+
+WHAT IT COULD COST
+
+The app holds several wallets per coin, and switching the wallet context opens
+a different file in the same wallet-rpc. A node that restarts while another
+wallet is open (a crash, an unpark restart, the user's own restart) confirms
+THAT wallet. A swap started with the first wallet then funds its lock from the
+second, which may not hold the amount, or redeems into the second. PATCH-36
+made this more reachable: a bid deferred while its coin was parked activates
+on whatever wallet is open at the next start.
+
+THE FIX
+
+- The confirmed identity is kept in kv_string
+  (pwnda_host_wallet_pin_<coin>).
+- While the coin has a bid in an active state (the engine's own
+  activeBidsQueryStr), a restarted node refuses to confirm a different wallet.
+  Its spends stay refused, getWalletInfo raises the reason, and the node
+  confirms as soon as the app opens the pinned wallet again.
+- With nothing in progress, the pin follows the wallet.
+
+BasicSwap.pwndaSyncHostWalletPins does every DB read and write, never inside an
+interface's _mx_wallet. The bid loop holds the DB lock while it calls into
+interfaces, so taking the DB lock under _mx_wallet could deadlock against it.
+The interfaces compare in memory only, against _pwnda_expected_main_wallet.
+The sync runs:
+- before unlockWallets unlocks any coin (XMR/ZEPH confirm inside the seed check
+  unlockWallet runs; ZANO confirms in unlockWallet itself);
+- after the unlock loop, to record what was confirmed;
+- every 60 s from update().
+
+Not covered: a node with unencrypted wallets confirms at start() before the
+first sync. Grove always encrypts (C5), so its nodes confirm at unlock.
+
+Verified by scripts/swap/verify-host-wallet-pin.py, which drives the real
+interfaces and the real BasicSwap methods against an in-memory sqlite, with
+negative controls.
+
+Upstream candidate: no. Upstream has no host-managed main wallet.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -491,6 +491,8 @@
+         self._last_checked_split_messages = 0
+         self._last_checked_delayed_auto_accept = 0
+         self._last_checked_pending_sweeps = 0
++        # PWNDA-PATCH-37: when update() last synced the host-wallet pins.
++        self._pwnda_last_pin_sync = 0
+         self._pending_sweeps = {}
+         self._possibly_revoked_offers = collections.deque([], maxlen=1000)
+         self._expired_offer_revokes = collections.deque([], maxlen=1000)
+@@ -2108,6 +2110,10 @@
+     def unlockWallets(self, password: str, coin=None) -> None:
+         try:
+             self._read_zmq_queue = False
++            # PWNDA-PATCH-37: load each host wallet's pin before any
++            # interface confirms its identity. XMR/ZEPH confirm inside the
++            # seed check unlockWallet runs; ZANO in unlockWallet itself.
++            self.pwndaSyncHostWalletPins()
+             for c in self.getListOfWalletCoins():
+                 if coin and c != coin:
+                     continue
+@@ -2116,6 +2122,8 @@
+                 except Exception as e:  # noqa: F841
+                     self.log.warning(f"Failed to unlock wallet {getCoinName(c)}")
+                     raise
++            # PWNDA-PATCH-37: record the identities just confirmed.
++            self.pwndaSyncHostWalletPins()
+ 
+             if coin is None or coin == Coins.PART:
+                 self._is_locked = False
+@@ -5347,6 +5355,76 @@
+                 self.closeDB(cursor, commit=True)
+         except Exception as e:
+             self.log.debug(f"Error clearing cached balances: {e}")
++
++    # PWNDA-PATCH-37: a host wallet's identity is pinned across restarts
++    # while swaps on its coin are in progress.
++    #
++    # XMR/ZEPH (PATCH-5/8) and ZANO (PATCH-17/35) confirm the host wallet's
++    # address once per session and refuse spends from any other. That
++    # confirmation trusted whatever wallet was open, so a node restarted
++    # with a different wallet open in the app confirmed THAT one, and a
++    # swap started with the first wallet funded from, or redeemed into,
++    # the second.
++    #
++    # All DB access is here, never inside an interface's _mx_wallet: the
++    # bid loop holds the DB lock while it calls into interfaces, so taking
++    # the DB lock under _mx_wallet could deadlock against it. Interfaces
++    # only compare against _pwnda_expected_main_wallet, which this sets.
++    def pwndaHostWalletPinKey(self, ci) -> str:
++        return "pwnda_host_wallet_pin_" + ci.coin_name().lower()
++
++    def pwndaCoinHasActiveBids(self, coin_type) -> bool:
++        cursor = self.openDB()
++        try:
++            query = (
++                "SELECT COUNT(*) FROM bids INNER JOIN offers "
++                "ON bids.offer_id = offers.offer_id "
++                "WHERE (offers.coin_from = :coin OR offers.coin_to = :coin) AND"
++                + self.activeBidsQueryStr()
++            )
++            row = cursor.execute(
++                query, {"coin": int(coin_type), "now": self.getTime()}
++            ).fetchone()
++            return row is not None and row[0] > 0
++        finally:
++            self.closeDB(cursor, commit=False)
++
++    def pwndaSyncHostWalletPins(self) -> None:
++        for c in self.activeCoins():
++            try:
++                ci = self.ci(c)
++            except Exception:
++                continue
++            if not getattr(ci, "_external_main_wallet", False):
++                continue
++            if not hasattr(ci, "_pwnda_expected_main_wallet"):
++                continue
++            key = self.pwndaHostWalletPinKey(ci)
++            try:
++                pinned = self.getStringKV(key)
++                confirmed = ci._cached_main_wallet_address
++                if confirmed is not None:
++                    # This session's identity. PATCH-8/17 refuse drift from
++                    # it, so it is the wallet any bid started this session
++                    # uses.
++                    if confirmed != pinned:
++                        self.setStringKV(key, confirmed)
++                        if pinned is not None:
++                            self.log.info(
++                                f"PWNDA-PATCH-37: {ci.coin_name()} host wallet "
++                                f"pin moved to the wallet confirmed this session"
++                            )
++                    ci._pwnda_expected_main_wallet = None
++                    continue
++                busy = pinned is not None and self.pwndaCoinHasActiveBids(c)
++                ci._pwnda_expected_main_wallet = pinned if busy else None
++            except Exception as e:
++                # Keep the interface's expectation as it was: an unreadable
++                # pin must not be read as nothing to protect.
++                self.log.warning(
++                    f"PWNDA-PATCH-37: could not sync the {ci.coin_name()} "
++                    f"host wallet pin: {e}"
++                )
+ 
+     def getCachedMainWalletAddress(self, ci, cursor=None):
+         db_key = "main_wallet_addr_" + ci.coin_name().lower()
+@@ -15578,6 +15656,11 @@
+                 self._retryPendingSweeps()
+                 self._last_checked_pending_sweeps = now
+ 
++            # PWNDA-PATCH-37: keep the host-wallet pins current.
++            if now - self._pwnda_last_pin_sync >= 60:
++                self._pwnda_last_pin_sync = now
++                self.pwndaSyncHostWalletPins()
++
+         except Exception as ex:
+             self.logException(f"update {ex}")
+ 
+diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
+--- a/basicswap/interface/xmr/xmr.py
++++ b/basicswap/interface/xmr/xmr.py
+@@ -122,6 +122,11 @@
+         self._have_checked_seed = False
+         self._wallet_filename = coin_settings.get("wallet_name", "swap_wallet")
+         self._cached_main_wallet_address = None
++        # PWNDA-PATCH-37: set by BasicSwap.pwndaSyncHostWalletPins. Not None
++        # only while swaps started with that wallet are in progress; any
++        # other host wallet is then refused at confirmation.
++        self._pwnda_expected_main_wallet = None
++        self._pwnda_identity_refusal = None
+ 
+         daemon_login = None
+         if coin_settings.get("rpcuser", "") != "":
+@@ -300,9 +305,10 @@
+             # port fail loudly instead of silently operating on a stranger's
+             # wallet.
+             if self._cached_main_wallet_address is None:
+-                self._cached_main_wallet_address = self.rpc_wallet("get_address")[
+-                    "address"
+-                ]
++                address = self.rpc_wallet("get_address")["address"]
++                # PWNDA-PATCH-37: raises while swaps use a different wallet.
++                self._pwndaCheckExpectedMainWallet(address)
++                self._cached_main_wallet_address = address
+             return
+         if is_default and self._cached_main_wallet_address is not None:
+             try:
+@@ -323,6 +329,19 @@
+                 ]
+             except Exception:
+                 pass
++
++    def _pwndaCheckExpectedMainWallet(self, address: str) -> None:
++        # PWNDA-PATCH-37: see BasicSwap.pwndaSyncHostWalletPins. In memory
++        # only; the caller holds _mx_wallet.
++        expected = getattr(self, "_pwnda_expected_main_wallet", None)
++        if expected is not None and address != expected:
++            self._pwnda_identity_refusal = (
++                f"PWNDA-PATCH-37: the {self.coin_name()} host wallet is "
++                f"{address}, but swaps in progress on this node use "
++                f"{expected}; open that wallet in the app to continue them"
++            )
++            raise TemporaryError(self._pwnda_identity_refusal)
++        self._pwnda_identity_refusal = None
+ 
+     def _confirmMainWalletIdentity(self) -> None:
+         # PWNDA-PATCH-8 (revised): re-read the main wallet-rpc connection's live
+@@ -360,6 +379,12 @@
+         except Exception:
+             open_wallet_addr = "UNKNOWN"
+         if open_wallet_addr != self._cached_main_wallet_address:
++            if (
++                self._cached_main_wallet_address is None
++                and getattr(self, "_pwnda_identity_refusal", None) is not None
++            ):
++                # PWNDA-PATCH-37: say why nothing is confirmed.
++                raise TemporaryError(self._pwnda_identity_refusal)
+             raise TemporaryError(
+                 f"main wallet-rpc connection reports {open_wallet_addr}, expected "
+                 f"confirmed identity {self._cached_main_wallet_address}; "
+diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
+--- a/basicswap/interface/zano/zano.py
++++ b/basicswap/interface/zano/zano.py
+@@ -252,6 +252,10 @@
+         # while it is None, rather than treating "never confirmed" as "assume
+         # OK".
+         self._cached_main_wallet_address = None
++        # PWNDA-PATCH-37: see XMRInterface; set by
++        # BasicSwap.pwndaSyncHostWalletPins.
++        self._pwnda_expected_main_wallet = None
++        self._pwnda_identity_refusal = None
+ 
+         # PWNDA-PATCH-15 (a): True when this ZANO deployment shares an externally
+         # (host-)managed main wallet rather than one BasicSwap derives from its own
+@@ -669,6 +673,19 @@
+             return
+         if not address:
+             return
++        # PWNDA-PATCH-37: see BasicSwap.pwndaSyncHostWalletPins.
++        expected = getattr(self, "_pwnda_expected_main_wallet", None)
++        if expected is not None and address != expected:
++            refusal = (
++                f"PWNDA-PATCH-37: the ZANO host wallet is {address}, but swaps "
++                f"in progress on this node use {expected}; open that wallet "
++                f"in the app to continue them"
++            )
++            if refusal != getattr(self, "_pwnda_identity_refusal", None):
++                self._log.warning(refusal)
++            self._pwnda_identity_refusal = refusal
++            return
++        self._pwnda_identity_refusal = None
+         self._cached_main_wallet_address = address
+         self._log.info(
+             f"PWNDA-PATCH-35: confirmed the ZANO main wallet identity at {when}: "
+@@ -701,6 +718,12 @@
+         except Exception:
+             open_wallet_addr = "UNKNOWN"
+         if open_wallet_addr != self._cached_main_wallet_address:
++            if (
++                self._cached_main_wallet_address is None
++                and getattr(self, "_pwnda_identity_refusal", None) is not None
++            ):
++                # PWNDA-PATCH-37: say why nothing is confirmed.
++                raise TemporaryError(self._pwnda_identity_refusal)
+             raise TemporaryError(
+                 f"main wallet-rpc connection reports {open_wallet_addr}, expected "
+                 f"confirmed identity {self._cached_main_wallet_address}; "
+@@ -814,6 +837,13 @@
+         with self._mx_wallet:
+             # PWNDA-PATCH-35: see _cacheMainWalletIdentityIfUnset.
+             self._cacheMainWalletIdentityIfUnset("wallet info")
++            # PWNDA-PATCH-37: a refused host wallet is an error the wallet
++            # page shows, not a balance read from the wrong wallet.
++            if (
++                self._cached_main_wallet_address is None
++                and getattr(self, "_pwnda_identity_refusal", None) is not None
++            ):
++                raise TemporaryError(self._pwnda_identity_refusal)
+             rv = {}
+             try:
+                 balance_info = self.rpc_wallet("getbalance")

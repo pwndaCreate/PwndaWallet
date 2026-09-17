@@ -28,6 +28,13 @@
  *
  * The index is a position into the SAME `Vec<GpuInfo>` `get_gpu_info`
  * returns and `useDeviceProfile` already renders. There is no verified
+ * **Resolved 2026-09-16** — the paragraph below was the original accepted
+ * gap, and it bit: app GPU 0 (RTX 5060 Ti) went out as SRBMiner `--gpu-id 0`,
+ * which SRBMiner numbers as the RX 6700 XT. Rust now translates each index into
+ * the miner's own id from its `--list-devices`
+ * (`miners.rs::map_gpu_indices_to_miner`) and refuses a card it cannot match.
+ *
+ * Original text: there is no verified
  * mapping from that OS-level enumeration to either miner's OWN internal
  * device numbering (their CUDA/OpenCL/HIP runtimes may order devices
  * differently) — this is a KNOWN, ACCEPTED gap, not an oversight: the

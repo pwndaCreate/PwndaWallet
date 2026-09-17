@@ -2,7 +2,12 @@ import { useCallback, useEffect, useState } from "react";
 import { getCurrentWindow, LogicalSize } from "@tauri-apps/api/window";
 import type { LandscapeTab } from "./LandscapeShell";
 import type { View } from "../../types/view";
-import { deriveFeatureFocus, type FeatureFocus } from "../../state/featureFocus";
+import {
+  deriveFeatureFocus,
+  LANDSCAPE_SETTINGS_SUBVIEWS,
+  NODE_MANAGER_VIEWS,
+  type FeatureFocus,
+} from "../../state/featureFocus";
 
 /**
  * Layout-mode orchestration hook. Owns:
@@ -89,13 +94,13 @@ export function useLayout(args: {
     else if (effective === "portrait" && isWindowLandscape) void applyWindowSize("portrait");
   }, [applyWindowSize]);
 
-  // If the user navigates away from the landscape settings tab while the
-  // Monero / Zephyr nodes sub-view is open, clear that sub-view so returning
-  // later lands on the settings panel, not the (stale) nodes screen.
+  // If the user navigates away from the landscape settings tab while a node
+  // manager sub-view is open, clear that sub-view so returning later lands on
+  // the settings panel, not the (stale) nodes screen.
   useEffect(() => {
     if (layout !== "landscape") return;
     if (landscapeTab === "settings") return;
-    if (view === "monero-nodes" || view === "zephyr-nodes") {
+    if (NODE_MANAGER_VIEWS.has(view)) {
       setView("dashboard");
     }
   }, [layout, landscapeTab, view, setView]);
@@ -113,10 +118,11 @@ export function useLayout(args: {
     } else if (
       landscapeTab === "settings" &&
       view !== "settings" &&
-      view !== "monero-nodes" &&
-      view !== "zephyr-nodes" &&
-      view !== "wallet-details" &&
-      view !== "miner-setup"
+      // The shared list in featureFocus.ts. A Settings sub-view missing from it
+      // is switched back to the settings panel the moment it opens, which is
+      // what the old literal list here did to the Zano node view (it never
+      // listed zano-nodes) until 2026-09-15.
+      !LANDSCAPE_SETTINGS_SUBVIEWS.has(view)
     ) {
       setView("settings");
     } else if (

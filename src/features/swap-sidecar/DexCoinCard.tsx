@@ -356,7 +356,7 @@ function CoinRow({
               `the swap node could not reach your ${
                 s.coin === "zano" ? "Zano" : "Zephyr"
               } wallet when it started`}
-            {". The swap node restarts itself to add it once that wallet is open in this app (at most twice per session); or restart it by hand."}
+            {". The swap node restarts itself to add it once that wallet is open in this app, and tries again later if a restart does not take; or restart it by hand."}
           </div>
         )}
 

@@ -76,7 +76,11 @@ export type ChainType =
   // 2026-09-02: Aptos — BIP44 ed25519 at m/44'/637'/0'/0'/0', address =
   // sha3_256(pubkey || 0x00). Derivation verified against two independent
   // implementations; see apt-wallet.ts's header.
-  | "aptos";
+  | "aptos"
+  // 2026-09-15: Xelis — independent 25-word seed (not BIP-39), homomorphically
+  // encrypted balances. Sidecar-backed like monero/zephyr/zano: the app runs
+  // the official `xelis_wallet` in RPC mode. See xelis-integration-plan.md.
+  | "xelis";
 
 export interface WalletInfo {
   chain: ChainType;
@@ -220,6 +224,62 @@ export interface GasBudget {
    * the UI warns on `false` and must not block on a guess.
    */
   sufficient: boolean | null;
+}
+
+/**
+ * The network's price for ONE specific send, found by building that exact
+ * transaction without broadcasting it (2026-09-15, Zephyr — see
+ * `send-quote.ts`). Returned by `ChainAdapter.quoteSend`.
+ *
+ * Every string field is exactly what was priced: `useSend` relays the quote's
+ * transaction only when recipient, amount and asset still match and the quote
+ * is recent (`quoteMatchesSend`); otherwise it sends fresh.
+ */
+export interface SendQuote {
+  /** Recipient as priced (trimmed). */
+  to: string;
+  /** Amount as priced (trimmed), in the SENT asset's units. */
+  amount: string;
+  /** Asset selector as passed to `sendTransaction`; undefined = native asset. */
+  assetType?: string;
+  /** Total network fee of the built transaction, decimal string. */
+  fee: string;
+  /**
+   * Ticker of the asset the fee is charged in, or `null` when the adapter
+   * cannot say — the modal then labels the fee neutrally instead of guessing.
+   */
+  feeTicker: string | null;
+  /**
+   * One plain-text sentence the Send modal shows under the fee, when the
+   * adapter knows something about THIS send's fee that the number does not
+   * say. Optional and chain-agnostic; absent means nothing to add. Added
+   * 2026-09-15 for Xelis, whose fee includes a one-off 0.001 XEL when the
+   * recipient account is not on chain yet.
+   */
+  feeNote?: string;
+  /** ms epoch when priced. */
+  quotedAt: number;
+  /** Adapter-private handle that `sendQuoted` broadcasts. Never read by the UI. */
+  ticket: unknown;
+}
+
+/**
+ * Why a quote failed. Only `insufficient-funds` and `invalid-address` refuse a
+ * send (`isDefinitiveQuoteError`); the others are advisory, because the
+ * network sets the fee and a pricing failure does not prove a send will fail.
+ */
+export type SendQuoteErrorKind =
+  | "insufficient-funds"
+  | "invalid-address"
+  | "not-ready"
+  | "other";
+
+/** What can be sent right now, in one asset. Decimal strings. */
+export interface SendableBalance {
+  /** Unlocked: spendable now. */
+  unlocked: string;
+  /** Total, including outputs still locked. */
+  total: string;
 }
 
 /**
@@ -465,6 +525,26 @@ export interface ChainAdapter {
     address: string,
     opts?: { to?: string; amount?: string },
   ): Promise<GasBudget>;
+
+  /**
+   * Price THIS send by building it without broadcasting (see `send-quote.ts`).
+   *
+   * Implemented where the wallet sets the fee itself and can build a
+   * transaction without relaying it (Zephyr, 2026-09-15). When present,
+   * `SendModal` shows this quote's fee instead of `getFeeEstimate`'s tiers.
+   * Throws `SendQuoteError`; only `insufficient-funds` and `invalid-address`
+   * may block the Send button.
+   */
+  quoteSend?(args: { to: string; amount: string; assetType?: string }): Promise<SendQuote>;
+
+  /**
+   * Broadcast the transaction a `quoteSend` built. `useSend` calls this only
+   * when the quote still matches the send and is recent (`quoteMatchesSend`).
+   */
+  sendQuoted?(quote: SendQuote): Promise<TxResult>;
+
+  /** Spendable (unlocked) and total balance of the asset a send would draw on. */
+  getSendableBalance?(assetType?: string): Promise<SendableBalance>;
 
   /**
    * True when the NETWORK computes the fee at broadcast time, so the estimate

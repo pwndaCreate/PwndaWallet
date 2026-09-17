@@ -98,6 +98,30 @@ export const NETWORK_PARAMS_DEFAULT: Partial<Record<ChainType, NetworkParams>> =
     networkHashrate: 450_000_000_000, // ~450 GH/s (observed 398-438)
     poolFeePct: POOL_FEE_DEFAULT,
   },
+  /**
+   * Xelis (XelisHash v3, CPU and GPU). Added 2026-09-15 from sources read
+   * that day:
+   *
+   *   - node.xelis.io `get_info` (daemon v1.25.0): `miner_reward` 31212574
+   *     atomic = 0.31212574 XEL (the block's `block_reward` 0.3286 includes a
+   *     `dev_reward` the miner never receives), `block_time_target` 5000 ms,
+   *     `difficulty` "249508910" → 49.9 MH/s at the 5 s target.
+   *   - K1Pool `/api/stats/xel`: `networkSpeed` 51.6 MH/s,
+   *     `avgBlockReward` 0.3121.
+   *   - WhatToMine `coins.Xelis`: `block_reward` 0.3121, `nethash` 38.2 MH/s
+   *     against its own measured 5.76 s block time — the same difficulty on a
+   *     different time base, so it prices a hash identically.
+   *
+   * `networkHashrate` rounds the observed 38–52 MH/s UP to 60 MH/s, this
+   * table's convention: over-estimate the network so the user's slice is
+   * never flattered.
+   */
+  xelis: {
+    blockReward: 0.3121,
+    blockTimeSecs: 5,
+    networkHashrate: 60_000_000,
+    poolFeePct: POOL_FEE_DEFAULT,
+  },
   ravencoin: {
     blockReward: 2500,          // post-halving 2024
     blockTimeSecs: 60,

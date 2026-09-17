@@ -9,7 +9,7 @@ import {
 } from "../../wallets/stablecoins";
 import { useState, useEffect, type ReactNode } from "react";
 import type { ChainType, WalletInfo } from "../../wallets";
-import { getAdapter, ALL_CHAINS } from "../../wallets";
+import { getAdapter } from "../../wallets";
 import { explorerTxUrl } from "../../wallets/explorers";
 import { openExternal } from "../../utils/openExternal";
 import { assetRank } from "../../wallets/coin-metadata";
@@ -24,6 +24,7 @@ import {
 } from "../../wallets/zph-rpc";
 import type { ChainTx } from "../../wallets/types";
 import { mergeChainTx } from "../activity/useTxHistory";
+import { txDisplayTicker } from "../../wallets/tx-display";
 import { ST } from "../../components/Primitives";
 import { CoinIcon } from "../../components/CoinIcon";
 import { MiniSpark } from "../../components/PrimitivesV2";
@@ -38,7 +39,6 @@ import { DerivationInfoCard } from "./DerivationInfoCard";
 import { LitecoinDerivationPanel } from "./LitecoinDerivationPanel";
 import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { placeholderSparkFor } from "./spark-fallback";
-import { SwapBalanceSubline } from "./SwapBalanceSubline";
 import {
   classifyBalance,
   formatMissingLabel,
@@ -49,6 +49,23 @@ import { DexXmrWalletSection } from "../monero/DexXmrWalletSection";
 import { fmtRelative } from "../../utils/format";
 import { zphAssetPrice, type ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { UtxoAccountCard } from "./UtxoAccountCard";
+import {
+  assetUsdValue,
+  displayedReceiveAddress,
+  formatAssetBalance,
+  formatAssetUsd,
+  historySurfaceFor,
+  importableChains,
+  parseBalanceNumber,
+  priceFor,
+  receiveBlockedReason,
+  sendBlockedReason,
+  swapAssetKeyFor,
+  swapBlockedReason,
+} from "./wallet-surface";
+import { AssetRow, ImportableAssetRow } from "./AssetRow";
+import { WalletActionRow } from "./WalletActionRow";
+import { AssetMarketBlock, priceSparkFor } from "./AssetMarketBlock";
 
 /* ══════ Types ═════════════════════════════════════════════════ */
 type SyncState = "idle" | "starting" | "syncing" | "synced" | "error" | "connection-lost";
@@ -84,22 +101,16 @@ export interface ZphSessionForLandscape extends BaseSyncSessionProps {
 }
 
 /* ══════ helpers ═════════════════════════════════════════════ */
-function parseBalanceNumber(raw: string | undefined): number | null {
-  if (!raw) return null;
-  const n = parseFloat(raw.replace(/,/g, ""));
-  return Number.isFinite(n) ? n : null;
-}
+// Balance parsing and USD formatting are the shared ones in
+// `wallet-surface.ts`, so portrait and this view cannot format the same number
+// two ways (portrait printed "—" for a known $0.00 until 2026-09-16).
 
 function getUsd(
   ticker: string,
   rawBalance: string | undefined,
   prices: Record<string, number>
 ): number | null {
-  const price = prices[ticker.toUpperCase()];
-  if (price == null) return null;
-  const n = parseBalanceNumber(rawBalance);
-  if (n == null) return null;
-  return n * price;
+  return assetUsdValue(rawBalance, priceFor(ticker, prices));
 }
 
 /** Same conversion as `getUsd`, for a total already summed to a number. */
@@ -108,31 +119,11 @@ function getUsdFromAmount(
   amount: number,
   prices: Record<string, number>
 ): number | null {
-  const price = prices[ticker.toUpperCase()];
-  if (price == null) return null;
-  return amount * price;
+  const price = priceFor(ticker, prices);
+  return price == null ? null : amount * price;
 }
 
-function fmtUsd(usd: number): string {
-  if (usd >= 1000) return `$${usd.toLocaleString("en-US", { maximumFractionDigits: 0 })}`;
-  return `$${usd.toFixed(2)}`;
-}
-
-function fmtBalance(raw: string | undefined): string {
-  if (!raw || raw === "--") return "—";
-  const n = parseBalanceNumber(raw);
-  if (n == null) return raw;
-  if (n === 0) return "0";
-  if (n >= 1000) return n.toLocaleString("en-US", { maximumFractionDigits: 2 });
-  if (n >= 1) return n.toFixed(4).replace(/0+$/, "").replace(/\.$/, "");
-  return n.toFixed(6).replace(/0+$/, "").replace(/\.$/, "");
-}
-
-function truncAddr(addr: string): string {
-  if (!addr) return "—";
-  if (addr.length <= 22) return addr;
-  return `${addr.slice(0, 11)}…${addr.slice(-8)}`;
-}
+const fmtBalance = formatAssetBalance;
 
 const PLACEHOLDER_SPARK = [4, 5, 4, 6, 5, 7, 6, 7, 8, 9, 8, 10];
 
@@ -164,6 +155,9 @@ export function WalletLandscapeView({
   xmrTxHistory,
   xmrSession,
   zanoCenterSlot,
+  xelisCenterSlot,
+  xelisSynced,
+  zanoReady,
   onOpenSwapForAsset,
   zphSession,
   importPanelSlot,
@@ -194,7 +188,8 @@ export function WalletLandscapeView({
   pricesByTicker: Record<string, number>;
   xmrTxHistory: XmrTransfer[];
   xmrSession: XmrSessionForLandscape | null;
-  /** Open the Swap tab with this asset pre-selected on AUTO. */
+  /** Open the Swap tab with this asset pre-selected on AUTO. Called with the
+   *  asset's swap-registry KEY (`swapAssetKeyFor`), e.g. `USDC-ARB`. */
   onOpenSwapForAsset?: (ticker: string) => void;
   zphSession: ZphSessionForLandscape | null;
   /** Zano's center-column content (import panel when not loaded; sync + assets
@@ -202,6 +197,20 @@ export function WalletLandscapeView({
    *  rendered INLINE here — same as the monero/zephyr center sections — so Zano
    *  is not a detached footer below this view. Only rendered on the zano panel. */
   zanoCenterSlot?: ReactNode;
+  // `zanoConnected` was removed 2026-09-16. Its one reader was the Recent
+  // block's Zano empty-copy, and Zano no longer renders that block: its
+  // history is `ZanoTxHistoryCard` in `zanoCenterSlot`
+  // (`historySurfaceFor`), which reads the session's own state.
+  /** Xelis's centre column, built by `LandscapeRoot` from the shared Xelis
+   *  components — the import panel when there is no Xelis wallet, sync +
+   *  history once there is one. Rendered in BOTH branches below. */
+  xelisCenterSlot?: ReactNode;
+  /** Whether the Xelis wallet has scanned the chain. Gates Send
+   *  (`sendBlockedReason`). */
+  xelisSynced?: boolean;
+  /** Whether the Zano wallet session is open (`syncState === "ready"`).
+   *  Gates Send (`sendBlockedReason`), 2026-09-16. */
+  zanoReady?: boolean;
   /**
    * Seed-import panel for the active chain, when that chain uses an
    * independent seed and has no wallet yet (Monero / Zephyr).
@@ -287,7 +296,7 @@ export function WalletLandscapeView({
       return getAdapter(ca).displayName.localeCompare(getAdapter(cb).displayName);
     });
   /**
-   * Independent-seed chains (XMR / ZEPH / ZANO) that have no wallet yet.
+   * Independent-seed chains (XMR / ZEPH / ZANO / XEL) that have no wallet yet.
    *
    * `chains` above is built from `walletsByChain`, so a chain whose seed has
    * never been imported is simply absent from the rail — and every one of
@@ -299,17 +308,16 @@ export function WalletLandscapeView({
    * onboarding, so for a wallet created in-app they are always in
    * `walletsByChain`. Zano is import-only, so it was the first chain to
    * actually fall into the hole (2026-08-28) — but a user who forgets a
-   * Monero wallet lands in exactly the same place, which is why this is
-   * keyed on `usesIndependentSeed` rather than special-casing Zano.
+   * Monero wallet lands in exactly the same place, which is why the shared
+   * helper keys on `usesIndependentSeed` rather than special-casing Zano.
+   * Portrait renders the same rows from the same helper (2026-09-16).
    *
    * Deliberately NOT merged into `chains`: that array feeds the portfolio
    * total, the sparkline history, and the vault's "N chains" count, none of
    * which should count a wallet that does not exist. These rows are
    * presentation only — an entry point, rendered after the held rows.
    */
-  const importableChains = (ALL_CHAINS as readonly ChainType[]).filter(
-    (c) => !!getAdapter(c).usesIndependentSeed && !walletsByChain[c],
-  );
+  const importable = importableChains(walletsByChain);
 
   /** Wallets that actually exist, as opposed to rows shown in the asset list
    *  (which also includes not-yet-set-up independent-seed chains). */
@@ -470,13 +478,28 @@ export function WalletLandscapeView({
   // Default focal = the active chain. When a Zephyr ecosystem asset (ZSD/ZRS/
   // ZYS) is selected, override the focal display + actions with that asset so
   // it gets the standard panel (balance / address / Send / Receive / Swap).
-  const effectiveZphAsset: ZphAssetType | null =
+  //
+  // The focused asset counts only while its row EXISTS. Rows are held assets
+  // (balance > 0), so sending a whole ZEPHUSD balance removes the row. Until
+  // 2026-09-15 `effectiveZphAsset` stayed "ZSD" regardless: the centre panel
+  // fell back to ZEPH and Quick send read "Send ZEPH" while opening a ZEPHUSD
+  // send. Both now derive from the row, so label and send agree by construction.
+  const focalZphRow =
     activeChain === "zephyr" && focusedZphAsset && focusedZphAsset !== "ZPH"
-      ? focusedZphAsset
+      ? zephyrAssetRows.find((r) => r.asset === focusedZphAsset) ?? null
       : null;
-  const focalZphRow = effectiveZphAsset
-    ? zephyrAssetRows.find((r) => r.asset === effectiveZphAsset) ?? null
-    : null;
+  const effectiveZphAsset: ZphAssetType | null = focalZphRow ? focalZphRow.asset : null;
+  // And drop the stale focus, so a balance arriving later does not silently
+  // re-focus an asset the user is no longer looking at. Only once balances
+  // have loaded: an unloaded list is not evidence the row is gone.
+  const focusedRowGone =
+    focusedZphAsset != null &&
+    focusedZphAsset !== "ZPH" &&
+    zphSession?.assetBalances != null &&
+    focalZphRow == null;
+  useEffect(() => {
+    if (focusedRowGone) setFocusedZphAsset(null);
+  }, [focusedRowGone]);
   const focalTicker = focalZphRow ? focalZphRow.ticker : activeAdapter.ticker;
   const focalName = focalZphRow ? focalZphRow.name : activeAdapter.displayName;
   const focalColor = focalZphRow
@@ -555,10 +578,7 @@ export function WalletLandscapeView({
       : positionEffectivelyZero
         ? new Array(activeHistory.length).fill(0)
         : activeHistory.map((p) => p * activeBalNum);
-  const priceSpark =
-    activeHistory.length > 0
-      ? activeHistory
-      : placeholderSparkFor(activeTickerUpper);
+  const priceSpark = priceSparkFor(activeTickerUpper, activeHistory);
 
   // 24h delta — first vs last point of the portfolio spark when we
   // have real data. Falls back to "—" when we don't.
@@ -577,11 +597,16 @@ export function WalletLandscapeView({
     setTimeout(() => setCopiedAddr(false), 1400);
   };
 
-  // Active chain's recent activity. XMR has a dedicated history; every
-  // other chain falls back to the generic per-chain feed.
+  // Active chain's recent activity, from the source `historySurfaceFor`
+  // names — the same rule portrait's `WalletTxHistorySubview` follows.
+  // Monero lists its own transfers here; Zano and Xelis show theirs in the
+  // dedicated card inside their centre slot, so this block is skipped for
+  // them (it used to render as well, listing their history twice); every
+  // other chain uses the generic per-address feed.
+  const historySurface = historySurfaceFor(activeChain);
   const xmrRecent = xmrTxHistory.slice(0, 6);
   const genericRecent = (() => {
-    if (activeChain === "monero") return [];
+    if (historySurface !== "generic") return [];
     if (!chainTxByKey) return [];
     return mergeChainTx({ txByChain: chainTxByKey }, activeChain).txs.slice(0, 6);
   })();
@@ -591,22 +616,37 @@ export function WalletLandscapeView({
     activeWallet?.mnemonic,
   );
 
-  const xmrDisplayAddress = (() => {
-    if (activeChain !== "monero" || !activeWallet) return null;
-    if (xmrSession?.showPrimary !== false) return activeWallet.address;
-    return xmrSession.receiveAddress ?? activeWallet.address;
-  })();
-  // Same rotation portrait uses, from the SAME hook -- an address that rotates
-  // on one layout and silently reuses index 0 on the other is invisible drift:
-  // both screens show *an* address and only one is safe to hand out twice.
-  const focalAddress =
-    activeChain === "monero"
-      ? xmrDisplayAddress ?? (activeWallet?.address ?? "")
-      : utxoReceiveAddress ?? activeWallet?.address ?? "";
+  // Same rotation portrait uses, from the SAME hook and the same helper -- an
+  // address that rotates on one layout and silently reuses index 0 on the
+  // other is invisible drift: both screens show *an* address and only one is
+  // safe to hand out twice. Landscape has no "show primary" toggle for UTXO
+  // chains, so it always shows the fresh one when there is one.
+  const focalAddress = activeWallet
+    ? displayedReceiveAddress({
+        chain: activeChain,
+        walletAddress: activeWallet.address,
+        xmrReceiveAddress: xmrSession?.receiveAddress,
+        xmrShowPrimary: xmrSession?.showPrimary !== false,
+        utxoReceiveAddress,
+        utxoShowPrimary: false,
+      })
+    : "";
 
-  const sendDisabled =
-    (activeChain === "monero" && xmrSession?.syncState !== "synced") ||
-    (activeChain === "zephyr" && zphSession?.syncState !== "synced");
+  // One gate, shared with portrait (`sendBlockedReason`). The comment that
+  // used to sit here said portrait "carries the same gate"; it gated Monero
+  // only, so an unsynced Zephyr or Xelis wallet could open Send there.
+  const sendReason = sendBlockedReason(activeChain, {
+    monero: xmrSession?.syncState === "synced",
+    zephyr: zphSession?.syncState === "synced",
+    zano: zanoReady === true,
+    xelis: xelisSynced === true,
+  });
+  const sendDisabled = sendReason != null;
+  const receiveReason = receiveBlockedReason(focalAddress);
+  // Keyed on the chain (and the focused Zephyr sub-asset), not the ticker:
+  // see `swapAssetKeyFor` for the USDC and L2-ETH seeds this replaced.
+  const swapKey = swapAssetKeyFor(activeChain, effectiveZphAsset);
+  const swapReason = swapBlockedReason(activeChain, !!onOpenSwapForAsset, effectiveZphAsset);
 
   const showXmrSync =
     activeChain === "monero" &&
@@ -694,7 +734,7 @@ export function WalletLandscapeView({
               className="tnum"
               style={{ fontSize: 9, color: "var(--text-dim)", marginTop: 1 }}
             >
-              {usd != null ? fmtUsd(usd) : "—"}
+              {formatAssetUsd(usd)}
             </div>
           </div>
         </button>
@@ -755,7 +795,7 @@ export function WalletLandscapeView({
                     className="tnum"
                     style={{ fontSize: 8, color: "var(--text-dim)" }}
                   >
-                    {legUsd != null ? fmtUsd(legUsd) : "—"}
+                    {formatAssetUsd(legUsd)}
                   </div>
                 </div>
               </button>
@@ -836,7 +876,7 @@ export function WalletLandscapeView({
                   className="tnum"
                   style={{ fontSize: 9, color: "var(--text-dim)", marginTop: 1 }}
                 >
-                  {r.usd != null ? fmtUsd(r.usd) : "—"}
+                  {formatAssetUsd(r.usd)}
                 </div>
               </div>
             </button>
@@ -984,162 +1024,44 @@ export function WalletLandscapeView({
               if (item.kind === "stable") return renderStablecoinRow(item.group);
               const { chain, w } = item;
               const a = getAdapter(chain);
-              const active = chain === activeChain && !effectiveZphAsset;
-              const rawBal = balancesByChain[chain];
-              const balText = fmtBalance(rawBal);
-              const usd = getUsd(a.ticker, rawBal, pricesByTicker);
               return (
-                <button
+                <AssetRow
                   key={chain}
-                  onClick={() => {
+                  name={a.displayName}
+                  ticker={a.ticker}
+                  color={a.color}
+                  active={chain === activeChain && !effectiveZphAsset}
+                  onSelect={() => {
                     setActiveChain(chain);
                     setFocusedZphAsset(null);
                   }}
-                  style={{
-                    width: "100%",
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 12,
-                    padding: "10px 14px",
-                    background: active ? `${a.color}14` : "transparent",
-                    border: "none",
-                    borderLeft: active ? `2px solid ${a.color}` : "2px solid transparent",
-                    borderBottom: "1px solid var(--border-soft)",
-                    // The box glows with the coin, so focus is legible without
-                    // colour having to do double duty.
-                    boxShadow: active ? `inset 0 0 22px -6px ${a.color}66` : "none",
-                    cursor: "pointer",
-                    textAlign: "left",
-                    fontFamily: "var(--font-mono)",
-                    color: active ? a.color : "var(--text)",
-                    transition: "background .12s ease, box-shadow .12s ease",
-                  }}
-                >
-                  {/* Every coin carries its OWN colour at rest (2026-09-02).
-                      It used to be white until selected and coloured only when
-                      active, which made colour mean "focused" instead of
-                      meaning "which coin" — the rail read as a monochrome list.
-                      Focus is now the halo plus the row's border/tint, so the
-                      two signals are independent. */}
-                  <CoinIcon
-                    sym={a.ticker}
-                    size={20}
-                    color={a.color}
-                    glow={active ? "accent" : false}
-                  />
-                  <div style={{ flex: 1, minWidth: 0 }}>
-                    {/* Show the chain's display name, not the bare ticker —
-                        the EVM L2s (Ethereum / Arbitrum / Base / Optimism) all
-                        share ticker "ETH" and the same derived address, so a
-                        ticker-only label rendered as several indistinguishable
-                        "ETH" rows. The ticker still appears on the subline. */}
-                    <div
-                      style={{
-                        fontSize: 11,
-                        fontWeight: 600,
-                        letterSpacing: 0.4,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {a.displayName}
-                    </div>
-                    <div
-                      style={{
-                        fontSize: 8,
-                        color: "var(--text-dim)",
-                        marginTop: 1,
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {a.ticker} · {w ? truncAddr(w.address) : "tap to set up"}
-                    </div>
-                    {/* Swap-node holding for this coin, when there is one.
-                        Deliberately in the NAME column and not the amount
-                        column on the right — the right column is the
-                        wallet's own money, and a second figure there would
-                        read as part of the same balance. */}
-                    <SwapBalanceSubline
-                      raw={swapRows[a.ticker.toUpperCase()]?.balance}
-                      ticker={a.ticker}
-                    />
-                  </div>
-                  <div style={{ textAlign: "right", flexShrink: 0 }}>
-                    <div className="tnum" style={{ fontSize: 11 }}>{balText}</div>
-                    <div
-                      className="tnum"
-                      style={{
-                        fontSize: 9,
-                        color: "var(--text-dim)",
-                        marginTop: 1,
-                      }}
-                    >
-                      {usd != null ? fmtUsd(usd) : "—"}
-                    </div>
-                  </div>
-                </button>
+                  balanceRaw={balancesByChain[chain]}
+                  usd={item.usd}
+                  address={w.address}
+                  swapBalanceRaw={swapRows[a.ticker.toUpperCase()]?.balance}
+                />
               );
             })
           )}
           {/* Independent-seed chains with no wallet yet — the entry point to
               their import panel, which is gated on this click setting
-              `activeChain`. See `importableChains` for why these are separate
-              from the held rows above and excluded from every total. */}
-          {importableChains.map((chain) => {
+              `activeChain`. See `importable` above for why these are separate
+              from the held rows above and excluded from every total. Portrait
+              renders the same rows from the same helper. */}
+          {importable.map((chain) => {
             const a = getAdapter(chain);
-            const active = chain === activeChain && !effectiveZphAsset;
             return (
-              <button
+              <ImportableAssetRow
                 key={`import-${chain}`}
-                onClick={() => {
+                name={a.displayName}
+                ticker={a.ticker}
+                color={a.color}
+                active={chain === activeChain && !effectiveZphAsset}
+                onSelect={() => {
                   setActiveChain(chain);
                   setFocusedZphAsset(null);
                 }}
-                title={`Import a ${a.displayName} wallet`}
-                style={{
-                  width: "100%",
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 12,
-                  padding: "10px 14px",
-                  background: active ? `${a.color}14` : "transparent",
-                  border: "none",
-                  borderLeft: active ? `2px solid ${a.color}` : "2px solid transparent",
-                  cursor: "pointer",
-                  textAlign: "left",
-                  opacity: active ? 1 : 0.72,
-                }}
-              >
-                <CoinIcon sym={a.ticker} size={22} color={a.color} glow={active ? "accent" : false} />
-                <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontFamily: "var(--font-mono)", fontSize: 11, color: "var(--text)" }}>
-                    {a.displayName}
-                  </div>
-                  <div
-                    style={{
-                      fontFamily: "var(--font-mono)",
-                      fontSize: 9,
-                      color: "var(--text-dim)",
-                      marginTop: 1,
-                    }}
-                  >
-                    {a.ticker} · not imported
-                  </div>
-                </div>
-                <div
-                  style={{
-                    fontFamily: "var(--font-mono)",
-                    fontSize: 9,
-                    color: "var(--text-dim)",
-                    flexShrink: 0,
-                  }}
-                >
-                  import ▸
-                </div>
-              </button>
+              />
             );
           })}
         </div>
@@ -1212,7 +1134,7 @@ export function WalletLandscapeView({
                   }}
                 >
                   ≈ <ST speed={18} delay={160}>
-                    {focalUsd != null ? fmtUsd(focalUsd) : "—"}
+                    {formatAssetUsd(focalUsd)}
                   </ST>
                 </div>
               </div>
@@ -1263,41 +1185,34 @@ export function WalletLandscapeView({
               />
             )}
 
-            {/* Action row — Send / Receive / Swap */}
-            <div
-              style={{
-                display: "grid",
-                gridTemplateColumns: "1fr 1fr 1fr",
-                gap: 10,
-              }}
-            >
-              <ActionTile
-                glyph="▲"
-                label="Send"
-                onClick={() => onSend(effectiveZphAsset ?? undefined)}
-                disabled={sendDisabled}
-              />
-              <ActionTile
-                glyph="▼"
-                label="Receive"
-                onClick={() => copyAddr(focalAddress)}
-              />
-              {/* Every asset, not just Zephyr.
+            {/* Action row — Send / Receive / Swap. The same component portrait
+                renders (`compact` there), with the same three gates from
+                `wallet-surface.ts`.
 
-                  This was `disabled={activeChain !== "zephyr"}`: on BTC, ETH,
-                  SOL and every other coin it rendered a greyed control that
-                  had never done anything, and Zephyr's opened the legacy
-                  ecosystem modal rather than the Swap tab. Both now go to the
-                  same place — the Swap tab with this asset pre-selected on
-                  the AUTO route. */}
-              <ActionTile
-                glyph="⇄"
-                label="Swap"
-                onClick={() => onOpenSwapForAsset?.(activeAdapter.ticker)}
-                disabled={!onOpenSwapForAsset}
-                accent
-              />
-            </div>
+                Swap goes to the Swap tab with this asset pre-selected on the
+                AUTO route, for every asset a swap venue carries. It was once
+                `disabled={activeChain !== "zephyr"}` — a dead control on every
+                other coin. It is now disabled, with the reason shown, only for
+                an asset no venue carries (XEL, RVN, …), where the tab could
+                only open on a form with no route. */}
+            <WalletActionRow
+              send={{
+                onClick: () => onSend(effectiveZphAsset ?? undefined),
+                blockedReason: sendReason,
+              }}
+              receive={{
+                onClick: () => copyAddr(focalAddress),
+                blockedReason: receiveReason,
+                title: "Copy the receive address",
+              }}
+              swap={{
+                onClick: () => {
+                  if (swapKey) onOpenSwapForAsset?.(swapKey);
+                },
+                blockedReason: swapReason,
+                title: `Swap ${focalName} in the Swap tab`,
+              }}
+            />
 
             {/* Address row */}
             <div
@@ -1326,36 +1241,44 @@ export function WalletLandscapeView({
                   flex: 1,
                   fontFamily: "var(--font-mono)",
                   fontSize: 11,
-                  color: "var(--text)",
+                  color: focalAddress ? "var(--text)" : "var(--text-dim)",
                   letterSpacing: 0.3,
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
                 }}
-                title={focalAddress}
+                title={focalAddress || undefined}
+                data-address-pending={focalAddress ? undefined : true}
               >
-                {focalAddress}
+                {/* A wallet can exist before its address is known (Xelis when
+                    this build cannot derive it offline, 2026-09-15; portrait's
+                    AccountCard says the same). Nothing to copy until then. */}
+                {focalAddress || "shown once the wallet opens"}
               </code>
-              <button
-                className="qbtn"
-                onClick={() => copyAddr(focalAddress)}
-                style={{
-                  padding: "5px 10px",
-                  fontSize: 10,
-                  color: copiedAddr ? "var(--accent)" : undefined,
-                  borderColor: copiedAddr ? "var(--accent)" : undefined,
-                }}
-              >
-                {copiedAddr ? "✓" : "copy"}
-              </button>
-              <button
-                className="qbtn"
-                onClick={() => copyAddr(focalAddress)}
-                style={{ padding: "5px 10px", fontSize: 10 }}
-                title="QR — copies address (dedicated modal coming in v2.1)"
-              >
-                qr
-              </button>
+              {focalAddress && (
+                <>
+                  <button
+                    className="qbtn"
+                    onClick={() => copyAddr(focalAddress)}
+                    style={{
+                      padding: "5px 10px",
+                      fontSize: 10,
+                      color: copiedAddr ? "var(--accent)" : undefined,
+                      borderColor: copiedAddr ? "var(--accent)" : undefined,
+                    }}
+                  >
+                    {copiedAddr ? "✓" : "copy"}
+                  </button>
+                  <button
+                    className="qbtn"
+                    onClick={() => copyAddr(focalAddress)}
+                    style={{ padding: "5px 10px", fontSize: 10 }}
+                    title="QR — copies address (dedicated modal coming in v2.1)"
+                  >
+                    qr
+                  </button>
+                </>
+              )}
             </div>
 
             {/* Monero subaddress affordances inside the focal column */}
@@ -1435,6 +1358,11 @@ export function WalletLandscapeView({
                 as a detached footer below this view. Content built by
                 LandscapeRoot from the shared Zano components. */}
             {activeChain === "zano" && zanoCenterSlot}
+
+            {/* Xelis — same delivery as Zano's slot above: built by
+                LandscapeRoot from the shared Xelis components and rendered
+                inline in the focal column. */}
+            {activeChain === "xelis" && xelisCenterSlot}
 
             {/* Derivation, for EVERY chain. Mounted here as well as in the
                 portrait dashboard — landscape is the DEFAULT layout, so a
@@ -1530,7 +1458,13 @@ export function WalletLandscapeView({
                 />
               )}
 
-            {/* Recent activity */}
+            {/* Recent activity — for the chains whose history has no card of
+                its own. Zano and Xelis render `ZanoTxHistoryCard` /
+                `XelisTxHistoryCard` in their centre slot above; this block
+                used to render for them as well, from the generic feed, so the
+                same transfers were listed twice (audit, 2026-09-16). Portrait's
+                `WalletTxHistorySubview` follows the same `historySurfaceFor`. */}
+            {(historySurface === "monero" || historySurface === "generic") && (
             <div>
               <div
                 style={{
@@ -1546,7 +1480,7 @@ export function WalletLandscapeView({
               >
                 Recent
               </div>
-              {activeChain === "monero" ? (
+              {historySurface === "monero" ? (
                 xmrRecent.length === 0 ? (
                   <EmptyMsg
                     text={
@@ -1576,16 +1510,16 @@ export function WalletLandscapeView({
                   />
                 )
               ) : genericRecent.length === 0 ? (
-                /* Zephyr and Zano read history from their own wallet-rpc and
-                   return an EMPTY page when no session is open
-                   (zph-wallet.ts:688). Rendering the same "No recent
-                   transactions." as a genuinely empty chain told the user they
-                   had none, when the truth was that nothing had been asked.
-                   Monero already distinguished the two; these now do too. */
+                /* Zephyr reads history from its own wallet-rpc and returns an
+                   EMPTY page when no session is open (zph-wallet.ts:688).
+                   Rendering the same "No recent transactions." as a genuinely
+                   empty chain told the user they had none, when the truth was
+                   that nothing had been asked. Zano and Xelis had arms here
+                   too (Zano's read Zephyr's state until 2026-09-15); they no
+                   longer reach this block. */
                 <EmptyMsg
                   text={
-                    (activeChain === "zephyr" || activeChain === "zano") &&
-                    zphSession?.syncState !== "synced"
+                    activeChain === "zephyr" && zphSession?.syncState !== "synced"
                       ? "Transaction history available after sync."
                       : "No recent transactions."
                   }
@@ -1602,7 +1536,8 @@ export function WalletLandscapeView({
                           ? ("failed" as const)
                           : ("out" as const),
                     amount: tx.amount,
-                    ticker: activeAdapter.ticker,
+                    // The asset this row moved: a Zephyr row may be ZEPHUSD etc.
+                    ticker: txDisplayTicker(tx, activeAdapter.ticker),
                     when: fmtRelative(tx.timestamp),
                     peer:
                       tx.confirmations !== undefined && tx.confirmations > 0
@@ -1613,6 +1548,7 @@ export function WalletLandscapeView({
                 />
               )}
             </div>
+            )}
           </>
           ) : importPanelSlot ? (
             /* Monero / Zephyr selected but not set up yet. Landscape is the
@@ -1629,6 +1565,12 @@ export function WalletLandscapeView({
                slot already carries the import panel when there is no wallet;
                it just had nowhere to render. */
             <div style={{ maxWidth: 560 }}>{zanoCenterSlot}</div>
+          ) : activeChain === "xelis" && xelisCenterSlot ? (
+            /* Xelis selected with no wallet: the same slot in the same branch
+               Zano had to be added to on 2026-09-13. Built once by
+               LandscapeRoot, rendered here and in the has-a-wallet branch
+               above, so neither can be the only one wired. */
+            <div style={{ maxWidth: 560 }}>{xelisCenterSlot}</div>
           ) : (
             <EmptyMsg
               text={`No ${activeAdapter.displayName} wallet imported.`}
@@ -1699,47 +1641,20 @@ export function WalletLandscapeView({
                 fontFamily: "var(--font-mono)",
               }}
             >
-              Awaiting sync to enable sends
+              {sendReason}
             </div>
           )}
         </div>
 
-        {/* Market mini */}
-        <div>
-          <div
-            style={{
-              fontSize: 9.5,
-              color: "var(--text-muted)",
-              letterSpacing: 1.5,
-              textTransform: "uppercase",
-              marginBottom: 10,
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            Market · {focalTicker}
-          </div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 10, fontFamily: "var(--font-mono)" }}>
-            <Row
-              k="price"
-              v={focalPrice != null ? fmtUsd(focalPrice) : "—"}
-              tnum
-            />
-            <Row k="balance" v={focalBalanceText} tnum />
-            <Row
-              k="value"
-              v={focalUsd != null ? fmtUsd(focalUsd) : "—"}
-              tnum
-            />
-          </div>
-          <div style={{ marginTop: 12 }}>
-            <MiniSpark
-              values={priceSpark}
-              w={260}
-              h={36}
-              color={activeAdapter.color}
-            />
-          </div>
-        </div>
+        {/* Market — the same block portrait renders inside AccountCard. */}
+        <AssetMarketBlock
+          ticker={focalTicker}
+          price={focalPrice}
+          balanceText={focalBalanceText}
+          usd={focalUsd}
+          priceSpark={priceSpark}
+          sparkColor={activeAdapter.color}
+        />
 
         {/* C6 — the swap node's own Monero wallet, shown only on the Monero
             panel and only after opt-in. `DexXmrWalletCard` was exported from
@@ -1789,40 +1704,8 @@ export function WalletLandscapeView({
 
 /* ══════ helpers ═════════════════════════════════════════════ */
 
-function ActionTile({
-  glyph,
-  label,
-  onClick,
-  disabled,
-  accent,
-}: {
-  glyph: string;
-  label: string;
-  onClick: () => void;
-  disabled?: boolean;
-  accent?: boolean;
-}) {
-  return (
-    <button
-      className={`qbtn${accent ? " accent" : ""}`}
-      onClick={onClick}
-      disabled={disabled}
-      style={{
-        padding: "14px 8px",
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 5,
-        fontSize: 10,
-        letterSpacing: 1.5,
-        textTransform: "uppercase",
-      }}
-    >
-      <span style={{ fontSize: 18, color: "var(--accent)" }}>{glyph}</span>
-      <span>{label}</span>
-    </button>
-  );
-}
+// The Send / Receive / Swap tiles that were here are `WalletActionRow`, shared
+// with portrait (2026-09-16).
 
 function ActivityList({
   items,

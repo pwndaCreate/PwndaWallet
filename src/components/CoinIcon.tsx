@@ -160,17 +160,21 @@ const GLYPHS: Record<string, Glyph> = {
       "##....##",
     ],
   },
+  // TRON's kite, rasterised from the logo's own geometry (tron-mark.json,
+  // filled: its strokes are 3% of the width, a quarter of a cell here) via
+  // svg_marks.py; deviations: none. Replaced the hand-drawn hourglass
+  // 2026-09-15.
   TRX: {
     kind: "p",
     g: [
-      "########",
-      "##....##",
-      ".##..##.",
+      "........",
+      ".#####..",
+      ".######.",
+      "..#####.",
       "..####..",
       "...##...",
-      "..####..",
-      ".######.",
-      "..####..",
+      "...#....",
+      "........",
     ],
   },
   ADA: {
@@ -239,14 +243,173 @@ const GLYPHS: Record<string, Glyph> = {
   // Ergo's protocol identity is "Sigma" (the Σ-protocol family), and the
   // official logo uses a capital sigma. Renders cleanly in JetBrains Mono.
   ERG: { kind: "g", t: "Σ", w: 700 },
+  // -- Rasterised from each project's own logo (2026-09-15) ----------------
+  // These eight drew the three-letter fallback until 2026-09-15. Each is the
+  // project's own SVG fitted into the 8x8 box and lit where a cell is at
+  // least half covered - the method behind the TRX kite above. A hand tune
+  // may only flip a cell the geometry left undecided (37.5-62.5% covered).
+  // Sources, pins and rasteriser: pwnda-web-art-sync/wallet-coin-marks/;
+  // `svg_marks.py --check-wallet` confirms these rows still match it.
+  //
+  // Xelis: rasterised from xelis-assets icons/svg/transparent/green.svg via
+  // svg_marks.py; deviations: none (the inner spikes reach 48% and drop out).
+  XEL: {
+    kind: "p",
+    g: [
+      "........",
+      "...##...",
+      "..####..",
+      ".#....#.",
+      ".#....#.",
+      "..#..#..",
+      "...##...",
+      "........",
+    ],
+  },
+  // Zano: rasterised from zano.org media-kit logo-symbol.svg via
+  // svg_marks.py; deviations: (4,2) and (3,5), exact 50% ties, cleared so the
+  // two loops do not fuse with the diagonal.
+  ZANO: {
+    kind: "p",
+    g: [
+      "....##..",
+      "...#..#.",
+      "..##...#",
+      ".####..#",
+      "#..####.",
+      "#...##..",
+      ".#..#...",
+      "..##....",
+    ],
+  },
+  // BNB: rasterised from cryptocurrency-icons 0.18.1 black/bnb.svg, badge
+  // circle removed (no official SVG was reachable), via svg_marks.py;
+  // deviations: the four centre cells (39-45%) lit so the centre tile stays.
+  BNB: {
+    kind: "p",
+    g: [
+      "........",
+      "...##...",
+      "..####..",
+      ".#.##.#.",
+      ".#.##.#.",
+      "..####..",
+      "...##...",
+      "........",
+    ],
+  },
+  // Sui: rasterised from the sui.io media kit's Logo_Sui_Droplet_Black.svg
+  // via svg_marks.py, filled (its outline and wave are half a cell wide);
+  // deviations: none.
+  SUI: {
+    kind: "p",
+    g: [
+      "........",
+      "...##...",
+      "..####..",
+      ".######.",
+      ".######.",
+      ".######.",
+      "..####..",
+      "...##...",
+    ],
+  },
+  // Monad: rasterised from the logomark SVG on monad.xyz/brand-and-media-kit
+  // via svg_marks.py; deviations: none (the counter is four cells wide).
+  MON: {
+    kind: "p",
+    g: [
+      "........",
+      "..####..",
+      ".##..##.",
+      ".#....#.",
+      ".#....#.",
+      ".##..##.",
+      "..####..",
+      "........",
+    ],
+  },
+  // Dash: rasterised from dash.org brand-guidelines blue-d.svg via
+  // svg_marks.py; deviations: none.
+  DASH: {
+    kind: "p",
+    g: [
+      "........",
+      "..#####.",
+      ".....###",
+      ".###..##",
+      ".###..#.",
+      ".....##.",
+      "..####..",
+      "........",
+    ],
+  },
+  // Stellar: rasterised from the stellar.org 2026 logo press kit (the mark
+  // paths of its SDF lockup SVG) via svg_marks.py; deviations: none.
+  XLM: {
+    kind: "p",
+    g: [
+      "........",
+      "..###...",
+      ".#...#..",
+      ".#.#..#.",
+      ".#..#.#.",
+      "..#...#.",
+      "...###..",
+      "........",
+    ],
+  },
+  // NEAR: rasterised from the N mark SVG on near.org/brand via svg_marks.py;
+  // deviations: none.
+  NEAR: {
+    kind: "p",
+    g: [
+      "........",
+      "###...##",
+      "###..###",
+      "##.#..##",
+      "##..#.##",
+      "###..###",
+      "##...###",
+      "........",
+    ],
+  },
 };
+
+/** One entry of the glyph table - exported for CoinIcon.coverage.test.ts. */
+export type CoinGlyph = Glyph;
+
+/** The whole glyph table, read-only - exported for CoinIcon.coverage.test.ts. */
+export function coinGlyphTable(): Readonly<Record<string, CoinGlyph>> {
+  return GLYPHS;
+}
+
+/**
+ * The glyph CoinIcon draws for `sym`, or undefined when it would fall back to
+ * three letters. The component renders through this, so the coverage test
+ * checks the same lookup a user sees.
+ *
+ * Case-insensitive. A per-network leg key (`USDC-ARB`, `USDT0-POL`,
+ * `USDT-TRON`) draws its symbol's mark, the way `assetRank` ranks it: the swap
+ * form, its confirm modal and the swap history hand the leg key straight to
+ * CoinIcon, so before 2026-09-15 every stablecoin leg fell back to "USD".
+ */
+export function resolveCoinGlyph(sym: string): CoinGlyph | undefined {
+  const upper = (sym || "").toUpperCase();
+  const own = (key: string): CoinGlyph | undefined =>
+    Object.prototype.hasOwnProperty.call(GLYPHS, key) ? GLYPHS[key] : undefined;
+  const direct = own(upper);
+  if (direct) return direct;
+  const dash = upper.indexOf("-");
+  return dash > 0 ? own(upper.slice(0, dash)) : undefined;
+}
 
 /**
  * Unified 12×12 ring-frame coin icon — one outer pixel ring with a
- * unique inner glyph per ticker. Replaces the older PixelCoin (16×16
- * with ad-hoc per-coin grids and a 3-letter text fallback) on the v2
- * dashboard, account card, and activity rows so every chain shares
- * the same visual silhouette.
+ * unique inner glyph per ticker. Replaced the older PixelCoin (16×16
+ * with ad-hoc per-coin grids and a 3-letter text fallback; removed
+ * 2026-09-15) on the v2 dashboard, account card, and activity rows so
+ * every chain shares the same visual silhouette.
  */
 export function CoinIcon({
   sym,
@@ -273,7 +436,7 @@ export function CoinIcon({
   style?: CSSProperties;
 }) {
   const upper = (sym || "").toUpperCase();
-  const glyph = GLYPHS[upper];
+  const glyph = resolveCoinGlyph(sym);
   const innerColor = accent ?? color;
   // Unique per instance: two icons for the same symbol would otherwise emit
   // duplicate mask ids into the document.

@@ -300,6 +300,19 @@
 
 .qbtn.danger:hover { background: rgba(255,59,59,0.10); border-color: var(--danger); }
 
+/* Disabled — the BEHAVIORS.md rule every primitive follows (`--disabled-opacity`
+ * + not-allowed, no hover change). `.qbtn` had none until 2026-09-16, so a
+ * disabled tile looked exactly like a live one: the wallet's Swap tile for XEL
+ * (no route) and Send for an unsyncing Monero wallet read as broken buttons.
+ * Last in the block, so it beats the variant colours and their hovers. */
+.qbtn:disabled { opacity: var(--disabled-opacity, 0.4); cursor: not-allowed; }
+/* Each hover reset restores that variant's resting look, background included
+ * (`.primary` rests on a white fill; the others are transparent). */
+.qbtn:disabled:hover { color: var(--text-muted); border-color: var(--border); }
+.qbtn.primary:disabled:hover { background: var(--white); color: #050505; border-color: var(--white); }
+.qbtn.accent:disabled:hover { background: transparent; color: var(--accent); border-color: var(--accent-mid); }
+.qbtn.danger:disabled:hover { background: transparent; color: var(--danger); border-color: rgba(255,59,59,0.4); }
+
 
 /* Field input — flat, monospace, terminal-feel */
 .field {

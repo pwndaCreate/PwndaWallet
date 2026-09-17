@@ -1,5 +1,12 @@
 import { describe, it, expect } from "vitest";
-import { MINING_COINS, isGpuCoin } from "./miningCoins";
+import {
+  MINING_COINS,
+  algorithmFor,
+  coinLanes,
+  coinMinesOn,
+  isDualLaneCoin,
+  lanesLabel,
+} from "./miningCoins";
 
 /**
  * The array order is load-bearing, not cosmetic: `MineSimpleView` shows
@@ -18,28 +25,70 @@ describe("MINING_COINS — the collapsed-view order", () => {
     ]);
   });
 
+  // XEL has had a house pool since 2026-09-16 but stays here: the top three
+  // are full, and which coin leaves them is the operator's call.
+  it("XEL sits first behind the fold, not in the top three", () => {
+    expect(MINING_COINS[3].sym).toBe("XEL");
+  });
+
   it("every coin present before this change is still present after it", () => {
     // Reordering must never silently drop a coin — the whole point of a
     // single shared array (per this file's own header) is that a coin can't
     // go missing from one surface while staying in another.
     expect(MINING_COINS.map((c) => c.sym).sort()).toEqual(
-      ["CFX", "ERG", "RVN", "XMR", "ZANO", "ZEPH"].sort()
+      ["CFX", "ERG", "RVN", "XEL", "XMR", "ZANO", "ZEPH"].sort()
     );
   });
 
-  it("hardware lane is unchanged by the reorder", () => {
+  it("each coin's lanes are exactly the declared ones", () => {
     const byChain = Object.fromEntries(
-      MINING_COINS.map((c) => [c.chain, c.hardware])
+      MINING_COINS.map((c) => [c.chain, coinLanes(c.chain)])
     );
     expect(byChain).toEqual({
-      monero: "cpu",
-      zephyr: "cpu",
-      ravencoin: "gpu",
-      conflux: "gpu",
-      ergo: "gpu",
-      zano: "gpu",
+      monero: ["cpu"],
+      zephyr: ["cpu"],
+      xelis: ["cpu", "gpu"],
+      ravencoin: ["gpu"],
+      conflux: ["gpu"],
+      ergo: ["gpu"],
+      zano: ["gpu"],
     });
-    expect(isGpuCoin("zano")).toBe(true);
-    expect(isGpuCoin("monero")).toBe(false);
+  });
+});
+
+describe("per-lane algorithms", () => {
+  it("XEL mines XelisHash v3 on both lanes", () => {
+    expect(algorithmFor("xelis", "cpu")).toBe("xelishashv3");
+    expect(algorithmFor("xelis", "gpu")).toBe("xelishashv3");
+    expect(isDualLaneCoin("xelis")).toBe(true);
+    expect(lanesLabel("xelis")).toBe("CPU/GPU");
+  });
+
+  it("a single-lane coin has no algorithm on the lane it cannot mine", () => {
+    expect(algorithmFor("monero", "cpu")).toBe("randomx");
+    expect(algorithmFor("monero", "gpu")).toBeNull();
+    expect(algorithmFor("zano", "gpu")).toBe("progpowz");
+    expect(algorithmFor("zano", "cpu")).toBeNull();
+    expect(isDualLaneCoin("zano")).toBe(false);
+    expect(lanesLabel("zano")).toBe("GPU");
+  });
+
+  it("every rostered coin names an algorithm for each lane it claims", () => {
+    for (const c of MINING_COINS) {
+      const lanes = coinLanes(c.chain);
+      expect(lanes.length).toBeGreaterThan(0);
+      for (const lane of lanes) {
+        expect(algorithmFor(c.chain, lane)).not.toBeNull();
+        expect(coinMinesOn(c.chain, lane)).toBe(true);
+      }
+    }
+  });
+
+  it("an unrostered coin is CPU-only for gating but has no algorithm to mine", () => {
+    // Conservative: a CPU lane always exists, so the gating rule has
+    // something to consult — but nothing can START it, because there is no
+    // algorithm to launch.
+    expect(coinLanes("bitcoin")).toEqual(["cpu"]);
+    expect(algorithmFor("bitcoin", "cpu")).toBeNull();
   });
 });

@@ -24,9 +24,21 @@ If you're a future contributor (human or agent) and you want to import something
 
 | Feature folder | May import (in addition to bare deps + same-folder + `src/{components,lib,utils,design}`) | Banned |
 |---|---|---|
-| **mining** | `src/types/mining`, `src/wallets/coin-metadata`, type-only `ChainType` / `ChainAdapter` from `src/wallets/index` or `src/wallets/types`, `src/secure-random`, `src/platform/*` | All sibling feature folders, `src/store`, `src/crypto`, `src/state/*`, `src/wallets/*-wallet`, `src/wallets/xmr-*`, `src/wallets/zph-*`, `src/wallets/zano-*`, `src/wallets/ada-*`, `src/App`, `src/api/*` |
+| **mining** | `src/types/mining`, `src/wallets/coin-metadata`, type-only `ChainType` / `ChainAdapter` from `src/wallets/index` or `src/wallets/types`, `src/secure-random`, `src/platform/*` | All sibling feature folders, `src/store`, `src/crypto`, `src/state/*`, `src/wallets/*-wallet`, `src/wallets/xmr-*`, `src/wallets/zph-*`, `src/wallets/zano-*`, `src/wallets/xelis-*`, `src/wallets/ada-*`, `src/App`, `src/api/*` |
 | **lite** (`src-lite/`) | Everything mining can import, **plus** `src/features/mining/**`, `src/wallets/usd-prices`, `src/styles.css`, `src/design/**`, `src/platform/*` | All sibling feature folders other than mining, `src/store`, `src/crypto`, `src/state/*`, `src/wallets/*-wallet`, `src/App` |
 | **design** (`src/design/`) | `src/lib/`, `src/utils/`, type-only `ChainType` / `ChainAdapter` from `src/wallets/{index,types}` | All `src/features/**` folders, `src/store`, `src/crypto`, `src/state/*`, `src/App`, `src/wallets/*-wallet`, `src/api/*`. **Narrow exception**: files under `src/design/catalog/compositions/` MAY import real feature views — that's the whole point of compositions. |
+| **wallet** | `src/features/{swap,swap-sidecar,xelis}` via their `index.ts` **only**; `src/features/{monero,zephyr,zano}/*` (the independent-seed panels and cards both layouts mount; those folders have no barrel yet); `src/features/onboarding/*` (derivation detection); two named files from barrel-less folders: `src/features/activity/useTxHistory`, `src/features/landscape/SyncStatusPanel`; `src/wallets/*`, `src/store`, `src/crypto`, `src/state/*`, `src/types/*`, `src/platform/*`. Test files are exempt (they may cross-check a router's internals). | Internals of `swap`, `swap-sidecar`, `xelis`; any other file of `activity` or `landscape`; `src/features/{auth,mining,send,settings,vault}` (`send`/`vault` need a barrel first); `src/App` |
+| **swap** | `src/wallets/*`, `src/store`, `src/crypto`, `src/state/*`, `src/api/*` | — |
+| **swap-sidecar** | `src/api/basicswap`, `src/api/basicswapDaemon` (C2 daemon-direct routing bindings), `src/wallets/{usd-prices,coin-metadata}`, `src/store` (the plaintext opt-in + DEX-coin keys only), `src/features/swap/index` (router types via the public barrel) | Sibling feature internals, `src/crypto`, `src/App`. **Desktop-only** — PwndaLite must never link it (it drags in the whole swap engine surface). |
+| **vault** | `src/wallets/*`, `src/store`, `src/crypto`, `src/state/*`, `src/features/xelis` via its `index.ts` (the Xelis seed check and in-memory wallet the import panel also uses, so both say the same words) | — |
+| **send** | `src/wallets/*`, `src/store`, `src/state/*` | — |
+| **monero / zephyr / zano / xelis** | `src/wallets/{xmr,zph,zano,xelis}-*`, `src/store`, `src/state/*`. `xelis` exposes its public surface through `src/features/xelis/index.ts` | Mining, Lite and the design layer may not import `src/features/xelis` (enforced by `scripts/check-boundaries.mjs`) |
+| **landscape** | All feature folders (it's the layout root) | — |
+| **auth / onboarding** | `src/state/*`, `src/store`, `src/crypto` | — |
+| **activity** | `src/wallets/*`, `src/state/*`, `src/features/swap/index` (runtime — the unified history view loads `loadSwapHistory` + drift helpers + `SwapHistoryEntry` type via swap's public barrel; nothing from swap's internals) | — |
+| **settings** | `src/state/*`, `src/store`, `src/features/mining/*` (settings hosts the Miner Setup gateway), `src/api/proxy` (SWAP RELAY card: status/enroll/test + the server-URL override), `src/features/swap/router-modes` (router picker), `src/features/swap/{SweepBackSection,DexCnWalletCard}` (the swap-NODE surfaces that moved out of the Swap tab on 2026-09-05 — `settings/SwapNodeExtras.tsx` is their one host, mounted by both layouts), `src/features/swap-sidecar` (via its barrel), `src/wallets/chain-rpcs` (NETWORK card probes) | — |
+
+The **mining**, **lite**, **design** and **wallet** rows are enforced by `scripts/check-boundaries.mjs` — each fails the build (exit 1) on a forbidden import. (This line named only mining and lite until 2026-09-16, although `design` had been enforced since the design-system modularization. The wallet rule was added that day, after the wallet row had drifted: it claimed sibling features were reached "via their `index.ts`", while the wallet imported monero/zephyr/zano files directly and `wallet-surface.ts` reached into swap's private `asset-capabilities.ts`, and nothing checked either.) The other feature rows are documented here so they're discoverable, but the script doesn't yet check them — the cost is mostly false-positive triage. Add per-feature enforcement when the pattern repeats (e.g. when a third product variant arrives).
 
 ### The sidecar fee has no feature folder, on purpose
 
@@ -46,18 +58,8 @@ a Tauri command named settle/collect/pay/charge ever appears in that module.
 
 If a fee UI is ever built, it belongs in an existing feature folder (settings) as
 a consumer of those three read-only bindings. Published schedule: `FEE.md`.
-| **wallet** | `src/features/{vault,monero,zephyr,send,activity}` via their `index.ts`, `src/wallets/*`, `src/store`, `src/crypto`, `src/state/*` | — |
-| **swap** | `src/wallets/*`, `src/store`, `src/crypto`, `src/state/*`, `src/api/*` | — |
-| **swap-sidecar** | `src/api/basicswap`, `src/api/basicswapDaemon` (C2 daemon-direct routing bindings), `src/wallets/{usd-prices,coin-metadata}`, `src/store` (the plaintext opt-in + DEX-coin keys only), `src/features/swap/index` (router types via the public barrel) | Sibling feature internals, `src/crypto`, `src/App`. **Desktop-only** — PwndaLite must never link it (it drags in the whole swap engine surface). |
-| **vault** | `src/wallets/*`, `src/store`, `src/crypto`, `src/state/*` | — |
-| **send** | `src/wallets/*`, `src/store`, `src/state/*` | — |
-| **monero / zephyr / zano** | `src/wallets/{xmr,zph,zano}-*`, `src/store`, `src/state/*` | — |
-| **landscape** | All feature folders (it's the layout root) | — |
-| **auth / onboarding** | `src/state/*`, `src/store`, `src/crypto` | — |
-| **activity** | `src/wallets/*`, `src/state/*`, `src/features/swap/index` (runtime — the unified history view loads `loadSwapHistory` + drift helpers + `SwapHistoryEntry` type via swap's public barrel; nothing from swap's internals) | — |
-| **settings** | `src/state/*`, `src/store`, `src/features/mining/*` (settings hosts the Miner Setup gateway), `src/api/proxy` (SWAP RELAY card: status/enroll/test + the server-URL override), `src/features/swap/router-modes` (router picker), `src/features/swap/{SweepBackSection,DexCnWalletCard}` (the swap-NODE surfaces that moved out of the Swap tab on 2026-09-05 — `settings/SwapNodeExtras.tsx` is their one host, mounted by both layouts), `src/features/swap-sidecar` (via its barrel), `src/wallets/chain-rpcs` (NETWORK card probes) | — |
 
-The **mining** and **lite** rows are enforced by `scripts/check-boundaries.mjs` — both fail the build (exit 1) on any forbidden import. The other feature rows are documented here so they're discoverable, but the script doesn't yet check them — the cost is mostly false-positive triage. Add per-feature enforcement when the pattern repeats (e.g. when a third product variant arrives).
+*(This section used to sit in the middle of the table above, from 2026-08-29, which cut the table in two: every row after it, wallet through settings, rendered as plain text. Moved here 2026-09-16.)*
 
 ---
 
@@ -90,9 +92,9 @@ The boundary check fails the build (exit 1) so a "fix later" merge is impossible
 `src-tauri/src/` has a parallel contract enforced by the `full` Cargo feature:
 
 - Mining modules (`miners`, `pool_*`, `pool_dialects`, `proxy_pool`, `device_info`) compile into every build. (The `dev_fee` module + the `leaderboard` uplink were removed 2026-07-06 in the pure-wallet cutover — archived under `PwndaWalletVault/wiki/archive/`.)
-- Wallet / swap / RPC modules (`swap`, `xmr_rpc`, `zph_rpc`, `sol_rpc`, `http_proxy`, `wallet_rpc_common`, `secure_random`, `auth_keypair`) are gated behind `#[cfg(feature = "full")]` and stripped from the lite build.
+- Wallet / swap / RPC modules (`swap`, `xmr_rpc`, `zph_rpc`, `zano_rpc`, `xelis_rpc`, `sol_rpc`, `http_proxy`, `wallet_rpc_common`, `secure_random`, `auth_keypair`) are gated behind `#[cfg(feature = "full")]` and stripped from the lite build. (`zano_rpc` was gated since Zano landed but missing from this list until 2026-09-15.)
 - The boundary check: `cargo build --no-default-features` must succeed. CI runs this on every PR.
-- No mining-side Rust module should `use crate::swap`, `crate::xmr_rpc`, `crate::zph_rpc`, `crate::sol_rpc`, `crate::http_proxy`, `crate::wallet_rpc_common`, or `crate::secure_random`. Grep for new `^use crate::` edges before merging mining-side changes.
+- No mining-side Rust module should `use crate::swap`, `crate::xmr_rpc`, `crate::zph_rpc`, `crate::zano_rpc`, `crate::xelis_rpc`, `crate::sol_rpc`, `crate::http_proxy`, `crate::wallet_rpc_common`, or `crate::secure_random`. Grep for new `^use crate::` edges before merging mining-side changes.
 
 ---
 

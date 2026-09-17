@@ -1,0 +1,134 @@
+Grove PATCH-35: confirm ZANO's host-wallet identity on every node start
+
+PATCH-17 gave ZanoInterface a wrong-wallet guard: before every spend on the
+main (host) wallet-rpc connection, _confirmMainWalletIdentity re-reads the live
+address and refuses unless it equals _cached_main_wallet_address -- including
+when that is None, so "never confirmed" fails closed. The only assignment of the
+cache was in initialiseWallet's _external_main_wallet branch.
+
+A running node never calls initialiseWallet for ZANO. Its callers are
+bin/prepare.py (a separate, first-time process), reseedWallet (a manual UI
+action) and XMR-only debug code. So on every real Grove node the cache stayed
+None for the node's whole life, and EVERY spend from the shared ZANO wallet was
+refused: publishBLockTx and both withdrawCoin branches.
+
+WHAT IT COST (2026-09-13, mainnet)
+
+The first funded ZANO<>LTC swap. This node bid (sends ZANO). The offerer's LTC
+lock confirmed; every attempt to publish the ZANO lock logged
+
+    main wallet-rpc connection reports Zx..., expected confirmed identity None;
+    refusing to send
+
+100 times over 18 hours, across 13 engine restarts, none of which logged
+initialiseWallet's own "ZANO main wallet is host-managed" line. The offerer
+refunded through the lock-refund path. Nothing was lost -- the ZANO was never
+sent -- but no ZANO-sending swap could ever have succeeded on this engine.
+
+WHY XMR NEVER HAD IT, AND WHY THE SUITE STAYED GREEN
+
+XMRInterface caches in openWallet (PATCH-8), and every main-wallet path opens the
+default wallet first, so the node confirms at its first balance read or send.
+ZanoInterface.openWallet is a no-op -- Zano has no open_wallet RPC -- so the
+equivalent moment never came.
+
+verify-zano-interface.py section 3 called initialiseWallet directly on a stub
+and checked the cache: it proved the method caches, not that the node ever calls
+it. The regtest matrix does not set external_main_wallet, which makes the guard a
+no-op, so "ZANO 8/8" ran with the guard off.
+
+THE FIX
+
+_cacheMainWalletIdentityIfUnset: confirm once, while still None, from a
+non-spend path, under the same rule as XMRInterface.openWallet. Called from
+unlockWallet, which the node runs at every start, and from getWalletInfo, the
+periodic read, so a host wallet that was briefly unreachable at unlock is still
+confirmed before any spend. It is never called from inside the guard: a guard
+that fills its own reference from the live read it is about to compare against
+would pass for any wallet.
+
+Unchanged: a wallet swapped AFTER confirmation is still refused, a second unlock
+does not re-pin a different wallet, and a non-Grove deployment
+(external_main_wallet False) makes no extra RPC call.
+
+Verified by verify-zano-interface.py section 10, which starts from a fresh
+interface that never ran initialiseWallet. Its negative control reproduces the
+2026-09-13 refusal on an engine without this patch.
+
+Scope: ZANO only. ZEPH inherits XMRInterface.openWallet's confirmation;
+verify-zeph-host-wallet.py section 13 proves it on a restarted node.
+
+Upstream candidate: no. ZanoInterface is Grove's own module (PATCH-15).
+
+Regenerated 2026-09-17 on basicswap v0.18.9 (5471e609): the hand-edited body had hunk line counts that `git apply` rejects ("corrupt patch at line 113"), so check-basicswap-upstream.mjs reported this patch, and 0037 after it, as BREAK on every tag, while apply-engine-patches.mjs (which ignores hunk counts) applied it. The change is the same.
+
+diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
+index 03e7b0a..5aff347 100644
+--- a/basicswap/interface/zano/zano.py
++++ b/basicswap/interface/zano/zano.py
+@@ -635,6 +635,46 @@ class ZanoInterface(CoinInterface):
+                 "the payout address is then taken from the live wallet."
+             )
+ 
++    def _cacheMainWalletIdentityIfUnset(self, when: str) -> None:
++        # PWNDA-PATCH-35: the "host confirms its wallet's identity" moment, on
++        # every node start -- not only inside initialiseWallet, which a running
++        # node never calls for ZANO (bin/prepare.py, reseedWallet and XMR-only
++        # debug code are its only callers). With the confirmation there alone,
++        # _cached_main_wallet_address stayed None for the life of every node and
++        # _confirmMainWalletIdentity refused every spend from the host wallet:
++        # 2026-09-13, the first funded ZANO<>LTC swap, 100 publishBLockTx
++        # retries over 18 h, all "expected confirmed identity None; refusing to
++        # send". XMR never had this gap because PATCH-8 caches in openWallet,
++        # which runs at every start; ZANO's openWallet is a no-op.
++        #
++        # Same rule as XMRInterface.openWallet: confirm ONCE, while still None,
++        # from a non-spend path. Never call this from inside the spend guard --
++        # a guard that fills its own reference from the live read it compares
++        # against would pass for any wallet. Callers: unlockWallet (the node's
++        # start) and getWalletInfo (the periodic read, so a host wallet that was
++        # briefly unreachable at unlock is still confirmed before any spend).
++        #
++        # The caller must hold self._mx_wallet.
++        if not self._external_main_wallet:
++            return
++        if self._cached_main_wallet_address is not None:
++            return
++        try:
++            address = self.rpc_wallet("getaddress")["address"]
++        except Exception as e:
++            self._log.warning(
++                f"PWNDA-PATCH-35: could not confirm the ZANO main wallet identity at "
++                f"{when} (spends stay refused until it is confirmed): {e}"
++            )
++            return
++        if not address:
++            return
++        self._cached_main_wallet_address = address
++        self._log.info(
++            f"PWNDA-PATCH-35: confirmed the ZANO main wallet identity at {when}: "
++            f"{address}"
++        )
++
+     def _confirmMainWalletIdentity(self) -> None:
+         # PWNDA-PATCH-17 (revised): re-read the main wallet-rpc connection's live
+         # address and compare it to the identity confirmed earlier by
+@@ -772,6 +812,8 @@ class ZanoInterface(CoinInterface):
+ 
+     def getWalletInfo(self):
+         with self._mx_wallet:
++            # PWNDA-PATCH-35: see _cacheMainWalletIdentityIfUnset.
++            self._cacheMainWalletIdentityIfUnset("wallet info")
+             rv = {}
+             try:
+                 balance_info = self.rpc_wallet("getbalance")
+@@ -1601,6 +1643,9 @@ class ZanoInterface(CoinInterface):
+     def unlockWallet(self, password: str, check_seed: bool = True) -> None:
+         self._log.info("unlockWallet - {}".format(self.ticker()))
+         self._wallet_password = password
++        # PWNDA-PATCH-35: the node's start -- see _cacheMainWalletIdentityIfUnset.
++        with self._mx_wallet:
++            self._cacheMainWalletIdentityIfUnset("unlock")
+         if check_seed and not self._have_checked_seed:
+             self._sc.checkWalletSeed(self.coin_type())
+ 

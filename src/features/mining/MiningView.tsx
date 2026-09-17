@@ -1,15 +1,39 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChainType } from "../../wallets";
 import { ALL_CHAINS, getCoinMeta } from "../../wallets/coin-metadata";
-import { estimateEarningsForChain, formatCoinAmount } from "./earnings";
+import { formatCoinAmount } from "./earnings";
 import { useCoinStats } from "./useCoinStats";
 import { useDeviceProfile } from "./useDeviceProfile";
 import { CHAIN_MINING_PREFIX, type CpuAlgorithm, type GpuAlgorithm } from "../../types/mining";
-import { cpuThreadsPreLaunchLabel } from "./utils/devicePower";
+import {
+  ALGORITHM_LABEL,
+  CPU_ALGORITHM_DEFAULT_COIN,
+  GPU_ALGORITHM_COIN,
+} from "./algorithms";
+import {
+  cpuLaneMiner,
+  cpuThreadsLabel,
+  laneHasIntensity,
+  laneIntensityLabel,
+  startBlocker,
+  type StartBlocker,
+} from "./miningLane";
+import { formatUsdPerDay, useMinedAssetView } from "./minedAssetView";
+import { useMiningEarnings } from "./useMiningEarnings";
+import { EarnCapabilityBlock } from "./components/EarnCapabilityBlock";
+import { MineRunButton, MinerStatusBanner } from "./components/MineRunControls";
+import { LaneTuningControls } from "./components/LaneTuningControls";
+import { XmrigHashrateFix } from "./components/XmrigHashrateFix";
+import {
+  MINING_COINS,
+  algorithmFor,
+  coinLanes,
+  coinMinesOn,
+  lanesLabel,
+} from "./miningCoins";
 import { ST, Dot } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
-import { HashrateFixPanel } from "./HashrateFixPanel";
 import { decoratePoolLabel, poolHostPort } from "./pools";
 import { ProxyModePanel } from "./ProxyModePanel";
 import { PoolStatsPanel, getStatsAdapter } from "./pool-stats";
@@ -20,7 +44,6 @@ import { HashrateAreaChart } from "./HashrateAreaChart";
 import type { HashrateAreaPoint } from "./HashrateAreaChart";
 import type { HashrateBucket } from "./hashrateHistoryStore";
 import { coinTileLocked, pickMiningCoin } from "./pickCoin";
-import { LoadSlider } from "./components/LoadSlider";
 import { EarningsPerPeriod } from "./components/EarningsPerPeriod";
 import type { MiningProjection } from "../../types/mining";
 import { MineSimpleView } from "./MineSimpleView";
@@ -153,10 +176,16 @@ export function MiningView({
     workerName,
     setWorkerName,
     miningIntensity,
-    setMiningIntensity,
     gpuIntensity,
-    setGpuIntensity,
+    gpuIntensityLevel,
+    setGpuIntensityLevel,
     cpuThreadCount,
+    cpuThreads,
+    setCpuThreads,
+    gpus,
+    gpuSelection,
+    setGpuSelection,
+    runningCpuMiner,
     minersReady,
     minerError,
     minerInfo,
@@ -169,13 +198,6 @@ export function MiningView({
     session,
     startMining,
     stopMining,
-    hashrateFixPlan,
-    hashrateFixStatus,
-    scanningEnv,
-    rescanEnv,
-    hardResetting,
-    hardResetMessage,
-    hardReset,
     selectedPoolId,
     setSelectedPoolId,
     selectedPool,
@@ -245,14 +267,30 @@ export function MiningView({
     miningHardware === "gpu" && gpuAlgorithm === "octopus";
   const algoForDisplay =
     miningHardware === "cpu" ? cpuAlgorithm : gpuAlgorithm;
-  const algoLabel =
-    miningHardware === "cpu"
-      ? "RandomX"
-      : gpuAlgorithm === "kawpow"
-        ? "KawPow"
-        : gpuAlgorithm === "autolykos"
-          ? "Autolykos2"
-          : "Octopus";
+  // One label table (`algorithms.ts`), not a per-surface if/else chain whose
+  // final `else` names a specific algorithm — that shape is why a ZANO
+  // session read "Octopus" here until 2026-09-15.
+  const algoLabel = ALGORITHM_LABEL[algoForDisplay];
+  // Which binary the CPU lane runs (the backend's answer while it mines).
+  // Gates the xmrig-only MSR controls below: XelisHash runs on SRBMiner's CPU
+  // lane, unelevated, where MSR mod means nothing. The hashrate-fix panel
+  // takes the same gate from `XmrigHashrateFix` — until 2026-09-16 it was
+  // gated on the CPU lane alone, despite this comment.
+  const cpuMinerBinary = cpuLaneMiner({ cpuAlgorithm, isMiningCpu, runningCpuMiner });
+
+  /**
+   * What the mined coin may claim, and whether this lane can start — the
+   * same two decisions SIMPLE and landscape PRO render. Portrait PRO's own
+   * numbers were already native; what it lacked was the capability-gated
+   * EARN block (promo + chips + note), which it now mounts below.
+   */
+  const asset = useMinedAssetView({
+    miningCoin,
+    projection,
+    minedAmount,
+    pricesByTicker,
+  });
+  const blockedBy = startBlocker({ minersReady, payoutAddress: minerAddress });
 
   // Per-coin profitability tiles — same source-of-truth pipeline the
   // landscape view uses. Five `useCoinStats` calls share one in-memory
@@ -263,6 +301,7 @@ export function MiningView({
   const rvnStats = useCoinStats("ravencoin");
   const cfxStats = useCoinStats("conflux");
   const ergStats = useCoinStats("ergo");
+  const xelStats = useCoinStats("xelis");
   const profile = useDeviceProfile({
     pricesByTicker: pricesByTicker ?? {},
     liveCoinParams: {
@@ -271,6 +310,7 @@ export function MiningView({
       ravencoin: rvnStats,
       conflux: cfxStats,
       ergo: ergStats,
+      xelis: xelStats,
     },
   });
   // Pick the device row matching the current hardware kind (CPU rows
@@ -282,27 +322,30 @@ export function MiningView({
   const profitabilityRows: {
     chain: ChainType;
     ticker: string;
+    algoLabel: string;
+    lanes: string;
     perDayUsd: number;
-  }[] = (
-    [
-      { chain: "monero",    ticker: "XMR",  perDayUsd: 0 },
-      { chain: "zephyr",    ticker: "ZEPH", perDayUsd: 0 },
-      { chain: "ravencoin", ticker: "RVN",  perDayUsd: 0 },
-      { chain: "conflux",   ticker: "CFX",  perDayUsd: 0 },
-      { chain: "ergo",      ticker: "ERG",  perDayUsd: 0 },
-    ] as const
-  ).map((r) => {
-    // Source the prediction from the device row that *matches the
-    // coin's required hardware*, not just the user's currently-
-    // selected one. So a CPU coin (XMR) reads from the CPU device
-    // even when the user is currently looking at GPU mining.
-    const isCpuCoin = r.chain === "monero" || r.chain === "zephyr";
-    const dev = profile.devices.find(
-      (d) => d.kind === (isCpuCoin ? "cpu" : "gpu")
-    );
+  }[] = MINING_COINS.map((c) => {
+    // Source each prediction from a device row on a lane the COIN can
+    // actually use, not the user's currently-selected one — so a CPU coin
+    // still shows a figure while the user is looking at GPU mining. A
+    // dual-lane coin (XEL) prefers the DISPLAYED lane, so its tile answers
+    // "what would this pay me on the lane I'm looking at".
+    //
+    // The list is the roster itself. The hardcoded five-coin array that was
+    // here is why ZANO never appeared in this strip after it shipped, and
+    // the `isCpuCoin = monero || zephyr` test it used could not describe a
+    // coin that mines on both lanes at all.
+    const lane = coinMinesOn(c.chain, miningHardware)
+      ? miningHardware
+      : coinLanes(c.chain)[0];
+    const dev = profile.devices.find((d) => d.kind === lane);
     return {
-      ...r,
-      perDayUsd: dev?.predictions[r.chain]?.perDayUsd ?? 0,
+      chain: c.chain,
+      ticker: c.sym,
+      algoLabel: c.algo,
+      lanes: lanesLabel(c.chain),
+      perDayUsd: dev?.predictions[c.chain]?.perDayUsd ?? 0,
     };
   });
   const onPickCoinFromTile = (chain: ChainType) => {
@@ -341,6 +384,8 @@ export function MiningView({
         <div style={{ padding: 10 }}>
           <MineSimpleView
             miner={miner}
+            addressFor={addressFor}
+            onSetup={onSetup}
             compact
             pricesByTicker={pricesByTicker}
             reachableTickers={reachableTickers}
@@ -376,8 +421,7 @@ export function MiningView({
       <MiningRunningHero
         mining={isMining}
         starting={miningStarting}
-        canStart={minersReady && !!minerAddress}
-        blockedBy={!minersReady ? "miners" : !minerAddress ? "address" : null}
+        blockedBy={blockedBy}
         onSetup={onSetup}
         session={session}
         hashrateSamples={hashrateSamples}
@@ -386,36 +430,30 @@ export function MiningView({
         coinName={getCoinMeta(miningCoin).displayName}
         coinChain={miningCoin}
         algoLabel={algoLabel}
+        // The thread count follows the binary that will actually run (xmrig
+        // takes a percentage hint, SRBMiner an exact count) — one helper,
+        // shared with landscape's header chip and hardware rows.
         hardwareLabel={
           miningHardware === "cpu"
-            ? `CPU · ${
-                isMining && session?.threadsActive != null
-                  ? `${session.threadsActive} threads`
-                  : cpuThreadsPreLaunchLabel(miningIntensity, cpuThreadCount)
-              }`
+            ? `CPU · ${cpuThreadsLabel({
+                mining: isMining,
+                threadsActive: session?.threadsActive,
+                intensity: miningIntensity,
+                cpuThreadCount,
+                cpuThreads,
+                cpuMiner: cpuMinerBinary,
+              })}`
             : "GPU"
         }
-        intensityLabel={
-          miningHardware === "cpu"
-            ? miningIntensity === "low"
-              ? "Low"
-              : miningIntensity === "medium"
-                ? "Medium"
-                : "Max"
-            : gpuIntensity === "auto"
-              ? "Auto"
-              : gpuIntensity === "low"
-                ? "Low"
-                : gpuIntensity === "medium"
-                  ? "Medium"
-                  : "Max"
-        }
-        // Hide the INTENSITY tile for GPU+Octopus (the only path still
-        // using lolMiner — and lolMiner has no intensity surface). CPU
-        // (xmrig) and SRBMiner-MULTI paths (KawPow / Autolykos2) keep it.
-        showIntensity={
-          miningHardware === "cpu" || gpuAlgorithm !== "octopus"
-        }
+        intensityLabel={laneIntensityLabel({
+          hardware: miningHardware,
+          miningIntensity,
+          gpuIntensity,
+          gpuIntensityLevel,
+        })}
+        // Hide the INTENSITY tile where the lane's miner has no intensity
+        // surface (lolMiner / Octopus).
+        showIntensity={laneHasIntensity(miningHardware, gpuAlgorithm)}
         poolLabel={
           selectedPool ? poolHostPort(selectedPool.endpoint) : "—"
         }
@@ -459,23 +497,29 @@ export function MiningView({
         onStop={stopMining}
       />
 
-      {minerError && <div className="miner-error">{minerError}</div>}
-      {minerInfo && (
-        <div
-          style={{
-            margin: "8px 0",
-            padding: "6px 10px",
-            border: "1px solid var(--accent)",
-            background: "rgba(0,255,102,0.08)",
-            color: "var(--accent)",
-            fontFamily: "var(--font-mono)",
-            fontSize: 11,
-            letterSpacing: 0.4,
-          }}
-        >
-          {minerInfo}
-        </div>
-      )}
+      {/* useMiner's error/info lines and the blocked-start hint — the same
+          banner landscape PRO and SIMPLE render. The hint used to sit near
+          the bottom of this page; it now sits under the control it explains. */}
+      <MinerStatusBanner
+        error={minerError}
+        info={minerInfo}
+        blockedBy={blockedBy}
+        mining={isMining}
+        style={{ marginBottom: 12 }}
+      />
+
+      {/* EARN promo + display-coin chips for a coin with a route; the
+          capability note for one without. Portrait PRO rendered none of
+          these until 2026-09-16, although `onOpenEarn` was wired to it. */}
+      <EarnCapabilityBlock
+        asset={asset}
+        onSelectDisplayCoin={onSelectDisplayCoin}
+        reachableTickers={reachableTickers}
+        onOpenEarn={onOpenEarn}
+        conversionRunning={conversionRunning}
+        compact
+        style={{ marginBottom: 12 }}
+      />
 
       {/* Per-coin profitability strip — mirrors the landscape coin
           picker's $/day chip but laid out as a 2×2 grid for the 560
@@ -546,13 +590,7 @@ export function MiningView({
                     textTransform: "uppercase",
                   }}
                 >
-                  {r.chain === "monero" || r.chain === "zephyr"
-                    ? "RandomX · CPU"
-                    : r.chain === "ravencoin"
-                      ? "KawPow · GPU"
-                      : r.chain === "ergo"
-                        ? "Autolykos2 · GPU"
-                        : "Octopus · GPU"}
+                  {r.algoLabel} · {r.lanes}
                 </div>
               </div>
               <div
@@ -752,16 +790,25 @@ export function MiningView({
       <div className="mine-config">
         {miningHardware === "cpu" ? (
           <>
-            <div className="mine-config-row">
-              <span className="mine-label"><ST delay={395} speed={22}>INTENSITY</ST></span>
-              <LoadSlider
-                value={miningIntensity}
-                onChange={setMiningIntensity}
-                disabled={isMining}
-                variant="compact"
-                delayBase={450}
-              />
-            </div>
+            {/* CPU thread slider — the shared lane block landscape PRO
+                mounts too (LaneTuningControls). Replaced the three-step
+                LOAD tier 2026-09-16. */}
+            <LaneTuningControls
+              hardware="cpu"
+              gpuAlgorithm={gpuAlgorithm}
+              cpuMiner={cpuMinerBinary}
+              laneMining={isMining}
+              cpuThreads={cpuThreads}
+              cpuThreadCount={cpuThreadCount}
+              setCpuThreads={setCpuThreads}
+              gpuIntensityLevel={gpuIntensityLevel}
+              setGpuIntensityLevel={setGpuIntensityLevel}
+              gpus={gpus}
+              gpuSelection={gpuSelection}
+              setGpuSelection={setGpuSelection}
+              variant="compact"
+              delayBase={450}
+            />
             {advancedOpen && (
               <>
                 <div className="mine-config-row">
@@ -769,30 +816,54 @@ export function MiningView({
                   <select
                     className="mine-select mine-select-sm"
                     value={cpuAlgorithm}
-                    onChange={(e) => setCpuAlgorithm(e.target.value as CpuAlgorithm)}
+                    onChange={(e) => {
+                      const next = e.target.value as CpuAlgorithm;
+                      setCpuAlgorithm(next);
+                      // Move the coin with the algorithm. Leaving Monero
+                      // selected under XelisHash would describe a pairing
+                      // that cannot start — and the GPU select had exactly
+                      // that defect until 2026-09-15. Routed through the
+                      // shared picker, the same one the tiles use.
+                      const fits =
+                        coinMinesOn(miningCoin, "cpu") &&
+                        algorithmFor(miningCoin, "cpu") === next;
+                      if (!fits) {
+                        pickMiningCoin(CPU_ALGORITHM_DEFAULT_COIN[next], miner);
+                      }
+                    }}
                     disabled={isMining}
                   >
-                    <option value="randomx">RandomX</option>
+                    <option value="randomx">RandomX (XMR/ZEPH)</option>
+                    <option value="xelishashv3">XelisHash v3 (XEL)</option>
                   </select>
                 </div>
-                <div className="mine-config-row mine-msr-row">
-                  <label className="mine-msr-label">
-                    <input
-                      type="checkbox"
-                      checked={enableMsr}
-                      onChange={(e) => setEnableMsr(e.target.checked)}
-                      disabled={isMining}
-                    />
-                    <ST delay={615} speed={20}>MSR optimization</ST>
-                  </label>
-                  <button type="button" className="btn-link" onClick={() => setShowFixMsrDialog(true)}>
-                    <ST delay={670} speed={22}>fix msr</ST>
-                  </button>
-                </div>
-                {isMining && msrStatus !== "unknown" && msrStatus !== "disabled" && (
-                  <div className="mine-msr-status">
-                    MSR: {msrStatus === "ok" ? "Applied" : "Not applied"}
-                  </div>
+                {/* MSR mod is an xmrig/RandomX feature: it needs elevation
+                    and rewrites model-specific registers to speed up the
+                    RandomX dataset. SRBMiner's CPU lane (XelisHash) runs
+                    unelevated and ignores all of it, so the checkbox and its
+                    status line would be dead controls there. */}
+                {cpuMinerBinary === "xmrig" && (
+                  <>
+                    <div className="mine-config-row mine-msr-row">
+                      <label className="mine-msr-label">
+                        <input
+                          type="checkbox"
+                          checked={enableMsr}
+                          onChange={(e) => setEnableMsr(e.target.checked)}
+                          disabled={isMining}
+                        />
+                        <ST delay={615} speed={20}>MSR optimization</ST>
+                      </label>
+                      <button type="button" className="btn-link" onClick={() => setShowFixMsrDialog(true)}>
+                        <ST delay={670} speed={22}>fix msr</ST>
+                      </button>
+                    </div>
+                    {isMining && msrStatus !== "unknown" && msrStatus !== "disabled" && (
+                      <div className="mine-msr-status">
+                        MSR: {msrStatus === "ok" ? "Applied" : "Not applied"}
+                      </div>
+                    )}
+                  </>
                 )}
               </>
             )}
@@ -804,62 +875,47 @@ export function MiningView({
               <select
                 className="mine-select mine-select-sm"
                 value={gpuAlgorithm}
-                onChange={(e) => setGpuAlgorithm(e.target.value as GpuAlgorithm)}
+                onChange={(e) => {
+                  const next = e.target.value as GpuAlgorithm;
+                  setGpuAlgorithm(next);
+                  // Each GPU algorithm belongs to exactly one coin, so the
+                  // coin follows the pick. Until 2026-09-15 this select
+                  // changed ONLY the algorithm: choosing Autolykos2 while
+                  // Ravencoin was selected left the panel claiming to mine
+                  // RVN with Ergo's algorithm. ZANO was also missing from
+                  // the list entirely, so it was unreachable here.
+                  pickMiningCoin(GPU_ALGORITHM_COIN[next], miner);
+                }}
                 disabled={isMining}
               >
                 <option value="kawpow">KawPow (RVN)</option>
                 <option value="octopus">Octopus (CFX)</option>
                 <option value="autolykos">Autolykos2 (ERG)</option>
+                <option value="progpowz">ProgPowZ (ZANO)</option>
+                <option value="xelishashv3">XelisHash v3 (XEL)</option>
               </select>
             </div>
-            {/* GPU intensity row — only shown when the selected
-                algorithm runs through SRBMiner-MULTI (KawPow + Autolykos2).
-                lolMiner (Octopus / CFX) has no equivalent `--gpu-intensity`
-                flag so we hide the row instead of showing dead controls.
-                Auto = no flag, SRBMiner self-tunes. Low/Med/Max map to
-                `--gpu-intensity 16/22/28` in `useMiner.ts::getGpuIntensityValue`.
-                See `wiki/concepts/srbminer-flags.md`. */}
-            {gpuAlgorithm !== "octopus" && (
-              <div className="mine-config-row">
-                <span className="mine-label">
-                  <ST delay={395} speed={22}>INTENSITY</ST>
-                </span>
-                <div className="mine-intensity">
-                  <button
-                    className={`mine-int-btn ${gpuIntensity === "auto" ? "active" : ""}`}
-                    onClick={() => setGpuIntensity("auto")}
-                    disabled={isMining}
-                    title="SRBMiner self-tunes intensity (default)"
-                  >
-                    <ST delay={420} speed={22}>AUTO</ST>
-                  </button>
-                  <button
-                    className={`mine-int-btn ${gpuIntensity === "low" ? "active low" : ""}`}
-                    onClick={() => setGpuIntensity("low")}
-                    disabled={isMining}
-                    title="--gpu-intensity 16 (conservative; lower VRAM / power)"
-                  >
-                    <ST delay={450} speed={22}>LOW</ST>
-                  </button>
-                  <button
-                    className={`mine-int-btn ${gpuIntensity === "medium" ? "active med" : ""}`}
-                    onClick={() => setGpuIntensity("medium")}
-                    disabled={isMining}
-                    title="--gpu-intensity 22 (balanced)"
-                  >
-                    <ST delay={505} speed={22}>MED</ST>
-                  </button>
-                  <button
-                    className={`mine-int-btn ${gpuIntensity === "high" ? "active high" : ""}`}
-                    onClick={() => setGpuIntensity("high")}
-                    disabled={isMining}
-                    title="--gpu-intensity 28 (max kernel work-size; may OOM on <8 GB cards)"
-                  >
-                    <ST delay={560} speed={22}>MAX</ST>
-                  </button>
-                </div>
-              </div>
-            )}
+            {/* GPU device picker + intensity slider — the shared lane block
+                landscape PRO mounts too. The intensity slider covers AUTO (no
+                flag) and SRBMiner's documented 1-31; on lolMiner's lane
+                (Octopus / CFX, no `--gpu-intensity`) it renders locked with
+                the reason. See `wiki/concepts/srbminer-flags.md`. */}
+            <LaneTuningControls
+              hardware="gpu"
+              gpuAlgorithm={gpuAlgorithm}
+              cpuMiner={cpuMinerBinary}
+              laneMining={isMining}
+              cpuThreads={cpuThreads}
+              cpuThreadCount={cpuThreadCount}
+              setCpuThreads={setCpuThreads}
+              gpuIntensityLevel={gpuIntensityLevel}
+              setGpuIntensityLevel={setGpuIntensityLevel}
+              gpus={gpus}
+              gpuSelection={gpuSelection}
+              setGpuSelection={setGpuSelection}
+              variant="compact"
+              delayBase={420}
+            />
           </>
         )}
       </div>
@@ -993,20 +1049,10 @@ export function MiningView({
         </div>
       )}
 
-      {/* Start/Stop button now lives inside <MiningRunningHero> at the
-          top. We only surface a setup-hint here when the user can't
-          start (miners not installed / no wallet for the selected
-          coin) AND mining isn't already running — if mining is active,
-          the address MUST have been resolved at start time, so showing
-          "No mining address set" would be contradictory state. F4 added
-          the !isMining guard 2026-05-25. */}
-      {!isMining && !(minersReady && minerAddress) && (
-        <div className="mine-setup-hint">
-          <ST speed={20}>
-            {!minersReady ? "Set up miners in Miner Setup to start" : "No mining address set for selected coin"}
-          </ST>
-        </div>
-      )}
+      {/* The setup hint that lived here (can't start: miners missing / no
+          address; hidden while mining, F4 2026-05-25) moved into the shared
+          <MinerStatusBanner> under the hero on 2026-09-16, so landscape and
+          SIMPLE show the same words. */}
 
       {/* Bottom-of-page <PoolStatsPanel> removed 2026-05-15. The same
           panel is now rendered inside <MiningRunningHero> in the slot
@@ -1015,21 +1061,9 @@ export function MiningView({
           hashrate readout puts Pending / Hashrate / Shares in the
           user's eyeline without scrolling. */}
 
-      {miningHardware === "cpu" && (hashrateFixPlan || scanningEnv) && (
-        <div style={{ marginTop: 14 }}>
-          <HashrateFixPanel
-            plan={hashrateFixPlan}
-            status={hashrateFixStatus}
-            scanning={scanningEnv}
-            isMining={isMiningCpu}
-            hardResetting={hardResetting}
-            hardResetMessage={hardResetMessage}
-            onRescan={rescanEnv}
-            onHardReset={hardReset}
-            hideWhenHealthy
-          />
-        </div>
-      )}
+      {/* xmrig-only diagnostics. Gated on the CPU lane running XMRIG, not
+          just on the CPU lane — see `XmrigHashrateFix`. */}
+      <XmrigHashrateFix miner={miner} />
 
       {showFixMsrDialog && (
         <div className="modal-overlay" onClick={() => setShowFixMsrDialog(false)}>
@@ -1065,7 +1099,6 @@ export function MiningView({
 function MiningRunningHero({
   mining,
   starting,
-  canStart,
   blockedBy,
   onSetup,
   session,
@@ -1091,13 +1124,12 @@ function MiningRunningHero({
 }: {
   mining: boolean;
   starting: boolean;
-  canStart: boolean;
-  /** Which precondition is missing, when `canStart` is false. Drives the CTA
-   *  label so it names the thing that's actually wrong. Before 2026-08-12 the
-   *  button read "Set up miners" for BOTH causes, which sent users to
-   *  reinstall already-working miners when the real blocker was a missing
-   *  payout address for the selected coin. */
-  blockedBy?: "miners" | "address" | null;
+  /** Which precondition is missing, or `null` when the lane can start. Drives
+   *  the CTA label so it names the thing that's actually wrong. Before
+   *  2026-08-12 the button read "Set up miners" for BOTH causes, which sent
+   *  users to reinstall already-working miners when the real blocker was a
+   *  missing payout address for the selected coin. */
+  blockedBy: StartBlocker;
   /** Click handler for the disabled-state CTA. When `canStart` is
    *  false the green "Setup miners to start" button used to be inert
    *  (UXS-20260516-115). It now navigates to Miner Setup via this
@@ -1249,19 +1281,13 @@ function MiningRunningHero({
   };
 
   // Earnings estimate: needs my hashrate + the chain's volatile params
-  // (network hashrate / block reward / block time). `useCoinStats` is
-  // the layered source — WhatToMine first, per-chain explorer second,
-  // hardcoded `NETWORK_PARAMS_DEFAULT` last. The estimator merges any
-  // null fields back to the hardcoded constants automatically.
-  const coinStats = useCoinStats(coinChain);
-  const earnings =
-    mining && current && current > 0
-      ? estimateEarningsForChain(coinChain, current, {
-          networkHashrate: coinStats.networkHashrate ?? undefined,
-          blockReward: coinStats.blockReward ?? undefined,
-          blockTimeSecs: coinStats.blockTimeSecs ?? undefined,
-        })
-      : null;
+  // (network hashrate / block reward / block time), layered WhatToMine →
+  // per-chain explorer → hardcoded `NETWORK_PARAMS_DEFAULT`. The shared
+  // `useMiningEarnings` is the one path every Mine surface prices through.
+  const { earnings, coinStats } = useMiningEarnings(
+    coinChain,
+    mining && current != null && current > 0 ? current : null,
+  );
 
   // USD conversion for the hero caption (UXS-20260516-002) and the
   // SESSION-card EST. EARNINGS cell (UXS-20260516-001). Three states
@@ -1279,13 +1305,8 @@ function MiningRunningHero({
     typeof coinUsdPrice === "number" && Number.isFinite(coinUsdPrice) && coinUsdPrice > 0;
   const earningsDayUsd =
     earnings && pricePresent ? earnings.day * coinUsdPrice : null;
-  const formatUsdPerDay = (usd: number): string => {
-    if (!Number.isFinite(usd) || usd === 0) return "$0.00/day";
-    if (usd >= 100) return `$${usd.toFixed(0)}/day`;
-    if (usd >= 1) return `$${usd.toFixed(2)}/day`;
-    if (usd >= 0.01) return `$${usd.toFixed(3)}/day`;
-    return `$${usd.toFixed(4)}/day`;
-  };
+  // `formatUsdPerDay` is the shared formatter (`minedAssetView.ts`), the one
+  // landscape PRO's REV chip and USD row use.
 
   // 1 HR area-chart input. Pass the raw `{t, value}` samples — the
   // chart bridges idle gaps to zero internally so we don't have to
@@ -1623,51 +1644,22 @@ function MiningRunningHero({
         </div>
       )}
 
-      {mining ? (
-        <Btn
-          variant="danger"
-          full
-          size="lg"
-          onClick={onStop}
-          style={{ marginBottom: 14 }}
-        >
-          Stop mining
-        </Btn>
-      ) : canStart ? (
-        <Btn
-          variant="accent"
-          full
-          size="lg"
-          onClick={onStart}
-          disabled={starting}
-          style={{ marginBottom: 14 }}
-        >
-          {starting ? "Starting..." : "Start mining"}
-        </Btn>
-      ) : (
-        /* UXS-20260516-115: when the user can't start mining yet
-           (missing miner binaries OR no payout address for the
-           selected coin), the CTA used to render with the same
-           "accent" green styling as the live Start button but with
-           `disabled={true}`. Clicking it produced no feedback, no
-           toast, no navigation — the button text "Setup miners to
-           start" was a state caption masquerading as an action verb.
-           Now: render as a ghost (visually distinct from active
-           Start) and actually navigate to Miner Setup on click via
-           the `onSetup` prop, so the action verb matches the outcome. */
-        <Btn
-          variant="ghost"
-          full
-          size="lg"
-          onClick={blockedBy === "address" ? undefined : onSetup}
-          disabled={starting || blockedBy === "address" || !onSetup}
-          style={{ marginBottom: 14 }}
-        >
-          {blockedBy === "address"
-            ? `► No ${coinTicker} payout address`
-            : "► Set up miners"}
-        </Btn>
-      )}
+      {/* Stop / Start / blocked, from the shared run control. The blocked
+          state (UXS-20260516-115: a ghost that names what is missing and,
+          for missing miners, navigates to Miner Setup) was portrait-only
+          until 2026-09-16; SIMPLE and landscape PRO now render the same
+          state machine with the pixel look. */}
+      <MineRunButton
+        variant="hero"
+        mining={mining}
+        starting={starting}
+        blockedBy={blockedBy}
+        coinTicker={coinTicker}
+        onStart={onStart}
+        onStop={onStop}
+        onSetup={onSetup}
+        style={{ marginBottom: 14 }}
+      />
 
       <div
         style={{

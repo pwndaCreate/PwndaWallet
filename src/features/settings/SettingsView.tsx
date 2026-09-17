@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { formatAppVersion } from "../../lib/appVersion";
 import { WalletsCard } from "./WalletsCard";
 import type { AddWalletOpts, WalletKind } from "../../vault-schema";
 import type { ChainType } from "../../wallets/types";
@@ -21,6 +22,7 @@ import {
 } from "../swap-sidecar";
 import { DexCoinsSection } from "./DexCoinsSection";
 import { SwapNodeExtras } from "./SwapNodeExtras";
+import { NodeEntryList } from "./NodeEntryList";
 import {
   DEFAULT_PROXY_URL,
   enrollWithProxy,
@@ -105,6 +107,8 @@ export function SettingsView({
   onOpenMoneroNodes,
   onOpenZephyrNodes,
   onOpenZanoNodes,
+  xelisSeedLoaded,
+  onOpenXelisNodes,
   scanDateSlot,
   onAddWallet,
   onRenameWallet,
@@ -127,6 +131,9 @@ export function SettingsView({
   onOpenMoneroNodes: () => void;
   onOpenZephyrNodes: () => void;
   onOpenZanoNodes: () => void;
+  /** Xelis (2026-09-15): the Xelis Nodes button shows once a Xelis wallet is open. */
+  xelisSeedLoaded: string | null;
+  onOpenXelisNodes: () => void;
   /** Scan-date editor built by App — the SAME element landscape renders, so
    *  the two layouts cannot drift. */
   scanDateSlot?: React.ReactNode;
@@ -198,21 +205,23 @@ export function SettingsView({
         <button className="btn-primary btn-block" onClick={onOpenMinerSetup}>
           <ST delay={175} speed={20}>► Miner Setup</ST>
         </button>
-        {xmrSeedLoaded && (
-          <button className="btn-primary btn-block" onClick={onOpenMoneroNodes}>
-            <ST delay={230} speed={20}>► Monero Nodes</ST>
-          </button>
-        )}
-        {zphSeedLoaded && (
-          <button className="btn-primary btn-block" onClick={onOpenZephyrNodes}>
-            <ST delay={305} speed={20}>► Zephyr Nodes</ST>
-          </button>
-        )}
-        {zanoSeedLoaded && (
-          <button className="btn-primary btn-block" onClick={onOpenZanoNodes}>
-            <ST delay={380} speed={20}>► Zano Nodes</ST>
-          </button>
-        )}
+      </Card>
+      {/* Node management for every sidecar chain — the same list landscape's
+          Privacy Wallets panel renders. These were four buttons that each
+          vanished when their chain was absent, while landscape listed Monero
+          and Zephyr with a "not imported" chip (audit, 2026-09-16). */}
+      <Card title="PRIVACY WALLETS">
+        <NodeEntryList
+          compact
+          xmrSeedLoaded={xmrSeedLoaded}
+          zphSeedLoaded={zphSeedLoaded}
+          zanoSeedLoaded={zanoSeedLoaded}
+          xelisSeedLoaded={xelisSeedLoaded}
+          onOpenMoneroNodes={onOpenMoneroNodes}
+          onOpenZephyrNodes={onOpenZephyrNodes}
+          onOpenZanoNodes={onOpenZanoNodes}
+          onOpenXelisNodes={onOpenXelisNodes}
+        />
       </Card>
       {/* Removing a wallet (including the primary XMR/ZPH pair) now lives
           only in Settings ▸ Wallets — removeWallet() there does the same
@@ -317,7 +326,7 @@ function SettingsAboutCard() {
     setDevEnabled(false);
     setTapCount(0);
   };
-  const version = (import.meta.env.VITE_APP_VERSION as string | undefined) ?? "v2.0.1";
+  const version = formatAppVersion();
   return (
     <Card title="ABOUT">
       <div style={{ display: "flex", flexDirection: "column", gap: 6, fontSize: 11 }}>
@@ -1429,10 +1438,13 @@ function UpdateRow() {
         )}
         {state === "checking" && <span style={{ fontSize: 10 }}>checking…</span>}
         {state === "current" && (
-          <span style={{ fontSize: 10, color: "var(--text-dim)" }}>up to date</span>
+          <span style={{ fontSize: 10, color: "var(--text-dim)" }}>no newer release found</span>
         )}
         {state === "found" && (
-          <span style={{ fontSize: 10, color: "var(--accent)" }}>v{info?.version} available</span>
+          <span style={{ fontSize: 10, color: "var(--accent)" }}>
+            latest release v{info?.version} · this build{" "}
+            {formatAppVersion(info?.currentVersion || undefined)}
+          </span>
         )}
         {state === "installing" && (
           <span className="tnum" style={{ fontSize: 10 }}>

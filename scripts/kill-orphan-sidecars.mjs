@@ -27,7 +27,25 @@
 
 import { spawnSync } from "node:child_process";
 
-const TARGETS = ["monero-wallet-rpc.exe", "zephyr-wallet-rpc.exe"];
+/**
+ * Every wallet sidecar image this app spawns.
+ *
+ * `simplewallet.exe` (Zano) was MISSING here from 2026-08-27 until 2026-09-15,
+ * and `xelis_wallet.exe` was added with the Xelis sidecar in the same change.
+ * The gap was invisible in the ordinary case — both chains' launch-time cleanup
+ * reaps their own orphans by pidfile and by port — but that is case (1) above,
+ * and this script exists for case (2): an orphan holding a FILE HANDLE on the
+ * binary under `target\debug\binaries\`, which blocks `cargo build` before the
+ * app can run its launch-time cleanup at all. Zano additionally runs a SECOND
+ * `simplewallet.exe` (the engine's scratch wallet on 18086), so one stale
+ * session could leave two.
+ */
+const TARGETS = [
+  "monero-wallet-rpc.exe",
+  "zephyr-wallet-rpc.exe",
+  "simplewallet.exe",
+  "xelis_wallet.exe",
+];
 
 function killByImage(image) {
   // `/FI "IMAGENAME eq X"` would be redundant here because `/IM X` already

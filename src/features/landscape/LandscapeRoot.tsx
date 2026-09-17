@@ -1,7 +1,6 @@
 import type { EngineOwnership } from "../../lib/swapSeedFingerprint";
 import { getAdapter, type ChainType, type WalletInfo } from "../../wallets";
 import type { ZphAssetBalance, ZphAssetType } from "../../wallets/zph-rpc";
-import { ZPH_UI_TICKER } from "../../wallets/zph-rpc";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import type { XmrTransfer } from "../../wallets/xmr-wallet";
 import type { WalletKind } from "../../vault-schema";
@@ -14,6 +13,7 @@ import { WalletDetailsCard } from "../wallet/WalletDetailsCard";
 import { MineLandscapeView } from "../mining/MineLandscapeView";
 import type { MiningProjection } from "../../types/mining";
 import { MiningSetupWizard } from "../mining/MiningSetupWizard";
+import { enableMiningAndOpenSetup, openMinerSetup } from "../mining/minerSetupEntry";
 import { ActivityView } from "../activity/ActivityView";
 import { EarnConvertBody } from "../swap/EarnConvertBody";
 import type { ConvertPipelineState } from "../swap/useConvertPipeline";
@@ -29,9 +29,17 @@ import { ZanoAssetsCard } from "../zano/ZanoAssetsCard";
 import { ZanoTxHistoryCard } from "../zano/ZanoTxHistoryCard";
 import type { ZanoAssetBalance, ZanoTransferEntry } from "../../wallets/zano-rpc";
 import type { ZanoSyncState } from "../zano/useZanoSession";
+import {
+  XelisImportPanel,
+  XelisNodesView,
+  XelisSyncCard,
+  XelisTxHistoryCard,
+  type XelisNodesApi,
+  type XelisSessionApi,
+} from "../xelis";
 import { SettingsLandscapeView } from "../settings/SettingsLandscapeView";
 import { MinerSetupView } from "../mining/MinerSetupView";
-import { SendModal } from "../send/SendModal";
+import { ActiveSendModal } from "../send/SendModal";
 import { ZephyrSwapModal } from "../zephyr/ZephyrSwapModal";
 import { DeskSwapTrackerModal, type DeskTrackerState } from "../swap";
 import { SidecarSwapTracker, type SidecarSwapState } from "../swap-sidecar";
@@ -184,13 +192,31 @@ export function LandscapeRoot(props: {
   zanoTxHistory: ZanoTransferEntry[];
   zanoTxLoading: boolean;
   setZanoSeedLoaded: (v: string | null) => void;
-  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<void>;
-  startZanoSync: (seed: string, masterPassword: string, passphrase?: string) => void;
+  /** Resolves the saved entry's sidecar wallet file, or null when nothing was
+   *  saved — `ZanoImportPanel` opens that file (2026-09-15). */
+  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<string | null>;
+  startZanoSync: (
+    seed: string,
+    masterPassword: string,
+    passphrase?: string,
+    walletFile?: string
+  ) => void;
   retryZanoSync: () => void;
   handleZanoDownloadBinary: () => void;
   refreshZanoAssetBalances: () => Promise<void>;
   zanoNodes: Parameters<typeof ZanoNodesView>[0]["nodes"];
   openZanoNodesView: () => Promise<void>;
+
+  // ── XELIS (2026-09-15): the whole useXelisSession return ──
+  xelisSeedLoaded: string | null;
+  setXelisSeedLoaded: (v: string | null) => void;
+  /** Resolves the saved entry's wallet directory, or null when nothing was saved. */
+  saveXelisSeedToVault: (seed: string) => Promise<string | null>;
+  xelisSession: XelisSessionApi;
+  xelisNodes: XelisNodesApi;
+  openXelisNodesView: () => Promise<void>;
+  showXelisSeed?: boolean;
+  setShowXelisSeed?: (v: boolean) => void;
 
   // ── Tx history ──
   chainTxByKey: Record<string, ChainTx[]>;
@@ -396,6 +422,14 @@ export function LandscapeRoot(props: {
     handleZanoDownloadBinary,
     zanoNodes,
     openZanoNodesView,
+    xelisSeedLoaded,
+    setXelisSeedLoaded,
+    saveXelisSeedToVault,
+    xelisSession,
+    xelisNodes,
+    openXelisNodesView,
+    showXelisSeed,
+    setShowXelisSeed,
     chainTxByKey,
     chainTxLoading,
     chainTxErrors,
@@ -596,14 +630,69 @@ export function LandscapeRoot(props: {
                   />
                 )}
                 <ZanoAssetsCard assetBalances={zanoAssetBalances} />
-                {zanoSyncState !== "idle" && (
-                  <ZanoTxHistoryCard
-                    syncState={zanoSyncState}
-                    txHistory={zanoTxHistory}
-                    txLoading={zanoTxLoading}
-                    onCopy={copyToClipboard}
+                {/* Zano's ONLY history surface in landscape since 2026-09-16
+                    (WalletLandscapeView no longer adds the generic "Recent"
+                    list for it — `historySurfaceFor`). So it renders whenever
+                    a wallet exists, idle included: the card says "will appear
+                    once the wallet connects" itself, and an idle gate here
+                    would leave an idle wallet with no history surface at all. */}
+                <ZanoTxHistoryCard
+                  syncState={zanoSyncState}
+                  txHistory={zanoTxHistory}
+                  txLoading={zanoTxLoading}
+                  onCopy={copyToClipboard}
+                />
+              </>
+            )
+          }
+          // `zanoConnected` removed 2026-09-16: it fed only the Recent block's
+          // Zano empty-copy, and that block no longer renders for Zano.
+          xelisSynced={xelisSession.syncState === "synced"}
+          // Zano's Send gate (2026-09-16); portrait reads the same state.
+          zanoReady={zanoSyncState === "ready"}
+          // Xelis, built from the shared Xelis components exactly like Zano's
+          // slot above: the import panel with no Xelis wallet, sync + history
+          // with one. WalletLandscapeView renders it in BOTH branches.
+          xelisCenterSlot={
+            !walletsByChain.xelis ? (
+              <XelisImportPanel
+                sessionPassword={sessionPassword}
+                setError={setError}
+                setWalletsByChain={setWalletsByChain}
+                setXelisSeedLoaded={setXelisSeedLoaded}
+                saveXelisSeedToVault={saveXelisSeedToVault}
+                startXelisSync={xelisSession.start}
+              />
+            ) : (
+              <>
+                {xelisSession.syncState !== "idle" && (
+                  <XelisSyncCard
+                    syncState={xelisSession.syncState}
+                    syncError={xelisSession.syncError}
+                    syncStatus={xelisSession.syncStatus}
+                    syncStatusError={xelisSession.syncStatusError}
+                    balance={xelisSession.balance}
+                    balanceError={xelisSession.balanceError}
+                    binaryReady={xelisSession.binaryReady}
+                    downloading={xelisSession.downloading}
+                    downloadProgress={xelisSession.downloadProgress}
+                    accentColor={getAdapter("xelis").color}
+                    onDownloadBinary={() => void xelisSession.downloadBinary()}
+                    onRetry={xelisSession.retry}
                   />
                 )}
+                {/* Every state, as portrait's WalletTxHistorySubview does: the
+                    card says "appears once the wallet connects" while the
+                    session is down, and with the generic "Recent" list gone
+                    for Xelis (2026-09-16) an idle gate here would leave the
+                    wallet with no history surface at all. */}
+                <XelisTxHistoryCard
+                  syncState={xelisSession.syncState}
+                  txHistory={xelisSession.txHistory}
+                  txLoading={xelisSession.txLoading}
+                  txError={xelisSession.txError}
+                  onCopy={copyToClipboard}
+                />
               </>
             )
           }
@@ -652,17 +741,34 @@ export function LandscapeRoot(props: {
               convertPipeline?.stage === "hop1-running" ||
               convertPipeline?.stage === "hop2-running"
             }
+            // "► Set up miners" on a blocked START. Same shared handler as
+            // portrait's; only the navigation is landscape's (Miner Setup is
+            // a Settings sub-view here).
+            onSetup={() =>
+              openMinerSetup({
+                checkMinerStatus: miner.checkMinerStatus,
+                showMinerSetup: () => {
+                  setLandscapeTab("settings");
+                  setView("miner-setup");
+                },
+              })
+            }
           />
         ) : (
           <MiningSetupWizard
-            onSetUp={async () => {
-              await onEnableMining();
-              // Land on MinerSetupView (download / Defender / device profile).
-              // In landscape that sub-view lives under the settings tab.
-              (miner as any).checkMinerStatus?.();
-              setLandscapeTab("settings");
-              setView("miner-setup");
-            }}
+            // Land on MinerSetupView (download / Defender / device profile)
+            // with a fresh miner-status read — the shared handler portrait
+            // uses too. In landscape that sub-view lives under the settings tab.
+            onSetUp={() =>
+              enableMiningAndOpenSetup({
+                enableMining: onEnableMining,
+                checkMinerStatus: miner.checkMinerStatus,
+                showMinerSetup: () => {
+                  setLandscapeTab("settings");
+                  setView("miner-setup");
+                },
+              })
+            }
             onDismiss={() => setLandscapeTab("wallet")}
           />
         )
@@ -689,6 +795,7 @@ export function LandscapeRoot(props: {
           chainsOwned={ownedChains}
           addressByChain={addressByChain}
           pricesByTicker={pricesByTicker}
+          zphStats={zphReserveInfo.stats}
         />
       )}
       {/* Keep the import live so future paths (e.g. a portrait sheet
@@ -718,10 +825,16 @@ export function LandscapeRoot(props: {
           <ZanoNodesView nodes={zanoNodes} onBack={() => setView("dashboard")} />
         </div>
       )}
+      {landscapeTab === "settings" && view === "xelis-nodes" && (
+        <div style={{ flex: 1, minHeight: 0, overflow: "auto", padding: 10 }}>
+          <XelisNodesView nodes={xelisNodes} onBack={() => setView("dashboard")} />
+        </div>
+      )}
       {landscapeTab === "settings" &&
         view !== "monero-nodes" &&
         view !== "zephyr-nodes" &&
         view !== "zano-nodes" &&
+        view !== "xelis-nodes" &&
         view !== "wallet-details" &&
         view !== "miner-setup" && (
           <SettingsLandscapeView
@@ -733,9 +846,11 @@ export function LandscapeRoot(props: {
             xmrSeedLoaded={xmrSeedLoaded}
             zphSeedLoaded={zphSeedLoaded}
             zanoSeedLoaded={zanoSeedLoaded}
+            xelisSeedLoaded={xelisSeedLoaded}
             onOpenMoneroNodes={openMoneroNodesView}
             onOpenZephyrNodes={openZephyrNodesView}
             onOpenZanoNodes={openZanoNodesView}
+            onOpenXelisNodes={openXelisNodesView}
             onOpenMinerSetup={() => {
               (miner as any).checkMinerStatus();
               setView("miner-setup");
@@ -755,12 +870,23 @@ export function LandscapeRoot(props: {
           {miningOptedIn ? (
             <MinerSetupView
               miner={miner as any}
+              // Portrait passes these; without them the device profile's
+              // per-coin $/day had no prices in landscape (parity audit,
+              // 2026-09-16).
+              pricesByTicker={pricesByTicker}
               onBack={() => setView("settings")}
               onDisableMining={onDisableMining}
             />
           ) : (
             <MiningSetupWizard
-              onSetUp={async () => { await onEnableMining(); (miner as any).checkMinerStatus?.(); }}
+              onSetUp={() =>
+                enableMiningAndOpenSetup({
+                  enableMining: onEnableMining,
+                  checkMinerStatus: miner.checkMinerStatus,
+                  // Already on Settings ▸ Miner Setup; this keeps it there.
+                  showMinerSetup: () => setView("miner-setup"),
+                })
+              }
               onDismiss={() => setView("settings")}
             />
           )}
@@ -784,6 +910,9 @@ export function LandscapeRoot(props: {
             zanoSeedPassphrase={zanoSeedPassphrase}
             showZanoSeed={showZanoSeed}
             setShowZanoSeed={setShowZanoSeed}
+            xelisSeedLoaded={xelisSeedLoaded}
+            showXelisSeed={showXelisSeed}
+            setShowXelisSeed={setShowXelisSeed}
             setShowZphSeed={setShowZphSeed}
             currentSolanaDerivationChoice={currentSolanaDerivationChoice}
             onChangeSolanaDerivation={handleChangeSolanaDerivation}
@@ -857,9 +986,14 @@ export function LandscapeRoot(props: {
 
       {/* Modals still rendered on top */}
       {showSendModal && walletsByChain[activeChain] && (
-        <SendModal
+        // The same wrapper portrait mounts (2026-09-15): the asset label, and
+        // the price of a fee charged in a Zephyr ecosystem asset, derive from
+        // the send-asset store `useSend` sends with. The `sendAssetType` prop
+        // is that same value; the wrapper reads it at the source.
+        <ActiveSendModal
           adapter={getAdapter(activeChain)}
           usdPrice={pricesByTicker[getAdapter(activeChain).ticker.toUpperCase()]}
+          zphStats={zphReserveInfo.stats}
           fromAddress={walletsByChain[activeChain]?.address}
           sendTo={sendTo}
           setSendTo={setSendTo}
@@ -868,13 +1002,6 @@ export function LandscapeRoot(props: {
           sending={sending}
           onSend={handleSend}
           onClose={closeSendModal}
-          // Zephyr ecosystem assets reuse the ZEPH adapter; label the modal with
-          // the actual asset (ZEPHUSD/ZEPHRSV/ZEPHYRS) so it doesn't say "ZEPH".
-          assetLabel={
-            sendAssetType
-              ? ZPH_UI_TICKER[sendAssetType as ZphAssetType]
-              : undefined
-          }
         />
       )}
 

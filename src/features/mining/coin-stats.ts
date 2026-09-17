@@ -49,6 +49,9 @@ const WTM_KEY_FOR_CHAIN: Partial<Record<ChainType, string>> = {
   ravencoin: "Ravencoin",
   conflux: "Conflux",
   ergo: "Ergo",
+  // Verified present 2026-09-15: `coins.Xelis` → tag "XEL", algorithm
+  // "Xelishashv3", nethash/block_reward/block_time all populated.
+  xelis: "Xelis",
 };
 
 const URL = "https://whattomine.com/coins.json";

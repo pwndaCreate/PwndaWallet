@@ -15,6 +15,9 @@ const COIN_DECIMALS: Partial<Record<ChainType, number>> = {
   conflux: 18,
   // ERG = 1e9 nanoErg per ERG (Sigmaverse / EIP-26 atomic unit).
   ergo: 9,
+  // XEL = 1e8 atomic units per XEL (K1Pool `/api/stats/xel` reports
+  // `coinMul: 100000000`; the daemon's `miner_reward` 31212574 = 0.312 XEL).
+  xelis: 8,
 };
 
 /**

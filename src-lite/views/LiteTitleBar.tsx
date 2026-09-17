@@ -1,7 +1,9 @@
 import type { CSSProperties } from "react";
+import { LITE_APP_VERSION, formatAppVersion } from "../../src/lib/appVersion";
 import { Dot } from "../../src/components/Primitives";
 
-const LITE_VERSION = "v0.5.0";
+/** From src-tauri/tauri-lite.conf.json — the version the Lite binary reports. */
+const LITE_VERSION = formatAppVersion(LITE_APP_VERSION);
 
 /**
  * PwndaLite titlebar — same shape as the full wallet's `<TitleBar>` from

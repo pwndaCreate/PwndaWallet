@@ -1,5 +1,5 @@
 import type { ChainType } from "../../wallets";
-import type { CpuAlgorithm, GpuAlgorithm } from "../../types/mining";
+import type { CpuAlgorithm, GpuAlgorithm, MiningHardware } from "../../types/mining";
 
 /**
  * Mining pool registry.
@@ -46,12 +46,30 @@ export interface PoolDef {
    * plain TCP uses `stratum+tcp://` (or no scheme for xmrig — both work).
    */
   endpoint: string;
-  /** True when `endpoint` is a TLS port. Drives xmrig `--tls` + SRBMiner `--tls-sni`. */
+  /** True when `endpoint` is a TLS port. Drives xmrig `--tls` + SRBMiner `--tls true`. */
   ssl: boolean;
   userFormat: UserFormat;
   passFormat: PassFormat;
   /** Display string for min payout. */
   minPayout: string;
+  /**
+   * The lanes this ENDPOINT serves, when the pool splits them. Absent = every
+   * lane that mines `coin` with `algorithm`.
+   *
+   * Added 2026-09-15 for Xelis, the first coin mined on both lanes with one
+   * algorithm id: `coin` + `algorithm` alone cannot tell K1Pool's CPU port
+   * (9350, low starting difficulty) from its GPU port (9351), so without this a
+   * CPU miner could be pointed at a GPU-difficulty port.
+   */
+  hardware?: readonly MiningHardware[];
+  /**
+   * The pool reads an all-digit `.suffix` on the login as a FIXED DIFFICULTY,
+   * not a worker name. {@link poolWorkerName} then renames an all-digit
+   * worker, so a user who names a rig `1` does not pin the difficulty to 1.
+   * Added 2026-09-16 for `pwnda-xelis`: pwnda.org/start documents
+   * `YOUR_XELIS_ADDRESS.2000000` as the difficulty form (maximum 10,000,000).
+   */
+  numericWorkerIsDifficulty?: boolean;
 }
 
 // `PWNDA_POOL` entries (stratum+ssl://*.pwnda.org:20871) were removed
@@ -495,6 +513,154 @@ const ZANO_POOLS: PoolDef[] = [
 ];
 
 /**
+ * Xelis — XelisHash v3 on BOTH lanes (SRBMiner-MULTI's CPU lane and its GPU
+ * lane, as two separate processes).
+ *
+ * Every endpoint below was verified live on 2026-09-15 from the dev box, two
+ * ways: a raw stratum probe (subscribe + authorize with a throwaway,
+ * never-funded mainnet address → `result:true`, `mining.set_difficulty`,
+ * `mining.notify`), and real SRBMiner-MULTI 3.6.2 sessions with shares
+ * ACCEPTED on K1Pool (CPU) and HeroMiners (GPU) and TLS 1.3 established to
+ * Kryptex 8019 and K1Pool 9352. Evidence: `wiki/concepts/xelishash.md`.
+ *
+ * Probed and deliberately ABSENT: Kryptex 7019 over TLS (reset) and 8019 plain
+ * (closed); K1Pool 9352 plain (closed); Suprnova `xel.suprnova.cc:3333`, the
+ * pool SRBMiner's own example script names — it answers stratum, but it is an
+ * account-registration pool and nothing showed it credits a bare wallet login,
+ * and an accepted share that credits nobody is the class-B silent success
+ * `pool_ping.rs` exists to catch.
+ *
+ * Login is the bare address on the third-party pools (`userFormat:
+ * "address"`). XELIS stratum's `mining.authorize` carries the worker as its
+ * own field and SRBMiner fills it from `--worker`
+ * (`algorithms.ts::GPU_MINER.xelishashv3`), so the address stays exactly the
+ * address — which is also what K1Pool keys the account by. `pwnda-xelis` is
+ * the exception: its documented login is `address.worker` (see the entry).
+ *
+ * Corrected 2026-09-16. This block said "No `HOUSE_DEFAULT_POOL` entry: pwnda
+ * runs no XEL pool (operator decision D4)". That was true when written. pwnda
+ * now runs one (`xel.pwnda.org:17706`, listed on pwnda.org), the operator
+ * mines to it, and `HOUSE_DEFAULT_POOL.xelis` names it.
+ */
+const XELIS_POOLS: PoolDef[] = [
+  {
+    // Global GeoDNS host. Plain stratum on 7019. Min payout 0.1 XEL and 1%
+    // PROP fee, from pool.kryptex.com/xel 2026-09-15.
+    id: "kryptex-xelis",
+    name: "Kryptex",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+tcp://xel.kryptex.network:7019",
+    ssl: false,
+    userFormat: "address",
+    passFormat: "x",
+    minPayout: "0.1 XEL",
+  },
+  {
+    // TLS is a DIFFERENT port on Kryptex (8019); 7019 resets a TLS handshake.
+    id: "kryptex-xelis-ssl",
+    name: "Kryptex (SSL)",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+ssl://xel.kryptex.network:8019",
+    ssl: true,
+    userFormat: "address",
+    passFormat: "x",
+    minPayout: "0.1 XEL",
+  },
+  {
+    // K1Pool splits lanes by PORT: 9350 starts a CPU miner at difficulty
+    // 100000 (probe), 9351 a GPU miner at 500000. Pinned so a CPU miner is
+    // never pointed at the GPU port. Payout threshold 3 XEL (pool page and the
+    // account API's `payoutThreshold`).
+    id: "k1pool-xelis-cpu",
+    name: "K1Pool (CPU port)",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+tcp://eu.xel.k1pool.com:9350",
+    ssl: false,
+    userFormat: "address",
+    passFormat: "x",
+    minPayout: "3 XEL",
+    hardware: ["cpu"],
+  },
+  {
+    id: "k1pool-xelis-gpu",
+    name: "K1Pool (GPU port)",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+tcp://eu.xel.k1pool.com:9351",
+    ssl: false,
+    userFormat: "address",
+    passFormat: "x",
+    minPayout: "3 XEL",
+    hardware: ["gpu"],
+  },
+  {
+    // TLS port; GPU starting difficulty (500000 in the probe), so GPU lane.
+    id: "k1pool-xelis-ssl",
+    name: "K1Pool (SSL)",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+ssl://eu.xel.k1pool.com:9352",
+    ssl: true,
+    userFormat: "address",
+    passFormat: "x",
+    minPayout: "3 XEL",
+    hardware: ["gpu"],
+  },
+  {
+    // 1225 answers BOTH plain stratum and TLS (probed both). `minPayout` is
+    // unknown rather than guessed: xelis.herominers.com is blocked by the dev
+    // box's web filter, so neither its page nor its `/api/stats` could be read.
+    id: "herominers-xelis",
+    name: "HeroMiners",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+tcp://de.xelis.herominers.com:1225",
+    ssl: false,
+    userFormat: "address",
+    passFormat: "x",
+    minPayout: "—",
+  },
+  {
+    // PwndaWallet's own XEL pool, added 2026-09-16. Every value is from
+    // pwnda.org (its /start guide and the pool config in the site bundle):
+    // stratum `xel.pwnda.org:17706`, TLS only, hardware "GPU+CPU", PPLNS,
+    // 0.5% fee, payout every 4 h, min payout 0.05 XEL. The documented login
+    // is `--wallet YOUR_XELIS_ADDRESS.worker1 --password x`, and the address
+    // must keep its `xel:` prefix. A numeric suffix sets a fixed difficulty
+    // instead, hence `numericWorkerIsDifficulty`.
+    //
+    // No `hardware`: one port serves both lanes. The operator mines to it
+    // with SRBMiner (`--algorithm xelishashv3 --pool xel.pwnda.org:17706
+    // --tls true --wallet xel:….Rig --password x --disable-gpu`).
+    //
+    // SRBMiner 3.1.1 and 3.6.2 (Windows and Linux) send NO TLS SNI in any
+    // flag form. That was measured against a local TLS listener on 2026-09-16.
+    // The operator's working session therefore shows that this endpoint
+    // needs no SNI.
+    //
+    // Live evidence is the pool's own account API, not a probe from the dev
+    // box. It charted the operator's address at 2.0–7.3 kH/s from 23:44 to
+    // 01:00 UTC (2026-09-16/17), then 0. By 01:30 UTC every *.pwnda.org
+    // stratum host was a CNAME to `pwnda.a.pinggy.link`, which returned
+    // NXDOMAIN, so no raw stratum probe or app session could be run. The
+    // stats API (pwnda.org/xelis-api) still answered.
+    id: "pwnda-xelis",
+    name: "Pwnda Pool",
+    coin: "xelis",
+    algorithm: "xelishashv3",
+    endpoint: "stratum+ssl://xel.pwnda.org:17706",
+    ssl: true,
+    userFormat: "address.worker",
+    passFormat: "x",
+    minPayout: "0.05 XEL",
+    numericWorkerIsDifficulty: true,
+  },
+];
+
+/**
  * House-preferred pool per coin, overriding the payout-sort / registry-order
  * default in {@link getDefaultPoolId}.
  *
@@ -512,11 +678,14 @@ const ZANO_POOLS: PoolDef[] = [
  * touch `minPayout`, so the ascending-payout sort other pools rely on for
  * their own ordering stays honest. Add a coin here only when there is a
  * verified, live `stratum+ssl://*.pwnda.org:17706` endpoint for it — see the
- * live-verification note on each pwnda-* entry above.
+ * live-verification note on each pwnda-* entry above. (`pwnda-xelis`'s
+ * evidence is the pool crediting a real session, not a probe from here.)
  */
 export const HOUSE_DEFAULT_POOL: Partial<Record<ChainType, PoolId>> = {
   zephyr: "pwnda-zephyr",
   zano: "pwnda-zano",
+  // One port for both lanes, so this is the default on CPU and GPU alike.
+  xelis: "pwnda-xelis",
 };
 
 export const ALL_POOLS: PoolDef[] = [
@@ -526,10 +695,31 @@ export const ALL_POOLS: PoolDef[] = [
   ...RAVENCOIN_POOLS,
   ...ERGO_POOLS,
   ...ZANO_POOLS,
+  ...XELIS_POOLS,
 ];
 
-export function getPoolsForCoin(coin: ChainType, algorithm: Algorithm): PoolDef[] {
-  return ALL_POOLS.filter((p) => p.coin === coin && p.algorithm === algorithm);
+/**
+ * Pools for a (coin, algorithm) pair, optionally narrowed to one lane.
+ *
+ * `hardware` omitted keeps the pre-2026-09-15 behaviour (every endpoint for
+ * the pair). With it, an endpoint that declares `PoolDef.hardware` is kept
+ * only for its own lanes — the K1Pool CPU/GPU port split. Every other coin
+ * mines on one lane and declares no `hardware`, so its list is identical
+ * either way (`pools.test.ts` pins that).
+ */
+export function getPoolsForCoin(
+  coin: ChainType,
+  algorithm: Algorithm,
+  hardware?: MiningHardware,
+): PoolDef[] {
+  return ALL_POOLS.filter(
+    (p) =>
+      p.coin === coin &&
+      p.algorithm === algorithm &&
+      (hardware === undefined ||
+        p.hardware === undefined ||
+        p.hardware.includes(hardware))
+  );
 }
 
 export function getPoolById(id: PoolId): PoolDef | undefined {
@@ -559,22 +749,28 @@ export function getPoolById(id: PoolId): PoolDef | undefined {
  */
 function houseDefaultPoolId(
   coin: ChainType,
-  algorithm: Algorithm
+  algorithm: Algorithm,
+  hardware?: MiningHardware
 ): PoolId | undefined {
   const house = HOUSE_DEFAULT_POOL[coin];
   if (!house) return undefined;
-  return getPoolsForCoin(coin, algorithm).some((p) => p.id === house)
+  return getPoolsForCoin(coin, algorithm, hardware).some((p) => p.id === house)
     ? house
     : undefined;
 }
 
+/**
+ * `hardware` (optional, 2026-09-15): narrow the fallback to endpoints that
+ * serve that lane, so a dual-lane coin's CPU default is never a GPU-only port.
+ */
 export function getDefaultPoolId(
   coin: ChainType,
-  algorithm: Algorithm
+  algorithm: Algorithm,
+  hardware?: MiningHardware
 ): PoolId | undefined {
   return (
-    houseDefaultPoolId(coin, algorithm) ??
-    getPoolsForCoin(coin, algorithm)[0]?.id
+    houseDefaultPoolId(coin, algorithm, hardware) ??
+    getPoolsForCoin(coin, algorithm, hardware)[0]?.id
   );
 }
 
@@ -602,6 +798,14 @@ export function getDefaultPoolId(
 export function resolveDefaultPool(opts: {
   coin: ChainType;
   algorithm: Algorithm;
+  /**
+   * The lane being resolved (optional, 2026-09-15). When given, the house pool
+   * and the registry fallback are drawn only from endpoints that serve it.
+   * `liveLanePool` / `remembered` / `mostUsed` are not re-filtered here:
+   * `useMiner` already passes them through `inList(availablePools)`, and that
+   * list is lane-filtered.
+   */
+  hardware?: MiningHardware;
   /** The pool a live session for this lane is actually running, if any. */
   liveLanePool: PoolId | null;
   /** The user's last explicit pick for this lane, THIS app session. */
@@ -612,9 +816,9 @@ export function resolveDefaultPool(opts: {
   return (
     opts.liveLanePool ??
     opts.remembered ??
-    houseDefaultPoolId(opts.coin, opts.algorithm) ??
+    houseDefaultPoolId(opts.coin, opts.algorithm, opts.hardware) ??
     opts.mostUsed ??
-    getPoolsForCoin(opts.coin, opts.algorithm)[0]?.id ??
+    getPoolsForCoin(opts.coin, opts.algorithm, opts.hardware)[0]?.id ??
     null
   );
 }
@@ -685,6 +889,39 @@ export function decoratePoolLabel(
 }
 
 /**
+ * The worker name as this pool will receive it: trimmed, `worker1` when
+ * empty, and prefixed with `rig` when it is all digits on a pool that reads
+ * a numeric suffix as a difficulty (`PoolDef.numericWorkerIsDifficulty`).
+ *
+ * `buildCredentials` and {@link workerFlagFor} both use it, so the worker
+ * reads the same wherever it is sent.
+ */
+export function poolWorkerName(pool: PoolDef, worker: string): string {
+  const name = worker.trim() || "worker1";
+  return pool.numericWorkerIsDifficulty && /^\d+$/.test(name) ? `rig${name}` : name;
+}
+
+/**
+ * The value for SRBMiner's separate `--worker` flag, or `null` for none.
+ *
+ * Only a protocol that authorizes the worker as its own field takes one
+ * (`protocolSendsWorker`: XELIS), and only when the login does not already
+ * carry it. A pool whose login is `address.worker` (`pwnda-xelis`) gets the
+ * worker once, in the wallet string. SRBMiner then fills the field with its
+ * default, which is exactly the operator's working session, captured
+ * 2026-09-16 against a local TLS listener:
+ * `["xel:….OutsideRig","SRBMiner","x"]`.
+ */
+export function workerFlagFor(
+  pool: PoolDef,
+  worker: string,
+  protocolSendsWorker: boolean
+): string | null {
+  if (!protocolSendsWorker || pool.userFormat !== "address") return null;
+  return poolWorkerName(pool, worker);
+}
+
+/**
  * Build the username + password to send to the pool, given the pool config,
  * the user's wallet address, the worker name, and the coin's mining-prefix
  * (the `prefix:addr.worker` format is reserved for any future in-house
@@ -696,7 +933,7 @@ export function buildCredentials(opts: {
   worker: string;
   coinPrefix: string;
 }): { user: string; pass: string } {
-  const worker = opts.worker.trim() || "worker1";
+  const worker = poolWorkerName(opts.pool, opts.worker);
   let user: string;
   switch (opts.pool.userFormat) {
     case "address":

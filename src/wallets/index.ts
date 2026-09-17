@@ -45,6 +45,7 @@ import { ergoAdapter } from "./erg-wallet";
 import { nearAdapter } from "./near-wallet";
 import { aptAdapter } from "./apt-wallet";
 import { zanoAdapter } from "./zano-wallet";
+import { xelisAdapter } from "./xelis-wallet";
 import { usdcSolAdapter, usdtSolAdapter } from "./spl-token-wallet";
 import { usdtTronAdapter } from "./trc20-wallet";
 
@@ -96,6 +97,7 @@ const adapters: Record<ChainType, ChainAdapter> = {
   near: nearAdapter,
   aptos: aptAdapter,
   zano: zanoAdapter,
+  xelis: xelisAdapter,
 };
 
 export function getAdapter(chain: ChainType): ChainAdapter {
@@ -152,6 +154,7 @@ export const ALL_CHAINS: ChainType[] = [
   "near",
   "aptos",
   "zano",
+  "xelis",
 ];
 
 export type {
@@ -165,4 +168,7 @@ export type {
   TxHistoryPage,
   FeeEstimate,
   FeeTier,
+  SendQuote,
+  SendQuoteErrorKind,
+  SendableBalance,
 } from "./types";

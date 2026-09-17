@@ -2,6 +2,7 @@ import { useMemo, useState } from "react";
 import { ST } from "../../components/Primitives";
 import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
+import { txDisplayTicker } from "../../wallets/tx-display";
 import { explorerTxUrl } from "../../wallets/explorers";
 import type { ChainTx, ChainType } from "../../wallets";
 import { fmtRelative } from "../../utils/format";
@@ -388,7 +389,7 @@ function TxRow({ tx, last }: { tx: ChainTx; last: boolean }) {
       }
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
-      <CoinIcon sym={adapter.ticker} size={22} glow={false} />
+      <CoinIcon sym={txDisplayTicker(tx, adapter.ticker)} size={22} glow={false} />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div
           style={{
@@ -428,7 +429,7 @@ function TxRow({ tx, last }: { tx: ChainTx; last: boolean }) {
           }}
         >
           {isIn ? "+" : failed ? "" : "−"}
-          {tx.amount} {adapter.ticker}
+          {tx.amount} {txDisplayTicker(tx, adapter.ticker)}
         </div>
         <div
           style={{

@@ -31,6 +31,7 @@ import type {
   GpuAlgorithm,
   MiningHardware,
 } from "../../types/mining";
+import { isDualLaneCoin } from "./miningCoins";
 import {
   appendBucket,
   BUCKET_WINDOW_MS,
@@ -75,6 +76,8 @@ export interface UsePersistentHashrateResult {
   getSeriesFor: (
     chain: ChainType,
     algo: CpuAlgorithm | GpuAlgorithm,
+    /** Required to read a dual-lane coin's series; ignored otherwise. */
+    hardware?: MiningHardware,
   ) => HashrateBucket[];
   /** Convenience accessor for the currently-active series. */
   activeSeries: HashrateBucket[];
@@ -103,7 +106,16 @@ export function usePersistentHashrate(
   } = input;
 
   const algorithm = currentAlgoFor(miningHardware, cpuAlgorithm, gpuAlgorithm);
-  const activeKey: SeriesKey = makeSeriesKey(miningCoin, algorithm);
+  // A dual-lane coin (XEL) gets a per-LANE series. Its CPU session (~12–20
+  // kH/s) and GPU session (~11 kH/s) are different measurements of different
+  // hardware; folding them into one key would draw a 24-hour chart that steps
+  // between lanes as the user toggles and present it as one coin's history.
+  // Single-lane coins keep their original key, so existing history still loads.
+  const activeKey: SeriesKey = makeSeriesKey(
+    miningCoin,
+    algorithm,
+    isDualLaneCoin(miningCoin) ? miningHardware : undefined,
+  );
 
   // The hook's source of truth. Mirrors the on-disk file; renderers read from here.
   const [fileState, setFileState] = useState<HashrateHistoryFile | null>(null);
@@ -250,10 +262,18 @@ export function usePersistentHashrate(
 
   // ── Read API ─────────────────────────────────────────────────────
   const getSeriesFor = useCallback(
-    (chain: ChainType, algo: CpuAlgorithm | GpuAlgorithm): HashrateBucket[] => {
+    (
+      chain: ChainType,
+      algo: CpuAlgorithm | GpuAlgorithm,
+      hardware?: MiningHardware,
+    ): HashrateBucket[] => {
       const f = fileState;
       if (!f) return [];
-      const key = makeSeriesKey(chain, algo);
+      const key = makeSeriesKey(
+        chain,
+        algo,
+        isDualLaneCoin(chain) ? hardware : undefined,
+      );
       return [...(f.series[key] ?? [])];
     },
     [fileState],

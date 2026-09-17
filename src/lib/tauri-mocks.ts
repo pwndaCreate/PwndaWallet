@@ -29,6 +29,15 @@
  *     hidden lane must restore ITS coin — CPU→Zephyr, GPU→Ergo, not the
  *     monero/kawpow defaults) plus per-lane tile gating + the landscape
  *     hardware toggle (see [[mining-session-rehydration]]).
+ *   - `xelis_mining_active` — Xelis on BOTH lanes at once, as two SRBMiner
+ *     processes: the CPU lane through `is_srbminer_cpu_mining` +
+ *     `get_srbminer_cpu_snapshot` (~20 kH/s, 32 threads, K1Pool's CPU port)
+ *     and the GPU lane through `is_gpu_mining` + `get_gpu_miner_snapshot`
+ *     (~11 kH/s, Kryptex). Both `activeSessions` descriptors are seeded, so
+ *     post-reload rehydration renders the running XEL hero; K1Pool pool stats
+ *     and an XEL price are mocked. Verifies the dual-lane coin (the hardware
+ *     toggle keeps XEL on both lanes, the XEL tile locks only when both lanes
+ *     mine, each lane lists only its own K1Pool port).
  *   - `wallet_populated` — a funded multi-chain wallet: real balances for
  *     every chain (EVM via the window.fetch shim's eth_getBalance, BTC/LTC
  *     esplora, ERG, ALGO/TRX/HBAR, ADA/XLM/SUI, SOL via sol_rpc_call, XRP
@@ -69,6 +78,8 @@
  *   ✅ MOCKED (returns realistic data)
  *      - Mining lifecycle: is_mining, start/stop_xmrig, get_xmrig_snapshot,
  *        run_xmrig_benchmark, scan_msr_environment, hashrate-fix surface
+ *      - CPU lane #2 (SRBMiner / XelisHash): is_srbminer_cpu_mining,
+ *        start/stop_srbminer_cpu, get_srbminer_cpu_snapshot
  *      - Device discovery: get_cpu_info, get_gpu_info, get_cpu_thread_count
  *      - Pool integrations: fetch_pool_stats, ping_pools(_via_proxy),
  *        proxy_refresh, fetch_pool_min_payout
@@ -100,6 +111,17 @@
  *      - EVM Activity (Etherscan-v1 txlist) when wallet_populated.
  *      - XMR/ZPH wallet RPC (xmr_rpc_call/zph_rpc_call: get_balance /
  *        get_address / get_transfers) when wallet_populated / degraded.
+ *      - Xelis sidecar LIFECYCLE (xelis_binary_status, _rpc_is_running,
+ *        _ensure_wallet, _start_rpc, _stop_rpc, _probe_node,
+ *        _download_wallet_rpc), 2026-09-15.
+ *      - Xelis wallet RPC (xelis_rpc_call), filled 2026-09-15 by WALLET-CORE
+ *        from responses captured off the real binary: get_address /
+ *        get_balance / get_topoheight / is_online / network_info /
+ *        list_transactions / estimate_fees / build_transaction. Funded under
+ *        wallet_populated; under `degraded` the wallet is deliberately BEHIND
+ *        the daemon's stable topoheight, so the balance is unknown and the
+ *        adapter throws rather than showing 0 — that is the Xelis-specific
+ *        data-absent path, and it is the whole point of that fixture.
  *      - BasicSwap sidecar: ALL SEVEN swap_sidecar_* commands, stateful
  *        (opt_in / start / stop mutate the phase that status reports), plus
  *        an API proxy answering /json/coins, /json/wallets(/<ticker>)
@@ -153,6 +175,7 @@ type MockScenario =
   | "mining_projected"
   | "gpu_mining_active"
   | "cpu_gpu_mining_active"
+  | "xelis_mining_active"
   | "wallet_populated"
   | "degraded"
   | "swap_sidecar_idle"
@@ -406,6 +429,7 @@ function scenario(): MockScenario {
   if (raw === "mining_projected") return "mining_projected";
   if (raw === "gpu_mining_active") return "gpu_mining_active";
   if (raw === "cpu_gpu_mining_active") return "cpu_gpu_mining_active";
+  if (raw === "xelis_mining_active") return "xelis_mining_active";
   if (raw === "wallet_populated") return "wallet_populated";
   if (raw === "degraded") return "degraded";
   if (raw === "swap_sidecar_idle") return "swap_sidecar_idle";
@@ -475,12 +499,12 @@ function hashStr(s: string): number {
 }
 
 /** Device profile variant for cpuInfo()/gpuInfo() — `VITE_MOCK_DEVICE`. */
-function deviceVariant(): "default" | "no-gpu" | "low-end" | "multi-gpu" {
+function deviceVariant(): "default" | "no-gpu" | "low-end" | "multi-gpu" | "dual-gpu" {
   const raw =
     typeof import.meta !== "undefined"
       ? import.meta.env?.VITE_MOCK_DEVICE
       : undefined;
-  if (raw === "no-gpu" || raw === "low-end" || raw === "multi-gpu") return raw;
+  if (raw === "no-gpu" || raw === "low-end" || raw === "multi-gpu" || raw === "dual-gpu") return raw;
   return "default";
 }
 
@@ -646,6 +670,22 @@ function pluginStore(cmd: string, args: any): unknown {
             true,
           ];
         }
+        if (scenario() === "xelis_mining_active") {
+          // The LANE-SUFFIXED key (`makeSeriesKey`'s dual-lane form). XEL's
+          // CPU and GPU sessions are different measurements of different
+          // hardware, so they are different series; a single `xelis/…` key
+          // would draw one chart that steps between lanes as the user
+          // toggles and call it one coin's history.
+          return [
+            {
+              version: 1,
+              series: {
+                "xelis/xelishashv3/cpu": build24hSeries(Date.now()),
+              },
+            },
+            true,
+          ];
+        }
         return [null, false];
       }
       if (path.endsWith(PREFS_FILE) && key === ACTIVE_SESSIONS_KEY) {
@@ -672,6 +712,33 @@ function pluginStore(cmd: string, args: any): unknown {
           // Ergo AND toggling to CPU must show Zephyr (not the Monero
           // default) — BUG 1's per-hardware coin restore.
           return [{ cpu: cpuDesc, gpu: gpuDesc }, true];
+        }
+        if (scenario() === "xelis_mining_active") {
+          // ONE coin on BOTH lanes, as two SRBMiner processes. Each lane
+          // carries its OWN pool — K1Pool runs separate XELIS ports per
+          // hardware (9350 CPU / 9351 GPU) at different difficulties — so a
+          // restore that ignored the lane would put the CPU session on a GPU
+          // port. `miner` is "SRBMiner-MULTI" on both, which is why the CPU
+          // descriptor's miner field had to stop implying xmrig.
+          return [
+            {
+              cpu: {
+                hardware: "cpu",
+                coin: "xelis",
+                cpuAlgorithm: "xelishashv3",
+                miner: "SRBMiner-MULTI",
+                poolId: "k1pool-xelis-cpu",
+              },
+              gpu: {
+                hardware: "gpu",
+                coin: "xelis",
+                gpuAlgorithm: "xelishashv3",
+                miner: "SRBMiner-MULTI",
+                poolId: "kryptex-xelis",
+              },
+            },
+            true,
+          ];
         }
         return [null, false];
       }
@@ -749,8 +816,16 @@ function cpuInfo() {
 
 function gpuInfo() {
   // VITE_MOCK_DEVICE: no-gpu → [] (CPU-only branch), low-end → integrated,
-  // multi-gpu → three cards; default → one RTX 4080.
+  // multi-gpu → three cards; dual-gpu → an AMD APU iGPU (index 0, not
+  // dedicated) + two NVIDIA cards, the Mine GPU picker's "GPU 1 / GPU 2 /
+  // BOTH" case (2026-09-16); default → one RTX 4080.
   const v = deviceVariant();
+  if (v === "dual-gpu")
+    return [
+      { name: "AMD Radeon(TM) Graphics", vendor: "amd", vram_bytes: 512 * 1024 ** 2, driver_version: "31.0.21001" },
+      { name: "NVIDIA GeForce RTX 4080", vendor: "nvidia", vram_bytes: 16 * 1024 ** 3, driver_version: "552.22" },
+      { name: "NVIDIA GeForce RTX 3090", vendor: "nvidia", vram_bytes: 24 * 1024 ** 3, driver_version: "552.22" },
+    ];
   if (v === "no-gpu") return [];
   if (v === "low-end")
     return [{ name: "Intel UHD Graphics 630", vendor: "Intel", vram_bytes: 0, driver_version: "31.0.101" }];
@@ -815,6 +890,21 @@ function xmrigSnapshot() {
 }
 
 function gpuSnapshot() {
+  if (scenario() === "xelis_mining_active") {
+    // SRBMiner's XELIS GPU lane (~11 kH/s), numbers taken from a real
+    // capture. Unlike lolMiner, SRBMiner DOES report stratum latency, so
+    // `ping_ms` is a live value rather than null — it lives in the same
+    // `pool` object as difficulty and uptime, the paths the GPU snapshot
+    // parser used to miss entirely.
+    return {
+      hashrate: 11_404,
+      accepted: 37,
+      rejected: 0,
+      diff_current: 187_500,
+      ping_ms: 130,
+      uptime_secs: 62 * 60 + 12,
+    };
+  }
   if (
     scenario() !== "gpu_mining_active" &&
     scenario() !== "cpu_gpu_mining_active"
@@ -834,18 +924,91 @@ function gpuSnapshot() {
   };
 }
 
-function minerStats() {
+/**
+ * SRBMiner's CPU lane (XelisHash v3). The SAME wire shape as
+ * `get_xmrig_snapshot` — Rust normalises both CPU backends — but a different
+ * process, port and command, which is the whole point of the scenario.
+ * `threads_active` is SRBMiner's own resolved worker count.
+ */
+function srbCpuSnapshot() {
+  if (scenario() !== "xelis_mining_active") return null;
+  return {
+    hashrate: 20_180,
+    accepted: 58,
+    rejected: 0,
+    diff_current: 100_000,
+    ping_ms: 133,
+    uptime_secs: 62 * 60 + 12,
+    threads_active: 32,
+  };
+}
+
+function minerStats(poolId?: string) {
+  if (scenario() === "xelis_mining_active") {
+    const now = Math.floor(Date.now() / 1000);
+    if (poolId === "pwnda-xelis") {
+      // Pwnda's `/xelis-api/stats/<xel:address>`, normalised the way
+      // `pool_stats.rs::parse_pwnda_xelis` does it: ATOMIC strings (1e8) and
+      // H/s. The pool publishes no averages, shares, last share or worker
+      // count, so those are null here too — the panel must cope without them.
+      return {
+        pendingBalance: "4120000", // 0.0412 XEL
+        immatureBalance: "731000", // 0.00731 XEL
+        totalPaid: "125000000", // 1.25 XEL
+        payoutThreshold: "5000000", // 0.05 XEL
+        hashrate: 20_180,
+        hashrate1h: null,
+        hashrate6h: null,
+        hashrate24h: null,
+        validShares: null,
+        invalidShares: null,
+        staleShares: null,
+        lastShare: null,
+        workersOnline: null,
+        fetchedAt: now,
+      };
+    }
+    // K1Pool's `/api/miner/xel/<address>` document, already normalised the
+    // way `pool_stats.rs::parse_k1pool_miner` does it: balances are ATOMIC
+    // decimal strings (1e8 per XEL) and hashrates are plain H/s. Two workers
+    // online — one per lane, both under one account, because K1Pool keys
+    // the account by the address with no `xel:` prefix.
+    //
+    // Corrected 2026-09-16: this said "WHOLE-COIN decimal strings (not atomic
+    // units)" and returned "0.41822" etc., which `formatAtomic` rendered as
+    // 0.000418 XEL (and the 3 XEL minimum as "min 0 XEL"). The parser has
+    // always returned atomic strings (`k1pool_tests`: 0.37876 → "37876000").
+    return {
+      pendingBalance: "41822000", // 0.41822 XEL
+      immatureBalance: "37876000", // 0.37876 XEL
+      totalPaid: "259861000", // 2.59861 XEL
+      payoutThreshold: "300000000", // 3 XEL
+      hashrate: 31_580,
+      hashrate1h: 30_940,
+      hashrate6h: 29_880,
+      hashrate24h: 28_400,
+      validShares: 412,
+      invalidShares: 3,
+      staleShares: 0,
+      lastShare: now - 9,
+      workersOnline: 2,
+      fetchedAt: now,
+    };
+  }
   if (!cpuMiningActive()) {
     // Pool returns "no records for this address" pre-mining. Match
     // what the adapters return for unknown miners.
     return null;
   }
   const now = Math.floor(Date.now() / 1000);
+  // ATOMIC strings (1e12 for XMR/ZEPH), like every Rust parser returns.
+  // Corrected 2026-09-16 with the XEL branch above: these were whole-coin
+  // strings ("0.00231" …), which `formatAtomic` rendered as "0".
   return {
-    pendingBalance: "0.00231",
-    immatureBalance: "0.00098",
-    totalPaid: "0.04419",
-    payoutThreshold: "0.005",
+    pendingBalance: "2310000000", // 0.00231
+    immatureBalance: "980000000", // 0.00098
+    totalPaid: "44190000000", // 0.04419
+    payoutThreshold: "5000000000", // 0.005
     hashrate: 7240,
     hashrate1h: 7180,
     hashrate6h: 7090,
@@ -905,6 +1068,11 @@ const SANDBOX_PRICES_USD: Record<string, number> = {
   CFX: 0.183,
   ERG: 1.21,
   ZEPH: 1.51,
+  // Rounded from the live quote recorded in `usd-prices.ts` when XEL's
+  // provider ids were verified (2026-09-15: CoinGecko 0.202094, CoinPaprika
+  // 0.2020992 — agreeing to 0.003%). A fixture like every other row here,
+  // but taken from a real reading rather than invented.
+  XEL: 0.2021,
   RUNE: 4.18,
   NEAR: 5.42,
   DASH: 22.4,
@@ -934,6 +1102,7 @@ const COINGECKO_ID_TO_TICKER: Record<string, string> = {
   "bitcoin-cash": "BCH",
   ergo: "ERG",
   dash: "DASH",
+  xelis: "XEL",
 };
 
 const COINPAPRIKA_ID_TO_TICKER: Record<string, string> = {
@@ -957,6 +1126,7 @@ const COINPAPRIKA_ID_TO_TICKER: Record<string, string> = {
   "bch-bitcoin-cash": "BCH",
   "efyt-ergo": "ERG",              // synced 2026-06-17 (was "erg-ergo")
   "dash-dash": "DASH",
+  "xel-xelis": "XEL",              // mirrors TICKER_TO_COINPAPRIKA_ID
   // ZEPH intentionally absent — CoinPaprika does not list Zephyr Protocol,
   // mirroring the real TICKER_TO_COINPAPRIKA_ID map.
 };
@@ -2274,26 +2444,175 @@ function solRpcDispatch(args: any): unknown {
 // The frontend `rpc()` wrapper returns the invoke result AS the RPC `result`
 // object (no {result} envelope), so we return the bare result here.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Zephyr-only wallet-rpc behaviour (2026-09-15, send pricing + asset history).
+//
+// Shapes and error strings follow zephyr v2.3.0's wallet_rpc_server.cpp. Errors
+// are thrown as plain STRINGS formatted like `wallet_rpc_common.rs`
+// (`RPC error <code>: <message>`), because that is how Tauri rejects a Rust
+// `Err(String)`; throwing `Error` objects here would hide the string-rejection
+// bugs this sandbox exists to catch ("Transaction failed: undefined").
+// ---------------------------------------------------------------------------
+const ZPH_UNHANDLED = Symbol("zph-unhandled");
+
+/** Funded-scenario Zephyr balances, atomic (1e12). ZRS is partly locked on
+ *  purpose, so the Send modal's "spendable of total" line has something to show. */
+const ZPH_SANDBOX_BALANCES: Record<string, { balance: number; unlocked_balance: number }> = {
+  ZPH: { balance: 14_000_000_000_000, unlocked_balance: 14_000_000_000_000 },
+  ZSD: { balance: 42_000_000_000_000, unlocked_balance: 42_000_000_000_000 },
+  ZRS: { balance: 5_000_000_000_000, unlocked_balance: 4_200_000_000_000 },
+  ZYS: { balance: 3_000_000_000_000, unlocked_balance: 3_000_000_000_000 },
+};
+
+/** Flat fee the sandbox charges, in the SENT asset's atomic units (fees are
+ *  paid in the source asset: rctSigs.cpp:1861-1862 at v2.3.0). */
+const ZPH_SANDBOX_FEE = 25_400_000;
+
+/** Deterministic 64-hex id, so a quote and the relay of its metadata agree. */
+function zphMockHash(seed: string): string {
+  let h = 0x811c9dc5;
+  let out = "";
+  for (let round = 0; out.length < 64; round++) {
+    for (let i = 0; i < seed.length; i++) {
+      h ^= seed.charCodeAt(i) + round;
+      h = Math.imul(h, 0x01000193) >>> 0;
+    }
+    out += h.toString(16).padStart(8, "0");
+  }
+  return out.slice(0, 64);
+}
+
+function zphWalletRpcDispatch(method: string, params: any, funded: boolean): unknown {
+  switch (method) {
+    case "get_balance": {
+      const names: string[] = params?.all_assets
+        ? ["ZPH", "ZSD", "ZRS", "ZYS"]
+        : [String(params?.asset_type || "ZPH").toUpperCase()];
+      // Zero balances are omitted, exactly as wallet_rpc_server.cpp:483-484 does.
+      const balances = funded
+        ? names
+            .filter((n) => ZPH_SANDBOX_BALANCES[n])
+            .map((n) => ({
+              asset_type: n,
+              ...ZPH_SANDBOX_BALANCES[n],
+              blocks_to_unlock:
+                ZPH_SANDBOX_BALANCES[n].unlocked_balance < ZPH_SANDBOX_BALANCES[n].balance ? 4 : 0,
+            }))
+        : [];
+      return { balances };
+    }
+    case "validate_address": {
+      const a = String(params?.address ?? "");
+      const ok = /^ZEPH(YR|s|ii)[1-9A-HJ-NP-Za-km-z]+$/.test(a) && a.length >= 60;
+      return {
+        valid: ok,
+        integrated: ok && a.startsWith("ZEPHii"),
+        subaddress: ok && a.startsWith("ZEPHs"),
+        nettype: "mainnet",
+        openalias_address: "",
+      };
+    }
+    case "create_address":
+      // Subaddresses start "ZEPHs" (cryptonote_config.h:228), not "8" (Monero).
+      return {
+        address: "ZEPHs" + "6m7sandboxSubaddress".padEnd(94, "x"),
+        address_index: 1,
+      };
+    case "transfer": {
+      const dest = params?.destinations?.[0] ?? {};
+      const address = String(dest.address ?? "");
+      const amount = Number(dest.amount ?? 0);
+      if (!params?.source_asset !== !params?.destination_asset) {
+        throw "RPC error -4: Missing source or destination asset. Either specify both or neither.";
+      }
+      const src = String(params?.source_asset || "ZPH").toUpperCase();
+      const dst = String(params?.destination_asset || "ZPH").toUpperCase();
+      if (!/^ZEPH(YR|s|ii)[1-9A-HJ-NP-Za-km-z]+$/.test(address) || address.length < 60) {
+        throw `RPC error -2: WALLET_RPC_ERROR_CODE_WRONG_ADDRESS: ${address}`;
+      }
+      if (!(amount > 0)) throw "RPC error -46: destination amount is zero";
+      if (src !== dst && amount % 100_000_000 !== 0) {
+        throw "RPC error -4: Mint/redeem TX amounts permit at most 4 decimal places";
+      }
+      const bal = funded ? ZPH_SANDBOX_BALANCES[src] : undefined;
+      if (amount + ZPH_SANDBOX_FEE > (bal?.balance ?? 0)) throw "RPC error -17: not enough money";
+      if (amount + ZPH_SANDBOX_FEE > (bal?.unlocked_balance ?? 0)) {
+        throw "RPC error -37: not enough unlocked money";
+      }
+      const txHash = zphMockHash(`${address}|${amount}|${src}|${dst}|${Date.now()}`);
+      const built = {
+        tx_hash: txHash,
+        tx_key: zphMockHash(`key|${txHash}`),
+        amount,
+        fee: ZPH_SANDBOX_FEE,
+        weight: 1541,
+      };
+      // A dry run (`do_not_relay`) returns the signed blob for relay_tx; the
+      // sandbox encodes the hash in it so the relay reports the same id.
+      return params?.do_not_relay && params?.get_tx_metadata
+        ? { ...built, tx_metadata: txHash + "0".repeat(256) }
+        : built;
+    }
+    case "relay_tx": {
+      const hex = String(params?.hex ?? "");
+      if (hex.length < 64 || !/^[0-9a-f]+$/i.test(hex)) throw "RPC error -26: Failed to parse hex.";
+      return { tx_hash: hex.slice(0, 64) };
+    }
+    case "get_transfers": {
+      if (!funded) return { in: [], out: [], pending: [], failed: [], pool: [] };
+      const now = Math.floor(Date.now() / 1000);
+      const entry = (o: Record<string, unknown>) => ({
+        payment_id: "0000000000000000",
+        subaddr_index: { major: 0, minor: 0 },
+        address: "ZEPHYR2qjmpfgEjnpvUnmcW84J5q3uvP5Z5oc8h6F9zsTrhpFkPgsandbox",
+        locked: false,
+        ...o,
+      });
+      // One row per asset shape the renderers must label: ZEPH and ZEPHUSD
+      // receipts, a ZEPHYRS receipt, a ZEPHUSD send, and an UNCONFIRMED
+      // ZEPHRSV receipt (`pool` = incoming in the mempool).
+      return {
+        in: [
+          entry({ txid: zphMockHash("in-zph"), asset_type: "ZPH", amount: 6_500_000_000_000, fee: 24_000_000, height: 1_897_800, timestamp: now - 86_400 * 3, confirmations: 2_200 }),
+          entry({ txid: zphMockHash("in-zsd"), asset_type: "ZSD", amount: 45_000_000_000_000, fee: 25_100_000, height: 1_899_300, timestamp: now - 86_400, confirmations: 700 }),
+          entry({ txid: zphMockHash("in-zys"), asset_type: "ZYS", amount: 3_000_000_000_000, fee: 25_300_000, height: 1_899_940, timestamp: now - 7_200, confirmations: 60 }),
+        ],
+        out: [
+          entry({
+            txid: zphMockHash("out-zsd"),
+            asset_type: "ZSD",
+            amount: 3_000_000_000_000,
+            fee: ZPH_SANDBOX_FEE,
+            height: 1_899_880,
+            timestamp: now - 14_400,
+            confirmations: 120,
+            destinations: [{ address: "ZEPHYR3sandboxRecipientxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", amount: 3_000_000_000_000 }],
+          }),
+        ],
+        pending: [],
+        failed: [],
+        pool: [
+          entry({ txid: zphMockHash("pool-zrs"), asset_type: "ZRS", amount: 1_250_000_000_000, fee: 25_200_000, height: 0, timestamp: now - 120, confirmations: 0, locked: true }),
+        ],
+      };
+    }
+    default:
+      return ZPH_UNHANDLED;
+  }
+}
+
 function xmrRpcDispatch(args: any, kind: "xmr" | "zph"): unknown {
   const method: string = args?.method ?? "";
   const funded = walletFunded();
   const atomic = 850_000_000_000; // 0.85 XMR (1e12 piconero)
   const height = kind === "xmr" ? 3_000_000 : 1_900_000;
+  if (kind === "zph") {
+    const zph = zphWalletRpcDispatch(method, args?.params, funded);
+    if (zph !== ZPH_UNHANDLED) return zph;
+  }
   switch (method) {
     case "get_balance":
-      if (kind === "zph") {
-        // Multi-asset: ZPH / ZSD / ZRS / ZYS (UI labels ZEPH/ZEPHUSD/ZEPHRSV/ZEPHYRS).
-        return funded
-          ? {
-              balances: [
-                { asset_type: "ZPH", balance: 14_000_000_000_000, unlocked_balance: 14_000_000_000_000, blocks_to_unlock: 0 },
-                { asset_type: "ZSD", balance: 42_000_000_000_000, unlocked_balance: 42_000_000_000_000, blocks_to_unlock: 0 },
-                { asset_type: "ZRS", balance: 5_000_000_000_000, unlocked_balance: 5_000_000_000_000, blocks_to_unlock: 0 },
-                { asset_type: "ZYS", balance: 3_000_000_000_000, unlocked_balance: 3_000_000_000_000, blocks_to_unlock: 0 },
-              ],
-            }
-          : { balances: [{ asset_type: "ZPH", balance: 0, unlocked_balance: 0 }] };
-      }
+      // Zephyr's per-asset `get_balance` is answered by zphWalletRpcDispatch.
       return { balance: funded ? atomic : 0, unlocked_balance: funded ? atomic : 0, multisig_import_needed: false, blocks_to_unlock: 0 };
     case "get_address":
       return {
@@ -2386,6 +2705,184 @@ function zanoRpcDispatch(args: any): unknown {
       return { wallet_file_size: 1670 };
     default:
       return {};
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Xelis wallet RPC (xelis_rpc_call) — FILLED BY WALLET-CORE, 2026-09-15.
+//
+// Every shape below is copied from a response the REAL `xelis_wallet` v1.25.0
+// binary gave during the P0 spike (`rpc-samples/`, filed in the vault at
+// `wiki/queries/2026-09-15-xelis-wallet-binary-spike.md`). Three consequences
+// of that are load-bearing and easy to "tidy" into wrongness:
+//
+//  1. `get_balance` returns a BARE u64, not `{balance}`. `get_topoheight` and
+//     `get_nonce` likewise.
+//  2. `network_info` carries `topoheight` AND a lower `stable_topoheight`
+//     (383957 vs 383933 live). `getSyncStatus` compares against the stable one,
+//     so a mock where they are equal would never exercise the real comparison.
+//  3. `estimate_fees` answers 25000 to a REGISTERED destination and 125000 to a
+//     fresh one. `estimateTransferFee` measures the 100000 surcharge by pricing
+//     the same send to this wallet's own address and differencing, so this mock
+//     must answer differently for self vs anyone else — a flat number would
+//     make the fee note silently untestable.
+//
+// The address is a real binary-produced vector (the world-public spike test
+// seed, never funded), not an invented string, so it survives the address
+// pre-filter in `xelis-keys.ts` instead of being rejected by the very code the
+// sandbox is meant to exercise.
+const XELIS_SANDBOX_ADDRESS =
+  "xel:qc3hdkmsc0nqks7jqz8cpnzv5c3ur7my6yy7ct6ulf5kuexv53pqqjlaht0";
+const XELIS_SANDBOX_PEER =
+  "xel:ym3qntl80esaae92u6ac4dk0nq2lle8scy03f8xknud9at29w3csqnyl7dc";
+const XELIS_NATIVE_ASSET_MOCK = "0".repeat(64);
+
+function xelisRpcDispatch(args: any): unknown {
+  const method: string = args?.method ?? "";
+  const params = args?.params ?? {};
+  const funded = walletFunded();
+  // `degraded` is funded but UNSYNCED on purpose: it is the fixture for
+  // "the wallet cannot tell you its balance yet", which for Xelis is a THROWN
+  // error rather than a zero — `get_balance` answers 0 while scanning and that
+  // is indistinguishable from an empty wallet.
+  const unsynced = scenario() === "degraded";
+
+  // 8 decimals. 4,200 XEL at the ~$0.20 the spike priced live.
+  const balanceAtomic = funded ? 420_000_000_000 : 0;
+  const daemonTopoheight = 8_904_921; // live mainnet figure, 2026-09-15
+  const stableTopoheight = 8_904_893;
+  const walletTopoheight = unsynced ? 8_512_004 : daemonTopoheight;
+
+  switch (method) {
+    case "get_version":
+      return "1.25.0-b149b57a";
+    case "get_network":
+      // Lowercase. API.md shows "Testnet"; the binary serialises lowercase.
+      return "mainnet";
+    case "get_address":
+      return XELIS_SANDBOX_ADDRESS;
+    case "get_balance":
+      return balanceAtomic;
+    case "has_balance":
+      return funded;
+    case "get_nonce":
+      return funded ? 7 : 0;
+    case "get_topoheight":
+      return walletTopoheight;
+    case "is_online":
+      return true;
+    case "get_tracked_assets":
+      return [XELIS_NATIVE_ASSET_MOCK];
+    case "network_info":
+      return {
+        average_block_time: 4657,
+        block_reward: 32855256,
+        block_time_target: 5000,
+        block_version: 7,
+        circulating_supply: 599732954261050,
+        connected_to: "wss://node.xelis.io/json_rpc",
+        difficulty: "255937095",
+        height: 7672788,
+        maximum_supply: 1840000000000000,
+        mempool_size: 0,
+        network: "mainnet",
+        pruned_topoheight: null,
+        stable_topoheight: stableTopoheight,
+        stableheight: 7672764,
+        top_block_hash:
+          "43d3408cb60a456e7aa757dafd2417a8a0d1bafa141791bc86e5c763802ad64a",
+        topoheight: daemonTopoheight,
+        version: "1.25.0-a6ae4cd9",
+      };
+    case "set_offline_mode":
+    case "set_online_mode":
+      return true;
+    case "estimate_fees": {
+      // See note 3 above. `destination === self` is the registered baseline.
+      const to = params?.transfers?.[0]?.destination;
+      return to === XELIS_SANDBOX_ADDRESS ? 25000 : 125000;
+    }
+    case "build_transaction": {
+      if (!funded) {
+        // VERBATIM from the binary against an unfunded wallet.
+        throw (
+          "RPC error -32004: BALANCE_NOT_FOUND Balance for asset " +
+          `${XELIS_NATIVE_ASSET_MOCK} was not found`
+        );
+      }
+      return {
+        hash: "ca283257c2b7a167fef8b16ba1c525785bce365ff22223629448db2cedc34a5b",
+        fee: 125000,
+        nonce: 7,
+        size: 2048,
+        source: XELIS_SANDBOX_ADDRESS,
+        version: 0,
+      };
+    }
+    case "list_transactions": {
+      if (!funded) return [];
+      // Flattened variant keys, snake_case, exactly as `api/wallet.rs` defines
+      // them. Timestamps are MILLISECONDS (XELIS block times are ms).
+      const now = Date.now();
+      return [
+        {
+          hash: "ca283257c2b7a167fef8b16ba1c525785bce365ff22223629448db2cedc34a5b",
+          topoheight: daemonTopoheight - 12,
+          timestamp: now - 45 * 60 * 1000,
+          incoming: {
+            from: XELIS_SANDBOX_PEER,
+            transfers: [
+              {
+                asset: XELIS_NATIVE_ASSET_MOCK,
+                amount: 250_000_000_000,
+                extra_data: null,
+              },
+            ],
+          },
+        },
+        {
+          hash: "75704058dab4956f372b3f0109b0cf81aa2fe504482826037bda67bcf872b732",
+          topoheight: daemonTopoheight - 840,
+          timestamp: now - 6 * 60 * 60 * 1000,
+          outgoing: {
+            fee: 125000,
+            nonce: 6,
+            transfers: [
+              {
+                destination: XELIS_SANDBOX_PEER,
+                asset: XELIS_NATIVE_ASSET_MOCK,
+                amount: 30_000_000_000,
+                extra_data: null,
+              },
+            ],
+          },
+        },
+        {
+          hash: "f65066fc838156c6dec1fdbf7b861b6e678ecca341db368010cce24340a40cae",
+          topoheight: daemonTopoheight - 5_200,
+          timestamp: now - 28 * 60 * 60 * 1000,
+          coinbase: { reward: 32855256 },
+        },
+      ];
+    }
+    case "get_pending_transactions":
+      return [];
+    case "get_assets":
+      return [];
+    case "get_asset_precision":
+      // The binary ERRORS here on a wallet that has not stored the asset yet,
+      // which is why XEL's 8 decimals are hardcoded rather than queried.
+      throw (
+        "RPC error -32004: Error while loading data with encrypted key from disk"
+      );
+    default:
+      // Deliberately a throw, not `{}`: a typed caller could read an empty
+      // object as a real answer, which is how Zano once rendered "Sent -0" for
+      // a received transfer.
+      throw (
+        `RPC error -32601: METHOD_NOT_FOUND Method '${method}' in request was not found ` +
+        "(xelisRpcDispatch in src/lib/tauri-mocks.ts)"
+      );
   }
 }
 
@@ -2811,6 +3308,15 @@ function sidecarStatus(): unknown {
     // shown to exactly the users who already have a node — never to a fresh
     // install, which is the state the sandbox otherwise always simulates.
     particlUnpruned: import.meta.env.VITE_MOCK_PARTICL_UNPRUNED === "1",
+    // 2026-09-15. The unlock screen's "swaps waiting" note (`LoginView`).
+    // `VITE_MOCK_SWAPS_WAITING=<n>` reports n swaps in progress as of 30
+    // minutes ago; absent, the note stays hidden, as on a node with none.
+    swapsLastSeen: import.meta.env.VITE_MOCK_SWAPS_WAITING
+      ? {
+          inProgress: Number(import.meta.env.VITE_MOCK_SWAPS_WAITING),
+          at: Math.floor(Date.now() / 1000) - 1800,
+        }
+      : null,
     // The coins the RUNNING node reports — Rust reads them out of the engine
     // (`activeCoins()`: every chainclient block whose `connection_type` is
     // not "none"), so this is derived from the same rows `swap_sidecar_coin_
@@ -3677,6 +4183,12 @@ function sidecarApi(method: "GET" | "POST", rawPath: unknown, body: any): unknow
 // Top-level dispatch
 // ---------------------------------------------------------------------------
 
+function recordMinerStart(cmd: string, args: unknown): null {
+  const g = globalThis as { __pwndaMinerStarts?: { cmd: string; args: unknown }[] };
+  (g.__pwndaMinerStarts ??= []).push({ cmd, args });
+  return null;
+}
+
 const MOCKS: Record<string, (args: any) => unknown> = {
   // Plugin namespace
   "plugin:opener|open_url": () => null,
@@ -3704,19 +4216,31 @@ const MOCKS: Record<string, (args: any) => unknown> = {
     scenario() === "degraded",
   is_gpu_mining: () =>
     scenario() === "gpu_mining_active" ||
-    scenario() === "cpu_gpu_mining_active",
-  start_xmrig: () => null,
-  start_gpu_miner: () => null,
+    scenario() === "cpu_gpu_mining_active" ||
+    scenario() === "xelis_mining_active",
+  // The CPU lane's OTHER backend, with its own process slot and API port.
+  // `is_mining` (xmrig's PID check) stays FALSE during a XelisHash session:
+  // keeping them separate here is what lets the sandbox catch a frontend
+  // that asks only xmrig whether the CPU is mining.
+  is_srbminer_cpu_mining: () => scenario() === "xelis_mining_active",
+  // Each start records its args on `window.__pwndaMinerStarts` so a sandbox
+  // pass can read back exactly what the thread / intensity / device controls
+  // would launch with (2026-09-16). Sandbox-only; nothing secret is passed.
+  start_xmrig: (args) => recordMinerStart("start_xmrig", args),
+  start_gpu_miner: (args) => recordMinerStart("start_gpu_miner", args),
+  start_srbminer_cpu: (args) => recordMinerStart("start_srbminer_cpu", args),
   stop_xmrig: () => null,
   stop_gpu_miner: () => null,
+  stop_srbminer_cpu: () => null,
   run_xmrig_benchmark: () => ({ hashrate: 7250, durationSecs: 30 }),
 
   // Mining: live snapshots
   get_xmrig_snapshot: () => xmrigSnapshot(),
   get_gpu_miner_snapshot: () => gpuSnapshot(),
+  get_srbminer_cpu_snapshot: () => srbCpuSnapshot(),
 
   // Mining: pool integrations
-  fetch_pool_stats: () => minerStats(),
+  fetch_pool_stats: (args: any) => minerStats(args?.poolId),
   ping_pools: (args: any) => pingResults(args?.reqs),
   ping_pools_via_proxy: (args: any) => pingResults(args?.reqs),
   proxy_refresh: () => ({
@@ -3862,18 +4386,21 @@ const MOCKS: Record<string, (args: any) => unknown> = {
   },
   open_data_location: () => null,
 
-  // Background wallet-rpc sidecar updater (sidecar_update.rs). Monero is shown
-  // mid-reconcile — installed v0.18.5.0 with a newer v0.18.5.1 shipped in the
-  // installer — so the "in use / shipped" divergence branch actually renders
-  // in the sandbox. Zephyr is dormant (never opened), which is the other
-  // branch. Between them the card's two states are both covered.
+  // Background updater + Settings ▸ Wallet binaries (sidecar_update.rs). One
+  // wallet per row state, so every branch of `describeWalletBinary` renders:
+  // Monero mid-reconcile (in use v0.18.5.0, shipped v0.18.5.1), Zephyr
+  // dormant with a payload (Unpack), Zano unpacked before version markers
+  // existed (the real dev machine's state on 2026-09-16), and Xelis absent
+  // from the build (Download) — the state that stranded the user that day.
   sidecar_update_status: () => ({
     enabled: true,
     lastCheck: Math.floor(Date.now() / 1000) - 3 * 60 * 60,
-    moneroInstalled: "v0.18.5.0",
-    zephyrInstalled: null,
-    moneroBundled: "v0.18.5.1",
-    zephyrBundled: "v2.3.0",
+    wallets: [
+      { id: "monero", installed: "v0.18.5.0", present: true, bundled: "v0.18.5.1" },
+      { id: "zephyr", installed: null, present: false, bundled: "v2.3.0" },
+      { id: "zano", installed: null, present: true, bundled: "v2.2.1.506" },
+      { id: "xelis", installed: null, present: false, bundled: null },
+    ],
   }),
   sidecar_update_set_enabled: () => null,
   sidecar_update_check_now: () => null,
@@ -4160,6 +4687,9 @@ const MOCKS: Record<string, (args: any) => unknown> = {
   zph_rpc_is_running: () => walletFunded(),
   xmr_check_wallet_rpc: () => walletFunded(),
   zph_check_wallet_rpc: () => walletFunded(),
+  // Settings ▸ Wallet binaries calls these directly (2026-09-16).
+  xmr_download_wallet_rpc: () => null,
+  zph_download_wallet_rpc: () => null,
   xmr_check_defender_exclusion: () => true,
   zph_check_defender_exclusion: () => true,
   xmr_start_rpc: () => null,
@@ -4184,6 +4714,31 @@ const MOCKS: Record<string, (args: any) => unknown> = {
   zano_probe_node: () => ({ url: "http://37.27.100.59:10500", ok: true, latency_ms: 300, height: 3_834_338, error: null }),
   zano_rpc_call: (args: any) => zanoRpcDispatch(args),
   zano_download_wallet_rpc: () => null,
+
+  // Xelis sidecar lifecycle (`xelis_rpc.rs`, contract 2026-09-15): every
+  // command the contract names except `xelis_rpc_call`, which goes to the
+  // deliberately empty `xelisRpcDispatch` above until WALLET-CORE fills it with
+  // shapes captured from the real binary. Same funded / not-loaded convention
+  // as XMR/ZPH/ZANO. The probe echoes the URL it was asked about; the latency
+  // is a fixture, and the height is a REAL mainnet topoheight read from
+  // node.xelis.io on 2026-09-15 during the wallet-core cross-check. (It was
+  // `null` with a comment saying no Xelis topoheight had been verified here —
+  // true when the mock was written, false once the sidecar landed, and a null
+  // height makes the node picker's "caught up" comparison untestable.)
+  xelis_binary_status: () => true,
+  xelis_rpc_is_running: () => walletFunded(),
+  xelis_ensure_wallet: () => true,
+  xelis_start_rpc: () => null,
+  xelis_stop_rpc: () => null,
+  xelis_probe_node: (args: any) => ({
+    url: typeof args?.url === "string" ? args.url : "https://node.xelis.io",
+    ok: true,
+    latency_ms: 180,
+    height: 8_906_977,
+    error: null,
+  }),
+  xelis_download_wallet_rpc: () => null,
+  xelis_rpc_call: (args: any) => xelisRpcDispatch(args),
 
   // ── BasicSwap swap sidecar (swap_sidecar.rs) ──────────────────────────
   // Stateful — see the `sidecar*` block above for why `_start` resolves on a
@@ -4609,6 +5164,12 @@ const MOCKS: Record<string, (args: any) => unknown> = {
       );
     }
     // No live bid feed in the sandbox — see the Monero twin above.
+    // `VITE_MOCK_SWAP_IN_PROGRESS=1` (2026-09-15) answers "in use" for an
+    // enabled, configured, unparked coin. That reaches Lock's "the swap node
+    // keeps your wallet open" note and removeWallet's refusal.
+    if (import.meta.env.VITE_MOCK_SWAP_IN_PROGRESS === "1") {
+      return c.enabled && c.configured && !c.parked;
+    }
     return false;
   },
   swap_sidecar_set_coin: (args: any) => {

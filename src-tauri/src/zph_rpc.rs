@@ -859,6 +859,368 @@ pub async fn zph_rpc_is_running(app: AppHandle) -> Result<bool, String> {
 }
 
 // =========================================================================
+// Engine-owned SWAP wallet-rpc (2026-09-15)
+// =========================================================================
+//
+// BasicSwap keeps a coin's MAIN wallet and its PER-SWAP wallets on two
+// wallet-rpc clients (PWNDA-PATCH-5): main traffic goes to `mainwalletrpcport`,
+// and every per-swap wallet — the watch wallet `findTxB` opens, the spend
+// wallet `spendBLockTx` builds — is opened on `walletrpcport`. A wallet-rpc
+// holds ONE open wallet at a time.
+//
+// Until 2026-09-15 `swap_sidecar::apply_host_zph_wallet_to_config` pointed BOTH
+// ports at the user's own zephyr-wallet-rpc (this module's 18083). The first
+// per-swap `open_wallet` therefore closed the user's wallet on their own
+// process, and the engine cannot reopen it — it has no password for it. The
+// Zephyr panel then showed a swap wallet, and the node's next main-wallet spend
+// refused with "expected confirmed identity" — ZANO's 2026-09-13 symptom by
+// another road. `scripts/swap/verify-zeph-host-wallet.py` section 16
+// reproduces it against the real engine code. Monero never had this: its
+// per-swap wallets live on the engine's own monero-wallet-rpc.
+//
+// This is that second process for Zephyr, owned by the swap supervisor: the
+// same binary as the user's, a wallet-dir of its own that PERSISTS across
+// restarts (an in-flight swap reopens its wallets by name), and fresh
+// credentials each start (the supervisor rewrites them into basicswap.json
+// before the engine reads it).
+
+/// Preferred port. 18083 is the user's Zephyr wallet-rpc and 18084/18086 are
+/// Zano's Main/Scratch; a busy port falls back to a free one.
+pub const ZPH_SWAP_RPC_PORT: u16 = 18087;
+
+/// Inside the app-data dir, beside (never inside) [`ZPH_WALLET_DIR_NAME`].
+const ZPH_SWAP_WALLET_DIR_NAME: &str = "zph-swap-wallets";
+
+#[derive(Default)]
+struct ZphSwapState {
+    child: Option<tokio::process::Child>,
+    port: u16,
+    creds: Option<(String, String)>,
+    starting: bool,
+}
+
+/// `std::sync::Mutex`, like Zano Scratch's state: its guard is never held
+/// across an `.await` (every function below takes what it needs in a block
+/// scope first), which keeps the futures `Send`.
+fn zph_swap_state() -> &'static Mutex<ZphSwapState> {
+    static STATE: OnceLock<Mutex<ZphSwapState>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(ZphSwapState::default()))
+}
+
+/// How the supervisor reaches the swap wallet-rpc it started.
+#[derive(Clone, Debug)]
+pub struct ZphSwapWalletStarted {
+    pub port: u16,
+    pub user: String,
+    pub pass: String,
+}
+
+fn get_swap_wallet_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let app_data = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("Failed to get app data dir: {}", e))?;
+    let dir = app_data.join(ZPH_SWAP_WALLET_DIR_NAME);
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("Failed to create the Zephyr swap wallet dir: {}", e))?;
+    Ok(dir)
+}
+
+fn get_swap_pidfile(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(get_swap_wallet_dir(app)?.join("swap-wallet-rpc.pid"))
+}
+
+fn get_swap_log_file(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(get_swap_wallet_dir(app)?.join("swap-wallet-rpc.log"))
+}
+
+fn zph_swap_rpc_url(port: u16) -> String {
+    format!("http://127.0.0.1:{}/json_rpc", port)
+}
+
+/// The swap wallet-rpc's command line. Pure, so its shape is unit-tested:
+/// wallet-dir mode (no `--wallet-file` — the engine opens and creates per-swap
+/// wallets over RPC), its own port and credentials, the same daemon rules as
+/// [`zph_start_rpc`].
+pub fn zph_swap_spawn_args(
+    port: u16,
+    creds: &(String, String),
+    wallet_dir: &std::path::Path,
+    daemon_address: &str,
+    log_file: &std::path::Path,
+    concurrency: u32,
+) -> Vec<String> {
+    let mut args: Vec<String> = vec![
+        "--rpc-bind-ip".into(),
+        "127.0.0.1".into(),
+        "--rpc-bind-port".into(),
+        port.to_string(),
+        "--rpc-login".into(),
+        format!("{}:{}", creds.0, creds.1),
+        "--wallet-dir".into(),
+        wallet_dir.to_string_lossy().to_string(),
+        "--daemon-address".into(),
+        daemon_address.to_string(),
+        "--log-level".into(),
+        "0".into(),
+        "--non-interactive".into(),
+        "--log-file".into(),
+        log_file.to_string_lossy().to_string(),
+        "--max-concurrency".into(),
+        concurrency.to_string(),
+    ];
+    if daemon_address.starts_with("http://") {
+        args.push("--daemon-ssl".into());
+        args.push("disabled".into());
+    }
+    if daemon_address.contains("127.0.0.1") || daemon_address.contains("localhost") {
+        args.push("--trusted-daemon".into());
+    }
+    args
+}
+
+/// Start (or attach to) the engine-owned swap wallet-rpc and wait until it
+/// answers. Refuses rather than share: a port that resolves to the user's own
+/// wallet-rpc is an error, never a fallback.
+pub async fn zph_swap_wallet_start(
+    app: &AppHandle,
+    daemon_address: &str,
+) -> Result<ZphSwapWalletStarted, String> {
+    {
+        let mut st = zph_swap_state()
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if st.child.is_some() {
+            return match st.creds.clone() {
+                Some((user, pass)) => Ok(ZphSwapWalletStarted { port: st.port, user, pass }),
+                None => Err(
+                    "the Zephyr swap wallet-rpc is running but has no recorded credentials"
+                        .to_string(),
+                ),
+            };
+        }
+        if st.starting {
+            return Err("a Zephyr swap wallet-rpc start is already in progress".to_string());
+        }
+        st.starting = true;
+    }
+    struct StartingClaim;
+    impl Drop for StartingClaim {
+        fn drop(&mut self) {
+            if let Ok(mut st) = zph_swap_state().lock() {
+                st.starting = false;
+            }
+        }
+    }
+    let _claim = StartingClaim;
+
+    // A swap wallet-rpc left behind by a hard-killed session: pidfile-precise
+    // and image-checked, exactly like the user's own instance.
+    let pidfile = get_swap_pidfile(app)?;
+    if let Some(old_pid) = read_pidfile(&pidfile) {
+        let _ = kill_process_by_pid_and_image(old_pid, ZPH_BINARY_NAME).await;
+        for _ in 0..10 {
+            if !port_is_bound(ZPH_SWAP_RPC_PORT).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        delete_pidfile(&pidfile);
+    }
+
+    let port = crate::wallet_rpc_common::pick_free_port(ZPH_SWAP_RPC_PORT);
+    if port == ZPH_RPC_PORT || port == active_zph_port() {
+        return Err(format!(
+            "refusing to start the Zephyr swap wallet-rpc on port {} — that is the user's own \
+             wallet-rpc, and per-swap wallets opened there would close the user's wallet",
+            port
+        ));
+    }
+
+    let binary = resolve_rpc_binary(app)?;
+    let wallet_dir = get_swap_wallet_dir(app)?;
+    let log_file = get_swap_log_file(app)?;
+    let creds = (random_hex(16), random_hex(16));
+    let concurrency = (num_cpus::get_physical() as u32).clamp(2, 16);
+    let args = zph_swap_spawn_args(port, &creds, &wallet_dir, daemon_address, &log_file, concurrency);
+
+    let mut cmd = tokio::process::Command::new(&binary);
+    cmd.args(&args);
+    cmd.current_dir(&wallet_dir);
+    #[cfg(target_os = "windows")]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    cmd.kill_on_drop(true);
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    cmd.stdin(std::process::Stdio::null());
+
+    let child = cmd
+        .spawn()
+        .map_err(|e| format!("Failed to spawn the Zephyr swap wallet-rpc: {}", e))?;
+    if let Some(pid) = child.id() {
+        write_pidfile(&pidfile, pid);
+    }
+    {
+        let mut st = zph_swap_state()
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        st.child = Some(child);
+        st.port = port;
+        st.creds = Some(creds.clone());
+        st.starting = false;
+    }
+
+    let url = zph_swap_rpc_url(port);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        if do_rpc_call_at(
+            &url,
+            Some(&creds),
+            "get_version",
+            serde_json::json!({}),
+            std::time::Duration::from_secs(2),
+        )
+        .await
+        .is_ok()
+        {
+            return Ok(ZphSwapWalletStarted {
+                port,
+                user: creds.0.clone(),
+                pass: creds.1.clone(),
+            });
+        }
+        let exited = {
+            let mut st = zph_swap_state()
+                .lock()
+                .map_err(|e| format!("Lock error: {}", e))?;
+            match st.child.as_mut() {
+                Some(c) => c.try_wait().ok().flatten(),
+                None => None,
+            }
+        };
+        if let Some(status) = exited {
+            let tail = read_log_tail(&log_file, 3072);
+            zph_swap_kill_and_clear().await;
+            delete_pidfile(&pidfile);
+            return Err(format!(
+                "the Zephyr swap wallet-rpc exited during startup ({}). Last log lines:\n{}",
+                status, tail
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let tail = read_log_tail(&log_file, 3072);
+            let _ = zph_swap_wallet_stop(app).await;
+            return Err(format!(
+                "the Zephyr swap wallet-rpc did not become ready within 30s. Last log lines:\n{}",
+                tail
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
+/// Take whatever child is recorded, store and close its open wallet, then kill
+/// it. Needs no `AppHandle`, so it is unit-testable. Idempotent.
+async fn zph_swap_kill_and_clear() {
+    let (child_opt, port, creds) = {
+        let mut st = match zph_swap_state().lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let child = st.child.take();
+        let creds = st.creds.take();
+        st.starting = false;
+        (child, st.port, creds)
+    };
+    let Some(mut child) = child_opt else {
+        return;
+    };
+    if let Some(c) = creds.as_ref() {
+        // `store` first: an open per-swap wallet carries the swap's scan state.
+        let url = zph_swap_rpc_url(port);
+        for (method, secs) in [("store", 10), ("close_wallet", 5), ("stop_wallet", 5)] {
+            let _ = do_rpc_call_at(
+                &url,
+                Some(c),
+                method,
+                serde_json::json!({}),
+                std::time::Duration::from_secs(secs),
+            )
+            .await;
+        }
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    let _ = child.kill().await;
+    let _ = child.wait().await;
+}
+
+/// Stop the engine-owned swap wallet-rpc. Wallet files are KEPT — an in-flight
+/// swap reopens its per-swap wallets by name after the node restarts.
+/// Idempotent, like every other stop in this module.
+pub async fn zph_swap_wallet_stop(app: &AppHandle) -> Result<(), String> {
+    zph_swap_kill_and_clear().await;
+    if let Ok(p) = get_swap_pidfile(app) {
+        delete_pidfile(&p);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod swap_wallet_rpc_tests {
+    use super::*;
+
+    fn arg_after<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
+        args.iter()
+            .position(|a| a == flag)
+            .and_then(|i| args.get(i + 1))
+            .map(|s| s.as_str())
+    }
+
+    #[test]
+    fn the_swap_wallet_rpc_never_prefers_the_users_port_or_wallet_dir() {
+        assert_ne!(ZPH_SWAP_RPC_PORT, ZPH_RPC_PORT);
+        assert_ne!(ZPH_SWAP_WALLET_DIR_NAME, ZPH_WALLET_DIR_NAME);
+    }
+
+    #[test]
+    fn spawn_args_are_wallet_dir_mode_on_their_own_port() {
+        let creds = ("u".to_string(), "p".to_string());
+        let dir = std::path::Path::new("/data/zph-swap-wallets");
+        let log = std::path::Path::new("/data/zph-swap-wallets/swap-wallet-rpc.log");
+        let args = zph_swap_spawn_args(18087, &creds, dir, "http://remote-node.example:17767", log, 4);
+        assert_eq!(arg_after(&args, "--rpc-bind-port"), Some("18087"));
+        assert_eq!(arg_after(&args, "--rpc-bind-ip"), Some("127.0.0.1"));
+        assert_eq!(arg_after(&args, "--rpc-login"), Some("u:p"));
+        assert_eq!(arg_after(&args, "--wallet-dir"), Some(dir.to_string_lossy().as_ref()));
+        assert!(!args.iter().any(|a| a == "--wallet-file"), "the engine opens per-swap wallets over RPC");
+        assert!(args.iter().any(|a| a == "--non-interactive"));
+        assert_eq!(arg_after(&args, "--daemon-ssl"), Some("disabled"));
+        assert!(!args.iter().any(|a| a == "--trusted-daemon"), "a remote daemon is untrusted");
+    }
+
+    #[test]
+    fn daemon_rules_match_the_users_instance() {
+        let creds = ("u".to_string(), "p".to_string());
+        let dir = std::path::Path::new("d");
+        let log = std::path::Path::new("l");
+        let https = zph_swap_spawn_args(18087, &creds, dir, "https://node.example:443", log, 2);
+        assert!(!https.iter().any(|a| a == "--daemon-ssl"), "https keeps autodetect");
+        let local = zph_swap_spawn_args(18087, &creds, dir, "http://127.0.0.1:17767", log, 2);
+        assert!(local.iter().any(|a| a == "--trusted-daemon"));
+    }
+
+    #[tokio::test]
+    async fn stopping_with_nothing_running_is_a_no_op() {
+        zph_swap_kill_and_clear().await;
+        zph_swap_kill_and_clear().await;
+        let st = zph_swap_state().lock().unwrap();
+        assert!(st.child.is_none());
+        assert!(st.creds.is_none());
+        assert!(!st.starting);
+    }
+}
+
+// =========================================================================
 // Tauri command — node probe (bypasses webview CORS)
 // =========================================================================
 
@@ -1568,6 +1930,147 @@ mod tests {
             .and_then(|v| v.as_u64())
             .expect("version field missing from response");
         assert!(version > 0, "version looked empty: {}", value);
+    }
+
+    /// 2026-09-15, against the REAL binary: the property the swap wallet-rpc
+    /// exists for. A wallet created on a SEPARATE process leaves the user's
+    /// open wallet alone; the same create on the user's OWN process replaces
+    /// it — the old topology's defect, reproduced with zephyr-wallet-rpc
+    /// itself rather than `verify-zeph-host-wallet.py`'s stub. The swap
+    /// process is started from the production `zph_swap_spawn_args`, so this
+    /// also proves that argument set yields a working wallet-rpc.
+    #[tokio::test]
+    #[ignore = "live; spawns two zephyr-wallet-rpc processes + uses a public daemon"]
+    async fn zph_rpc_live_swap_wallet_rpc_leaves_the_users_wallet_open() {
+        let binary = match test_binary_path() {
+            Some(p) => p,
+            None => {
+                eprintln!(
+                    "SKIP: no real zephyr-wallet-rpc[.exe] found at src-tauri/binaries/ \
+                     or the repo's .cache/sidecars-fetch/."
+                );
+                return;
+            }
+        };
+        let root = std::env::temp_dir().join(format!("pwnda-zph-swap-live-{}", random_hex(4)));
+        let user_dir = root.join("user");
+        let swap_dir = root.join("swap");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::create_dir_all(&swap_dir).unwrap();
+
+        async fn call(
+            port: u16,
+            creds: &(String, String),
+            method: &str,
+            params: serde_json::Value,
+            secs: u64,
+        ) -> Result<serde_json::Value, String> {
+            do_rpc_call_at(
+                &format!("http://127.0.0.1:{}/json_rpc", port),
+                Some(creds),
+                method,
+                params,
+                std::time::Duration::from_secs(secs),
+            )
+            .await
+        }
+        async fn address(port: u16, creds: &(String, String)) -> Option<String> {
+            for _ in 0..12 {
+                if let Ok(v) =
+                    call(port, creds, "get_address", serde_json::json!({ "account_index": 0 }), 10)
+                        .await
+                {
+                    return v.get("address").and_then(|a| a.as_str()).map(|s| s.to_string());
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+            None
+        }
+
+        // The user's process, with the user's wallet open.
+        let user_port: u16 = 28185;
+        let user_creds = (random_hex(8), random_hex(8));
+        let mut user = spawn_wallet_rpc(&binary, user_port, &user_dir, &user_creds).await;
+        let created_user = call(
+            user_port,
+            &user_creds,
+            "create_wallet",
+            serde_json::json!({ "filename": "user-wallet", "language": "English" }),
+            60,
+        )
+        .await;
+        let user_addr = address(user_port, &user_creds).await;
+
+        // The swap process, started from the production argument set.
+        let swap_port: u16 = 28186;
+        let swap_creds = (random_hex(8), random_hex(8));
+        let log = swap_dir.join("swap-wallet-rpc.log");
+        let mut swap_cmd = tokio::process::Command::new(&binary);
+        swap_cmd.args(zph_swap_spawn_args(swap_port, &swap_creds, &swap_dir, ZPH_TEST_DAEMON, &log, 2));
+        swap_cmd.current_dir(&swap_dir);
+        #[cfg(target_os = "windows")]
+        swap_cmd.creation_flags(CREATE_NO_WINDOW);
+        swap_cmd
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .stdin(std::process::Stdio::null());
+        let mut swap = swap_cmd.spawn().expect("spawn the swap wallet-rpc from zph_swap_spawn_args");
+        let mut swap_version = Err("not attempted".to_string());
+        for _ in 0..80 {
+            swap_version = call(swap_port, &swap_creds, "get_version", serde_json::json!({}), 2).await;
+            if swap_version.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+
+        // A per-swap wallet on the SWAP process.
+        let created_swap = call(
+            swap_port,
+            &swap_creds,
+            "create_wallet",
+            serde_json::json!({ "filename": "per-swap-wallet", "language": "English" }),
+            60,
+        )
+        .await;
+        let user_addr_after_separate = address(user_port, &user_creds).await;
+        let swap_file_in_dir = swap_dir.join("per-swap-wallet.keys").exists();
+
+        // CONTROL — the old topology: the same create on the USER's process.
+        let created_on_user = call(
+            user_port,
+            &user_creds,
+            "create_wallet",
+            serde_json::json!({ "filename": "per-swap-on-user-process", "language": "English" }),
+            60,
+        )
+        .await;
+        let user_addr_after_shared = address(user_port, &user_creds).await;
+
+        let _ = user.kill().await;
+        let _ = user.wait().await;
+        let _ = swap.kill().await;
+        let _ = swap.wait().await;
+        let _ = std::fs::remove_dir_all(&root);
+
+        created_user.expect("create the user's wallet");
+        let user_addr = user_addr.expect("the user's wallet answers get_address");
+        swap_version.expect("the swap wallet-rpc started from zph_swap_spawn_args answers get_version");
+        created_swap.expect("create a per-swap wallet on the swap process");
+        assert!(swap_file_in_dir, "the per-swap wallet file must land in the swap wallet dir");
+        assert_eq!(
+            user_addr_after_separate.as_deref(),
+            Some(user_addr.as_str()),
+            "a per-swap wallet on a SEPARATE process must leave the user's wallet open"
+        );
+        created_on_user.expect("control: create on the user's process");
+        assert_ne!(
+            user_addr_after_shared.as_deref(),
+            Some(user_addr.as_str()),
+            "control: a per-swap wallet on the user's OWN process replaces the user's wallet — \
+             if this ever holds equal, the control no longer demonstrates the defect"
+        );
     }
 
     /// GATE (Grove expansion plan, Phase C, unit C-RZ): "a headless start

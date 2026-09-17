@@ -29,6 +29,23 @@ export type ZphAssetType = "ZPH" | "ZSD" | "ZRS" | "ZYS";
 
 export const ZPH_ASSETS: ZphAssetType[] = ["ZPH", "ZSD", "ZRS", "ZYS"];
 
+/**
+ * The RPC asset a send selector names. `undefined` is the chain's native asset
+ * (ZPH), which is what every non-asset send passes.
+ *
+ * Anything else THROWS. Until 2026-09-15 `sendTransaction` mapped every
+ * unrecognised selector to ZPH, so a caller that passed a UI ticker
+ * ("ZEPHUSD") or a stray value would have sent ZEPH while the modal said
+ * something else. Refusing costs nothing; guessing can move the wrong asset.
+ */
+export function parseZphAssetSelector(selector: string | undefined): ZphAssetType {
+  if (selector === undefined) return "ZPH";
+  if ((ZPH_ASSETS as string[]).includes(selector)) return selector as ZphAssetType;
+  throw new Error(
+    `Unknown Zephyr asset ${JSON.stringify(selector)} (expected ZPH, ZSD, ZRS or ZYS). Nothing was sent.`,
+  );
+}
+
 /** Map RPC asset type to the ticker shown in the UI. */
 export const ZPH_UI_TICKER: Record<ZphAssetType, string> = {
   ZPH: "ZEPH",
@@ -295,7 +312,26 @@ export async function getAllBalances(): Promise<ZphAssetBalance[]> {
   return r.balances ?? [];
 }
 
-/** Fetch a single asset's balance. */
+/**
+ * The entry for `asset` in a `get_balance` response, or null (= none held).
+ *
+ * Selected BY `asset_type`, never by position. zephyr-wallet-rpc v2.3.0 builds
+ * the array from the requested asset list and skips zero balances
+ * (`wallet_rpc_server.cpp:475, 483-484`), so a single-`asset_type` request
+ * returns either nothing or that one asset, and `list[0]` happened to be
+ * right. It stops being right as soon as a response carries more than one
+ * entry (`all_assets`, or a future server), which is why the vendored swap
+ * engine searches instead of indexing
+ * (`upstream/patches/0013-zephyr-coin-module.patch`). Corrected 2026-09-15.
+ */
+export function pickAssetBalance(
+  list: ZphAssetBalance[] | null | undefined,
+  asset: ZphAssetType
+): ZphAssetBalance | null {
+  return (list ?? []).find((b) => b.asset_type === asset) ?? null;
+}
+
+/** Fetch a single asset's balance. `null` means the wallet holds none of it. */
 export async function getBalanceForAsset(
   asset: ZphAssetType
 ): Promise<ZphAssetBalance | null> {
@@ -303,8 +339,7 @@ export async function getBalanceForAsset(
     account_index: 0,
     asset_type: asset,
   });
-  const list = r.balances ?? [];
-  return list[0] ?? null;
+  return pickAssetBalance(r.balances, asset);
 }
 
 export async function getAddress(): Promise<string> {

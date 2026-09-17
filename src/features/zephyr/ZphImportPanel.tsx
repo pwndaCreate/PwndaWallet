@@ -17,9 +17,10 @@ import { dateStringToZephyrHeight } from "../../utils/heightFromDate";
  * Generate path: clicking "Generate new 25-word Zephyr seed" populates
  * the textarea so the user can review the seed before persisting it.
  *
- * Owns local form state. Async flow: validate → derive → cache seed
- * → race best node for the current tip (when no creation date is
- * provided) → persist to vault → start sidecar sync.
+ * Owns local form state. Async flow: validate → derive → race best
+ * node for the current tip (when no creation date is provided) →
+ * persist to vault (which names the wallet file) → cache seed → start
+ * sidecar sync on that file.
  */
 export function ZphImportPanel({
   sessionPassword,
@@ -35,8 +36,15 @@ export function ZphImportPanel({
     React.SetStateAction<Partial<Record<ChainType, WalletInfo>>>
   >;
   setZphSeedLoaded: (seed: string | null) => void;
-  saveZphSeedToVault: (seed: string, restoreHeight: number | null) => Promise<void>;
-  startZphSync: (seed: string, masterPassword: string, restoreHeight?: number) => void;
+  /** Resolves the saved entry's wallet file, or null when nothing was saved
+   *  (the vault hook has already reported why). */
+  saveZphSeedToVault: (seed: string, restoreHeight: number | null) => Promise<string | null>;
+  startZphSync: (
+    seed: string,
+    masterPassword: string,
+    restoreHeight?: number,
+    walletFilename?: string
+  ) => void;
 }) {
   const [importValue, setImportValue] = useState("");
   const [importing, setImporting] = useState(false);
@@ -63,10 +71,11 @@ export function ZphImportPanel({
         setError("Invalid Zephyr seed — " + validation.error);
         return;
       }
+      if (!sessionPassword) {
+        setError("Session password missing — please lock and unlock the wallet.");
+        return;
+      }
       const zphWallet = await zphAdapter.deriveFromOwnSeed!(seed);
-      setWalletsByChain((prev) => ({ ...prev, zephyr: zphWallet }));
-      setZphSeedLoaded(seed);
-      setImportValue("");
 
       // Pick a restore height:
       //   - user-supplied creation date → convert
@@ -88,14 +97,20 @@ export function ZphImportPanel({
           /* non-fatal — falls to scan-from-genesis */
         }
       }
-      setImportCreationDate("");
+      /**
+       * Save FIRST: the saved entry names the wallet file this session opens.
+       * Without it the session opened the PRIMARY wallet's `pwnda-zph-active`,
+       * and `initZphSession`'s address-mismatch self-heal deletes the file it
+       * opened (2026-09-16). See `XmrImportPanel` and log.md.
+       */
+      const walletFile = await saveZphSeedToVault(seed, zphRestoreHeight);
+      if (!walletFile) return; // nothing saved; the vault hook said why
 
-      await saveZphSeedToVault(seed, zphRestoreHeight);
-      if (!sessionPassword) {
-        setError("Session password missing — please lock and unlock the wallet.");
-        return;
-      }
-      startZphSync(seed, sessionPassword, zphRestoreHeight ?? 0);
+      setWalletsByChain((prev) => ({ ...prev, zephyr: zphWallet }));
+      setZphSeedLoaded(seed);
+      setImportValue("");
+      setImportCreationDate("");
+      startZphSync(seed, sessionPassword, zphRestoreHeight ?? 0, walletFile);
     } catch (e: any) {
       console.error("[ZphImportPanel] import threw:", e);
       setError("Zephyr import failed: " + (e?.message || String(e)));
