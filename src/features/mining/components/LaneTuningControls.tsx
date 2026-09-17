@@ -14,14 +14,19 @@
  */
 import type { GpuAlgorithm, MiningHardware } from "../../../types/mining";
 import type { GpuSelection } from "../gpuSelection";
-import { laneHasIntensity, type CpuMinerBinary } from "../miningLane";
+import {
+  LOLMINER_NO_INTENSITY,
+  gpuIntensityUnsupportedReason,
+  type CpuMinerBinary,
+} from "../miningLane";
 import type { CpuThreads, GpuIntensitySetting, GpuLike } from "../miningTuning";
 import { CpuThreadsControl } from "./CpuThreadsControl";
 import { GpuDevicePicker } from "./GpuDevicePicker";
 import { GpuIntensityControl } from "./GpuIntensityControl";
 
-export const LOLMINER_NO_INTENSITY =
-  "lolMiner (Octopus) has no intensity flag — it runs at its own default";
+// Re-exported: it moved to `miningLane` on 2026-09-17, when the reasons became
+// per-algorithm, and callers still import it from here.
+export { LOLMINER_NO_INTENSITY };
 
 export function LaneTuningControls({
   hardware,
@@ -68,7 +73,7 @@ export function LaneTuningControls({
       />
     );
   }
-  const hasIntensity = laneHasIntensity("gpu", gpuAlgorithm);
+  const intensityLocked = gpuIntensityUnsupportedReason(gpuAlgorithm);
   return (
     <div
       style={{
@@ -88,7 +93,7 @@ export function LaneTuningControls({
         value={gpuIntensityLevel}
         onChange={setGpuIntensityLevel}
         disabled={laneMining}
-        unsupportedReason={hasIntensity ? null : LOLMINER_NO_INTENSITY}
+        unsupportedReason={intensityLocked}
         variant={variant}
         delayBase={delayBase}
       />

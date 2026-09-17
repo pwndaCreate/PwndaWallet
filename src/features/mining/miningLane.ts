@@ -86,12 +86,43 @@ export function cpuThreadsLabel(args: {
 }
 
 /** Whether the displayed lane's miner has an intensity control at all. */
+export const LOLMINER_NO_INTENSITY =
+  "lolMiner (Octopus) has no intensity flag — it runs at its own default";
+
 export function laneHasIntensity(
   hardware: MiningHardware,
   gpuAlgorithm: GpuAlgorithm,
 ): boolean {
   // lolMiner (Octopus / CFX) has no `--gpu-intensity`; SRBMiner does.
-  return hardware === "cpu" || GPU_MINER[gpuAlgorithm].miner === "SRBMiner-MULTI";
+  if (hardware === "cpu") return true;
+  if (GPU_MINER[gpuAlgorithm].miner !== "SRBMiner-MULTI") return false;
+  // ...but not for an algorithm whose intensity is a VRAM request. See
+  // `gpuIntensityUnsupportedReason`.
+  return gpuIntensityUnsupportedReason(gpuAlgorithm) === null;
+}
+
+/**
+ * Why the GPU intensity control is locked on this lane, or `null` when it
+ * works.
+ *
+ * XelisHash gives every thread in flight its own 531 KiB scratchpad
+ * (`xelis-hash/src/v3.rs`: `MEMORY_SIZE = 531 * 128` u64), so "intensity" is a
+ * request for VRAM, and SRBMiner publishes no mapping from its 0-31 scale to a
+ * thread count. On 2026-09-17 a two-card run at 20 asked for more memory than
+ * either card had: both filled, the miner reported "not enough memory", and
+ * the machine froze. SRBMiner sizes itself to each card when the flag is
+ * absent, which is what its own start-mining-xelis.bat does.
+ */
+export function gpuIntensityUnsupportedReason(
+  gpuAlgorithm: GpuAlgorithm,
+): string | null {
+  if (GPU_MINER[gpuAlgorithm].miner !== "SRBMiner-MULTI") {
+    return LOLMINER_NO_INTENSITY;
+  }
+  if (gpuAlgorithm === "xelishashv3") {
+    return "XelisHash gives each GPU thread its own 531 KB scratchpad, so SRBMiner sizes itself to your card's memory — a manual intensity here asks for VRAM the card may not have.";
+  }
+  return null;
 }
 
 const INTENSITY_LONG: Record<MiningIntensity | GpuIntensity, string> = {
