@@ -48,11 +48,17 @@ export interface UseTxHistoryResult {
  * account summary registry — and this collapses the resulting per-address
  * entries back into one chain-level list.
  *
- * Dedupes by txid, keeping the first occurrence. A genuine internal
- * sweep can legitimately appear under two of a chain's addresses with two
- * different per-address amounts/directions; collapsing to one row is the
- * right call for a "recent activity" list even though it means an internal
- * transfer's second leg is not separately shown.
+ * One row per txid. When a tx touches several of the wallet's addresses the
+ * row shows the WALLET's net: the signed per-address amounts are summed.
+ *
+ * Corrected 2026-09-17. This used to keep the first occurrence. A 1.2 LTC
+ * send that spent 3.52 LTC from change/0 and returned 2.32 to change/2 read
+ * "-3.52247525 LTC", the whole input, because change/0's row came first. The
+ * P2P fee spend after a swap (change/2 → fee + change/3) had the same shape.
+ *
+ * Rows that cannot be signed (`pending`, or an address row with no direction)
+ * keep the old first-occurrence behaviour for that txid; a mempool tx is
+ * shown once, not netted from a partial picture.
  */
 export function mergeChainTx(
   result: {
@@ -65,16 +71,22 @@ export function mergeChainTx(
   const prefix = `${chain}:`;
   const loadingMap = result.loading ?? {};
   const errorsMap = result.errors ?? {};
-  const txs: ChainTx[] = [];
-  const seen = new Set<string>();
+  const byHash = new Map<string, ChainTx[]>();
+  const order: string[] = [];
+  const ownAddresses = new Set<string>();
   for (const [k, list] of Object.entries(result.txByChain)) {
     if (!k.startsWith(prefix)) continue;
+    ownAddresses.add(k.slice(prefix.length));
     for (const tx of list) {
-      if (seen.has(tx.hash)) continue;
-      seen.add(tx.hash);
-      txs.push(tx);
+      const rows = byHash.get(tx.hash);
+      if (rows) rows.push(tx);
+      else {
+        byHash.set(tx.hash, [tx]);
+        order.push(tx.hash);
+      }
     }
   }
+  const txs = order.map((h) => netAcrossAddresses(byHash.get(h)!, ownAddresses));
   txs.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
 
   let loading = false;
@@ -94,6 +106,55 @@ export function mergeChainTx(
   }
 
   return { txs, loading, error };
+}
+
+/** Signed amount of one address row in atomic units, or null if unsignable. */
+function signedAtomic(tx: ChainTx): bigint | null {
+  const netSat = tx.meta?.netSat;
+  if (typeof netSat === "number" && Number.isFinite(netSat)) return BigInt(Math.trunc(netSat));
+  if (tx.direction !== "in" && tx.direction !== "out" && tx.direction !== "self") return null;
+  const m = /^(\d+)(?:\.(\d{1,8}))?$/.exec(tx.amount);
+  if (!m) return null;
+  const units = BigInt(m[1]) * 100_000_000n + BigInt((m[2] ?? "").padEnd(8, "0"));
+  return tx.direction === "out" ? -units : tx.direction === "in" ? units : 0n;
+}
+
+function formatAtomic(v: bigint): string {
+  const abs = v < 0n ? -v : v;
+  return `${abs / 100_000_000n}.${(abs % 100_000_000n).toString().padStart(8, "0")}`;
+}
+
+/**
+ * One row for a txid seen under several of the wallet's addresses: the
+ * wallet's net. Exported for tests. A single row is returned unchanged.
+ */
+export function netAcrossAddresses(rows: ChainTx[], ownAddresses: ReadonlySet<string>): ChainTx {
+  const first = rows[0];
+  if (rows.length === 1) return first;
+  const signed = rows.map(signedAtomic);
+  if (signed.some((s) => s === null)) return first;
+  const net = (signed as bigint[]).reduce((a, b) => a + b, 0n);
+  const direction: ChainTx["direction"] = net > 0n ? "in" : net < 0n ? "out" : "self";
+  // The counterparty is the first output that is not one of our own addresses.
+  let counterparty: string | undefined;
+  if (direction === "out") {
+    for (const r of rows) {
+      const outs = r.meta?.outputs;
+      const ext = Array.isArray(outs)
+        ? (outs as unknown[]).find((a): a is string => typeof a === "string" && !ownAddresses.has(a))
+        : undefined;
+      counterparty = ext ?? (r.counterparty && !ownAddresses.has(r.counterparty) ? r.counterparty : undefined);
+      if (counterparty) break;
+    }
+  }
+  return {
+    ...first,
+    direction,
+    amount: formatAtomic(net),
+    fee: direction === "out" ? rows.find((r) => r.fee)?.fee : undefined,
+    counterparty,
+    meta: { ...first.meta, netSat: Number(net), mergedAddresses: rows.length },
+  };
 }
 
 const STORE_FILE = "tx-cache.json";

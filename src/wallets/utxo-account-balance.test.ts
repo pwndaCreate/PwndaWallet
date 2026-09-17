@@ -141,7 +141,7 @@ describe("cheapCandidates — the window the cheap path re-probes", () => {
     }
   });
 
-  it("serial specs: touched entries + receive/0 + a short lookahead past the highest used index", () => {
+  it("serial specs: touched entries + receive/0 + the lowest unused holes + a short lookahead past the highest used index", () => {
     const { spec } = makeSpec({});
     const known = [
       { path: childPath(ACCOUNT, 0, 3), address: addrAt(0, 3), chainIndex: 0 as const, index: 3 },
@@ -149,10 +149,26 @@ describe("cheapCandidates — the window the cheap path re-probes", () => {
     ];
     const c = cheapCandidates(MNEMONIC, spec, known);
     const idx = (ci: UtxoChainIndex) => c.filter((e) => e.chainIndex === ci).map((e) => e.index).sort((a, b) => a - b);
-    // receive: 0 (always), 3 (known), then 4..3+L
-    expect(idx(0)).toEqual([0, 3, ...Array.from({ length: CHEAP_LOOKAHEAD_SERIAL }, (_, i) => 4 + i)]);
-    // change: 20 (known), then 21..20+L — NOT 0..19, that is what makes it cheap
-    expect(idx(1)).toEqual([20, ...Array.from({ length: CHEAP_LOOKAHEAD_SERIAL }, (_, i) => 21 + i)]);
+    // receive: 0 (always, and the first hole), 1 (second hole), 3 (known), then 4..3+L
+    expect(idx(0)).toEqual([0, 1, 3, ...Array.from({ length: CHEAP_LOOKAHEAD_SERIAL }, (_, i) => 4 + i)]);
+    // change: the lowest L unused (0, 1), 20 (known), then 21..20+L. Still
+    // not all of 0..19: only where a first-unused allocator puts change next.
+    expect(idx(1)).toEqual([0, 1, 20, ...Array.from({ length: CHEAP_LOOKAHEAD_SERIAL }, (_, i) => 21 + i)]);
+  });
+
+  it("2026-09-17: change landing in a HOLE below the highest used index is probed (serial)", () => {
+    // The operator's LTC account: change 0, 1, 2 and 20 used (20 is the
+    // 2026-08-22 incident). The P2P fee spend put 2.32 LTC on change/3, the
+    // lowest unused index, and the old window probed only change/21-22.
+    const { spec } = makeSpec({});
+    const known = [0, 1, 2, 20].map((i) => ({
+      path: childPath(ACCOUNT, 1, i), address: addrAt(1, i), chainIndex: 1 as const, index: i,
+    }));
+    const c = cheapCandidates(MNEMONIC, spec, known);
+    const change = c.filter((e) => e.chainIndex === 1).map((e) => e.index);
+    expect(change).toContain(3);
+    expect(change).toContain(4);
+    expect(change).not.toContain(10); // still cheap: only the next unused ones
   });
 
   it("batch specs: the WHOLE range 0..maxUsed+lookahead, densely, on both chains", () => {
