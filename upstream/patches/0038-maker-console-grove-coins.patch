@@ -1,0 +1,124 @@
+Grove PATCH-38: market-maker console for the Grove coins (price tiles, AMM script, identity copy)
+
+Found 2026-09-17 reviewing the console as a maker would use it for ZEPH/ZANO.
+Pwnda's own UI is taker-only, so makers create offers and run the AMM from
+this console.
+
+WHAT WAS WRONG
+
+1. No ZANO or ZEPH price tile on the offers page. offers.html lists both with
+   'show': false. Upstream hid Zano in bcd251c4 (2024-10), before upstream had
+   any Zano chain support; PATCH-26 copied that flag for Zephyr. The data path
+   is already there: offers-pricechart.js iterates CoinManager's coins (both
+   registered by PATCH-26), its container list names 'zano' and 'zeph', and
+   /json/coinprices, /json/coinvolume and /json/coinhistory resolve both
+   tickers (ZEPH through PATCH-28's CoinGecko id, zephyr-protocol). Clicking a
+   tile switches the chart through the same generic handler every coin uses.
+
+2. The AMM could not start on Grove. ui/page_amm.py runs
+   <datadir>/basicswap/scripts/createoffers.py, a file that lives in
+   upstream's repository outside the Python package and is placed there only
+   by upstream's own installers. A Grove datadir has no basicswap/ directory,
+   so "Start" launched the interpreter on a missing file. The script itself is
+   coin-generic: it resolves coins from /json/coins, defaults to adaptor_sig,
+   and prices through /json/rates, so ZEPH and ZANO templates work unchanged.
+
+   The script now ships inside the package as basicswap/scripts/createoffers.py,
+   a verbatim copy of the pinned tag's scripts/createoffers.py carried as an
+   applier asset (upstream/patches/assets/). The bundled copy is preferred
+   because it is pinned to this engine's API (the ephemeral token the GUI
+   passes); the datadir path stays as the fallback. Refresh the asset on every
+   pin move: scripts/ammScriptAsset.test.mjs fails when it differs from the
+   pinned clone.
+
+3. The offer form described the "Send-from address" as "the address that will
+   hold and lock the coins you send during the swap", and the new-address hint
+   said it would "receive its locked funds". Both are false. addr_from goes to
+   prepareSMSGAddress(): it is the Particl messaging identity the offer is
+   announced from. Each swap locks funds in its own swap-derived addresses.
+   A maker reading the old text could think funds sit in that address.
+
+WHAT IS NOT CHANGED
+
+The duplicate-process check in page_amm.py runs `ps aux`, which does not
+exist on Windows; the exception is caught and the check returns no processes,
+so only duplicate detection is lost there. Not patched.
+
+Applies to: basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4), after PATCH-37.
+Marker: PWNDA-PATCH-38
+
+diff --git a/basicswap/static/js/pages/offer-new-page.js b/basicswap/static/js/pages/offer-new-page.js
+index ce7fa50..ad6d5a8 100644
+--- a/basicswap/static/js/pages/offer-new-page.js
++++ b/basicswap/static/js/pages/offer-new-page.js
+@@ -247,7 +247,9 @@ const AddrFromHint = {
+             hint.className = 'text-xs mt-1';
+             return;
+         }
+-        hint.textContent = 'A new address will be created to identify this offer and receive its locked funds.';
++        // PWNDA-PATCH-38: this is an SMSG identity (prepareSMSGAddress); it
++        // never receives the swap's funds.
++        hint.textContent = 'A new messaging address will be created to identify this offer. It holds no funds.';
+         hint.className = 'text-xs mt-1 offer-hint-info';
+     }
+ };
+diff --git a/basicswap/templates/offer_new_1.html b/basicswap/templates/offer_new_1.html
+index d424484..891a651 100644
+--- a/basicswap/templates/offer_new_1.html
++++ b/basicswap/templates/offer_new_1.html
+@@ -173,7 +173,7 @@
+                     {% endfor %}
+                   </select>
+                 </div>
+-                <p class="text-xs text-gray-500 dark:text-gray-300 mt-2">The address that will hold and lock the coins you send during the swap. Showing the most recent addresses; type above to search all.</p>
++                <p class="text-xs text-gray-500 dark:text-gray-300 mt-2">{# PWNDA-PATCH-38 #}Your network identity: the messaging address this offer is announced from and bidders reply to. It never holds coins; each swap locks funds in its own swap addresses. Showing the most recent addresses; type above to search all.</p>
+                 <p id="addr-from-hint" class="text-xs mt-1"></p>
+               </div>
+             </div>
+diff --git a/basicswap/templates/offers.html b/basicswap/templates/offers.html
+index 0b54e65..ac876f6 100644
+--- a/basicswap/templates/offers.html
++++ b/basicswap/templates/offers.html
+@@ -104,6 +104,7 @@
+  <div class="lg:container mx-auto">
+   <div class="flex flex-wrap justify-center lg:justify-start xl:justify-center" id="coin-container">
+ {# PWNDA-PATCH-26: ZEPH registered beside ZANO below (Grove carries both as chainclients). A comment cannot sit inside the set-tag's dict literal: Jinja lexes `{#` there as an unexpected char (seen live 2026-09-04). #}
++{# PWNDA-PATCH-38: ZANO and ZEPH tiles shown. Upstream hid Zano (2024-10) before it had chain support; Grove registers both, and /json/coinprices, coinvolume and coinhistory resolve both (ZEPH via PATCH-28's CoinGecko id). #}
+ {% set coin_data = {
+     'BTC': {'name': 'Bitcoin', 'symbol': 'BTC', 'image': 'Bitcoin.png', 'show': true},
+     'XMR': {'name': 'Monero', 'symbol': 'XMR', 'image': 'Monero.png', 'show': true},
+@@ -117,8 +118,8 @@
+     'DOGE': {'name': 'Dogecoin', 'symbol': 'DOGE', 'image': 'Dogecoin.png', 'show': true},
+     'DCR': {'name': 'Decred', 'symbol': 'DCR', 'image': 'Decred.png', 'show': true},
+     'NMC': {'name': 'Namecoin', 'symbol': 'NMC', 'image': 'Namecoin.png', 'show': true},
+-    'ZANO': {'name': 'Zano', 'symbol': 'ZANO', 'image': 'Zano.png', 'show': false},
+-    'ZEPH': {'name': 'Zephyr', 'symbol': 'ZEPH', 'image': 'Zephyr.png', 'show': false},
++    'ZANO': {'name': 'Zano', 'symbol': 'ZANO', 'image': 'Zano.png', 'show': true},
++    'ZEPH': {'name': 'Zephyr', 'symbol': 'ZEPH', 'image': 'Zephyr.png', 'show': true},
+     'WOW': {'name': 'Wownero', 'symbol': 'WOW', 'image': 'Wownero.png', 'show': true}
+     }
+   %}
+diff --git a/basicswap/ui/page_amm.py b/basicswap/ui/page_amm.py
+index 18219f3..eec28be 100644
+--- a/basicswap/ui/page_amm.py
++++ b/basicswap/ui/page_amm.py
+@@ -56,6 +56,19 @@ def get_amm_state_path(swap_client, state_file=None):
+ 
+ def get_amm_script_path(swap_client):
+     """Get the path to the AMM script"""
++    # PWNDA-PATCH-38: the script ships inside the package
++    # (basicswap/scripts/createoffers.py, copied from the pinned upstream tag).
++    # Upstream expects it under <datadir>/basicswap/scripts/, which only its own
++    # installers create, so on Pwnda Grove "Start" launched Python on a missing
++    # file. The bundled copy wins because it is pinned to this engine's API; the
++    # datadir copy remains the fallback for an operator's own script.
++    bundled = os.path.join(
++        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
++        "scripts",
++        "createoffers.py",
++    )
++    if os.path.exists(bundled):
++        return bundled
+     return os.path.join(swap_client.data_dir, "basicswap", "scripts", "createoffers.py")
+ 
+ 

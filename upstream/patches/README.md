@@ -24,7 +24,14 @@ does not ship), so thirty-three files yield `+p32`. `src-tauri/src/grove.rs`'s
 `grove::tests::expected_patch_level_matches_the_series`, which recomputes it from
 this directory — so the number cannot drift silently even while this prose does.
 
-The newest is **0037-host-wallet-pin-across-restarts.patch**: the host wallet's
+The newest is **0038-maker-console-grove-coins.patch** (`+p37`, 2026-09-17): the
+console as a maker uses it for ZEPH/ZANO. Price tiles for both coins, the AMM
+script shipped inside the package (upstream's `scripts/createoffers.py`, carried
+as the asset `assets/basicswap/scripts/createoffers.py`; refresh it on every pin
+move, `scripts/ammScriptAsset.test.mjs` fails otherwise), and the send-from
+address described as the messaging identity it is. `verify-maker-console.py`.
+
+Before it, **0037-host-wallet-pin-across-restarts.patch**: the host wallet's
 identity (XMR, ZEPH, ZANO) is kept in `kv_string`, and while that coin has a swap
 in progress a restarted node refuses to confirm a DIFFERENT wallet. Before it, the
 first confirmation after any restart trusted whatever wallet the app had open, so

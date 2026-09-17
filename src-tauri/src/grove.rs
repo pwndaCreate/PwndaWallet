@@ -135,7 +135,7 @@ pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.9";
 /// 35 -> 36 on 2026-09-15: 0037 (a restarted node refuses to confirm a
 /// different XMR/ZEPH/ZANO host wallet while swaps on that coin are in
 /// progress). It touches `basicswap/`, so it counts.
-pub const EXPECTED_PATCH_LEVEL: u32 = 36;
+pub const EXPECTED_PATCH_LEVEL: u32 = 37;
 
 /// The identifier this build expects a correctly-patched runtime to carry,
 /// e.g. `pwnda-grove 0.18.5+p26`.
