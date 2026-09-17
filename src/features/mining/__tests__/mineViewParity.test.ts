@@ -293,8 +293,11 @@ describe("#4 lane controls and labels are shared", () => {
     expect(src.slice(Math.max(0, cpuAt - 200), cpuAt)).toMatch(/hardware === "cpu"/);
     expect(src).toContain("<GpuDevicePicker");
     expect(src).toContain("<GpuIntensityControl");
-    // lolMiner's lane keeps the slider, locked with the reason.
-    expect(src).toMatch(/unsupportedReason=\{hasIntensity \? null : LOLMINER_NO_INTENSITY\}/);
+    // A lane whose miner or algorithm has no usable intensity keeps the
+    // slider, locked with its own reason (lolMiner; XelisHash since
+    // 2026-09-17 — see `gpuIntensityUnsupportedReason`).
+    expect(src).toMatch(/unsupportedReason=\{intensityLocked\}/);
+    expect(src).toMatch(/gpuIntensityUnsupportedReason\(gpuAlgorithm\)/);
   });
 
   it("SIMPLE uses the shared GPU picker, not its own device list", () => {
@@ -303,10 +306,15 @@ describe("#4 lane controls and labels are shared", () => {
     expect(src).not.toMatch(/gpus\.map\(/);
   });
 
-  it("only lolMiner's lane has no intensity control", () => {
+  it("lolMiner's lane and XelisHash have no intensity control", () => {
     expect(laneHasIntensity("cpu", "octopus")).toBe(true);
     expect(laneHasIntensity("gpu", "octopus")).toBe(false);
-    for (const alg of ["kawpow", "autolykos", "progpowz", "xelishashv3"] as const) {
+    // 2026-09-17: xelishashv3 moved to the locked side. Each thread owns a
+    // 531 KiB scratchpad, so the intensity is a VRAM request, and setting 20
+    // filled a 12 GB and a 16 GB card and froze the machine. SRBMiner sizes
+    // itself when the flag is absent.
+    expect(laneHasIntensity("gpu", "xelishashv3")).toBe(false);
+    for (const alg of ["kawpow", "autolykos", "progpowz"] as const) {
       expect(laneHasIntensity("gpu", alg)).toBe(true);
     }
   });
