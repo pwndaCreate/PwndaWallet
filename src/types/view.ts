@@ -13,6 +13,7 @@ export type View =
   | "monero-nodes"
   | "zephyr-nodes"
   | "zano-nodes"
+  | "xelis-nodes"
   | "activity"
   | "swap";
 

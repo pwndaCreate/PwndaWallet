@@ -9,21 +9,35 @@ import { algorithmHashUnit, formatHashrateParts } from "./pool-stats/format";
 import { PoolStatsPanel, getStatsAdapter } from "./pool-stats";
 import { poolHostPort, decoratePoolLabel } from "./pools";
 import { ProxyModePanel } from "./ProxyModePanel";
-import { estimateEarningsForChain } from "./earnings";
-import { MINING_COINS } from "./miningCoins";
+import {
+  MINING_COINS,
+  coinLanes,
+  coinMinesOn,
+  lanesLabel,
+} from "./miningCoins";
+import { ALGORITHM_LABEL } from "./algorithms";
 import { coinTileLocked, pickMiningCoin } from "./pickCoin";
+import { formatUsdPerDay, useMinedAssetView } from "./minedAssetView";
+import { useMiningEarnings } from "./useMiningEarnings";
+import {
+  cpuLaneMiner,
+  cpuThreadsLabel,
+  laneHasIntensity,
+  laneIntensityLabel,
+  startBlocker,
+} from "./miningLane";
 import type { MiningProjection } from "../../types/mining";
 import { MineSimpleView } from "./MineSimpleView";
 import { readMineViewMode, writeMineViewMode, type MineViewMode } from "./mineViewMode";
 import {
-  DisplayCoinChips,
-  EarnPromoStrip,
   MicroLabel,
-  MINED_TICKER,
   Panel,
   ViewModeChip,
-  formatProjected,
 } from "./components/mine-simple";
+import { EarnCapabilityBlock } from "./components/EarnCapabilityBlock";
+import { MineRunButton, MinerStatusBanner } from "./components/MineRunControls";
+import { LaneTuningControls } from "./components/LaneTuningControls";
+import { XmrigHashrateFix } from "./components/XmrigHashrateFix";
 import {
   PoolTroubleStrip,
   ProHeader,
@@ -33,7 +47,6 @@ import {
 import { useCoinStats } from "./useCoinStats";
 import { useDeviceProfile } from "./useDeviceProfile";
 import type { useMiner } from "./useMiner";
-import { LoadSlider } from "./components/LoadSlider";
 import { EarningsPerPeriod } from "./components/EarningsPerPeriod";
 
 type MinerApi = ReturnType<typeof useMiner>;
@@ -65,6 +78,12 @@ interface MineLandscapeViewProps {
   conversionRunning?: boolean;
   /** Assets reachable from mining, for the hero's asset dropdown. */
   reachableTickers?: readonly string[];
+  /**
+   * Open Miner Setup from a "Set up miners" run control — the same prop
+   * portrait's `MiningView` takes. Landscape had no route there from START
+   * until 2026-09-16.
+   */
+  onSetup?: () => void;
 }
 
 /**
@@ -101,6 +120,7 @@ export function MineLandscapeView({
   onOpenEarn,
   conversionRunning = false,
   reachableTickers,
+  onSetup,
 }: MineLandscapeViewProps) {
   const {
     miningCoin,
@@ -116,9 +136,19 @@ export function MineLandscapeView({
     miningStarting,
     workerName,
     miningIntensity,
-    setMiningIntensity,
     cpuThreadCount,
+    cpuThreads,
+    setCpuThreads,
+    gpuIntensity,
+    gpuIntensityLevel,
+    setGpuIntensityLevel,
+    gpus,
+    gpuSelection,
+    setGpuSelection,
+    runningCpuMiner,
     minersReady,
+    minerError,
+    minerInfo,
     hashrateSamples,
     startMining,
     stopMining,
@@ -179,17 +209,27 @@ export function MineLandscapeView({
   }, [hashrateSamples, isMining]);
   const heroParts = formatHashrateParts(current || null, baseUnit);
 
-  // Earnings — same path as portrait. Live network hashrate when
-  // available; falls back to the hardcoded chain default otherwise.
-  const coinStats = useCoinStats(miningCoin);
-  const earnings =
-    isMining && current > 0
-      ? estimateEarningsForChain(miningCoin, current, {
-          networkHashrate: coinStats.networkHashrate ?? undefined,
-          blockReward: coinStats.blockReward ?? undefined,
-          blockTimeSecs: coinStats.blockTimeSecs ?? undefined,
-        })
-      : null;
+  // Earnings — the one shared path (`useMiningEarnings`): live network
+  // hashrate when available, the hardcoded chain default otherwise.
+  const { earnings } = useMiningEarnings(
+    miningCoin,
+    isMining && current > 0 ? current : null,
+  );
+
+  /**
+   * What the mined coin may claim — the same decision SIMPLE and portrait
+   * PRO render. The BAL chip and the per-period rows below used to multiply
+   * by `projection`'s XMR rate with no capability check, so a Xelis session
+   * showed XEL earnings × an XMR→BTC rate, labelled BTC (parity audit,
+   * 2026-09-16). Only a coin with a route is projected now; every other coin
+   * reads in its own units, with daily USD and the capability note.
+   */
+  const asset = useMinedAssetView({
+    miningCoin,
+    projection,
+    minedAmount,
+    pricesByTicker,
+  });
 
   // For a chain switch we have to also flip the hardware (CPU for XMR /
   // ZEPH, GPU for RVN / CFX). `useMiner` lets us do this independently
@@ -206,7 +246,9 @@ export function MineLandscapeView({
   // Payout address for the currently-selected mining coin — supplied by
   // the parent (App.tsx for the full wallet; LiteApp.tsx for Pwnda Lite).
   const minerAddress = addressFor(miningCoin);
-  const canStart = minersReady && !!minerAddress;
+  // Why START cannot run, shared with portrait. `canStart` was computed here
+  // and never read, so a lane with no payout address looked startable.
+  const blockedBy = startBlocker({ minersReady, payoutAddress: minerAddress });
   const selectedProbe = selectedPoolId ? poolPings[selectedPoolId] : undefined;
   const poolHost = selectedPool ? poolHostPort(selectedPool.endpoint) : "—";
   // Prefer the miner's own ping (live, updated each snapshot) over the
@@ -220,6 +262,26 @@ export function MineLandscapeView({
   const gpuOctopusBlock =
     miningHardware === "gpu" && gpuAlgorithm === "octopus";
 
+  // Lane labels, from the helpers portrait uses. Landscape printed the raw
+  // logical-core count as "threads" (not what xmrig's percentage hint or
+  // SRBMiner's `--cpu-threads` launch), and the CPU tier on the GPU lane.
+  const cpuMiner = cpuLaneMiner({ cpuAlgorithm, isMiningCpu, runningCpuMiner });
+  const threadsLabel = cpuThreadsLabel({
+    mining: isMining,
+    threadsActive: session?.threadsActive,
+    intensity: miningIntensity,
+    cpuThreadCount,
+    cpuThreads,
+    cpuMiner,
+  });
+  const hasIntensity = laneHasIntensity(miningHardware, gpuAlgorithm);
+  const laneIntensity = {
+    hardware: miningHardware,
+    miningIntensity,
+    gpuIntensity,
+    gpuIntensityLevel,
+  };
+
   // Device profile drives the per-coin earnings preview in the picker.
   // Filters coins by hardware kind: if the user is on the CPU side,
   // show CPU-eligible coins (XMR / ZEPH); on GPU, show GPU coins
@@ -232,6 +294,7 @@ export function MineLandscapeView({
   const rvnStats = useCoinStats("ravencoin");
   const cfxStats = useCoinStats("conflux");
   const ergStats = useCoinStats("ergo");
+  const xelStats = useCoinStats("xelis");
   const profile = useDeviceProfile({
     pricesByTicker: pricesByTicker ?? {},
     liveCoinParams: {
@@ -240,11 +303,21 @@ export function MineLandscapeView({
       ravencoin: rvnStats,
       conflux: cfxStats,
       ergo: ergStats,
+      xelis: xelStats,
     },
   });
+  // Predicted $/day for a coin, read from a device on a lane that COIN can
+  // actually use. A dual-lane coin (XEL) prefers the displayed lane, so its
+  // row answers "what would this pay me on the lane I'm looking at"; a coin
+  // the displayed lane can't mine still shows its own figure rather than a
+  // blank, which is what a picker is for — comparing coins BEFORE switching
+  // to one.
   const earningsForChain = (chain: ChainType): number | null => {
+    const lane = coinMinesOn(chain, miningHardware)
+      ? miningHardware
+      : coinLanes(chain)[0];
     for (const dev of profile.devices) {
-      if (dev.kind !== miningHardware) continue;
+      if (dev.kind !== lane) continue;
       const p = dev.predictions[chain];
       if (p && p.perDayUsd > 0) return p.perDayUsd;
     }
@@ -280,6 +353,8 @@ export function MineLandscapeView({
       >
         <MineSimpleView
           miner={miner}
+          addressFor={addressFor}
+          onSetup={onSetup}
           pricesByTicker={pricesByTicker}
           reachableTickers={reachableTickers}
           projection={projection}
@@ -300,7 +375,37 @@ export function MineLandscapeView({
    * mock keeps it deliberately, so a user who came here to tune something
    * never loses sight of the number they came for. It renders `—` when the
    * rate is unknown, never 0, for the reason spelled out in mine-simple.tsx.
+   *
+   * Only a coin with a route has a balance to project: the injected balance
+   * AND rate are both XMR's. Any other coin gets REV — its own daily USD
+   * revenue, which is what its capability note promises.
    */
+  const chipStyle = {
+    border: "1px solid var(--accent)",
+    background: "var(--accent-soft)",
+    color: "var(--accent)",
+    padding: "4px 10px",
+    fontSize: 9,
+    letterSpacing: 1,
+    fontVariantNumeric: "tabular-nums",
+  } as const;
+  const balance = asset.formatDisplay(asset.minedAmount);
+  const revenueUsd = asset.usdPerDay(earnings?.day);
+  const valueChip = asset.canProject ? (
+    projection ? (
+      <span style={chipStyle}>
+        BAL {balance === "—" ? `— ${asset.displayTicker}` : balance}
+      </span>
+    ) : null
+  ) : (
+    <span
+      style={{ ...chipStyle, border: "1px solid var(--border)", background: "transparent" }}
+      title={asset.capabilityNote ?? undefined}
+    >
+      REV {revenueUsd == null ? "—/day" : `≈ ${formatUsdPerDay(revenueUsd)}`}
+    </span>
+  );
+
   const proHeader = (
     <ProHeader
       coinLabel={
@@ -309,12 +414,15 @@ export function MineLandscapeView({
           {activeAdapter.displayName}
         </span>
       }
-      algoLabel={(miningHardware === "cpu" ? cpuAlgorithm : gpuAlgorithm).toUpperCase()}
-      // Read-only state, per 3b: the CONTROLS for these live in SIMPLE.
+      algoLabel={
+        ALGORITHM_LABEL[miningHardware === "cpu" ? cpuAlgorithm : gpuAlgorithm]
+      }
+      // Read-only state, per 3b. The lane's intensity (the GPU tier on the
+      // GPU lane) and the thread count the binary will actually launch.
       hardwareChip={[
         miningHardware.toUpperCase(),
-        miningIntensity === "medium" ? "MED" : miningIntensity.toUpperCase(),
-        miningHardware === "cpu" && cpuThreadCount ? `${cpuThreadCount}T` : null,
+        hasIntensity ? laneIntensityLabel(laneIntensity, "short") : null,
+        miningHardware === "cpu" ? threadsLabel : null,
       ]
         .filter(Boolean)
         .join(" · ")}
@@ -323,28 +431,7 @@ export function MineLandscapeView({
       uptimeLabel={fmtSeconds(session?.uptimeSecs ?? 0)}
       right={
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
-          {projection && (
-            <span
-              style={{
-                border: "1px solid var(--accent)",
-                background: "var(--accent-soft)",
-                color: "var(--accent)",
-                padding: "4px 10px",
-                fontSize: 9,
-                letterSpacing: 1,
-                fontVariantNumeric: "tabular-nums",
-              }}
-            >
-              BAL{projection.targetTicker === "XMR" ? " " : " ≈ "}
-              {formatProjected(
-                minedAmount != null && projection.ratePerXmr != null
-                  ? minedAmount * projection.ratePerXmr
-                  : null,
-                projection.targetTicker,
-              )}{" "}
-              {projection.targetTicker}
-            </span>
-          )}
+          {valueChip}
           <ViewModeChip mode="pro" onToggle={() => setMode("simple")} />
         </span>
       }
@@ -362,22 +449,26 @@ export function MineLandscapeView({
    */
   /**
    * Per-hour/day/month in the DISPLAY coin when a route exists, else in the
-   * mined coin. Reuses `earnings` — the same estimate the console's own
-   * breakdown renders — so the two cannot disagree.
+   * mined coin — `asset.formatDisplay` decides which, the same way SIMPLE's
+   * hero does. The comment here always promised "else in the mined coin";
+   * the code multiplied by the XMR rate regardless until 2026-09-16.
+   *
+   * A coin with no route also gets its daily USD, which is what its
+   * capability note ("daily revenue shown instead") says is on screen.
    */
-  const proProjectionRows = (() => {
-    const rate = projection?.ratePerXmr ?? null;
-    const tick = projection?.targetTicker ?? activeAdapter.ticker;
-    const fmt = (v: number | undefined) =>
-      v == null || rate == null
-        ? "—"
-        : `≈ ${formatProjected(v * rate, tick)} ${tick}`;
-    return [
-      { label: "per hour", value: fmt(earnings?.hour) },
-      { label: "per day", value: fmt(earnings?.day) },
-      { label: "per month", value: fmt(earnings?.month) },
-    ];
-  })();
+  const proProjectionRows = [
+    { label: "per hour", value: asset.formatDisplay(earnings?.hour) },
+    { label: "per day", value: asset.formatDisplay(earnings?.day) },
+    { label: "per month", value: asset.formatDisplay(earnings?.month) },
+    ...(asset.canProject
+      ? []
+      : [
+          {
+            label: "usd / day",
+            value: revenueUsd == null ? "—" : `≈ ${formatUsdPerDay(revenueUsd)}`,
+          },
+        ]),
+  ];
 
   const proInstruments = (
     <div style={{ display: "flex", flexDirection: "column", gap: 12, padding: 12 }}>
@@ -557,13 +648,13 @@ export function MineLandscapeView({
                       letterSpacing: 0.5,
                     }}
                   >
-                    {c.algo}
+                    {c.algo} · {lanesLabel(c.chain)}
                   </div>
                 </div>
-                {/* Predicted $/day for this coin on the currently-
-                    selected hardware. Quiet placeholder ("—") when
-                    detection hasn't completed yet OR the user is on
-                    a hardware kind this coin can't run. */}
+                {/* Predicted $/day for this coin, on a lane the coin can
+                    actually use (see `earningsForChain`). Renders nothing
+                    while device detection hasn't completed or the coin has
+                    no profile yet — never a fabricated 0. */}
                 {(() => {
                   const usd = earningsForChain(c.chain);
                   if (usd == null) return null;
@@ -668,22 +759,17 @@ export function MineLandscapeView({
               fontSize: 10,
             }}
           >
-            {/* Shows raw cpuThreadCount regardless of intensity — pre-existing
-                display quirk, not part of the 2026-07 intensity/priority
-                rework (see wiki/concepts/mining-process-management.md).
-                Left as-is; the portrait view's equivalent (MiningView.tsx
-                hardwareLabel) now shows the real per-intensity value. */}
+            {/* Until 2026-09-16 this printed the raw logical-core count
+                whatever the intensity, and the CPU tier on the GPU lane.
+                Both now come from `miningLane.ts`, the helpers portrait's
+                hero uses, so the two layouts read the same. */}
             <KvRow
               k="threads"
-              v={
-                miningHardware === "cpu"
-                  ? `${cpuThreadCount}`
-                  : "—"
-              }
+              v={miningHardware === "cpu" ? threadsLabel : "—"}
             />
             <KvRow
               k="intensity"
-              v={miningIntensity}
+              v={hasIntensity ? laneIntensityLabel(laneIntensity) : "—"}
               tnum={false}
             />
             <KvRow
@@ -692,6 +778,11 @@ export function MineLandscapeView({
               accent={isMining}
             />
           </div>
+
+          {/* xmrig's RandomX diagnostics — the same gated panel portrait
+              mounts. Absent on the GPU lane and on XelisHash's SRBMiner CPU
+              lane, where none of it applies. */}
+          <XmrigHashrateFix miner={miner} compact />
 
           {/* Debug toggle — surfaces the miner's console window so the user
               can see share-accepted/rejected, pool diff changes, errors.
@@ -802,14 +893,37 @@ export function MineLandscapeView({
             block above (frame 3b renders them once, at the top). This column
             keeps the LOAD control, which 3b does not draw and which SIMPLE
             only exposes as three coarse steps. */}
-        {/* intensity slider — extracted to LoadSlider per T2.1 so the
-            portrait MiningView consumes the same primitive (no visual
-            drift between layouts). */}
-        <LoadSlider
-          value={miningIntensity}
-          onChange={setMiningIntensity}
-          disabled={isMining && miningHardware === "cpu"}
+        {/* The DISPLAYED lane's tuning block — the same shared component
+            portrait PRO renders (LaneTuningControls): the CPU thread slider
+            on the CPU lane; the GPU device picker + intensity slider on the
+            GPU lane (locked with a reason for lolMiner, which has no flag).
+            Until 2026-09-16 this was a three-step LOAD tier and a four-step
+            GPU tier; before that, landscape showed the CPU control on the GPU
+            lane too. Locked while the displayed lane mines. */}
+        <LaneTuningControls
+          hardware={miningHardware}
+          gpuAlgorithm={gpuAlgorithm}
+          cpuMiner={cpuMiner}
+          laneMining={isMining}
+          cpuThreads={cpuThreads}
+          cpuThreadCount={cpuThreadCount}
+          setCpuThreads={setCpuThreads}
+          gpuIntensityLevel={gpuIntensityLevel}
+          setGpuIntensityLevel={setGpuIntensityLevel}
+          gpus={gpus}
+          gpuSelection={gpuSelection}
+          setGpuSelection={setGpuSelection}
           variant="full"
+        />
+
+        {/* useMiner's error/info lines and the blocked-start hint. Landscape
+            rendered none of them before 2026-09-16, so a refused start
+            ("No mining address set for the selected coin.") was silent. */}
+        <MinerStatusBanner
+          error={minerError}
+          info={minerInfo}
+          blockedBy={blockedBy}
+          mining={isMining}
         />
 
         {/* 3b's bottom row: the run control and the EARN promo. Both are in
@@ -817,25 +931,19 @@ export function MineLandscapeView({
             switched to the console to watch a session had to go back to
             SIMPLE to stop it. */}
         <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
-          <button
-            type="button"
-            onClick={() => (isMining ? void stopMining() : void startMining())}
-            disabled={!minersReady || miningStarting}
-            style={{
-              fontFamily: "var(--font-pixel)",
-              flex: "1 1 160px",
-              border: "1px solid var(--accent)",
-              background: "var(--accent-dim)",
-              color: "var(--accent)",
-              padding: "22px 12px",
-              fontSize: 13,
-              letterSpacing: 1,
-              cursor: !minersReady || miningStarting ? "not-allowed" : "pointer",
-              opacity: !minersReady || miningStarting ? 0.55 : 1,
-            }}
-          >
-            {miningStarting ? "starting…" : isMining ? "■ STOP" : "► START"}
-          </button>
+          <MineRunButton
+            variant="pixel"
+            labels="short"
+            mining={isMining}
+            starting={miningStarting}
+            blockedBy={blockedBy}
+            coinTicker={asset.minedTicker}
+            onStart={() => void startMining()}
+            onStop={() => void stopMining()}
+            onSetup={onSetup}
+            fontSize={13}
+            style={{ flex: "1 1 160px" }}
+          />
           <div style={{ flex: "1 1 220px", minWidth: 0 }}>
             {/* Reported 2026-08-29: PRO had no control feeding
                 `onSelectDisplayCoin`, so `projection.targetTicker` could only
@@ -848,17 +956,27 @@ export function MineLandscapeView({
                 in, even though `onSelectDisplayCoin` was threaded all the way
                 down to this component already. Reusing the exact same chip
                 component SIMPLE uses, not a second implementation. */}
-            {onSelectDisplayCoin && (
-              <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 6 }}>
-                <DisplayCoinChips
-                  selected={projection?.targetTicker ?? MINED_TICKER}
-                  onSelect={onSelectDisplayCoin}
-                  reachableTickers={reachableTickers}
-                />
-              </div>
-            )}
-            <EarnPromoStrip
-              targetTicker={projection?.targetTicker ?? MINED_TICKER}
+            {/* 2026-09-15: and the whole strip only renders when the MINED
+                coin has a route out. `MineSimpleView` has always gated it
+                (`canProject`, from `capabilityFor`), which is why a ZEPH /
+                RVN / CFX / ERG / XEL session shows no promo there. PRO
+                rendered it unconditionally and fell back to `MINED_TICKER`
+                — the literal "XMR" — so a Xelis session advertised "turn
+                mined XMR into BTC while you're ready", on the same screen
+                whose SIMPLE mode correctly says XEL has no swap route out of
+                mining. Observed in the landscape console during the Xelis
+                visual pass. The chips go with it: offering a target picker
+                for a coin that cannot be converted is a control that cannot
+                do anything (`mine-simple.tsx`'s own note on
+                `onSelectDisplayCoin: null`). */}
+            {/* 2026-09-16: that gate now lives in ONE place,
+                `EarnCapabilityBlock`, which portrait PRO and SIMPLE mount
+                too. With no route it renders the capability note instead —
+                the sentence that says why there is no promo. */}
+            <EarnCapabilityBlock
+              asset={asset}
+              onSelectDisplayCoin={onSelectDisplayCoin}
+              reachableTickers={reachableTickers}
               onOpenEarn={onOpenEarn}
               conversionRunning={conversionRunning}
               compact

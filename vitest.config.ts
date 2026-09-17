@@ -35,6 +35,11 @@ export default defineConfig({
       "src/features/onboarding/**/*.test.ts",
       "src/features/activity/**/*.test.ts",
       "src/features/mining/**/*.test.ts",
+      // PwndaLite (src-lite/) added 2026-09-15 with liteSupportedChains.test.ts,
+      // the guard that every mining-roster coin has a Lite address field (ZANO
+      // had been missing one since 2026-08-28). Added in the same change as the
+      // file, so it never sat uncollected.
+      "src-lite/**/*.test.ts",
       "src/features/vault/**/*.test.ts",
       "src/features/wallet/**/*.test.ts",
       // settings + monero were absent until 2026-08-19. They host the Settings
@@ -59,6 +64,20 @@ export default defineConfig({
       // the unreachable file in its failure message before the file had ever
       // been run. The guard worked exactly as intended.
       "src/features/zephyr/**/*.test.ts",
+      // xelis added 2026-09-15 in the same change as its first test file, so
+      // the folder is never a place a test can sit uncollected.
+      "src/features/xelis/**/*.test.ts",
+      // zano added 2026-09-15 with zanoWalletFile.test.ts, the guard that a
+      // session opens the file its vault entry names. The folder had existed
+      // since 2026-08-27 with no glob reaching it, so any test written there
+      // before this line would have been collected by nothing — the fifth
+      // instance of the trap `testGlobCoverage.test.ts` now catches.
+      "src/features/zano/**/*.test.ts",
+      // auth added 2026-09-15 with swapsWaitingNotice.test.ts (the unlock
+      // screen's note about swaps waiting for the unlock). Named explicitly, it
+      // reported "No test files found": the fourth time this list stood between
+      // a test and ever running.
+      "src/features/auth/**/*.test.ts",
       "src/wallets/**/*.test.ts",
       // src/lib holds the pure helpers any feature may import (CLAUDE.md's
       // layout note). bip85.ts lives there and is fund-critical — a wrong

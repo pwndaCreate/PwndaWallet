@@ -13,6 +13,20 @@
  * without mounting the modal.
  */
 import type { FeeEstimate } from "../../wallets";
+import type { SendQuote } from "../../wallets/types";
+
+/**
+ * A quote's fee note, trimmed and ready to show, or null when there is nothing
+ * to add. Chain-agnostic: any adapter's quote may carry one (Xelis sets it when
+ * the fee includes the one-off charge for a recipient account not yet on
+ * chain). Added 2026-09-15.
+ */
+export function feeNoteText(quote: Pick<SendQuote, "feeNote"> | null | undefined): string | null {
+  const note = quote?.feeNote;
+  if (typeof note !== "string") return null;
+  const trimmed = note.trim();
+  return trimmed === "" ? null : trimmed;
+}
 
 /** Units that are a per-(v)byte rate in the coin's 1e-8 base unit. */
 const PER_BYTE_RATE = /^(sat|duffs)\/v?B$/i;
@@ -64,7 +78,9 @@ export function feeTotalFor(
   return { coin: coins.toFixed(8), usd: formatUsd(coins, usdPrice) };
 }
 
-function formatUsd(coins: number, usdPrice: number | undefined): string | null {
+/** "$0.03", "< $0.01", or null when there is no usable price. Also used by the
+ *  Send modal's quoted-fee line (2026-09-15). */
+export function formatUsd(coins: number, usdPrice: number | undefined): string | null {
   if (usdPrice == null || !Number.isFinite(usdPrice) || usdPrice <= 0) return null;
   const usd = coins * usdPrice;
   if (usd < 0.01) return "< $0.01";

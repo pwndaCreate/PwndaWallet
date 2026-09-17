@@ -6,6 +6,7 @@ import type { ChainType } from "../../wallets";
 import { getCoinMeta } from "../../wallets/coin-metadata";
 import {
   CHAIN_MINING_PROFILES,
+  canCalibrate,
   type ChainMiningProfile,
 } from "./hardware-benchmarks";
 import {
@@ -66,11 +67,13 @@ export function DeviceProfilePanel({
   const zphStats = useCoinStats("zephyr");
   const rvnStats = useCoinStats("ravencoin");
   const cfxStats = useCoinStats("conflux");
+  const xelStats = useCoinStats("xelis");
   const liveCoinParams = {
     monero: xmrStats,
     zephyr: zphStats,
     ravencoin: rvnStats,
     conflux: cfxStats,
+    xelis: xelStats,
   };
   const profile = useDeviceProfile({
     pricesByTicker,
@@ -518,28 +521,48 @@ function DeviceCard({
                   </div>
                 );
               })()}
-              <button
-                className="qbtn"
-                onClick={() => onCalibrate(device, profile)}
-                disabled={running}
-                title={
-                  device.kind === "cpu"
-                    ? "Run an offline RandomX benchmark on this CPU. Takes up to ~90 seconds — xmrig pegs the CPU at 100 % during the run."
-                    : profile.algo === "kawpow"
-                      ? "Run a KawPoW probe on this GPU. Takes up to ~2 minutes (DAG + auto-tune + mining window). Requires internet — SRBMiner has no offline KawPoW bench mode, so we briefly connect to a public Ravencoin pool with a burn address."
-                      : "Run an offline Octopus benchmark on this GPU. Takes ~30–60 seconds."
-                }
-                style={{
-                  padding: "4px 10px",
-                  fontSize: 9,
-                  letterSpacing: 0.6,
-                  textTransform: "uppercase",
-                  borderColor: running ? "var(--accent-mid)" : undefined,
-                  color: running ? "var(--accent)" : undefined,
-                }}
-              >
-                {running ? "running…" : "calibrate"}
-              </button>
+              {canCalibrate(device.kind, profile) ? (
+                <button
+                  className="qbtn"
+                  onClick={() => onCalibrate(device, profile)}
+                  disabled={running}
+                  title={
+                    device.kind === "cpu"
+                      ? "Run an offline RandomX benchmark on this CPU. Takes up to ~90 seconds — xmrig pegs the CPU at 100 % during the run."
+                      : profile.algo === "kawpow"
+                        ? "Run a KawPoW probe on this GPU. Takes up to ~2 minutes (DAG + auto-tune + mining window). Requires internet — SRBMiner has no offline KawPoW bench mode, so we briefly connect to a public Ravencoin pool with a burn address."
+                        : "Run an offline Octopus benchmark on this GPU. Takes ~30–60 seconds."
+                  }
+                  style={{
+                    padding: "4px 10px",
+                    fontSize: 9,
+                    letterSpacing: 0.6,
+                    textTransform: "uppercase",
+                    borderColor: running ? "var(--accent-mid)" : undefined,
+                    color: running ? "var(--accent)" : undefined,
+                  }}
+                >
+                  {running ? "running…" : "calibrate"}
+                </button>
+              ) : (
+                // XelisHash has no benchmark path (SRBMiner has no offline
+                // bench, and the KawPoW probe's pool cannot measure it). Say
+                // how the number DOES get measured instead of offering a
+                // button that would run xmrig/KawPoW against the wrong
+                // algorithm.
+                <span
+                  title="No offline benchmark exists for this algorithm. Mine it: after about a minute of stable hashrate the measured value replaces this estimate automatically."
+                  style={{
+                    padding: "4px 0",
+                    fontSize: 9,
+                    letterSpacing: 0.6,
+                    textTransform: "uppercase",
+                    color: "var(--text-dim)",
+                  }}
+                >
+                  measured live
+                </span>
+              )}
               {running && (
                 <div
                   style={{

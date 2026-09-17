@@ -1015,7 +1015,11 @@ export async function rescanXmrFromHeight(
   seed: string,
   masterPassword: string,
   newHeight: number,
-  walletFilename: string = XMR_WALLET_FILENAME
+  // REQUIRED, deliberately without the legacy default `initXmrSession` has:
+  // this deletes the file before rebuilding it, and a caller that left the
+  // name out deleted the PRIMARY wallet's file (`ScanDateCard`, until
+  // 2026-09-16). Making it required lets the compiler catch the next one.
+  walletFilename: string
 ): Promise<void> {
   try {
     await closeXmrWallet();

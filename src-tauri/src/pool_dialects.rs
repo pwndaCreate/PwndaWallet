@@ -1,5 +1,5 @@
 //! Per-pool Stratum dialect knowledge — hostname-keyed subscribe shapes +
-//! the V1/RandomX handshake frame builders.
+//! the V1/RandomX/XELIS handshake frame builders.
 //!
 //! **This module is fee-free.** It was extracted from the (removed) dev-fee
 //! proxy on 2026-07-06 ([[pure-wallet-transition-plan]] Workstream A) because
@@ -49,7 +49,8 @@ pub const PROBE_WORKER: &str = "smoke";
 pub enum SubscribeParamsShape {
     /// `params: []` — safe default; works against HeroMiners / Nanopool / WoolyPooly.
     Empty,
-    /// `params: [agent]`. Triggers a silent EOF on WoolyPooly.
+    /// `params: [agent]`. Triggers a silent EOF on WoolyPooly. The shape
+    /// SRBMiner-MULTI 3.6.2 sends for XELIS stratum (see [`build_xelis_subscribe`]).
     Agent,
     /// `params: [agent, "EthereumStratum/1.0.0"]` — NiceHash extension negotiation.
     AgentExt,
@@ -124,9 +125,40 @@ pub fn quirks_for(pool_url: &str) -> PoolQuirks {
     classify_host(&host, port)
 }
 
+/// XELIS pool hosts, matched on the Xelis-specific SUBDOMAIN — never on the
+/// pool brand, because Kryptex, K1Pool and HeroMiners each host many coins under
+/// one parent domain (`erg.kryptex.network`, `de.ravencoin.herominers.com`, …)
+/// and those must keep their own dialects.
+fn is_xelis_pool_host(host: &str) -> bool {
+    host == "xel.kryptex.network"
+        || (host.starts_with("xel-") && host.ends_with(".kryptex.network"))
+        || host.ends_with(".xel.k1pool.com")
+        || host.ends_with(".xel.k1pool.org")
+        || host == "xelis.herominers.com"
+        || host.ends_with(".xelis.herominers.com")
+}
+
 /// Classification table. Each branch is independent; add a `_ if ... =>`
 /// arm + a unit test for a new pool.
 fn classify_host(host: &str, port: Option<u16>) -> PoolQuirks {
+    // XELIS (XelisHash v3). First, and subdomain-scoped (see
+    // `is_xelis_pool_host`), so the brand-wide rules below never see these
+    // hosts. Shape captured 2026-09-15 from a real SRBMiner-MULTI 3.6.2
+    // session through a logging relay:
+    //   {"id":1, "method":"mining.subscribe", "params":["SRBMiner-MULTI/3.6.2"]}
+    // = `Agent`. K1Pool REJECTS `Empty` with
+    // `{"code":-3,"message":"Please update your miner software"}` and closes;
+    // Kryptex and HeroMiners accept either. All three pushed
+    // `mining.set_difficulty` after authorize; none pushed
+    // `mining.set_extranonce` in three captured sessions.
+    if is_xelis_pool_host(host) {
+        return PoolQuirks {
+            subscribe_params_shape: SubscribeParamsShape::Agent,
+            set_difficulty_expected: true,
+            may_push_set_extranonce: false,
+        };
+    }
+
     // WoolyPooly — split per coin (CFX vs ERG vs RVN) by PORT.
     // 3094 → CFX (Octopus) → WalletWithPass (pool registers worker→wallet
     // binding at SUBSCRIBE time; Empty leaves it unset → shares accepted
@@ -287,6 +319,35 @@ pub fn build_randomx_login(
     })
 }
 
+/// Build the XELIS stratum `mining.subscribe` frame exactly as SRBMiner-MULTI
+/// 3.6.2 sends it for `xelishashv3` (captured 2026-09-15 through a logging
+/// relay against K1Pool and HeroMiners): one agent string and — unlike the V1
+/// builder above — NO `jsonrpc` field.
+///
+/// docs.xelis.io describes `params: [agent, ["xel/v2"]]`; the real miner does
+/// not send the algorithm list, and all three live pools accepted what it does
+/// send, so the probe mirrors the miner, not the document.
+pub fn build_xelis_subscribe(id: u64, agent: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "method": "mining.subscribe",
+        "params": [agent],
+    })
+}
+
+/// Build the XELIS stratum `mining.authorize` frame as SRBMiner-MULTI 3.6.2
+/// sends it: THREE params — wallet (its `--wallet`), worker (its `--worker`),
+/// password — plus `jsonrpc:"2.0"`. The V1 builder folds the worker into the
+/// user string instead, which is not this protocol's shape.
+pub fn build_xelis_authorize(id: u64, wallet: &str, worker: &str, pass: &str) -> Value {
+    serde_json::json!({
+        "id": id,
+        "jsonrpc": "2.0",
+        "method": "mining.authorize",
+        "params": [wallet, worker, pass],
+    })
+}
+
 /* ══════ Tests — validate the dialect corpus ═════════════════════════ */
 
 #[cfg(test)]
@@ -385,6 +446,68 @@ mod tests {
     fn hashvault_xmr_safe() {
         let q = quirks_for("stratum+ssl://pool.hashvault.pro:443");
         assert_eq!(q.subscribe_params_shape, SubscribeParamsShape::Empty);
+    }
+
+    // ── XELIS (2026-09-15) ──────────────────────────────────────────────
+
+    #[test]
+    fn xelis_pool_hosts_use_the_srbminer_agent_shape() {
+        // Every XEL endpoint in pools.ts, plus the regional variants the pools
+        // publish, TCP and TLS.
+        for url in [
+            "stratum+tcp://xel.kryptex.network:7019",
+            "stratum+ssl://xel.kryptex.network:8019",
+            "stratum+tcp://xel-eu.kryptex.network:7019",
+            "stratum+tcp://xel-us.kryptex.network:7019",
+            "stratum+tcp://eu.xel.k1pool.com:9350",
+            "stratum+tcp://eu.xel.k1pool.com:9351",
+            "stratum+ssl://eu.xel.k1pool.com:9352",
+            "stratum+tcp://ru.xel.k1pool.org:9350",
+            "stratum+tcp://de.xelis.herominers.com:1225",
+            "stratum+ssl://fi.xelis.herominers.com:1225",
+        ] {
+            let q = quirks_for(url);
+            assert_eq!(q.subscribe_params_shape, SubscribeParamsShape::Agent, "{url}");
+            assert!(q.set_difficulty_expected, "{url}");
+            assert!(!q.may_push_set_extranonce, "{url}");
+        }
+    }
+
+    #[test]
+    fn xelis_rule_is_subdomain_scoped_not_brand_scoped() {
+        // The same brands host other coins; those must not inherit XELIS's
+        // shape. HeroMiners RVN keeps its catch-all Empty; an ERG host under
+        // Kryptex keeps the safe default.
+        assert_eq!(
+            quirks_for("stratum+tcp://de.ravencoin.herominers.com:1140").subscribe_params_shape,
+            SubscribeParamsShape::Empty
+        );
+        assert_eq!(
+            quirks_for("stratum+tcp://erg.kryptex.network:7021").subscribe_params_shape,
+            SubscribeParamsShape::Empty
+        );
+        assert!(!is_xelis_pool_host("kryptex.network"));
+        assert!(!is_xelis_pool_host("xel.k1pool.com.evil.example"));
+    }
+
+    #[test]
+    fn xelis_subscribe_is_byte_shape_of_srbminer_3_6_2() {
+        // Captured: {"id":1, "method":"mining.subscribe", "params":["SRBMiner-MULTI/3.6.2"]}
+        let v = build_xelis_subscribe(1, "SRBMiner-MULTI/3.6.2");
+        assert_eq!(v["id"], 1);
+        assert_eq!(v["method"], "mining.subscribe");
+        assert_eq!(v["params"], serde_json::json!(["SRBMiner-MULTI/3.6.2"]));
+        assert!(v.get("jsonrpc").is_none(), "SRBMiner's XELIS subscribe carries no jsonrpc");
+    }
+
+    #[test]
+    fn xelis_authorize_carries_wallet_worker_and_password_separately() {
+        // Captured: {"id":2,"jsonrpc":"2.0","method":"mining.authorize",
+        //            "params":["xel:teqlmzt…","pwnda-cpu","x"]}
+        let v = build_xelis_authorize(2, "xel:addr", "pwnda-cpu", "x");
+        assert_eq!(v["method"], "mining.authorize");
+        assert_eq!(v["jsonrpc"], "2.0");
+        assert_eq!(v["params"], serde_json::json!(["xel:addr", "pwnda-cpu", "x"]));
     }
 
     #[test]

@@ -2223,8 +2223,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn release_lease_does_not_stop_while_another_lease_remains() {
+    // A tokio runtime: on Linux, spawning a tokio child needs one (the
+    // pidfd reaper). Windows did not, so this passed there only (2026-09-16).
+    #[tokio::test]
+    async fn release_lease_does_not_stop_while_another_lease_remains() {
         let mut inner = fresh_inner_with_child();
         inner.leases.insert(XmrLease::Session);
         inner.leases.insert(XmrLease::SwapEngine);
@@ -2243,8 +2245,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn release_lease_stops_once_the_last_lease_is_released() {
+    // A tokio runtime: on Linux, spawning a tokio child needs one (the
+    // pidfd reaper). Windows did not, so this passed there only (2026-09-16).
+    #[tokio::test]
+    async fn release_lease_stops_once_the_last_lease_is_released() {
         let mut inner = fresh_inner_with_child();
         inner.leases.insert(XmrLease::SwapEngine);
 
@@ -2300,8 +2304,10 @@ mod tests {
         assert_eq!((u.as_str(), p.as_str()), ("fresh_u", "fresh_p"));
     }
 
-    #[test]
-    fn release_lease_of_an_unheld_lease_is_harmless() {
+    // A tokio runtime: on Linux, spawning a tokio child needs one (the
+    // pidfd reaper). Windows did not, so this passed there only (2026-09-16).
+    #[tokio::test]
+    async fn release_lease_of_an_unheld_lease_is_harmless() {
         // Releasing a lease this caller never held (e.g. a double-release,
         // or SwapEngine releasing before it ever acquired) must not stop a
         // process a DIFFERENT lease is still relying on.

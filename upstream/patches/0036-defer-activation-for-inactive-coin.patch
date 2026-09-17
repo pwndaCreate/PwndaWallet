@@ -1,0 +1,102 @@
+Grove PATCH-36: a coin that is not active this session defers a bid, never kills it
+
+Grove runs host-wallet coins (ZEPH, ZANO) only while the app's own wallet
+process is up. The vault is locked when the swap node autostarts, so those coins
+PARK for that start, and the supervisor restarts the node once the wallet comes
+up. Upstream has never had a coin disappear under an in-flight swap, and treats
+it as a broken bid in two places.
+
+WHAT IT COST (2026-09-13, mainnet, the ZANO<>LTC swap)
+
+This node was waiting to publish the ZANO lock (tx B), retrying every ~3 min
+(the PATCH-35 identity refusal). The app was closed at ~15:51. At the 16:27
+restart ZANO was parked, and loading the bid failed:
+
+    Failed to activate bid! Error: 16
+    basicswap.util.InactiveCoin: 16
+
+loadFromDB's handler then ran deactivateBid, whose
+
+    DELETE FROM actions WHERE linked_id = :bid_id
+
+(UPDATE ... active_ind = 2 under debug) retired the bid's queued
+SEND_XMR_SWAP_LOCK_TX_B retry. The unpark restart four minutes later loaded the
+bid as in progress again, but nothing re-queues that action, so the node never
+tried the ZANO lock again. It sat until the offerer refunded 15 hours later.
+The failure repeated at three later starts. So even with PATCH-35 in place, this
+restart alone would have failed the swap.
+
+The second place is checkQueuedActions. An action that comes due while its coin
+is parked raises InactiveCoin, falls into the generic except, sets the bid to
+BID_ERROR and is deleted with the processed rows.
+
+THE FIX
+
+- loadFromDB: InactiveCoin during activation logs "activation deferred" and
+  leaves the bid untouched: no BID_ERROR, no deactivateBid, so its queued actions
+  survive. The next start with the coin active activates it exactly as before.
+- checkQueuedActions: InactiveCoin keeps the action, in the same retry list
+  TemporaryError uses, and does not error the bid. The action runs once the coin
+  is back.
+
+Every other activation failure and action failure is handled exactly as before.
+
+Scope: InactiveCoin only. It is raised by BasicSwap.ci() for a coin with no
+interface this session, and never by a swap step's own failure.
+
+Verified by verify-redeem-recovery-patches.py (PWNDA-PATCH-36 section), which
+drives the real loadFromDB and checkQueuedActions against stubbed DB cursors.
+Each case has a negative control: a ValueError must still error the bid.
+
+Upstream candidate: possibly. Upstream can hit it too, whenever a coin is removed
+from basicswap.json while one of its bids is in progress.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -3927,4 +3927,26 @@
+                     try:
+                         self.activateBid(cursor, bid)
++                    except InactiveCoin as ex:
++                        # PWNDA-PATCH-36: a coin that is not active THIS session
++                        # (a Grove host-wallet coin parks while the vault is
++                        # locked) defers the bid; it is not a broken bid. The
++                        # handler below sets BID_ERROR and runs deactivateBid,
++                        # which DELETEs the bid's queued actions -- on
++                        # 2026-09-13 that retired a ZANO lock retry nothing ever
++                        # re-queued, and the swap waited for a refund. Leave the
++                        # bid and its actions for the next start.
++                        self.swaps_in_progress.pop(bid.bid_id, None)
++                        coin_name = Coins(ex.coinid).name
++                        self.log.warning(
++                            f"Deferring bid {self.log.id(bid.bid_id)}: {coin_name} is not "
++                            "active this session (PWNDA-PATCH-36)"
++                        )
++                        self.logEvent(
++                            Concepts.BID,
++                            bid.bid_id,
++                            EventLogTypes.ERROR,
++                            f"Activation deferred: {coin_name} is not active this session",
++                            cursor,
++                        )
+                     except Exception as ex:
+                         self.logException(f"Failed to activate bid! Error: {ex}")
+@@ -11491,7 +11512,18 @@
+                 except TemporaryError as ex:
+                     self.log.warning(
+                         f"checkQueuedActions temporary error for {self.log.id(linked_id)}: {ex}"
+                     )
+                     retry_action_ids.append(action_id)
++                except InactiveCoin as ex:
++                    # PWNDA-PATCH-36: the action's coin is parked this session.
++                    # Falling through to the generic handler below would set the
++                    # bid to BID_ERROR and delete the action. Keep it for when
++                    # the coin is back, like a TemporaryError.
++                    self.log.debug(
++                        f"checkQueuedActions: {Coins(ex.coinid).name} is not active this "
++                        f"session; keeping action {action_type} for "
++                        f"{self.log.id(linked_id)} (PWNDA-PATCH-36)"
++                    )
++                    retry_action_ids.append(action_id)
+                 except Exception as ex:
+                     err_msg = f"checkQueuedActions failed: {ex}"

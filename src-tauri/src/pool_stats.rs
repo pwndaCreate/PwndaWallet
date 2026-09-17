@@ -72,6 +72,21 @@ enum ParserKind {
     /// integration.
     NanopoolErgJson,
     WoolypoolyJson,
+    /// K1Pool miner account (`GET /api/miner/<coin>/<address>`), added
+    /// 2026-09-15 for Xelis. Verified against a live active account that day:
+    /// balances are whole-coin FLOATS (`pendingBalance`, `immatureBalance`,
+    /// `paidBalance`, `payoutThreshold`), hashrates are plain H/s numbers
+    /// (`curHashrate`, `dayHashrate`), `lastShare` is unix seconds, and the
+    /// account is keyed by the address WITHOUT its `xel:` prefix — a prefixed
+    /// query returns an all-zero account, not an error.
+    K1poolMinerJson,
+    /// Pwnda's own XEL pool account (`GET /xelis-api/stats/<xel:address>`),
+    /// added 2026-09-16. Read against the live API and the pwnda.org site's
+    /// own consumer of it that day. Balances are whole-XEL numbers: the site
+    /// multiplies them by its `atomicUnits: 1e8`. `hashrate` is H/s. The
+    /// account is keyed by the address WITH its `xel:` prefix: a bare address
+    /// is an HTTP 404 page, and an unknown prefixed one is all zeros.
+    PwndaXelisJson,
     /// Phase 2 — server-rendered HTML scraping. Currently returns an error
     /// so callers fall back to "open dashboard" UI gracefully.
     NtminerHtml,
@@ -169,6 +184,35 @@ const POOLS: &[PoolEndpoint] = &[
         url_template: "https://api.nanopool.org/v1/ergo/user/{addr}",
         kind: ParserKind::NanopoolErgJson,
     },
+    // ── Xelis (XEL), added 2026-09-15. K1Pool only: its account API was
+    // fetched live for a real active account that day. The three pools.ts
+    // entries are three PORTS (CPU 9350 / GPU 9351 / TLS 9352) of one account
+    // backend, so they share a URL. `{addr}` receives the address with its
+    // `xel:` prefix removed — see `api_address`. Kryptex (no discoverable
+    // per-address API) and HeroMiners (site blocked from the dev box, so no
+    // response was ever captured) are deliberately absent.
+    PoolEndpoint {
+        id: "k1pool-xelis-cpu",
+        url_template: "https://k1pool.com/api/miner/xel/{addr}",
+        kind: ParserKind::K1poolMinerJson,
+    },
+    PoolEndpoint {
+        id: "k1pool-xelis-gpu",
+        url_template: "https://k1pool.com/api/miner/xel/{addr}",
+        kind: ParserKind::K1poolMinerJson,
+    },
+    PoolEndpoint {
+        id: "k1pool-xelis-ssl",
+        url_template: "https://k1pool.com/api/miner/xel/{addr}",
+        kind: ParserKind::K1poolMinerJson,
+    },
+    // Pwnda's own XEL pool (2026-09-16). One port serves both lanes, so one
+    // entry. The site fetches the same URL with the colon left unencoded.
+    PoolEndpoint {
+        id: "pwnda-xelis",
+        url_template: "https://pwnda.org/xelis-api/stats/{addr}",
+        kind: ParserKind::PwndaXelisJson,
+    },
 ];
 
 const ALLOWED_HOSTS: &[&str] = &[
@@ -181,6 +225,10 @@ const ALLOWED_HOSTS: &[&str] = &[
     "api.nanopool.org",
     "api.woolypooly.com",
     "ntminerpool.com",
+    // K1Pool account API (Xelis, added 2026-09-15).
+    "k1pool.com",
+    // Pwnda XEL pool account API (added 2026-09-16).
+    "pwnda.org",
 ];
 
 fn is_host_allowed(host: &str) -> bool {
@@ -220,11 +268,15 @@ pub async fn fetch_pool_stats(
         .find(|p| p.id == pool_id)
         .ok_or_else(|| format!("Unknown pool_id: {}", pool_id))?;
 
-    // PWNDA pool ids ("pwnda-monero", etc.) intentionally don't appear in
-    // POOLS — the Mining UI hides the panel for them, but if a future caller
-    // tries one we want a clear error rather than a generic "Unknown".
+    // Most PWNDA pool ids ("pwnda-zephyr", "pwnda-zano") intentionally don't
+    // appear in POOLS — the Mining UI hides the panel for them, but if a
+    // future caller tries one we want a clear error rather than a generic
+    // "Unknown". `pwnda-xelis` is the exception (2026-09-16): its pool
+    // publishes a per-address API.
 
-    let url = pool.url_template.replace("{addr}", &address);
+    let url = pool
+        .url_template
+        .replace("{addr}", api_address(pool.kind, &address));
 
     let host = parse_https_host(&url)?;
     if !is_host_allowed(&host) {
@@ -282,6 +334,9 @@ pub async fn fetch_pool_stats(
             };
             parse_woolypooly(&body, decimals)?
         }
+        // XEL is the only coin on this parser today: 8 decimals.
+        ParserKind::K1poolMinerJson => parse_k1pool_miner(&body, 8)?,
+        ParserKind::PwndaXelisJson => parse_pwnda_xelis(&body)?,
         ParserKind::NtminerHtml => parse_ntminer_html(&body)?,
     };
     stats.fetched_at = now_secs;
@@ -734,6 +789,226 @@ fn parse_hashrate_field(v: &Value) -> Option<f64> {
 
 fn truncate(s: &str, max: usize) -> &str {
     if s.len() <= max { s } else { &s[..max] }
+}
+
+/// The address in the form the pool's API expects for `{addr}`.
+///
+/// K1Pool keys a Xelis account by the address WITHOUT its `xel:` network
+/// prefix. Verified 2026-09-15: `/api/miner/xel/xel:nm46…` returned an
+/// all-zero account (3.4 KB) while `/api/miner/xel/nm46…` returned the real
+/// one (180 KB, two workers, 259.57 XEL paid). The prefixed query is not an
+/// error, so without this a user's stats panel would read a confident zero.
+/// Every other parser takes the address exactly as given.
+fn api_address(kind: ParserKind, address: &str) -> &str {
+    match kind {
+        ParserKind::K1poolMinerJson => {
+            let trimmed = address.trim();
+            trimmed.strip_prefix("xel:").unwrap_or(trimmed)
+        }
+        _ => address,
+    }
+}
+
+/// K1Pool account schema (`GET /api/miner/<coin>/<address>`). Field map pinned
+/// against a real, active XEL account on 2026-09-15:
+///
+/// - `miner.pendingBalance` / `immatureBalance` / `paidBalance` /
+///   `payoutThreshold` — whole-coin FLOATS (`immatureBalance: 0.37876`,
+///   `payoutThreshold: 3`), shifted to atomic strings here like WoolyPooly's.
+/// - `miner.curHashrate` / `dayHashrate` — plain H/s numbers
+///   (`393451` ⇔ `curHashrateStr: "393.45 KH/s"`).
+/// - `miner.lastShare` — unix seconds; `miner.workersOnline` — a count.
+///
+/// `avgHashrate` is deliberately NOT mapped to a 1h/6h tile: the API gives no
+/// window for it, and a mislabelled average is worse than an absent one.
+/// An address the pool has never seen returns this same object with every
+/// number zero — passed through as zeros, with `lastShare: 0` → `None`
+/// ("never"), not as an error.
+fn parse_k1pool_miner(body: &str, decimals: u32) -> Result<MinerStatsDto, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("K1Pool JSON parse: {}", e))?;
+    let m = &v["miner"];
+    if !m.is_object() {
+        return Err("K1Pool: response has no `miner` object".to_string());
+    }
+    Ok(MinerStatsDto {
+        pending_balance: float_to_atomic_string(&m["pendingBalance"], decimals)
+            .unwrap_or_else(|| "0".into()),
+        immature_balance: float_to_atomic_string(&m["immatureBalance"], decimals),
+        total_paid: float_to_atomic_string(&m["paidBalance"], decimals),
+        payout_threshold: float_to_atomic_string(&m["payoutThreshold"], decimals),
+        hashrate: as_f64(&m["curHashrate"]).unwrap_or(0.0),
+        hashrate1h: None,
+        hashrate6h: None,
+        hashrate24h: as_f64(&m["dayHashrate"]),
+        valid_shares: None,
+        invalid_shares: None,
+        stale_shares: None,
+        last_share: as_u64(&m["lastShare"]).filter(|t| *t > 0),
+        workers_online: as_u64(&m["workersOnline"]),
+        fetched_at: 0,
+    })
+}
+
+/// pwnda-xelis's published minimum payout: `minPayout: "0.05 XEL"` in the
+/// pwnda.org pool config (and `pools.ts`). The account API doesn't return it,
+/// and the panel's "min … XEL" line needs it.
+const PWNDA_XEL_MIN_PAYOUT: f64 = 0.05;
+
+/// Pwnda XEL account schema (`GET /xelis-api/stats/<xel:address>`). Field
+/// map pinned 2026-09-16 against the live API and the labels pwnda.org itself
+/// shows for these fields:
+///
+/// - `balance` — "UNPAID - accrues until the payout threshold" → pending.
+/// - `balance_pending` — "awaiting 200 block confirmations" → maturing.
+/// - `paid` — "TOTAL_PAID" → lifetime paid.
+/// - `hashrate` — current H/s.
+///
+/// All three balances are whole-XEL numbers. `est_pending` (the running
+/// round estimate) has no field in the shared shape, so it is dropped.
+/// `hr_chart` and `withdrawals` are not mapped either. The site reports no
+/// 1h/6h/24h averages, last share or worker count, so those stay `None`
+/// rather than a made-up zero. An address the pool has never seen returns
+/// zeros with `hr_chart: null`, passed through as zeros like K1Pool's.
+fn parse_pwnda_xelis(body: &str) -> Result<MinerStatsDto, String> {
+    let v: Value = serde_json::from_str(body)
+        .map_err(|e| format!("Pwnda XEL JSON parse: {}", e))?;
+    if as_f64(&v["balance"]).is_none() {
+        return Err("Pwnda XEL: response has no numeric `balance`".to_string());
+    }
+    Ok(MinerStatsDto {
+        pending_balance: float_to_atomic_string(&v["balance"], 8)
+            .unwrap_or_else(|| "0".into()),
+        immature_balance: float_to_atomic_string(&v["balance_pending"], 8),
+        total_paid: float_to_atomic_string(&v["paid"], 8),
+        payout_threshold: float_to_atomic_string(&Value::from(PWNDA_XEL_MIN_PAYOUT), 8),
+        hashrate: as_f64(&v["hashrate"]).unwrap_or(0.0),
+        hashrate1h: None,
+        hashrate6h: None,
+        hashrate24h: None,
+        valid_shares: None,
+        invalid_shares: None,
+        stale_shares: None,
+        last_share: None,
+        workers_online: None,
+        fetched_at: 0,
+    })
+}
+
+#[cfg(test)]
+mod pwnda_xelis_tests {
+    use super::*;
+
+    /// The live response for the operator's address, 2026-09-16, just after
+    /// a session ended (the chart's last points are 0).
+    const OPERATOR: &str = r#"{"balance":0,"balance_pending":0,"est_pending":0,"hashrate":0,"hr_chart":[{"t":1789602284,"h":2750},{"t":1789603184,"h":6831},{"t":1789604084,"h":7276},{"t":1789604984,"h":1971},{"t":1789605884,"h":4139},{"t":1789606784,"h":5147},{"t":1789607684,"h":0},{"t":1789608584,"h":0}],"paid":0,"withdrawals":[]}"#;
+
+    /// An address the pool has never seen, same day.
+    const NEVER_SEEN: &str = r#"{"balance":0,"balance_pending":0,"est_pending":0,"hashrate":0,"hr_chart":null,"paid":0,"withdrawals":[]}"#;
+
+    /// The live shape with non-zero values filled in, so the unit conversion
+    /// is actually exercised: whole XEL in, atomic (1e8) strings out.
+    const FUNDED: &str = r#"{"balance":0.0412,"balance_pending":0.00731,"est_pending":0.001,"hashrate":7276.5,"hr_chart":[],"paid":1.25,"withdrawals":[{"time":1789600000,"amount":0.05,"txid":"ab"}]}"#;
+
+    #[test]
+    fn converts_whole_xel_to_atomic_strings() {
+        let s = parse_pwnda_xelis(FUNDED).expect("parse");
+        assert_eq!(s.pending_balance, "4120000");
+        assert_eq!(s.immature_balance.as_deref(), Some("731000"));
+        assert_eq!(s.total_paid.as_deref(), Some("125000000"));
+        assert_eq!(s.payout_threshold.as_deref(), Some("5000000"), "0.05 XEL");
+        assert_eq!(s.hashrate, 7276.5);
+    }
+
+    #[test]
+    fn the_live_operator_response_parses_as_zeros_with_no_invented_fields() {
+        for body in [OPERATOR, NEVER_SEEN] {
+            let s = parse_pwnda_xelis(body).expect("parse");
+            assert_eq!(s.pending_balance, "0");
+            assert_eq!(s.hashrate, 0.0);
+            assert_eq!(s.hashrate24h, None);
+            assert_eq!(s.last_share, None);
+            assert_eq!(s.workers_online, None);
+        }
+    }
+
+    #[test]
+    fn a_body_without_a_balance_is_an_error() {
+        // What the bare-address 404 would be if it ever came back as JSON.
+        assert!(parse_pwnda_xelis(r#"{"error":"not found"}"#).is_err());
+        assert!(parse_pwnda_xelis("<!doctype html>").is_err());
+    }
+
+    #[test]
+    fn the_address_keeps_its_xel_prefix_and_the_host_is_allowed() {
+        let pool = POOLS.iter().find(|p| p.id == "pwnda-xelis").expect("registered");
+        let url = pool
+            .url_template
+            .replace("{addr}", api_address(pool.kind, "xel:lfmtabc"));
+        assert_eq!(url, "https://pwnda.org/xelis-api/stats/xel:lfmtabc");
+        assert!(is_host_allowed(&parse_https_host(&url).unwrap()));
+    }
+}
+
+#[cfg(test)]
+mod k1pool_tests {
+    use super::*;
+
+    /// Trimmed from the live response for a real, active K1Pool XEL account
+    /// (`/api/miner/xel/nm46…`, 2026-09-15; 180 KB of charts removed).
+    const ACTIVE: &str = r#"{"miner":{"workersTotal":2,"workersOnline":2,"workersOffline":0,"workers":{"rig01":{"mineZil":false,"lastBeat":1789509667,"startedAt":1789423800,"hr":214445,"hr2":199611,"hr24":221155,"offline":false}},"curHashrate":393451,"curHashrateStr":"393.45 KH/s","avgHashrate":435196,"avgHashrateStr":"435.2 KH/s","dayHashrate":339855,"dayHashrateStr":"339.86 KH/s","coinsPerDay":47.08813,"lastShare":1789509667,"lastShareDiff":0,"paymentsTotal":47,"payoutThreshold":3,"immatureBalance":0.37876,"pendingBalance":0,"paidBalance":259.56861},"pool":{}}"#;
+
+    /// The throwaway address the pool had never seen, same day: the SAME
+    /// object with every number zero (note `workers` is an array here).
+    const NEVER_SEEN: &str = r#"{"miner":{"workersTotal":0,"workersOnline":0,"workersOffline":0,"workers":[],"curHashrate":0,"curHashrateStr":"0 H/s","avgHashrate":0,"dayHashrate":0,"lastShare":0,"payoutThreshold":3,"immatureBalance":0,"pendingBalance":0,"paidBalance":0}}"#;
+
+    #[test]
+    fn parses_a_live_active_account() {
+        let s = parse_k1pool_miner(ACTIVE, 8).expect("parse");
+        assert_eq!(s.hashrate, 393_451.0);
+        assert_eq!(s.hashrate24h, Some(339_855.0));
+        assert_eq!(s.hashrate1h, None, "avgHashrate has no documented window");
+        assert_eq!(s.pending_balance, "0");
+        assert_eq!(s.immature_balance.as_deref(), Some("37876000"));
+        assert_eq!(s.total_paid.as_deref(), Some("25956861000"));
+        assert_eq!(s.payout_threshold.as_deref(), Some("300000000"));
+        assert_eq!(s.last_share, Some(1_789_509_667));
+        assert_eq!(s.workers_online, Some(2));
+    }
+
+    #[test]
+    fn a_never_seen_address_is_zeros_not_an_error() {
+        let s = parse_k1pool_miner(NEVER_SEEN, 8).expect("parse");
+        assert_eq!(s.hashrate, 0.0);
+        assert_eq!(s.pending_balance, "0");
+        assert_eq!(s.last_share, None, "lastShare 0 means never");
+        assert_eq!(s.workers_online, Some(0));
+    }
+
+    #[test]
+    fn a_body_without_a_miner_object_is_an_error() {
+        assert!(parse_k1pool_miner(r#"{"error":"nope"}"#, 8).is_err());
+    }
+
+    #[test]
+    fn strips_the_xel_prefix_only_for_k1pool() {
+        assert_eq!(api_address(ParserKind::K1poolMinerJson, "xel:nm46abc"), "nm46abc");
+        assert_eq!(api_address(ParserKind::K1poolMinerJson, " nm46abc "), "nm46abc");
+        assert_eq!(api_address(ParserKind::HerominersJson, "xel:nm46abc"), "xel:nm46abc");
+    }
+
+    #[test]
+    fn every_xel_k1pool_pool_resolves_to_an_allowlisted_unprefixed_url() {
+        for id in ["k1pool-xelis-cpu", "k1pool-xelis-gpu", "k1pool-xelis-ssl"] {
+            let pool = POOLS.iter().find(|p| p.id == id).expect(id);
+            let url = pool
+                .url_template
+                .replace("{addr}", api_address(pool.kind, "xel:nm46abc"));
+            assert_eq!(url, "https://k1pool.com/api/miner/xel/nm46abc", "{id}");
+            let host = parse_https_host(&url).expect("https");
+            assert!(is_host_allowed(&host), "{id}: {host} not allowlisted");
+        }
+    }
 }
 
 

@@ -39,10 +39,13 @@ healthy start and periodically, which is what turns the 2026-08-23 bid into
 Not an upstream candidate as written: upstream's exit is manualBidUpdate on
 the HTML bid page, which takes an arbitrary state. This takes none.
 
+Rebased 2026-09-17 onto basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4): `pwndaTxConfirmations` was annotated `-> Optional[int]`; v0.18.9 no longer imports `Optional` in basicswap.py, so the engine would have failed to import. Now `-> int | None`. The diff below is regenerated; the change it makes is the same.
+
 diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 7eaa425..f8f30c4 100644
 --- a/basicswap/basicswap.py
 +++ b/basicswap/basicswap.py
-@@ -7717,6 +7717,82 @@
+@@ -7742,6 +7742,82 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                      "state": state_before,
                      "reason": "A refund is already in flight for this swap; the timelock path will complete it.",
                  }
@@ -125,11 +128,11 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
              # Gate 3 -- nothing to publish if the spend tx was never built.
              if not xmr_swap.a_lock_spend_tx:
                  return {
-@@ -7746,6 +7822,32 @@
+@@ -7771,6 +7847,32 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
          finally:
              self.closeDB(cursor, commit=False)
  
-+    def pwndaTxConfirmations(self, ci, txid: bytes) -> Optional[int]:
++    def pwndaTxConfirmations(self, ci, txid: bytes) -> int | None:
 +        # PWNDA-PATCH-27: how many confirmations chain A gives a transaction,
 +        # or None when the question cannot be answered -- and None means "do
 +        # not settle", never "assume confirmed". Electrum mode asks the backend

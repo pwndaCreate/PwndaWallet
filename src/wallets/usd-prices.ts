@@ -90,6 +90,10 @@ export const TICKER_TO_COINGECKO_ID: Record<string, string> = {
   SUI:   "sui",
   NEAR:  "near",
   ZANO:  "zano",
+  // Verified live 2026-09-15: /simple/price?ids=xelis&vs_currencies=usd
+  // returned {"xelis":{"usd":0.202094}}, and /search?query=xelis resolved to
+  // id "xelis", symbol XEL, market-cap rank 2747.
+  XEL:   "xelis",
 };
 
 /** Map ticker → CoinPaprika coin id (slug-uppercase format). */
@@ -133,6 +137,15 @@ const TICKER_TO_COINPAPRIKA_ID: Record<string, string> = {
   // by CoinGecko, and the last-known-good cache in fetchUsdPrices keeps its
   // value on screen through any cooldown window.
   ZANO:  "zano-zano", // verified live 2026-08-27 via /v1/search?q=zano
+  // Verified live 2026-09-15 via /v1/search?q=xelis&c=currencies →
+  // {"id":"xel-xelis","symbol":"XEL",…}; /v1/tickers/xel-xelis priced it at
+  // 0.2020992284055165 USD, within 0.003% of CoinGecko's figure the same minute.
+  //
+  // CryptoCompare has NO usable XEL entry: `pricemulti?fsyms=XEL&tsyms=USD`
+  // returns HTTP 401 (an API key is now required), as does `generalinfo`. The
+  // third provider is therefore permanently unavailable for this ticker, which
+  // is why both of the maps above carry it — XEL has two providers, not three.
+  XEL:   "xel-xelis",
 };
 
 const COINGECKO_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price";
@@ -199,6 +212,28 @@ function warnPriceFailureOnce(reason: string): void {
 
 let spotCache: { at: number; prices: Record<string, number> } | null = null;
 let spotInflight: Promise<Record<string, number>> | null = null;
+/** The uppercase tickers the in-flight round is fetching. */
+let spotInflightWanted: ReadonlySet<string> = new Set();
+
+/**
+ * When each ticker was last REQUESTED from the providers, answered or not.
+ *
+ * The cache is fresh for a caller only if every ticker it asks for was
+ * requested within the TTL. Until 2026-09-16 freshness was one timestamp for
+ * the whole cache, so a caller asking for a ticker the last round never
+ * requested (a coin that became held a moment ago) got the cached map back
+ * without it, and the coin read "—" until the window closed. Recording the
+ * request, not the answer, keeps an unpriceable ticker from forcing a refetch
+ * on every call.
+ */
+const spotAskedAt = new Map<string, number>();
+
+function spotCacheCovers(wanted: readonly string[], now: number): boolean {
+  return wanted.every((t) => {
+    const at = spotAskedAt.get(t);
+    return at != null && now - at < SPOT_CACHE_TTL_MS;
+  });
+}
 
 // Last-known-good price per uppercase ticker, accumulated across every
 // successful fetch and NEVER wholesale-cleared. A provider that can't price
@@ -384,21 +419,28 @@ export async function fetchUsdPrices(
     // correct number a few seconds later, the same trade-off
     // `hydrateBalances` already makes for balances — and kick off a REAL
     // refresh in the background rather than blocking this call on it.
-    // `at: 0` guarantees the recursive call's own TTL check treats this
-    // snapshot as already-expired, so it proceeds straight to a live fetch
-    // instead of re-serving the same stale prices back to itself.
+    // The recursive call is `force`d, so it goes straight to a live fetch
+    // instead of re-serving the same stale prices back to itself. (No ticker
+    // has a `spotAskedAt` entry yet either, so no caller treats this snapshot
+    // as fresh.)
     spotCache = { at: 0, prices: { ...lastGoodByTicker } };
     void fetchUsdPrices(tickers, { force: true });
     return spotCache.prices;
   }
-  const now = Date.now();
-  if (!force && spotCache && now - spotCache.at < SPOT_CACHE_TTL_MS) {
+  const wanted = Array.from(new Set(tickers.map((t) => t.toUpperCase())));
+  if (!force && spotCache && spotCacheCovers(wanted, Date.now())) {
     return spotCache.prices;
   }
-  if (spotInflight) return spotInflight;
+  if (spotInflight) {
+    if (wanted.every((t) => spotInflightWanted.has(t))) return spotInflight;
+    // The round in flight was asked for a different set. Let it land (one
+    // round at a time), then decide again — it may already cover us.
+    await spotInflight.catch(() => undefined);
+    return fetchUsdPrices(tickers, { force });
+  }
 
+  spotInflightWanted = new Set(wanted);
   spotInflight = (async () => {
-    const wanted = Array.from(new Set(tickers.map((t) => t.toUpperCase())));
     const fresh: Record<string, number> = {};
     let lastError: unknown = null;
 
@@ -444,7 +486,11 @@ export async function fetchUsdPrices(
     // priced earlier survives a later round that couldn't cover it (provider
     // gap or cooldown). The cache we hand back is the union — never a regression.
     lastGoodByTicker = { ...lastGoodByTicker, ...fresh };
-    spotCache = { at: Date.now(), prices: { ...lastGoodByTicker } };
+    const doneAt = Date.now();
+    spotCache = { at: doneAt, prices: { ...lastGoodByTicker } };
+    // Every ticker this round asked for, priced or not: an answer of "no
+    // price" (or a provider on cooldown) is still an answer for the window.
+    for (const t of wanted) spotAskedAt.set(t, doneAt);
     if (Object.keys(fresh).length > 0) writePriceCache(lastGoodByTicker);
 
     if (Object.keys(fresh).length === 0 && lastError) {
@@ -687,6 +733,9 @@ export async function fetchUsdPriceHistory(
 
 export function _resetCachesForTests(): void {
   spotCache = null;
+  spotInflight = null;
+  spotInflightWanted = new Set();
+  spotAskedAt.clear();
   lastGoodByTicker = {};
   historyCache.clear();
   cooldownUntil.coingecko = 0;

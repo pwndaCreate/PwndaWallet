@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { invoke } from "../../../lib/tauri";
-import type { GpuAlgorithm } from "../../../types/mining";
+import type { CpuAlgorithm, GpuAlgorithm } from "../../../types/mining";
+import { BENCH_ALGORITHM } from "../algorithms";
 import {
   setCalibratedHashrate,
   type CpuInfo,
@@ -35,13 +36,26 @@ type HashrateSample = { t: number; value: number };
  * poll), require max-min spread ≤ 5 % of average. Refs guard against
  * re-saving on every poll inside the same mining session — the flag
  * resets when the hardware stops mining.
+ *
+ * # Which key a measurement is saved under (fixed 2026-09-15)
+ *
+ * Until 2026-09-15 the CPU effect saved EVERY CPU session as `randomx`, and
+ * the GPU effect saved every GPU session that was not Octopus as `kawpow`.
+ * With one CPU algorithm and three benchmarked GPU algorithms that was
+ * merely fragile; with ZANO (`progpowz`) it was wrong: a Zano session's
+ * hashrate overwrote the user's Ravencoin prediction. The key now comes from
+ * `algorithms.ts::BENCH_ALGORITHM`, an exhaustive table, and an algorithm
+ * with no benchmark table is skipped rather than filed under another's key.
  */
 export function useCalibration(args: {
   isMiningCpu: boolean;
   isMiningGpu: boolean;
   cpuHashrateSamples: HashrateSample[];
   gpuHashrateSamples: HashrateSample[];
-  runningGpuMiner: "SRBMiner-MULTI" | "lolMiner" | null;
+  /** Algorithm of the CPU lane's session. Stable while it mines: the CPU
+   *  coin tiles and the algorithm snap are both locked for a busy lane. */
+  cpuAlgorithm: CpuAlgorithm;
+  /** Algorithm of the GPU lane's session (same stability argument). */
   gpuAlgorithm: GpuAlgorithm;
 }) {
   const {
@@ -49,7 +63,7 @@ export function useCalibration(args: {
     isMiningGpu,
     cpuHashrateSamples,
     gpuHashrateSamples,
-    runningGpuMiner,
+    cpuAlgorithm,
     gpuAlgorithm,
   } = args;
 
@@ -65,6 +79,11 @@ export function useCalibration(args: {
     // numbers, and the user gains nothing by us racing for the
     // earliest possible save.
     if (cpuHashrateSamples.length < 30) return;
+    const bench = BENCH_ALGORITHM[cpuAlgorithm];
+    if (!bench) {
+      cpuAutoCalibratedRef.current = true;
+      return;
+    }
     const recent = cpuHashrateSamples.slice(-15);
     const values = recent.map((s) => s.value);
     const min = Math.min(...values);
@@ -76,7 +95,7 @@ export function useCalibration(args: {
     invoke<CpuInfo>("get_cpu_info")
       .then((info) => {
         if (cancelled || !info?.name) return;
-        setCalibratedHashrate(info.name, "randomx", avg);
+        setCalibratedHashrate(info.name, bench, avg);
         cpuAutoCalibratedRef.current = true;
         window.dispatchEvent(new CustomEvent(CALIBRATION_UPDATED_EVENT));
       })
@@ -86,7 +105,7 @@ export function useCalibration(args: {
     return () => {
       cancelled = true;
     };
-  }, [isMiningCpu, cpuHashrateSamples]);
+  }, [isMiningCpu, cpuHashrateSamples, cpuAlgorithm]);
 
   const gpuAutoCalibratedRef = useRef(false);
   useEffect(() => {
@@ -96,6 +115,15 @@ export function useCalibration(args: {
     }
     if (gpuAutoCalibratedRef.current) return;
     if (gpuHashrateSamples.length < 30) return;
+    // No benchmark table for this algorithm (Autolykos2, ProgPowZ today):
+    // skip, and mark done so it is not re-evaluated every poll. Before
+    // 2026-09-15 this branch only excluded Autolykos2 and everything else
+    // fell through to `kawpow`.
+    const bench = BENCH_ALGORITHM[gpuAlgorithm];
+    if (!bench) {
+      gpuAutoCalibratedRef.current = true;
+      return;
+    }
     const recent = gpuHashrateSamples.slice(-15);
     const values = recent.map((s) => s.value);
     const min = Math.min(...values);
@@ -103,16 +131,6 @@ export function useCalibration(args: {
     const avg = values.reduce((a, b) => a + b, 0) / values.length;
     if (avg <= 0) return;
     if ((max - min) / avg > 0.05) return;
-    // Skip auto-calibration for Autolykos2 — `BenchAlgorithm` (in
-    // `hardware-benchmarks.ts`) doesn't include "autolykos" yet, so the
-    // static benchmark tables can't store it. ERG profitability tiles
-    // will show "—" until a follow-up extends the benchmark schema.
-    // Functional mining is unaffected.
-    if (gpuAlgorithm === "autolykos") return;
-    const algo: "kawpow" | "octopus" =
-      runningGpuMiner === "lolMiner" || gpuAlgorithm === "octopus"
-        ? "octopus"
-        : "kawpow";
     let cancelled = false;
     invoke<GpuInfo[]>("get_gpu_info")
       .then((gpus) => {
@@ -127,7 +145,7 @@ export function useCalibration(args: {
         const allSameModel = gpus.every((g) => g.name === gpus[0].name);
         if (allSameModel) {
           const perCard = avg / gpus.length;
-          setCalibratedHashrate(gpus[0].name, algo, perCard);
+          setCalibratedHashrate(gpus[0].name, bench, perCard);
           window.dispatchEvent(new CustomEvent(CALIBRATION_UPDATED_EVENT));
         }
         gpuAutoCalibratedRef.current = true;
@@ -136,5 +154,5 @@ export function useCalibration(args: {
     return () => {
       cancelled = true;
     };
-  }, [isMiningGpu, gpuHashrateSamples, runningGpuMiner, gpuAlgorithm]);
+  }, [isMiningGpu, gpuHashrateSamples, gpuAlgorithm]);
 }

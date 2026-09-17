@@ -7,6 +7,7 @@ import { BackupView } from "./BackupView";
 import { SetPasswordView } from "./SetPasswordView";
 import { ImportView } from "./ImportView";
 import { DerivationPickerView } from "../onboarding/DerivationPickerView";
+import type { SwapsWaiting } from "./swapsWaitingNotice";
 
 /**
  * The pre-wallet flow: welcome, unlock, import, derivation pick, seed backup,
@@ -57,6 +58,8 @@ export function AuthRouter(props: {
   handleConfirmDerivation: (choice: DerivationChoice) => void;
   handleSetPassword: (password: string, confirmPassword: string) => Promise<void>;
   copyToClipboard: (text: string, key?: string) => void;
+  /** The swap node's last in-progress reading, for the unlock screen. */
+  swapsWaiting?: SwapsWaiting | null;
 }) {
   const {
     view,
@@ -80,7 +83,13 @@ export function AuthRouter(props: {
   }
 
   if (view === "login") {
-    return <LoginView onUnlock={handleUnlock} onRemoveWallet={handleRemoveWallet} />;
+    return (
+      <LoginView
+        onUnlock={handleUnlock}
+        onRemoveWallet={handleRemoveWallet}
+        swapsWaiting={props.swapsWaiting}
+      />
+    );
   }
 
   if (view === "import") {

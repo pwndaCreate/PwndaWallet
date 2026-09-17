@@ -32,21 +32,27 @@ fn check_bundled_sidecars() {
     println!("cargo:rerun-if-changed=binaries/sidecars.json");
     println!("cargo:rerun-if-changed=binaries/monero-wallet-rpc.gz");
     println!("cargo:rerun-if-changed=binaries/zephyr-wallet-rpc.gz");
+    println!("cargo:rerun-if-changed=binaries/zano-simplewallet.gz");
+    println!("cargo:rerun-if-changed=binaries/xelis-wallet.gz");
 
     if !manifest.exists() {
         println!(
-            "cargo:warning=No binaries/sidecars.json — the Monero/Zephyr wallet-rpc \
-             payloads are NOT staged, so this build will not bundle them and XMR/ZPH \
-             users will download them on first use. For a release, run: \
+            "cargo:warning=No binaries/sidecars.json — the Monero/Zephyr/Zano/Xelis wallet \
+             payloads are NOT staged, so this build will not bundle them and those \
+             wallets will download them on first use. For a release, run: \
              node scripts/fetch-sidecars.mjs <win32|linux>"
         );
         return;
     }
 
-    // Warn per-sidecar so a half-staged directory is obvious.
+    // Warn per-sidecar so a half-staged directory is obvious. Zano and Xelis
+    // were missing from this list until 2026-09-16, which is how a tree staged
+    // before Xelis existed built without a word (log.md, that date).
     for (label, gz) in [
         ("Monero", "binaries/monero-wallet-rpc.gz"),
         ("Zephyr", "binaries/zephyr-wallet-rpc.gz"),
+        ("Zano", "binaries/zano-simplewallet.gz"),
+        ("Xelis", "binaries/xelis-wallet.gz"),
     ] {
         if !Path::new(gz).exists() {
             println!(
@@ -93,8 +99,9 @@ fn check_staged_platform(manifest: &Path) {
     if staged != expected {
         println!(
             "cargo:warning=binaries/sidecars.json is staged for '{}' but this build targets \
-             '{}' — the bundled wallet-rpc payloads will be REJECTED at runtime and XMR/ZPH \
-             users will download them instead. Run: node scripts/fetch-sidecars.mjs {}",
+             '{}' — every bundled wallet payload (XMR/ZPH/ZANO/XEL) will be REJECTED at \
+             runtime and those wallets will download their binary instead. Run: \
+             node scripts/fetch-sidecars.mjs {}",
             staged, expected, expected
         );
     }

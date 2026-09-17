@@ -10,17 +10,21 @@ import {
 import type { ChainType } from "../../src/wallets";
 
 /**
- * The chains PwndaLite supports as paste-in mining destinations. Matches
- * the chains with registered dev-fee wallets in
- * `src/features/mining/pools.ts::DEV_FEE_WALLETS` — anything mining-capable
- * in the full wallet is mineable from Lite.
+ * The chains PwndaLite supports as paste-in mining destinations — every coin
+ * on the shared mining roster (`src/features/mining/miningCoins.ts`), so
+ * anything mineable in the full wallet is mineable from Lite.
  *
- * 2026-05-14: ergo added by [[ergo-integration-plan]] PR-5. The ERG entry
- * will be inert until PR-3 lands the dev-fee wallet + pool definitions.
+ * 2026-05-14: ergo added by [[ergo-integration-plan]] PR-5.
+ * 2026-09-15: zano (missing since it joined the roster 2026-08-28 — a Lite
+ * user could pick ZANO but had nowhere to paste a payout address) and xelis.
+ * `liteSupportedChains.test.ts`, beside this file, pins this list against
+ * `MINING_COINS`, so the next coin cannot miss Lite the same way.
  */
 export const LITE_SUPPORTED_CHAINS: ChainType[] = [
   "monero",
   "zephyr",
+  "zano",
+  "xelis",
   "ravencoin",
   "conflux",
   "ergo",

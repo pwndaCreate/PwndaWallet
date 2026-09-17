@@ -28,11 +28,13 @@ from `upstream/patches/README.md`, `PwndaWalletVault/log.md`, and the code
 itself -- accurate, but not the original wording. See log.md 2026-09-03
 "patch-series recovery".
 
+Rebased 2026-09-17 onto basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4): rebased on the regenerated PATCH-3 and upstream's typing cleanup in wallet_manager.py. The diff below is regenerated; the change it makes is the same.
+
 diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
-index 4f97ad8..e48dab0 100644
+index 0f59622..4148ea8 100644
 --- a/basicswap/wallet_manager.py
 +++ b/basicswap/wallet_manager.py
-@@ -127,6 +127,18 @@ class WalletManager:
+@@ -126,6 +126,18 @@ class WalletManager:
          """
          return getattr(self, "_pwnda_address_types", {}).get(coin_type, "p2wpkh")
  
@@ -51,7 +53,7 @@ index 4f97ad8..e48dab0 100644
      def initializeFromAccountKey(
          self, coin_type: Coins, account_key: bytes, address_type: str = "p2wpkh"
      ) -> None:
-@@ -154,6 +166,15 @@ class WalletManager:
+@@ -153,6 +165,15 @@ class WalletManager:
          if address_type not in ("p2wpkh", "p2pkh"):
              raise ValueError(f"Unsupported address type {address_type}")
  
@@ -67,7 +69,7 @@ index 4f97ad8..e48dab0 100644
          ek = ExtKeyPair()
          ek.decode(account_key)
          if not ek.has_key():
-@@ -267,6 +288,59 @@ class WalletManager:
+@@ -266,6 +287,59 @@ class WalletManager:
          key = self._deriveKey(coin_type, index, internal)
          pubkey = PublicKey.from_secret(key).format()
          pkh = hash160(pubkey)

@@ -405,8 +405,10 @@ pub fn python_exe(app: &AppHandle) -> Result<PathBuf, String> {
 /// only ever diverge in a build running on the platform that was already
 /// right.
 fn python_exe_under(runtime: &std::path::Path, windows: bool) -> PathBuf {
+    // The suffix follows `windows`, not the host: this describes the Windows
+    // layout on any host (its test runs on Linux too since 2026-09-16).
     if windows {
-        runtime.join(format!("python{}", crate::platform::EXE_SUFFIX))
+        runtime.join("python.exe")
     } else {
         runtime.join("bin").join("python")
     }
@@ -638,6 +640,10 @@ pub struct SidecarStatus {
     /// layout", not "is this node pruned".
     #[serde(default)]
     pub particl_unpruned: bool,
+    /// The node's last reading of swaps in progress, for the lock screen. See
+    /// [`SwapsLastSeen`]. `None` before the first reading.
+    #[serde(default)]
+    pub swaps_last_seen: Option<SwapsLastSeen>,
 }
 
 // =========================================================================
@@ -772,6 +778,12 @@ pub struct ZphHostWalletParams {
     pub wallet_name: String,
     /// See [`XmrHostWalletParams::engine_pkg_dir`] — identical role.
     pub engine_pkg_dir: PathBuf,
+    /// The engine-owned swap wallet-rpc (`zph_rpc::zph_swap_wallet_start`),
+    /// where every per-swap wallet is opened. Never the user's process — see
+    /// [`apply_host_zph_wallet_to_config`] for what sharing it cost.
+    pub swap_port: u16,
+    pub swap_user: Secret,
+    pub swap_pass: Secret,
 }
 
 /// Zano's twin of [`XmrHostWalletParams`] / [`ZphHostWalletParams`] (Grove
@@ -2094,6 +2106,71 @@ pub(crate) fn cookie_auth(chain_datadir: &Path) -> Option<(String, String)> {
         }
     }
     None
+}
+
+/// The files a bitcoin-family daemon of ours writes at startup and removes
+/// only on a clean shutdown: its RPC `.cookie` and its pid file. One entry per
+/// managed loopback daemon, as `(coin, rpc port, candidate paths)`. The paths
+/// need not exist.
+///
+/// # Why (2026-09-15, a start that read the previous daemon's cookie)
+///
+/// ```text
+/// basicswap.log:  WARNING : Error, iteration 2: Mismatched pid
+///                 WARNING : Can't connect to PART RPC: RPC server error: Expecting
+///                   value: line 1 column 1 (char 0), method: getblockchaininfo.
+///                 ERROR : Can't connect to PART RPC, exiting.
+/// debug.log:      ThreadRPCServer incorrect password attempt from 127.0.0.1:30504
+/// ```
+///
+/// The engine's wait (`basicswap.py:1423`, `setCoinRunParams`) ends as soon as
+/// the pid file names the daemon it started AND a `.cookie` exists. particld
+/// writes its pid file before it generates the cookie, and a daemon that died
+/// without shutting down leaves its cookie behind. Between those two writes
+/// both conditions hold and the cookie belongs to the dead daemon. The engine
+/// read it in that window, particld replaced it in the same second, and every
+/// RPC after that was refused until the engine exited.
+///
+/// Pid names follow the engine: `<coin>d.pid` for the coins it lists at
+/// `basicswap.py:1399`, `<coin>.pid` otherwise. Chain subdirectories are the
+/// ones [`cookie_auth`] probes plus the named testnets `base.py:257` can pick
+/// from chainparams.
+pub fn daemon_auth_files(config_json: &str) -> Result<Vec<(String, u16, Vec<PathBuf>)>, String> {
+    const D_SUFFIXED: [&str; 7] = [
+        "bitcoin",
+        "litecoin",
+        "dogecoin",
+        "namecoin",
+        "dash",
+        "firo",
+        "bitcoincash",
+    ];
+    let mut out = Vec::new();
+    for t in parse_chain_daemon_targets(config_json)? {
+        if t.kind != DaemonKind::BitcoinRpc || !is_loopback(&t.host) {
+            continue;
+        }
+        let Some(chain_datadir) = t.chain_datadir.as_ref() else {
+            continue;
+        };
+        let pid_name = if D_SUFFIXED.contains(&t.coin.as_str()) {
+            format!("{}d.pid", t.coin)
+        } else {
+            format!("{}.pid", t.coin)
+        };
+        let mut files = Vec::new();
+        for sub in ["", "regtest", "testnet", "testnet3", "testnet4"] {
+            let dir = if sub.is_empty() {
+                chain_datadir.clone()
+            } else {
+                chain_datadir.join(sub)
+            };
+            files.push(dir.join(".cookie"));
+            files.push(dir.join(&pid_name));
+        }
+        out.push((t.coin, t.port, files));
+    }
+    Ok(out)
 }
 
 /// Derive the graceful-stop targets from a `basicswap.json`.
@@ -4438,6 +4515,117 @@ pub(crate) async fn active_bids_total(
     Ok(body.as_array().map(|r| r.len()).unwrap_or(0))
 }
 
+/// Every bid in progress on the node, both roles, deduplicated by id.
+///
+/// [`active_bids_total`] reads `bids` alone, only the half this node RECEIVED
+/// (see "Why two lists" on [`active_bids_for`]), so a taker's own swaps are
+/// missing from it. This is the whole book, and like `active_bids_for` it
+/// returns an error for a reply it cannot read rather than calling it zero.
+/// Swaps the engine itself is working on: `/json/active`, which lists its
+/// in-memory `swaps_in_progress` — the same thing BSX's "Swaps in Progress"
+/// page shows.
+///
+/// Until 2026-09-16 this counted `bids` + `sentbids` with
+/// `with_available_or_active`. That filter (`activeBidsQueryStr`) keeps any
+/// bid whose state is not in upstream's `inactive_states`, and
+/// `XMR_SWAP_FAILED` / `XMR_SWAP_FAILED_SWIPED` are not in it. The dev node
+/// had one of each (expired 3 and 11 days earlier, `in_progress = 0`), so the
+/// lock screen said "2 swaps in progress" while BSX said 0. The engine never
+/// resumes such a bid: `loadFromDB` only reloads `in_progress == 1` or
+/// `BID_RECEIVED < state < SWAP_COMPLETED`.
+///
+/// An unreadable reply (including a locked engine's error object) is an error,
+/// never zero.
+pub(crate) async fn swaps_in_progress_now(
+    state: &tauri::State<'_, SwapSidecarState>,
+) -> Result<usize, String> {
+    let (port, password) = api_context(state)?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(20))
+        .build()
+        .map_err(|e| format!("http client build failed: {}", e))?;
+    let url = build_api_url(port, "active", ApiMethod::Get)?;
+    let resp = client
+        .get(&url)
+        .header("Authorization", basic_auth_header(&password))
+        .send()
+        .await
+        .map_err(|e| format!("swap node request failed: {}", e))?;
+    let body = decode_api_response(resp).await?;
+    count_active_swaps(&body)
+}
+
+/// Pure half of [`swaps_in_progress_now`]: rows of `/json/active`, unique by
+/// `bid_id`.
+pub(crate) fn count_active_swaps(body: &serde_json::Value) -> Result<usize, String> {
+    let Some(rows) = body.as_array() else {
+        return Err(format!(
+            "active did not return a list, so the in-progress count is unknown: {body}"
+        ));
+    };
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut total = 0usize;
+    for row in rows {
+        match row.get("bid_id").and_then(|v| v.as_str()) {
+            Some(id) if !seen.insert(id) => continue,
+            _ => total += 1,
+        }
+    }
+    Ok(total)
+}
+
+/// What the node last had in progress, kept on disk so a LOCKED app can say
+/// so. Before the unlock the engine answers nothing, and after a restart it
+/// has not even loaded its bids.
+///
+/// 2026-09-15. Locking no longer takes the host wallets away from the node,
+/// but a node that starts while the vault is locked still waits for the
+/// unlock: its own wallets are encrypted with a key derived from the vault.
+/// The lock screen is where the user can act on that, and it had no way to
+/// know. Written by the janitor (`swap_bid.rs`), read by
+/// [`swap_sidecar_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SwapsLastSeen {
+    /// Bids in an active state, both roles.
+    pub in_progress: u32,
+    /// Unix seconds of the reading.
+    pub at: u64,
+}
+
+fn swaps_last_seen_file(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(sidecar_base_dir(app)?.join("swaps-last-seen.json"))
+}
+
+pub(crate) fn read_swaps_last_seen_at(path: &Path) -> Option<SwapsLastSeen> {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+}
+
+pub(crate) fn write_swaps_last_seen_at(path: &Path, reading: &SwapsLastSeen) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {}", parent.display(), e))?;
+    }
+    let body = serde_json::to_string(reading).map_err(|e| e.to_string())?;
+    std::fs::write(path, body).map_err(|e| format!("cannot write {}: {}", path.display(), e))
+}
+
+pub fn read_swaps_last_seen(app: &AppHandle) -> Option<SwapsLastSeen> {
+    swaps_last_seen_file(app)
+        .ok()
+        .and_then(|p| read_swaps_last_seen_at(&p))
+}
+
+pub fn write_swaps_last_seen(app: &AppHandle, in_progress: u32) -> Result<(), String> {
+    let at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    write_swaps_last_seen_at(&swaps_last_seen_file(app)?, &SwapsLastSeen { in_progress, at })
+}
+
 /// How many entries of a `/json/bids` reply touch `coin`, on either leg.
 ///
 /// The reply names coins by **display name** (`formatBids` ->
@@ -5106,16 +5294,23 @@ pub async fn swap_sidecar_cn_shared_in_use(
 ) -> Result<bool, String> {
     let key = coin_key_from(&coin).ok_or_else(|| format!("{coin:?} is not a swap-node coin"))?;
     let rec = read_optin(&app);
+    // The SAME consent activation uses. This read the explicit ack until
+    // 2026-09-15, but ZEPH and ZANO sharing has been opt-OUT since 2026-09-04
+    // (`maybe_activate_zph_host_wallet` / `maybe_activate_zano_host_wallet`
+    // call `shares_*_host_wallet`), and the ack is only written when someone
+    // flips the consent toggle. A coin nobody ever toggled was shared with the
+    // engine while this answered "not in use", so Lock and Forget went ahead
+    // under a swap.
     let consented = match key {
         "zephyr" => rec
             .coins
             .get("zephyr")
-            .map(|e| e.zph_host_wallet_ack_at.is_some())
+            .map(|e| shares_zph_host_wallet(rec.opted_in, e))
             .unwrap_or(false),
         "zano" => rec
             .coins
             .get("zano")
-            .map(|e| e.zano_host_wallet_ack_at.is_some())
+            .map(|e| shares_zano_host_wallet(rec.opted_in, e))
             .unwrap_or(false),
         _ => {
             return Err(format!(
@@ -5521,6 +5716,10 @@ pub struct ChainDaemonFatal {
     pub line: String,
     /// The txindex is inconsistent and can be rebuilt by deleting it.
     pub txindex_rebuildable: bool,
+    /// particld refused a conf that no longer asks for an index its block
+    /// database was built with ("-reindex to change -spentindex"). Repaired
+    /// by putting the index lines back ([`restore_particl_index_conf`]).
+    pub index_flags_dropped: bool,
 }
 
 /// The one particld error this supervisor repairs on its own.
@@ -5529,6 +5728,17 @@ pub const PARTICL_TXINDEX_MARKER: &str = "txindex: best block of the index not f
 /// Prefix `start_node_core` puts on the error it returns for that case, so
 /// the caller can repair and retry without parsing prose.
 pub const PARTICL_TXINDEX_ERR_PREFIX: &str = "[particl-txindex] ";
+
+/// particld's abort when the conf drops an index the block database still
+/// records. Verbatim (2026-09-15 … 2026-09-17, every dev-home start):
+/// `: You need to rebuild the database using -reindex to change -spentindex.`
+/// followed by `Aborted block database rebuild. Exiting.` — no `Error:` prefix,
+/// which is why [`classify_particld_log`] never saw it (log.md, C61).
+pub const PARTICL_INDEX_FLAG_MARKER: &str =
+    "You need to rebuild the database using -reindex to change -";
+
+/// Error prefix for the index-flag case, as [`PARTICL_TXINDEX_ERR_PREFIX`].
+pub const PARTICL_INDEX_FLAGS_ERR_PREFIX: &str = "[particl-index-flags] ";
 
 /// Classify a particld `debug.log` tail: did the daemon report an `Error:` and
 /// then shut itself down, both AFTER `since`?
@@ -5566,8 +5776,15 @@ pub fn classify_particld_log(
         if let Some(msg) = rest.strip_prefix("Error: ") {
             error_line = Some(msg.trim().to_string());
             shut_down = false;
+        } else if rest.contains(PARTICL_INDEX_FLAG_MARKER) {
+            // Stamped ": You need to rebuild …" — the init-error form.
+            error_line = Some(rest.trim_start_matches([' ', ':']).trim().to_string());
+            shut_down = false;
         }
-        if rest.trim() == "Shutdown: done" && error_line.is_some() {
+        let t = rest.trim();
+        if (t == "Shutdown: done" || t.starts_with("Aborted block database rebuild"))
+            && error_line.is_some()
+        {
             shut_down = true;
         }
     }
@@ -5576,7 +5793,8 @@ pub fn classify_particld_log(
         return None;
     }
     let txindex_rebuildable = line.contains(PARTICL_TXINDEX_MARKER);
-    Some(ChainDaemonFatal { line, txindex_rebuildable })
+    let index_flags_dropped = line.contains(PARTICL_INDEX_FLAG_MARKER);
+    Some(ChainDaemonFatal { line, txindex_rebuildable, index_flags_dropped })
 }
 
 /// The particl chainclient's own directory under the node datadir.
@@ -5607,13 +5825,20 @@ fn particl_rpc_port(datadir: &Path) -> Option<u16> {
         .map(|p| p as u16)
 }
 
-/// Repair an inconsistent Particl txindex by deleting it.
+/// Repair an inconsistent Particl txindex by emptying it.
 ///
 /// The txindex is DERIVED data: particld rebuilds it from the block files on
 /// the next start, in a background thread, while already serving RPC. Nothing
 /// else is touched — not the chainstate, not the wallet, not the blocks.
 /// Refuses while the daemon's RPC port is bound, because a running daemon owns
-/// that directory. Returns the path it removed.
+/// that directory. Returns the path it emptied.
+///
+/// **The directory itself stays** (fixed 2026-09-16, C61). It used to be
+/// deleted, and [`particl_chain_mode`] uses that directory as its only
+/// evidence that the chain is indexed. The same start then classified the
+/// chain `Prunable`, stripped `txindex=1`/`spentindex=1` from the conf, and
+/// particld refused every later start with "-reindex to change -spentindex".
+/// LevelDB rebuilds into an existing empty directory.
 pub async fn repair_particl_txindex(datadir: &Path) -> Result<PathBuf, String> {
     let dir = particl_datadir(datadir).join("indexes").join("txindex");
     if !dir.is_dir() {
@@ -5627,7 +5852,64 @@ pub async fn repair_particl_txindex(datadir: &Path) -> Result<PathBuf, String> {
         }
     }
     std::fs::remove_dir_all(&dir).map_err(|e| format!("remove {}: {}", dir.display(), e))?;
+    std::fs::create_dir_all(&dir).map_err(|e| format!("recreate {}: {}", dir.display(), e))?;
     Ok(dir)
+}
+
+/// `particl.conf` with both index lines present and no `prune=`, or `None`
+/// when it already is. Pure; the inverse of [`prune_particl_conf`]. Comments
+/// are kept, as there.
+pub fn restore_particl_index_lines(text: &str) -> Option<String> {
+    let has_tx = text.lines().any(|l| is_conf_line(l, "txindex"));
+    let has_spent = text.lines().any(|l| is_conf_line(l, "spentindex"));
+    let has_prune = text.lines().any(|l| is_conf_line(l, "prune"));
+    if has_tx && has_spent && !has_prune {
+        return None;
+    }
+    let mut out = String::new();
+    if !has_tx {
+        out.push_str("txindex=1\n");
+    }
+    if !has_spent {
+        out.push_str("spentindex=1\n");
+    }
+    let kept: Vec<&str> = text.lines().filter(|l| !is_conf_line(l, "prune")).collect();
+    out.push_str(&kept.join("\n"));
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    Some(out)
+}
+
+/// Undo a prune policy that was applied to a chain built WITH the indexes.
+///
+/// For particld's "-reindex to change -spentindex" abort: the block database
+/// still records the indexes, so the conf must ask for them again. Nothing has
+/// been pruned (particld aborts before it prunes anything), so this is a conf
+/// edit, not a data change. Also makes sure `indexes/txindex` exists, so
+/// [`particl_chain_mode`] reports the chain as indexed and the prune policy
+/// leaves the conf alone from now on; particld rebuilds a missing txindex from
+/// the block files. Refuses while the daemon's RPC port is bound.
+pub async fn restore_particl_index_conf(datadir: &Path) -> Result<PathBuf, String> {
+    let particl_dir = particl_datadir(datadir);
+    let conf = particl_dir.join("particl.conf");
+    if let Some(port) = particl_rpc_port(datadir) {
+        if crate::wallet_rpc_common::port_is_bound(port).await {
+            return Err(format!(
+                "particld is still serving on port {port}; not touching its conf"
+            ));
+        }
+    }
+    let text = std::fs::read_to_string(&conf)
+        .map_err(|e| format!("read {}: {}", conf.display(), e))?;
+    if let Some(out) = restore_particl_index_lines(&text) {
+        std::fs::write(&conf, out.as_bytes())
+            .map_err(|e| format!("write {}: {}", conf.display(), e))?;
+    }
+    let txindex = particl_dir.join("indexes").join("txindex");
+    std::fs::create_dir_all(&txindex)
+        .map_err(|e| format!("create {}: {}", txindex.display(), e))?;
+    Ok(conf)
 }
 
 // =========================================================================
@@ -6942,6 +7224,7 @@ pub const ZEPH_REGISTRATION_PATCH_FILE: &str = "basicswap.py";
 /// unchecked assumption.)
 ///
 /// Returns `Ok(false)` when nothing needed changing.
+#[allow(clippy::too_many_arguments)]
 pub fn apply_host_zph_wallet_to_config(
     datadir: &Path,
     engine_pkg: &Path,
@@ -6950,7 +7233,22 @@ pub fn apply_host_zph_wallet_to_config(
     auth_user: &str,
     auth_pass: &str,
     wallet_name: &str,
+    swap_port: u16,
+    swap_user: &str,
+    swap_pass: &str,
 ) -> Result<bool, String> {
+    // The engine opens every per-swap wallet on `walletrpcport`, and a
+    // wallet-rpc holds one open wallet. Pointing that at the user's process
+    // closed the user's wallet at the first per-swap open, and left the node's
+    // next main-wallet spend refusing — see `zph_rpc::ZPH_SWAP_RPC_PORT`'s
+    // section and verify-zeph-host-wallet.py section 16. Refused outright
+    // rather than written.
+    if swap_port == port {
+        return Err(format!(
+            "refusing to put the swap node's per-swap Zephyr wallets on the user's own \
+             wallet-rpc (port {port}) — they need a wallet-rpc of their own"
+        ));
+    }
     if !engine_has_patch(engine_pkg, ZEPH_MODULE_PATCH_FILE, "PWNDA-PATCH-13") {
         return Err(
             "this swap-node runtime does not carry the Zephyr coin-module patch \
@@ -6994,17 +7292,24 @@ pub fn apply_host_zph_wallet_to_config(
             ]),
         ),
         ("wallet_name", serde_json::Value::String(wallet_name.to_string())),
-        // The engine's SWAP-wallet client (`_rpc_wallet_swap`, per-swap
-        // wallets) talks to the SAME host process: Zephyr's block carries
-        // `manage_wallet_daemon: false` (the engine spawns nothing), so
-        // `walletrpcport` must be this process and `walletrpcuser`/
-        // `walletrpcpassword` its credentials -- not the placeholder constants
-        // prepare's segment ships (2026-09-04). Before this, the swap client
-        // pointed at 17768 with `zeph_wallet_user`, where nothing listens.
-        ("walletrpchost", serde_json::Value::String(host.to_string())),
-        ("walletrpcport", serde_json::Value::from(port)),
-        ("walletrpcuser", serde_json::Value::String(auth_user.to_string())),
-        ("walletrpcpassword", serde_json::Value::String(auth_pass.to_string())),
+        // The engine's SWAP-wallet client (`_rpc_wallet_swap`, every per-swap
+        // wallet) talks to the engine-owned swap wallet-rpc
+        // (`zph_rpc::zph_swap_wallet_start`) — its own process, port and
+        // credentials. Zephyr's block carries `manage_wallet_daemon: false`,
+        // so the engine spawns nothing; the supervisor started it.
+        //
+        // Corrected 2026-09-15. The 2026-09-04 version of this block pointed
+        // these four keys at the USER's process ("Before this, the swap client
+        // pointed at 17768 with `zeph_wallet_user`, where nothing listens").
+        // That fixed "nothing listens" by sharing the one process a wallet-rpc
+        // can keep only one wallet open in: the first per-swap `open_wallet`
+        // closed the user's wallet, and the node's next main-wallet spend
+        // refused. Refused above, and gated by
+        // `zeph_swap_wallets_never_share_the_host_wallet_rpc`.
+        ("walletrpchost", serde_json::Value::String("127.0.0.1".to_string())),
+        ("walletrpcport", serde_json::Value::from(swap_port)),
+        ("walletrpcuser", serde_json::Value::String(swap_user.to_string())),
+        ("walletrpcpassword", serde_json::Value::String(swap_pass.to_string())),
     ];
     if want.iter().all(|(k, val)| zephyr.get(*k) == Some(val)) {
         return Ok(false);
@@ -7122,13 +7427,35 @@ async fn maybe_activate_zph_host_wallet(app: &AppHandle) -> Option<ZphHostWallet
         return None;
     };
 
+    // The engine's per-swap wallets get a wallet-rpc of their own. Without it
+    // they were opened on the user's process above, closing the user's wallet
+    // mid-swap — see `apply_host_zph_wallet_to_config`. No fallback to sharing:
+    // if the swap wallet-rpc cannot start, ZEPH is not shared this start.
+    let swap = match crate::zph_rpc::zph_swap_wallet_start(app, ZPH_BOOTSTRAP_DAEMON).await {
+        Ok(s) => s,
+        Err(e) => {
+            set_park_reason(
+                "zephyr",
+                format!("the swap node's own Zephyr wallet-rpc could not start: {e}"),
+            );
+            supervisor_log(
+                app,
+                &format!("C-RZ: could not start the Zephyr swap wallet-rpc: {}", e),
+            );
+            return None;
+        }
+    };
+
     Some(ZphHostWalletParams {
         host: "127.0.0.1".to_string(),
-        port: crate::zph_rpc::ZPH_RPC_PORT,
+        port: crate::zph_rpc::active_zph_port(),
         auth_user: Secret::new(user),
         auth_pass: Secret::new(pass),
         wallet_name: crate::zph_rpc::ZPH_PRIMARY_WALLET_FILENAME.to_string(),
         engine_pkg_dir,
+        swap_port: swap.port,
+        swap_user: Secret::new(swap.user),
+        swap_pass: Secret::new(swap.pass),
     })
 }
 
@@ -7460,6 +7787,7 @@ mod zano_warmup_tests {
 
     #[test]
     fn the_warmup_covers_the_measured_gap_with_margin() {
+        // Pins D-34 (defect register): the Zano Main warm-up wait is bounded.
         // 14 s measured on 2026-09-04, and 38-41 s observed since. The bound
         // stays generous BECAUSE it is now only charged when a wallet is
         // actually opening — see `a_wallet_that_is_not_starting_does_not_wait`.
@@ -7472,6 +7800,7 @@ mod zano_warmup_tests {
     /// later, mid-use. Waiting is now conditional on something being on its way.
     #[test]
     fn a_wallet_that_is_not_starting_does_not_wait() {
+        // Pins D-74 (defect register): no warm-up wait when nothing is starting.
         // consented, not up, wallet file present, NOTHING spawned -> park now.
         assert_eq!(
             zano_warmup_plan(true, false, true, false),
@@ -7568,6 +7897,10 @@ async fn maybe_activate_zano_host_wallet(app: &AppHandle) -> Option<ZanoHostWall
         }
     };
     clear_park_reason("zano");
+    // From here the engine depends on Main: a lock must leave it serving, and a
+    // restart of Main must keep this secret (`zano_rpc::set_engine_claim`).
+    // Released when the node stops, and at the top of every start.
+    crate::zano_rpc::set_engine_claim(Some(main_jwt.clone()));
 
     Some(ZanoHostWalletParams {
         host: "127.0.0.1".to_string(),
@@ -8427,11 +8760,15 @@ fn apply_local_config_policy(cfg: &SidecarConfig) {
             hw.auth_user.expose(),
             hw.auth_pass.expose(),
             &hw.wallet_name,
+            hw.swap_port,
+            hw.swap_user.expose(),
+            hw.swap_pass.expose(),
         ) {
             Ok(true) => eprintln!(
                 "[swap-sidecar] C-RZ: pinned the swap node's Zephyr MAIN wallet to the \
-                 user's own wallet-rpc ({}:{})",
-                hw.host, hw.port
+                 user's own wallet-rpc ({}:{}) and its per-swap wallets to the swap \
+                 wallet-rpc (127.0.0.1:{})",
+                hw.host, hw.port, hw.swap_port
             ),
             Ok(false) => {}
             Err(e) => eprintln!("[swap-sidecar] C-RZ: could not activate ZEPH wallet sharing: {}", e),
@@ -9049,6 +9386,43 @@ pub async fn sweep_prepare_daemons(datadir: &Path) -> usize {
     n
 }
 
+/// Remove the `.cookie` and pid file of every managed bitcoin-family daemon
+/// whose RPC port is free. Returns the paths removed.
+///
+/// A daemon that dies without shutting down (a hard-killed session, a crash,
+/// power loss) leaves both files behind, and the next start can read the old
+/// cookie in place of the new one. [`daemon_auth_files`] has the start that
+/// failed that way.
+///
+/// Call it after [`sweep_prepare_daemons`] and before anything starts a
+/// daemon. A bound port means a live daemon owns the files, so they stay. A
+/// free port means no daemon is serving RPC from them, and the next daemon
+/// writes both afresh. A daemon still finishing its own shutdown would delete
+/// them anyway.
+pub async fn purge_stale_daemon_auth_files(datadir: &Path) -> Vec<PathBuf> {
+    let Ok(raw) = std::fs::read(datadir.join("basicswap.json")) else {
+        return Vec::new();
+    };
+    let Ok(text) = strip_bom(&raw) else {
+        return Vec::new();
+    };
+    let Ok(daemons) = daemon_auth_files(text) else {
+        return Vec::new();
+    };
+    let mut removed = Vec::new();
+    for (_coin, port, files) in daemons {
+        if crate::wallet_rpc_common::port_is_bound(port).await {
+            continue;
+        }
+        for f in files {
+            if f.is_file() && std::fs::remove_file(&f).is_ok() {
+                removed.push(f);
+            }
+        }
+    }
+    removed
+}
+
 /// Wait for every swept port to actually free.
 ///
 /// Split out of [`sweep_prepare_daemons`] so a caller running SEVERAL prepares
@@ -9492,7 +9866,13 @@ pub async fn start_node_core<S: SessionSink>(
             sink.set_phase(Phase::Failed {
                 reason: format!("particld exited: {}", fatal.line),
             })?;
-            let prefix = if fatal.txindex_rebuildable { PARTICL_TXINDEX_ERR_PREFIX } else { "" };
+            let prefix = if fatal.txindex_rebuildable {
+                PARTICL_TXINDEX_ERR_PREFIX
+            } else if fatal.index_flags_dropped {
+                PARTICL_INDEX_FLAGS_ERR_PREFIX
+            } else {
+                ""
+            };
             return Err(format!(
                 "{prefix}the Particl daemon shut itself down before the swap node was ready — {}",
                 fatal.line
@@ -9650,6 +10030,7 @@ pub async fn swap_sidecar_status(
         swap_seed_fingerprint: rec.swap_seed_fingerprint.clone(),
         particl_unpruned: particl_chain_mode(&dd.join(MANDATORY_COIN))
             == ParticlChainMode::IndexedChainPresent,
+        swaps_last_seen: read_swaps_last_seen(&app),
     })
 }
 
@@ -10896,6 +11277,19 @@ pub async fn swap_sidecar_start(
             &format!("stopped {} coin daemon(s) surviving from a previous session", swept),
         );
     }
+    // Before prepare or run.py starts any daemon: a cookie left by a daemon
+    // that died without shutting down can be read in place of the new one's,
+    // and the node then exits on refused RPC (2026-09-15, see
+    // `daemon_auth_files`).
+    for f in purge_stale_daemon_auth_files(&dd).await {
+        supervisor_log(
+            &app,
+            &format!(
+                "removed {}, left by a coin daemon that stopped without shutting down",
+                f.display()
+            ),
+        );
+    }
     lap("stop stale coin daemons", &mut mark);
 
     let configured = configured_ports_in(&dd);
@@ -10973,6 +11367,9 @@ pub async fn swap_sidecar_start(
     // construction (see the function's own doc comment): its `None` path
     // and this call's own errors never reach the `?` below.
     clear_park_reasons();
+    // A claim on Zano Main belongs to the node that took it. Activation below
+    // takes it again if this start shares Main.
+    crate::zano_rpc::set_engine_claim(None);
     let xmr_host_wallet = maybe_activate_xmr_host_wallet(&app).await;
     // C-RZ. Same placement reasoning as the XMR call immediately above:
     // before `build_config`, so a consented+capable engine gets ZEPH's
@@ -11094,6 +11491,37 @@ pub async fn swap_sidecar_start(
             .await
         };
         match attempt {
+            Err(e) if e.starts_with(PARTICL_INDEX_FLAGS_ERR_PREFIX) && !txindex_repaired => {
+                txindex_repaired = true;
+                let plain = e.trim_start_matches(PARTICL_INDEX_FLAGS_ERR_PREFIX).to_string();
+                supervisor_log(&app, &format!("start: {plain}"));
+                teardown_failed_start(&app, &state).await;
+                let _ = sweep_prepare_daemons(&dd).await;
+                let _ = purge_stale_daemon_auth_files(&dd).await;
+                match restore_particl_index_conf(&dd).await {
+                    Ok(conf) => {
+                        supervisor_log(
+                            &app,
+                            &format!(
+                                "particl: {} had lost txindex/spentindex that this chain was \
+                                 built with — restored them (nothing was pruned); starting again",
+                                conf.display()
+                            ),
+                        );
+                        emit_progress(
+                            &app,
+                            "preparing",
+                            12.0,
+                            "Restored the Particl index settings — starting again",
+                        );
+                        continue;
+                    }
+                    Err(re) => {
+                        supervisor_log(&app, &format!("particl: could not restore the index settings: {re}"));
+                        break Err(plain);
+                    }
+                }
+            }
             Err(e) if e.starts_with(PARTICL_TXINDEX_ERR_PREFIX) && !txindex_repaired => {
                 txindex_repaired = true;
                 let plain = e.trim_start_matches(PARTICL_TXINDEX_ERR_PREFIX).to_string();
@@ -11102,6 +11530,7 @@ pub async fn swap_sidecar_start(
                 // Down first, then repair, then once more.
                 teardown_failed_start(&app, &state).await;
                 let _ = sweep_prepare_daemons(&dd).await;
+                let _ = purge_stale_daemon_auth_files(&dd).await;
                 match repair_particl_txindex(&dd).await {
                     Ok(dir) => {
                         supervisor_log(
@@ -11126,7 +11555,10 @@ pub async fn swap_sidecar_start(
                     }
                 }
             }
-            Err(e) => break Err(e.trim_start_matches(PARTICL_TXINDEX_ERR_PREFIX).to_string()),
+            Err(e) => break Err(e
+                .trim_start_matches(PARTICL_TXINDEX_ERR_PREFIX)
+                .trim_start_matches(PARTICL_INDEX_FLAGS_ERR_PREFIX)
+                .to_string()),
             Ok(p) => break Ok(p),
         }
     };
@@ -11346,6 +11778,11 @@ pub async fn swap_sidecar_stop(
     // empty set for them.
     let _ = crate::zph_rpc::zph_stop_rpc(app.clone(), Some(crate::zph_rpc::ZphLease::SwapEngine))
         .await;
+    // The engine-owned Zephyr swap wallet-rpc goes with the engine. Its wallet
+    // files stay: an in-flight swap reopens them by name on the next start.
+    let _ = crate::zph_rpc::zph_swap_wallet_stop(&app).await;
+    // The node no longer reads Zano Main, so a lock may stop it again.
+    crate::zano_rpc::set_engine_claim(None);
     emit_progress(&app, "stopped", 100.0, "Swap node stopped");
     swap_sidecar_status(app.clone(), state).await
 }
@@ -11373,6 +11810,10 @@ pub async fn swap_sidecar_set_wallet_key(
         let mut guard = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
         guard.wallet_pwd = Some(Secret::new(key));
     }
+    // A key push is what an unlock does: the unpark listener exists again, so
+    // a parked coin need not wait out a retry interval earned while nothing
+    // was listening.
+    crate::swap_bid::note_wallet_key_pushed();
     // Learn — durably — that this install's wallets are encrypted. The only
     // reason a key exists is that C5 encryption was set up, and the marker is
     // what lets a later KEYLESS start know its addcoins are doomed before
@@ -12330,8 +12771,11 @@ mod tests {
 
     #[test]
     fn python_exe_is_flat_on_windows() {
-        let got = python_exe_under(std::path::Path::new(r"C:\app\swap-sidecar\runtime"), true);
-        assert_eq!(got, PathBuf::from(r"C:\app\swap-sidecar\runtime\python.exe"));
+        let rt = std::path::Path::new(r"C:\app\swap-sidecar\runtime");
+        let got = python_exe_under(rt, true);
+        // Joined, not a literal: on a Linux host `\` is not a separator.
+        assert_eq!(got, rt.join("python.exe"));
+        assert!(got.to_string_lossy().ends_with("python.exe"));
     }
 
     #[test]
@@ -13109,6 +13553,7 @@ mod tests {
     /// out mid-swap (2026-09-05). The policy write sets upstream's ceiling.
     #[test]
     fn console_session_timeout_is_raised_to_upstreams_ceiling_and_never_lowered() {
+        // Pins D-68 (defect register): the 15-minute console sign-out.
         let (out, changed) = ensure_session_timeout_in_config(r#"{"htmlport": 12800}"#).unwrap();
         assert!(changed);
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -13144,6 +13589,7 @@ mod tests {
     /// "the swap node started to stop/restart unprompted".
     #[test]
     fn autostart_waits_for_the_wallets_the_node_needs() {
+        // Pins D-81 (defect register): the gate must not wait on the wallet key.
         let f: &str = include_str!("swap_sidecar.rs");
         let body = &f[f.find("pub fn on_app_ready(").expect("on_app_ready moved")..];
         let body = &body[..body.find("swap_sidecar_start(").expect("start call moved")];
@@ -13259,12 +13705,82 @@ pub fn on_app_ready(").expect("gate end moved")];
         // No basicswap.json here, so no port to probe — the repair may run.
         let removed = tauri::async_runtime::block_on(repair_particl_txindex(&root)).unwrap();
         assert!(removed.ends_with(std::path::Path::new("indexes").join("txindex")));
-        assert!(!part.join("indexes").join("txindex").exists());
+        // Emptied, not removed: the directory is the indexed-chain evidence
+        // the prune policy reads on the very same start (C61, 2026-09-16).
+        let txi = part.join("indexes").join("txindex");
+        assert!(txi.is_dir(), "the txindex directory must survive the repair");
+        assert_eq!(std::fs::read_dir(&txi).unwrap().count(), 0, "…but empty");
+        assert_eq!(particl_chain_mode(&part), ParticlChainMode::IndexedChainPresent);
         assert!(part.join("blocks").is_dir(), "blocks untouched");
         assert!(part.join("chainstate").is_dir(), "chainstate untouched");
         assert_eq!(std::fs::read(part.join("wallet.dat")).unwrap(), b"keep");
-        // Second call: nothing to repair is an error, not a silent success.
-        assert!(tauri::async_runtime::block_on(repair_particl_txindex(&root)).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// C61, verbatim from dev-home's debug.log (2026-09-17 03:02 UTC): the
+    /// init-error form has no `Error:` prefix and ends in "Aborted block
+    /// database rebuild", and it must classify as the index-flag case.
+    #[test]
+    fn the_spentindex_abort_is_classified() {
+        let tail = "\
+2026-09-17T03:02:14Z LoadBlockIndexDB: spent index enabled
+2026-09-17T03:02:16Z : You need to rebuild the database using -reindex to change -spentindex.  This will redownload the entire blockchain.
+Please restart with -reindex or -reindex-chainstate to recover.
+2026-09-17T03:02:16Z Aborted block database rebuild. Exiting.
+2026-09-17T03:02:16Z Shutdown: In progress...
+";
+        let since = chrono::DateTime::parse_from_rfc3339("2026-09-17T03:02:06Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let f = classify_particld_log(tail, since).expect("the abort is fatal");
+        assert!(f.index_flags_dropped);
+        assert!(!f.txindex_rebuildable);
+        assert!(f.line.starts_with("You need to rebuild the database"), "{}", f.line);
+        // A later session's stamp makes it someone else's abort.
+        let later = chrono::DateTime::parse_from_rfc3339("2026-09-17T04:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        assert_eq!(classify_particld_log(tail, later), None);
+    }
+
+    #[test]
+    fn restoring_the_index_lines_undoes_the_prune_policy() {
+        // The conf dev-home was left with (C61).
+        assert_eq!(
+            restore_particl_index_lines("prune=550\n").as_deref(),
+            Some("txindex=1\nspentindex=1\n")
+        );
+        // Round trip: prune, then restore, gives the indexes back.
+        let original = "listen=0\n# prune=5 is a note\ntxindex=1\nspentindex=1\n";
+        let pruned = prune_particl_conf(original, 550).unwrap();
+        let restored = restore_particl_index_lines(&pruned).unwrap();
+        assert!(restored.lines().any(|l| l == "txindex=1"));
+        assert!(restored.lines().any(|l| l == "spentindex=1"));
+        assert!(!restored.lines().any(|l| l.starts_with("prune=")));
+        assert!(restored.contains("# prune=5 is a note"), "comments stay");
+        assert!(restored.contains("listen=0"));
+        // Already right: nothing to write.
+        assert_eq!(restore_particl_index_lines(original), None);
+    }
+
+    #[test]
+    fn restoring_the_conf_marks_the_chain_indexed() {
+        let root = std::env::temp_dir()
+            .join(format!("pwnda-index-restore-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let part = particl_datadir(&root);
+        std::fs::create_dir_all(part.join("blocks")).unwrap();
+        std::fs::create_dir_all(part.join("indexes")).unwrap();
+        std::fs::write(part.join("particl.conf"), "prune=550\n").unwrap();
+        assert_eq!(particl_chain_mode(&part), ParticlChainMode::Prunable, "the C61 state");
+        tauri::async_runtime::block_on(restore_particl_index_conf(&root)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(part.join("particl.conf")).unwrap(),
+            "txindex=1\nspentindex=1\n"
+        );
+        assert_eq!(particl_chain_mode(&part), ParticlChainMode::IndexedChainPresent);
+        // So the start-time prune policy now declines.
+        assert_eq!(apply_particl_prune_policy(&root), Ok(false));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -13413,6 +13929,52 @@ pub fn on_app_ready(").expect("gate end moved")];
         assert!(!shares_zano_host_wallet(true, &declined_z));
     }
 
+    /// D-29 (defect register): the ZEPH/ZANO activators must use the same
+    /// predicate the status row reports. They used to require an ack nothing
+    /// wrote, so the row said "Using my wallet" while the node never leased
+    /// it. Source-level: the fault is which predicate the activator calls.
+    #[test]
+    fn cn_activators_use_the_status_rows_sharing_predicate() {
+        let f: &str = include_str!("swap_sidecar.rs");
+        for (activator, predicate) in [
+            ("async fn maybe_activate_zph_host_wallet(", "shares_zph_host_wallet(rec.opted_in, e)"),
+            ("async fn maybe_activate_zano_host_wallet(", "shares_zano_host_wallet(rec.opted_in, e)"),
+        ] {
+            let body = &f[f.find(activator).expect("activator moved")..];
+            let body = &body[..body.find("if !consented").expect("consent gate moved")];
+            let code_only: String = body
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(code_only.contains(predicate), "{activator} must use {predicate}");
+            assert!(!code_only.contains("host_wallet_ack_at"), "{activator} must not require an ack");
+        }
+    }
+
+    /// D-69 (defect register): the console opens only on a Healthy node.
+    /// `is_running()` also admits `Starting`, and a console opened during the
+    /// 86-second prepare failed its login (2026-09-05). Source-level: the
+    /// fault is which phases the gate admits.
+    #[test]
+    fn console_opens_only_on_a_healthy_node() {
+        let f: &str = include_str!("swap_sidecar.rs");
+        let body = &f[f
+            .find("pub async fn swap_sidecar_open_console(")
+            .expect("open console moved")..];
+        let body = &body[..body
+            .find("read_or_create_auth_password(&app)")
+            .expect("login step moved")];
+        let code_only: String = body
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("//"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(code_only.contains("Phase::Healthy => {}"), "only Healthy may pass");
+        assert!(code_only.contains("Phase::Starting | Phase::Preparing =>"), "starting is refused");
+        assert!(!code_only.contains("is_running()"), "is_running() admits Starting");
+    }
+
     /// The shutdown token is scraped from a page that RENDERS.
     ///
     /// `/` is a 302 with an empty body (`http_server.py::page_index`), and
@@ -13422,6 +13984,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     /// Source-level because the fault is WHICH url is fetched.
     #[test]
     fn graceful_shutdown_does_not_scrape_the_index_redirect() {
+        // Pins D-73 (defect register): the shutdown token page.
         let f: &str = include_str!("swap_sidecar.rs");
         let body = &f[f
             .find("pub async fn graceful_shutdown_via_http(")
@@ -14130,6 +14693,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     /// consent one coin while the user pressed another's button.
     #[test]
     fn cn_host_wallet_consent_writes_the_coins_own_fields_and_refuses_others() {
+        // Pins D-21 (defect register): a command now writes the ZEPH/ZANO consent fields.
         let at = "2026-09-04T20:00:00+00:00";
         let mut e = CoinOptIn::default();
         apply_cn_host_wallet_consent("zephyr", &mut e, true, at).unwrap();
@@ -14162,6 +14726,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     /// per-coin routing the consent card reads, for all three mechanisms.
     #[test]
     fn share_flags_route_each_coin_through_its_own_sharing_mechanism() {
+        // Pins D-23 (defect register): `shares` is gated on `can_share` (full-mode bitcoin -> (false, false)).
         let on = CoinOptIn {
             enabled: true,
             mode: CoinMode::Lean,
@@ -14281,6 +14846,7 @@ pub fn on_app_ready(").expect("gate end moved")];
 
     #[test]
     fn host_wallet_policy_parks_or_runs_and_always_pins_the_remote_daemon() {
+        // Pins D-26 (defect register): a closed host wallet parks the coin instead of a 10-minute prepare.
         let dir = std::env::temp_dir().join(format!("pwnda-hw-policy-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let cfg = r#"{"chainclients":{
@@ -14357,6 +14923,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     /// engine), which no runtime assertion in this process would catch.
     #[test]
     fn the_engine_reconcile_runs_before_anything_spawns_and_never_while_running() {
+        // Pins D-64 (defect register): the bundled engine is reconciled on the start path.
         let f: &str = include_str!("swap_sidecar.rs");
         // 1. The start path calls it...
         let start = &f[f
@@ -15025,7 +15592,7 @@ pub fn on_app_ready(").expect("gate end moved")];
         std::fs::write(&zephyr_py, "class ZEPHInterface:\n    pass\n").unwrap();
         assert!(!engine_has_patch(&pkg, ZEPH_MODULE_PATCH_FILE, "PWNDA-PATCH-13"));
         let refused = apply_host_zph_wallet_to_config(
-            &dir, &pkg, "127.0.0.1", 28183, "u", "p", "wallet",
+            &dir, &pkg, "127.0.0.1", 28183, "u", "p", "wallet", 28187, "su", "sp",
         );
         let msg = refused.expect_err("an unpatched engine must be refused");
         assert!(msg.contains("0013"), "the message must name the patch: {msg}");
@@ -15041,7 +15608,7 @@ pub fn on_app_ready(").expect("gate end moved")];
         let bsw_py = dir.join("basicswap").join("basicswap.py");
         std::fs::write(&bsw_py, "class BasicSwap:\n    pass\n").unwrap();
         let half_refused = apply_host_zph_wallet_to_config(
-            &dir, &pkg, "127.0.0.1", 28183, "u", "p", "wallet",
+            &dir, &pkg, "127.0.0.1", 28183, "u", "p", "wallet", 28187, "su", "sp",
         );
         let half_msg = half_refused.expect_err("PATCH-13-only must still be refused");
         assert!(half_msg.contains("0014"), "the message must name the patch: {half_msg}");
@@ -15055,8 +15622,10 @@ pub fn on_app_ready(").expect("gate end moved")];
         assert!(engine_has_patch(&pkg, ZEPH_MODULE_PATCH_FILE, "PWNDA-PATCH-13"));
         assert!(engine_has_patch(&pkg, ZEPH_REGISTRATION_PATCH_FILE, "PWNDA-PATCH-14"));
         assert!(
-            apply_host_zph_wallet_to_config(&dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine")
-                .unwrap(),
+            apply_host_zph_wallet_to_config(
+                &dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine", 28187, "su", "sp",
+            )
+            .unwrap(),
             "the first write must report a change"
         );
         let v: serde_json::Value =
@@ -15072,12 +15641,18 @@ pub fn on_app_ready(").expect("gate end moved")];
              reasoning as apply_host_xmr_wallet_to_config"
         );
         assert_eq!(z["wallet_name"], "mine");
+        // Per-swap wallets go to the swap node's OWN wallet-rpc.
+        assert_eq!(z["walletrpcport"], 28187);
+        assert_eq!(z["walletrpcuser"], "su");
+        assert_eq!(z["walletrpcpassword"], "sp");
         // Untouched keys stay untouched.
         assert_eq!(z["rpcport"], 17767);
 
         assert!(
-            !apply_host_zph_wallet_to_config(&dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine")
-                .unwrap(),
+            !apply_host_zph_wallet_to_config(
+                &dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine", 28187, "su", "sp",
+            )
+            .unwrap(),
             "an unchanged config must report no write"
         );
 
@@ -15088,9 +15663,79 @@ pub fn on_app_ready(").expect("gate end moved")];
         )
         .unwrap();
         assert!(
-            !apply_host_zph_wallet_to_config(&dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine")
-                .unwrap()
+            !apply_host_zph_wallet_to_config(
+                &dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine", 28187, "su", "sp",
+            )
+            .unwrap()
         );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 2026-09-15. Until this date the writer pointed `walletrpcport` — where
+    /// the engine opens every per-swap wallet — at the USER's
+    /// zephyr-wallet-rpc, the same process as `mainwalletrpcport`. A wallet-rpc
+    /// holds one open wallet, so the first per-swap `open_wallet` closed the
+    /// user's wallet and the node's next main-wallet spend refused;
+    /// `scripts/swap/verify-zeph-host-wallet.py` section 16 reproduces that
+    /// against the real engine code. This is the gate on the writer.
+    #[test]
+    fn zeph_swap_wallets_never_share_the_host_wallet_rpc() {
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-zeph-swap-rpc-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let pkg = dir.join("basicswap");
+        std::fs::create_dir_all(pkg.join("interface").join("zephyr")).unwrap();
+        std::fs::write(
+            pkg.join("interface").join("zephyr").join("zephyr.py"),
+            "# PWNDA-PATCH-13: coin module\n",
+        )
+        .unwrap();
+        std::fs::write(
+            pkg.join("basicswap.py"),
+            "class BasicSwap:\n    pass  # PWNDA-PATCH-14: register zephyr\n",
+        )
+        .unwrap();
+        // What the 2026-09-04 writer left on disk: both clients on the user's process.
+        let shared_config = serde_json::json!({ "chainclients": { "zephyr": {
+            "rpcport": 17767, "walletrpcport": 28183, "mainwalletrpcport": 28183
+        } } });
+        std::fs::write(
+            dir.join("basicswap.json"),
+            serde_json::to_string_pretty(&shared_config).unwrap(),
+        )
+        .unwrap();
+
+        // Asked to share: refused outright, and nothing is written.
+        let shared = apply_host_zph_wallet_to_config(
+            &dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine", 28183, "u", "p",
+        );
+        let msg = shared.expect_err("the swap wallet-rpc must never be the user's own");
+        assert!(msg.contains("28183"), "the refusal must name the port: {msg}");
+        let untouched: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("basicswap.json")).unwrap())
+                .unwrap();
+        assert_eq!(untouched, shared_config, "a refusal must not write");
+
+        // Given a separate process, the old shared config is repaired.
+        assert!(apply_host_zph_wallet_to_config(
+            &dir, &pkg, "127.0.0.1", 28183, "u", "p", "mine", 28187, "su", "sp",
+        )
+        .unwrap());
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("basicswap.json")).unwrap())
+                .unwrap();
+        let z = &v["chainclients"]["zephyr"];
+        assert_ne!(
+            z["walletrpcport"], z["mainwalletrpcport"],
+            "per-swap wallets must never open on the user's wallet-rpc"
+        );
+        assert_eq!(z["walletrpcport"], 28187);
+        assert_eq!(z["mainwalletrpcport"], 28183);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -17696,6 +18341,7 @@ pub fn on_app_ready(").expect("gate end moved")];
             seed_mismatch: None,
             swap_seed_fingerprint: None,
             particl_unpruned: false,
+            swaps_last_seen: None,
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(!json.contains("password"), "status leaked a password: {json}");
@@ -17731,6 +18377,7 @@ pub fn on_app_ready(").expect("gate end moved")];
             seed_mismatch: None,
             swap_seed_fingerprint: None,
             particl_unpruned: false,
+            swaps_last_seen: Some(SwapsLastSeen { in_progress: 1, at: 1_800_000_000 }),
         };
         let json = serde_json::to_string(&drifted).unwrap();
         assert!(json.contains(r#""engine""#), "engine field absent: {json}");
@@ -17885,6 +18532,7 @@ pub fn on_app_ready(").expect("gate end moved")];
     /// graceful request and inside the bounded wait, never before either.
     #[tokio::test]
     async fn ladder_stops_daemons_early_once_the_parent_has_finalised() {
+        // Pins D-27 (defect register): the 124-second stop.
         // Alive for 6 liveness probes, finalised from the first finalised
         // probe, grace 200 ms at 100 ms polls -> the early stop lands on the
         // third poll, well before the parent's own exit.
@@ -18763,6 +19411,164 @@ rpcport=19796
         assert!(cookie_auth(&part).is_none());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── stale daemon auth files (2026-09-15) ────────────────────────
+
+    /// 2026-09-15: a start read the `.cookie` of a particld that had died
+    /// without shutting down, and the node exited on refused RPC. The files
+    /// such a daemon leaves carry the engine's pid names, are probed under
+    /// every chain layout, and are only ever proposed for a managed loopback
+    /// bitcoin-family daemon: monerod writes no cookie, and a remote or
+    /// electrum coin has no daemon of ours.
+    #[test]
+    fn stale_daemon_auth_files_follow_the_engine_names() {
+        let cfg = r#"{"chainclients": {
+            "particl": {"connection_type": "rpc", "manage_daemon": true,
+                        "rpchost": "127.0.0.1", "rpcport": 19792, "datadir": "/dd/particl"},
+            "litecoin": {"connection_type": "rpc", "manage_daemon": true,
+                         "rpchost": "127.0.0.1", "rpcport": 19795, "datadir": "/dd/litecoin"},
+            "bitcoincash": {"connection_type": "electrum", "manage_daemon": false,
+                            "datadir": "/dd/bitcoincash"},
+            "monero": {"connection_type": "rpc", "manage_daemon": true, "core_type_group": "xmr",
+                       "rpchost": "127.0.0.1", "rpcport": 29798, "datadir": "/dd/monero"},
+            "dash": {"connection_type": "rpc", "manage_daemon": true,
+                     "rpchost": "10.0.0.5", "rpcport": 19798, "datadir": "/dd/dash"}
+        }}"#;
+        let found = daemon_auth_files(cfg).expect("config must parse");
+        let coins: Vec<&str> = found.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert_eq!(coins, ["litecoin", "particl"]);
+
+        let (_, ltc_port, ltc) = &found[0];
+        assert_eq!(*ltc_port, 19795);
+        assert!(ltc.contains(&PathBuf::from("/dd/litecoin").join(".cookie")));
+        assert!(ltc.contains(&PathBuf::from("/dd/litecoin").join("litecoind.pid")));
+
+        let (_, part_port, part) = &found[1];
+        assert_eq!(*part_port, 19792);
+        assert!(
+            part.contains(&PathBuf::from("/dd/particl").join("particl.pid")),
+            "particl's pid file has no d suffix: {part:?}"
+        );
+        assert!(part.contains(&PathBuf::from("/dd/particl").join("regtest").join(".cookie")));
+        assert!(part.contains(&PathBuf::from("/dd/particl").join("testnet4").join(".cookie")));
+    }
+
+    /// The purge removes a dead daemon's cookie and pid file, keeps a live
+    /// daemon's, and touches nothing else. "Live" is a bound RPC port, held
+    /// here by a listener that never accepts.
+    #[tokio::test]
+    async fn stale_daemon_auth_files_are_purged_only_when_the_port_is_free() {
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-stale-cookie-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let part = dir.join("particl");
+        let ltc = dir.join("litecoin");
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::create_dir_all(&ltc).unwrap();
+
+        let live = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let live_port = live.local_addr().unwrap().port();
+        let dead_port = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let part_json = serde_json::to_string(&part.to_string_lossy().into_owned()).unwrap();
+        let ltc_json = serde_json::to_string(&ltc.to_string_lossy().into_owned()).unwrap();
+        let cfg = format!(
+            r#"{{"chainclients": {{
+                "particl": {{"connection_type": "rpc", "manage_daemon": true,
+                             "rpchost": "127.0.0.1", "rpcport": {dead_port}, "datadir": {part_json}}},
+                "litecoin": {{"connection_type": "rpc", "manage_daemon": true,
+                              "rpchost": "127.0.0.1", "rpcport": {live_port}, "datadir": {ltc_json}}}
+            }}}}"#
+        );
+        std::fs::write(dir.join("basicswap.json"), cfg).unwrap();
+
+        std::fs::write(part.join(".cookie"), "__cookie__:dead").unwrap();
+        std::fs::write(part.join("particl.pid"), "38952").unwrap();
+        std::fs::write(part.join("debug.log"), "kept").unwrap();
+        std::fs::write(ltc.join(".cookie"), "__cookie__:live").unwrap();
+        std::fs::write(ltc.join("litecoind.pid"), "4242").unwrap();
+
+        let removed = purge_stale_daemon_auth_files(&dir).await;
+
+        assert!(!part.join(".cookie").exists(), "a dead daemon's cookie must go");
+        assert!(!part.join("particl.pid").exists(), "and its pid file");
+        assert!(part.join("debug.log").exists(), "nothing else in the datadir is touched");
+        assert!(ltc.join(".cookie").exists(), "a live daemon's cookie must stay");
+        assert!(ltc.join("litecoind.pid").exists(), "and its pid file");
+        assert_eq!(removed.len(), 2, "{removed:?}");
+
+        drop(live);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── swaps last seen (2026-09-15) ────────────────────────────────
+
+    /// The lock screen's reading survives a round trip through its file, is
+    /// camelCase on the wire (the TS type reads `inProgress`), and an
+    /// unreadable file is no reading rather than a zero.
+    #[test]
+    fn active_swap_rows_are_counted_once_and_a_locked_reply_is_no_count() {
+        use serde_json::json;
+        assert_eq!(count_active_swaps(&json!([])), Ok(0), "BSX's 'No active swaps found'");
+        let two = json!([{"bid_id": "aa", "bid_state": "Script coin locked"},
+                         {"bid_id": "bb"}, {"bid_id": "aa"}]);
+        assert_eq!(count_active_swaps(&two), Ok(2));
+        // A locked engine answers an error object: unknown, not zero.
+        assert!(count_active_swaps(&json!({"error": "Wallet must be unlocked"})).is_err());
+    }
+
+    #[test]
+    fn swaps_last_seen_round_trips_and_an_unreadable_file_is_no_reading() {
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-swaps-last-seen-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let path = dir.join("nested").join("swaps-last-seen.json");
+        assert_eq!(read_swaps_last_seen_at(&path), None, "no file: no reading");
+        let reading = SwapsLastSeen { in_progress: 2, at: 1_800_000_000 };
+        write_swaps_last_seen_at(&path, &reading).expect("write");
+        assert_eq!(read_swaps_last_seen_at(&path), Some(reading));
+        let wire = std::fs::read_to_string(&path).unwrap();
+        assert!(wire.contains("\"inProgress\":2"), "camelCase for the TS type: {wire}");
+        std::fs::write(&path, "{not json").unwrap();
+        assert_eq!(read_swaps_last_seen_at(&path), None, "garbage is no reading, never zero");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The lock-screen count is the engine's own `swaps_in_progress`
+    /// (`/json/active`), errors on a reply it cannot read, and the janitor
+    /// writes only a count it actually read, so a locked engine never writes
+    /// zero over a real count.
+    #[test]
+    fn swaps_in_progress_count_is_the_engines_own_and_never_invents_zero() {
+        let src = include_str!("swap_sidecar.rs");
+        let start = src
+            .find("pub(crate) async fn swaps_in_progress_now(")
+            .expect("swaps_in_progress_now moved");
+        let body = &src[start..];
+        let body = &body[..body.find("\n}\n").expect("swaps_in_progress_now end")];
+        assert!(body.contains(r#"build_api_url(port, "active", ApiMethod::Get)"#));
+        assert!(!body.contains("with_available_or_active"), "the 2026-09-16 false count");
+        assert!(!body.contains("unwrap_or(0)"), "never default an unreadable list to 0");
+
+        let janitor = include_str!("swap_bid.rs");
+        let at = janitor
+            .find("crate::swap_sidecar::swaps_in_progress_now(&state)")
+            .expect("the janitor reads the count");
+        let tail = &janitor[at..(at + 900).min(janitor.len())];
+        assert!(tail.contains("if let Ok(n) = count"), "only a successful count is written");
     }
 
     // ── daemon-port preflight (P3 live-run defect) ──────────────────
@@ -20566,10 +21372,10 @@ mod itest {
         if !orphans.is_empty() {
             eprintln!("[itest] ORPHANS DETECTED, force-cleaning: {:?}", orphans);
             for (_, dp) in &daemon_pids {
-                let _ = crate::wallet_rpc_common::kill_pid_force(*dp).await;
+                let _ = crate::platform::kill_pid_force(*dp).await;
             }
             if let Some(pp) = parent_pid {
-                let _ = crate::wallet_rpc_common::kill_pid_force(pp).await;
+                let _ = crate::platform::kill_pid_force(pp).await;
             }
         }
 

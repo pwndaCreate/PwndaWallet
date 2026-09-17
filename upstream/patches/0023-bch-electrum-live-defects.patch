@@ -74,11 +74,13 @@ applies as written.
 Applies on top of PATCH-22. Touches basicswap/, so it counts toward the engine
 patch level (p21 -> p22).
 
+Rebased 2026-09-17 onto basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4): upstream rewrote `scriptToP2SH32LockingBytecode`'s hint to `bytes | str`, inside this patch's context. The diff below is regenerated; the change it makes is the same.
+
 diff --git a/basicswap/interface/bch/bch.py b/basicswap/interface/bch/bch.py
-index dcdf664..344953d 100644
+index f17e65d..90c7e7b 100644
 --- a/basicswap/interface/bch/bch.py
 +++ b/basicswap/interface/bch/bch.py
-@@ -139,6 +139,18 @@ class BCHInterface(BTCInterface):
+@@ -138,6 +138,18 @@ class BCHInterface(BTCInterface):
  
      def getUnspentsByAddr(self):
          unspent_addr = dict()
@@ -97,7 +99,7 @@ index dcdf664..344953d 100644
          unspent = self.rpc_wallet("listunspent")
          for u in unspent:
              if u.get("spendable", False) is False:
-@@ -233,10 +245,18 @@ class BCHInterface(BTCInterface):
+@@ -232,10 +244,18 @@ class BCHInterface(BTCInterface):
          address = self.encodeScriptDest(lock_tx_dest)
  
          if not self.isAddressMine(address, or_watch_only=True):
@@ -120,7 +122,7 @@ index dcdf664..344953d 100644
  
          return address
  
-@@ -252,10 +272,20 @@ class BCHInterface(BTCInterface):
+@@ -251,10 +271,20 @@ class BCHInterface(BTCInterface):
                  # cashaddr string; passed no scripthash, it would silently
                  # store "" and break the electrum scripthash subscription
                  # this whole light-mode path exists for.  Compute BCH's
@@ -145,7 +147,7 @@ index dcdf664..344953d 100644
                  wm.importWatchOnlyAddress(
                      self.coin_type(),
                      address,
-@@ -377,6 +407,22 @@ class BCHInterface(BTCInterface):
+@@ -376,6 +406,22 @@ class BCHInterface(BTCInterface):
              return CScript([OP_HASH256, script_hash, OP_EQUAL])
  
      def withdrawCoin(self, value: float, addr_to: str, subfee: bool):
@@ -168,7 +170,7 @@ index dcdf664..344953d 100644
          params = [addr_to, value, "", "", subfee, 0, False]
          return self.rpc_wallet("sendtoaddress", params)
  
-@@ -402,6 +448,31 @@ class BCHInterface(BTCInterface):
+@@ -401,6 +447,31 @@ class BCHInterface(BTCInterface):
          lock_tx_vout: int,
          script_pk: bytes,
      ) -> (int, int):
@@ -200,7 +202,7 @@ index dcdf664..344953d 100644
          txout = self.rpc("gettxout", [chain_b_lock_txid.hex(), lock_tx_vout, True])
          actual_value = self.make_int(txout["value"])
          return lock_tx_vout, actual_value
-@@ -599,6 +670,17 @@ class BCHInterface(BTCInterface):
+@@ -598,6 +669,17 @@ class BCHInterface(BTCInterface):
          )
  
      def getSpendableBalance(self) -> int:

@@ -15,13 +15,20 @@ import {
   NANOPOOL_ERGO_EU,
   NANOPOOL_ERGO_US,
 } from "./ergo";
+import {
+  K1POOL_XELIS_CPU,
+  K1POOL_XELIS_GPU,
+  K1POOL_XELIS_SSL,
+  PWNDA_XELIS,
+} from "./xelis";
 
 export type { MinerStats, PoolStatsAdapter } from "./types";
 export { PoolStatsPanel } from "./PoolStatsPanel";
 
 /**
  * Returns the stats adapter for a given pool ID, or null when:
- *   - the pool has no live-stats integration yet (PWNDA pools, Ntminer pre-Phase-2)
+ *   - the pool has no live-stats integration yet (pwnda-zephyr, pwnda-zano,
+ *     Ntminer pre-Phase-2; pwnda-xelis has one since 2026-09-16)
  *   - the pool ID is unknown.
  *
  * The UI hides `PoolStatsPanel` whenever this returns null.
@@ -45,4 +52,8 @@ const ADAPTERS: Record<string, PoolStatsAdapter> = {
   [WOOLYPOOLY_RAVENCOIN.id]: WOOLYPOOLY_RAVENCOIN,
   [WOOLYPOOLY_ERGO.id]: WOOLYPOOLY_ERGO,
   [NTMINERPOOL_ZEPHYR.id]: NTMINERPOOL_ZEPHYR,
+  [K1POOL_XELIS_CPU.id]: K1POOL_XELIS_CPU,
+  [K1POOL_XELIS_GPU.id]: K1POOL_XELIS_GPU,
+  [K1POOL_XELIS_SSL.id]: K1POOL_XELIS_SSL,
+  [PWNDA_XELIS.id]: PWNDA_XELIS,
 };

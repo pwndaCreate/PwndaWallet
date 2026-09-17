@@ -19,6 +19,12 @@ import { type AddWalletOpts, type WalletEntry, type WalletKind } from "../../vau
  * here, not only imported. Before, a Zano seed pasted here read
  * "Unrecognized" and there was no way to create any of the three.
  *
+ * 2026-09-15: Xelis joined the seed path and "create new". A 25-word Xelis
+ * seed uses Monero's English wordlist and checksum, so when the pasted words
+ * are also valid for Xelis the coin choice offers Monero · Zephyr · Xelis and
+ * nothing is pre-selected: restored as the wrong coin, the words open a
+ * different, empty wallet (`seed-kind.ts`).
+ *
  * Watch entries are view-only (eye chip); a private-key entry is single-chain.
  */
 
@@ -27,17 +33,26 @@ const KIND_META: Record<WalletKind, { short: string; color: string }> = {
   xmr: { short: "XMR", color: "#ff6b1a" },
   zph: { short: "ZPH", color: "#a78bfa" },
   zano: { short: "ZANO", color: "#f0a020" },
+  xelis: { short: "XEL", color: "#02FFCF" },
   privateKey: { short: "KEY", color: "#f59e0b" },
   watch: { short: "👁 WATCH", color: "#60a5fa" },
 };
 
 type AddMode = "seed" | "privateKey" | "watch";
 
+/** The coins a 25-word phrase can be for. */
+type CnChoice = "xmr" | "zph" | "xelis";
+
 /** Independent-seed coins that can be GENERATED here, with their chain. */
-const CREATABLE: ReadonlyArray<{ kind: "xmr" | "zph" | "zano"; chain: ChainType; label: string }> = [
+const CREATABLE: ReadonlyArray<{
+  kind: "xmr" | "zph" | "zano" | "xelis";
+  chain: ChainType;
+  label: string;
+}> = [
   { kind: "xmr", chain: "monero", label: "Monero" },
   { kind: "zph", chain: "zephyr", label: "Zephyr" },
   { kind: "zano", chain: "zano", label: "Zano" },
+  { kind: "xelis", chain: "xelis", label: "Xelis" },
 ];
 
 const inputStyle: React.CSSProperties = {
@@ -53,9 +68,9 @@ const inputStyle: React.CSSProperties = {
   outline: "none",
 };
 
-/** Networks offered for private-key import / watch (CryptoNote excluded). */
+/** Networks offered for private-key import / watch (independent-seed coins excluded). */
 const SINGLE_CHAIN_OPTIONS: ChainType[] = ALL_CHAINS.filter(
-  (c) => c !== "monero" && c !== "zephyr" && c !== "zano"
+  (c) => c !== "monero" && c !== "zephyr" && c !== "zano" && c !== "xelis"
 );
 
 function KindChip({ kind }: { kind: WalletKind }) {
@@ -111,7 +126,8 @@ export function WalletsCard({
   const [addValue, setAddValue] = useState(""); // seed / key / address
   const [addName, setAddName] = useState("");
   const [addChain, setAddChain] = useState<ChainType>("ethereum");
-  const [zphChoice, setZphChoice] = useState(false); // 25-word: treat as ZPH?
+  /** The coin picked for a 25-word phrase. null = not picked (see `coinChoice`). */
+  const [cnChoice, setCnChoice] = useState<CnChoice | null>(null);
   const [zanoPassphrase, setZanoPassphrase] = useState("");
   /** "YYYY-MM-DD" a 25-word Monero/Zephyr import was created around ("" = scan all). */
   const [restoreDate, setRestoreDate] = useState("");
@@ -131,6 +147,13 @@ export function WalletsCard({
     [addMode, addValue]
   );
 
+  // Monero stays the default for a Monero-or-Zephyr phrase, as before. When
+  // the words are ALSO a valid Xelis seed there is no default: the user picks.
+  const coinChoice: CnChoice | null = cnChoice ?? (detected.xelisPossible ? null : "xmr");
+  const coinOptions: ReadonlyArray<readonly [CnChoice, string]> = detected.xelisPossible
+    ? [["xmr", "Monero"], ["zph", "Zephyr"], ["xelis", "Xelis"]]
+    : [["xmr", "Monero"], ["zph", "Zephyr"]];
+
   const ordered = useMemo(() => {
     const primaryGroup = walletEntries.find((w) => w.kind === "bip39")?.groupId;
     return [...walletEntries].sort((a, b) => {
@@ -149,7 +172,7 @@ export function WalletsCard({
   const resetAdd = () => {
     setAddValue("");
     setAddName("");
-    setZphChoice(false);
+    setCnChoice(null);
     setZanoPassphrase("");
     setRestoreDate("");
     setGeneratedFor(null);
@@ -164,7 +187,8 @@ export function WalletsCard({
       const fresh = await getAdapter(c.chain).generateOwnSeed?.();
       if (!fresh) throw new Error(`${c.label} seed generation is not available`);
       setAddValue(fresh);
-      setZphChoice(c.kind === "zph"); // a 25-word Zephyr seed is otherwise read as Monero
+      // A generated 25-word seed is exactly the coin it was generated for.
+      setCnChoice(c.kind === "zano" ? null : c.kind);
       setZanoPassphrase("");
       setGeneratedFor(c.label);
       if (!addName.trim()) setAddName(`${c.label} wallet`);
@@ -178,7 +202,7 @@ export function WalletsCard({
   const handleAdd = async () => {
     let ok = false;
     if (addMode === "seed") {
-      const k = detected.ambiguous ? (zphChoice ? "zph" : "xmr") : detected.kind;
+      const k = detected.ambiguous ? coinChoice : detected.kind;
       if (!k) return;
       ok =
         k === "zano"
@@ -186,10 +210,14 @@ export function WalletsCard({
               zanoSeedPassphrase: zanoPassphrase,
               newlyCreated: !!generatedFor,
             })
-          : await onAdd(k, addValue, addName, undefined, {
-              restoreDate: restoreDate || undefined,
-              newlyCreated: !!generatedFor,
-            });
+          : k === "xelis"
+            ? await onAdd("xelis", addValue, addName, undefined, {
+                newlyCreated: !!generatedFor,
+              })
+            : await onAdd(k, addValue, addName, undefined, {
+                restoreDate: restoreDate || undefined,
+                newlyCreated: !!generatedFor,
+              });
     } else if (addMode === "privateKey") {
       ok = await onAdd("privateKey", addValue, addName, addChain);
     } else {
@@ -204,6 +232,7 @@ export function WalletsCard({
     generating ||
     !addValue.trim() ||
     (addMode === "seed" && !detected.kind) ||
+    (addMode === "seed" && detected.ambiguous && coinChoice === null) ||
     (detected.kind === "zano" && detected.zanoAuditable === true) ||
     (zanoNeedsPassphrase && !zanoPassphrase);
 
@@ -333,6 +362,12 @@ export function WalletsCard({
                         Secured Seed passphrase: <span style={{ userSelect: "all" }}>{e.zanoSeedPassphrase}</span>
                       </Mono>
                     )}
+                    {e.kind === "xelis" && (
+                      <Mono size={9} color="var(--warn)" style={{ display: "block", marginTop: 6, lineHeight: 1.5 }}>
+                        Label this backup as a Xelis seed. The same 25 words are also a valid Monero
+                        or Zephyr seed, and restored as either they open a different, empty wallet.
+                      </Mono>
+                    )}
                   </div>
                 )}
               </div>
@@ -369,7 +404,7 @@ export function WalletsCard({
                 return (
                   <button
                     key={m}
-                    onClick={() => { setAddMode(m); setAddValue(""); setGeneratedFor(null); }}
+                    onClick={() => { setAddMode(m); setAddValue(""); setGeneratedFor(null); setCnChoice(null); }}
                     style={{
                       flex: 1,
                       fontFamily: "var(--mono)",
@@ -409,8 +444,8 @@ export function WalletsCard({
             {addMode === "seed" ? (
               <textarea
                 value={addValue}
-                onChange={(e) => { setAddValue(e.target.value); setGeneratedFor(null); }}
-                placeholder="Recovery phrase — BIP39 · Monero (16/25) · Zephyr (25) · Zano (26)…"
+                onChange={(e) => { setAddValue(e.target.value); setGeneratedFor(null); setCnChoice(null); }}
+                placeholder="Recovery phrase — BIP39 · Monero (16/25) · Zephyr (25) · Xelis (25) · Zano (26)…"
                 rows={2}
                 spellCheck={false}
                 style={{ ...inputStyle, resize: "vertical", minHeight: 44 }}
@@ -425,8 +460,8 @@ export function WalletsCard({
               />
             )}
 
-            {/* Create new — Monero / Zephyr / Zano, which each use their own
-                seed rather than the BIP39 one. Offered while the box is
+            {/* Create new — Monero / Zephyr / Zano / Xelis, which each use their
+                own seed rather than the BIP39 one. Offered while the box is
                 empty; the generated seed lands in the box for review. */}
             {addMode === "seed" && !addValue.trim() && (
               <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }} data-create-seed>
@@ -452,28 +487,37 @@ export function WalletsCard({
               </Mono>
             )}
 
-            {/* Detected-kind feedback + 25-word disambiguation + Zano passphrase */}
+            {/* Detected-kind feedback + 25-word coin choice + Zano passphrase */}
             {addMode === "seed" && addValue.trim() && (
               detected.kind === null ? (
                 <Mono size={9} color="var(--danger)">
-                  Unrecognized — expected 12/24 BIP39, 16-word Monero, 25-word Monero/Zephyr, or a Zano seed.
+                  Unrecognized — expected 12/24 BIP39, 16-word Monero, 25-word Monero/Zephyr/Xelis, or a Zano seed.
                 </Mono>
               ) : detected.ambiguous ? (
-                <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-                  <Mono size={9} color="var(--text-dim)">25 words — which chain?</Mono>
-                  <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 2, overflow: "hidden" }}>
-                    {([["xmr", "Monero"], ["zph", "Zephyr"]] as const).map(([k, lbl]) => {
-                      const on = k === "zph" ? zphChoice : !zphChoice;
-                      return (
-                        <button key={k} onClick={() => setZphChoice(k === "zph")}
-                          style={{ fontFamily: "var(--mono)", fontSize: 9, padding: "4px 10px",
-                            background: on ? "var(--accent)" : "transparent", border: "none",
-                            color: on ? "#07120c" : "var(--text)", cursor: "pointer" }}>
-                          {lbl}
-                        </button>
-                      );
-                    })}
+                <div style={{ display: "flex", flexDirection: "column", gap: 6 }} data-seed-coin-choice>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                    <Mono size={9} color="var(--text-dim)">25 words — which coin?</Mono>
+                    <div style={{ display: "flex", border: "1px solid var(--border)", borderRadius: 2, overflow: "hidden" }}>
+                      {coinOptions.map(([k, lbl]) => {
+                        const on = coinChoice === k;
+                        return (
+                          <button key={k} onClick={() => setCnChoice(k)} aria-pressed={on}
+                            style={{ fontFamily: "var(--mono)", fontSize: 9, padding: "4px 10px",
+                              background: on ? "var(--accent)" : "transparent", border: "none",
+                              color: on ? "#07120c" : "var(--text)", cursor: "pointer" }}>
+                            {lbl}
+                          </button>
+                        );
+                      })}
+                    </div>
                   </div>
+                  {detected.xelisPossible && (
+                    <Mono size={8} color="var(--warn)" style={{ display: "block", lineHeight: 1.5 }}>
+                      These words are a valid Monero, Zephyr and Xelis seed alike, so the app cannot
+                      tell which coin they belong to. Restored as the wrong coin they open a different,
+                      empty wallet. Pick the coin the seed came from.
+                    </Mono>
+                  )}
                 </div>
               ) : detected.kind === "zano" ? (
                 detected.zanoAuditable ? (
@@ -500,6 +544,8 @@ export function WalletsCard({
                     )}
                   </div>
                 )
+              ) : detected.kind === "xelis" ? (
+                <Mono size={9} color="var(--accent)">Detected: Xelis seed</Mono>
               ) : (
                 <Mono size={9} color="var(--accent)">
                   Detected: {detected.kind === "bip39" ? "BIP39 recovery phrase" : "Monero polyseed"}
@@ -508,9 +554,10 @@ export function WalletsCard({
             )}
 
             {/* Restore date — 25-word Monero/Zephyr imports only. A polyseed
-                carries its own birthday, a Zano seed its own date, and a
-                seed generated here starts at the chain tip. */}
-            {addMode === "seed" && detected.ambiguous && !generatedFor && (
+                carries its own birthday, a Zano seed its own date, a Xelis
+                wallet takes no restore height, and a seed generated here
+                starts at the chain tip. */}
+            {addMode === "seed" && detected.ambiguous && !generatedFor && coinChoice !== "xelis" && (
               <div style={{ display: "flex", flexDirection: "column", gap: 4 }} data-restore-date>
                 <Mono size={9} color="var(--text-dim)">Created around (optional)</Mono>
                 <input

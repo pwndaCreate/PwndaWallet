@@ -22,6 +22,7 @@ const KIND_META: Record<WalletKind, { label: string; color: string }> = {
   xmr: { label: "XMR", color: "#ff6b1a" },
   zph: { label: "ZPH", color: "#a78bfa" },
   zano: { label: "ZANO", color: "#f0a020" },
+  xelis: { label: "XEL", color: "#02FFCF" },
   privateKey: { label: "KEY", color: "#f59e0b" },
   watch: { label: "👁", color: "#60a5fa" },
 };

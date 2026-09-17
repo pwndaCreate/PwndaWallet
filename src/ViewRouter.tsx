@@ -27,7 +27,7 @@ import {
 } from "./components/Primitives";
 import { TitleBar, Card } from "./components/PrimitivesV2";
 import { UpdateBanner } from "./components/UpdateBanner";
-import { SendModal } from "./features/send/SendModal";
+import { ActiveSendModal } from "./features/send/SendModal";
 import { ZephyrSwapModal } from "./features/zephyr/ZephyrSwapModal";
 import { DeskSwapTrackerModal, type DeskTrackerState } from "./features/swap";
 import {
@@ -37,9 +37,15 @@ import {
 import { MoneroNodesView } from "./features/monero/MoneroNodesView";
 import { ZephyrNodesView } from "./features/zephyr/ZephyrNodesView";
 import { ZanoNodesView } from "./features/zano/ZanoNodesView";
+import {
+  XelisNodesView,
+  type XelisNodesApi,
+  type XelisSessionApi,
+} from "./features/xelis";
 import { MiningView } from "./features/mining/MiningView";
 import { MinerSetupView } from "./features/mining/MinerSetupView";
 import { MiningSetupWizard } from "./features/mining/MiningSetupWizard";
+import { enableMiningAndOpenSetup, openMinerSetup } from "./features/mining/minerSetupEntry";
 import { SettingsView } from "./features/settings/SettingsView";
 import { DashboardView } from "./features/wallet/DashboardView";
 import { WalletDetailsCard } from "./features/wallet/WalletDetailsCard";
@@ -208,6 +214,7 @@ export type ViewRouterProps = {
   handleXmrAddDefenderExclusion: XmrSession["addDefender"];
   handleXmrDownloadBinary: XmrSession["downloadBinary"];
   startXmrSync: XmrSession["start"];
+  retryXmrSync: XmrSession["retry"];
 
   // ── ZPH session (aliases of useZphSession's return fields) ─
   zphSyncState: ZphSession["syncState"];
@@ -224,6 +231,7 @@ export type ViewRouterProps = {
   handleZphAddDefenderExclusion: ZphSession["addDefender"];
   handleZphDownloadBinary: ZphSession["downloadBinary"];
   startZphSync: ZphSession["start"];
+  retryZphSync: ZphSession["retry"];
 
   // ── Zephyr reserve info ────────────────────────────────────
   zphReserveInfo: ReturnType<typeof useZphReserveInfo>;
@@ -231,7 +239,7 @@ export type ViewRouterProps = {
   // ── ZANO session (aliases of useZanoSession's return fields) ─
   zanoSeedLoaded: string | null;
   setZanoSeedLoaded: (v: string | null) => void;
-  saveZanoSeedToVault: (seed: string, passphrase: string) => Promise<void>;
+  saveZanoSeedToVault: Vault["saveZanoSeedToVault"];
   zanoSyncState: ZanoSession["syncState"];
   zanoSyncError: ZanoSession["syncError"];
   zanoBinaryReady: ZanoSession["binaryReady"];
@@ -246,6 +254,16 @@ export type ViewRouterProps = {
   refreshZanoAssetBalances: ZanoSession["refreshAssetBalances"];
   zanoNodes: ReturnType<typeof useZanoNodes>;
   openZanoNodesView: () => Promise<void>;
+
+  // ── XELIS (2026-09-15): the whole useXelisSession return ───
+  xelisSeedLoaded: string | null;
+  setXelisSeedLoaded: (v: string | null) => void;
+  saveXelisSeedToVault: Vault["saveXelisSeedToVault"];
+  xelisSession: XelisSessionApi;
+  xelisNodes: XelisNodesApi;
+  openXelisNodesView: () => Promise<void>;
+  showXelisSeed?: boolean;
+  setShowXelisSeed?: (v: boolean) => void;
 
   // ── Tx history (aliases of useTxHistory's return fields) ───
   chainTxByKey: TxHistory["txByChain"];
@@ -398,6 +416,7 @@ export function ViewRouter(props: ViewRouterProps) {
     handleXmrAddDefenderExclusion,
     handleXmrDownloadBinary,
     startXmrSync,
+    retryXmrSync,
     zphSyncState,
     zphSyncPercent,
     zphSyncWalletHeight,
@@ -412,6 +431,7 @@ export function ViewRouter(props: ViewRouterProps) {
     handleZphAddDefenderExclusion,
     handleZphDownloadBinary,
     startZphSync,
+    retryZphSync,
     zphReserveInfo,
     zanoSeedLoaded,
     setZanoSeedLoaded,
@@ -430,6 +450,14 @@ export function ViewRouter(props: ViewRouterProps) {
     refreshZanoAssetBalances,
     zanoNodes,
     openZanoNodesView,
+    xelisSeedLoaded,
+    setXelisSeedLoaded,
+    saveXelisSeedToVault,
+    xelisSession,
+    xelisNodes,
+    openXelisNodesView,
+    showXelisSeed,
+    setShowXelisSeed,
     chainTxByKey,
     chainTxLoading,
     chainTxErrors,
@@ -557,7 +585,15 @@ export function ViewRouter(props: ViewRouterProps) {
           <MinerSetupView miner={miner} pricesByTicker={pricesByTicker} onBack={() => setView(Object.keys(walletsByChain).length > 0 ? "dashboard" : "home")} onDisableMining={onDisableMining} />
         ) : (
           <MiningSetupWizard
-            onSetUp={async () => { await onEnableMining(); setView("miner-setup"); }}
+            // Shared with landscape: persist the opt-in, refresh the miner
+            // status, show Miner Setup. Portrait used to skip the refresh.
+            onSetUp={() =>
+              enableMiningAndOpenSetup({
+                enableMining: onEnableMining,
+                checkMinerStatus: miner.checkMinerStatus,
+                showMinerSetup: () => setView("miner-setup"),
+              })
+            }
             onDismiss={() => setView(Object.keys(walletsByChain).length > 0 ? "dashboard" : "home")}
           />
         )
@@ -571,7 +607,12 @@ export function ViewRouter(props: ViewRouterProps) {
             addressFor={addressFor}
             pricesByTicker={pricesByTicker}
             onBack={() => setView("dashboard")}
-            onSetup={() => setView("miner-setup")}
+            onSetup={() =>
+              openMinerSetup({
+                checkMinerStatus: miner.checkMinerStatus,
+                showMinerSetup: () => setView("miner-setup"),
+              })
+            }
             projection={miningProjection}
             onSelectDisplayCoin={onSelectMineDisplayCoin}
             reachableTickers={mineReachableTickers}
@@ -587,7 +628,13 @@ export function ViewRouter(props: ViewRouterProps) {
           />
         ) : (
           <MiningSetupWizard
-            onSetUp={async () => { await onEnableMining(); setView("miner-setup"); }}
+            onSetUp={() =>
+              enableMiningAndOpenSetup({
+                enableMining: onEnableMining,
+                checkMinerStatus: miner.checkMinerStatus,
+                showMinerSetup: () => setView("miner-setup"),
+              })
+            }
             onDismiss={() => setView("dashboard")}
           />
         )
@@ -642,11 +689,11 @@ export function ViewRouter(props: ViewRouterProps) {
             onRefreshReceiveAddress: refreshXmrReceive,
             onAddDefenderExclusion: handleXmrAddDefenderExclusion,
             onDownloadBinary: handleXmrDownloadBinary,
-            onRetry: () => {
-              if (xmrSeedLoaded && sessionPassword) {
-                startXmrSync(xmrSeedLoaded, sessionPassword);
-              }
-            },
+            // The hook's own retry, which reopens the file and height the
+            // session was started with — the same function landscape passes.
+            // Re-deriving the arguments here dropped both, so Retry on any
+            // wallet but Main reopened Main's file (2026-09-16).
+            onRetry: retryXmrSync,
           }}
           zphSession={{
             syncState: zphSyncState,
@@ -665,11 +712,8 @@ export function ViewRouter(props: ViewRouterProps) {
             reserveFetchedAt: zphReserveInfo.fetchedAt,
             onAddDefenderExclusion: handleZphAddDefenderExclusion,
             onDownloadBinary: handleZphDownloadBinary,
-            onRetry: () => {
-              if (zphSeedLoaded && sessionPassword) {
-                startZphSync(zphSeedLoaded, sessionPassword);
-              }
-            },
+            // See the Monero retry above.
+            onRetry: retryZphSync,
           }}
           zanoSession={{
             syncState: zanoSyncState,
@@ -683,6 +727,10 @@ export function ViewRouter(props: ViewRouterProps) {
             onDownloadBinary: handleZanoDownloadBinary,
             onRetry: retryZanoSync,
           }}
+          xelisSeedLoaded={xelisSeedLoaded}
+          setXelisSeedLoaded={setXelisSeedLoaded}
+          saveXelisSeedToVault={saveXelisSeedToVault}
+          xelisSession={xelisSession}
           chainTxByKey={chainTxByKey}
           chainTxLoading={chainTxLoading}
           chainTxErrors={chainTxErrors}
@@ -763,9 +811,11 @@ export function ViewRouter(props: ViewRouterProps) {
             xmrSeedLoaded={xmrSeedLoaded}
             zphSeedLoaded={zphSeedLoaded}
             zanoSeedLoaded={zanoSeedLoaded}
+            xelisSeedLoaded={xelisSeedLoaded}
             onOpenMoneroNodes={openMoneroNodesView}
             onOpenZephyrNodes={openZephyrNodesView}
             onOpenZanoNodes={openZanoNodesView}
+            onOpenXelisNodes={openXelisNodesView}
           />
           {/* Layout toggle — appended below the existing settings view */}
           <Card title="LAYOUT" style={{ marginTop: 8 }}>
@@ -809,6 +859,9 @@ export function ViewRouter(props: ViewRouterProps) {
           zanoSeedPassphrase={zanoSeedPassphrase}
           showZanoSeed={showZanoSeed}
           setShowZanoSeed={setShowZanoSeed}
+          xelisSeedLoaded={xelisSeedLoaded}
+          showXelisSeed={showXelisSeed}
+          setShowXelisSeed={setShowXelisSeed}
           setShowZphSeed={setShowZphSeed}
           currentSolanaDerivationChoice={activeDerivationChoice.solana}
           onChangeSolanaDerivation={handleChangeSolanaDerivation}
@@ -833,10 +886,18 @@ export function ViewRouter(props: ViewRouterProps) {
         <ZanoNodesView nodes={zanoNodes} onBack={() => setView("settings")} />
       )}
 
+      {view === "xelis-nodes" && (
+        <XelisNodesView nodes={xelisNodes} onBack={() => setView("settings")} />
+      )}
+
       {showSendModal && wallet && (
-        <SendModal
+        // `ActiveSendModal` reads the asset being sent from the store `useSend`
+        // sends with. Portrait mounted the modal with no asset before
+        // 2026-09-15, so a ZEPHUSD send would have been titled "Send ZEPH".
+        <ActiveSendModal
           adapter={adapter}
           usdPrice={pricesByTicker[adapter.ticker.toUpperCase()]}
+          zphStats={zphReserveInfo.stats}
           fromAddress={wallet.address}
           sendTo={sendTo}
           setSendTo={setSendTo}

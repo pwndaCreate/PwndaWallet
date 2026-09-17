@@ -120,6 +120,8 @@ mod xmr_rpc;
 mod zph_rpc;
 #[cfg(feature = "full")]
 mod zano_rpc;
+#[cfg(feature = "full")]
+mod xelis_rpc;
 
 use std::sync::Mutex;
 
@@ -212,6 +214,10 @@ pub fn run() {
         .manage(miners::MinerStarting(std::sync::atomic::AtomicBool::new(false)))
         .manage(miners::GpuMinerStarting(std::sync::atomic::AtomicBool::new(false)))
         .manage(miners::GpuMinerProcess(Mutex::new(None)))
+        // SRBMiner-MULTI CPU lane (XelisHash v3) — its own slot so XEL-on-CPU
+        // and a GPU session are two independent processes. Registered with
+        // the other mining state: mining is compiled into every build.
+        .manage(miners::SrbCpuMinerProcess(Mutex::new(None)))
         .manage(miners::MinerLogPaths::default())
         .manage(miners::MinerWindowVisible(Mutex::new(false)))
         .manage(miners::MsrEnvCache(Mutex::new(None)))
@@ -233,6 +239,10 @@ pub fn run() {
             creds: None,
         })))
         .manage(zano_rpc::ZanoRpcChild::default())
+        // XELIS `xelis_wallet` sidecar. Same invoke-time resolution caveat as
+        // every state below: a missing `.manage()` fails every xelis_* command
+        // at RUNTIME, not at compile time.
+        .manage(xelis_rpc::XelisRpcChild::default())
         .manage(swap::state::SwapState::new())
         // BasicSwap sidecar supervisor state. Same runtime-resolution caveat
         // as DeskWatchers below: `State<'_, SwapSidecarState>` resolves at
@@ -285,6 +295,12 @@ pub fn run() {
             miners::start_gpu_miner,
             miners::stop_gpu_miner,
             miners::is_gpu_mining,
+            // SRBMiner-MULTI CPU lane (XelisHash v3). Mining commands compile
+            // into every build — full wallet and Pwnda Lite alike.
+            miners::start_srbminer_cpu,
+            miners::stop_srbminer_cpu,
+            miners::is_srbminer_cpu_mining,
+            miners::get_srbminer_cpu_snapshot,
             miners::delete_miners,
             pool_stats::fetch_pool_stats,
             pool_payout::fetch_pool_min_payout,
@@ -357,6 +373,25 @@ pub fn run() {
             zano_rpc::zano_ensure_wallet,
             #[cfg(feature = "full")]
             zano_rpc::zano_download_wallet_rpc,
+            // XELIS (2026-09-15). Wallet-layer commands, so every one of them
+            // is `full`-gated: `cargo build --no-default-features` must not
+            // compile a wallet sidecar into Pwnda Lite.
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_start_rpc,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_stop_rpc,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_rpc_call,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_rpc_is_running,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_probe_node,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_binary_status,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_ensure_wallet,
+            #[cfg(feature = "full")]
+            xelis_rpc::xelis_download_wallet_rpc,
             #[cfg(feature = "full")]
             sidecar_update::sidecar_update_status,
             #[cfg(feature = "full")]
@@ -699,6 +734,10 @@ pub fn run() {
                         Some("stopped: app exiting".to_string()),
                     )
                     .await;
+                    // The SRBMiner CPU lane (XelisHash v3) is an unelevated
+                    // child we own; stop it by its own handle like the GPU
+                    // lane, so an app exit never leaves it hashing.
+                    let _ = miners::stop_srbminer_cpu(app_handle.clone()).await;
                     let _ = miners::stop_gpu_miner(app_handle).await;
                 });
             }

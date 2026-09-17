@@ -1,23 +1,22 @@
 import { useCallback, useEffect, useState } from "react";
-import type { ChainAdapter, FeeEstimate, GasBudget } from "../../wallets/types";
-import { feeRateForSend, feeTotalFor } from "./feeDisplay";
+import type {
+  ChainAdapter,
+  FeeEstimate,
+  GasBudget,
+  SendQuote,
+  SendableBalance,
+} from "../../wallets/types";
+import { feeNoteText, feeRateForSend, feeTotalFor, formatUsd } from "./feeDisplay";
 import { coinAmountFromUsd, usdTextFromCoin } from "../../lib/usdAmount";
+import { errorText } from "../../lib/errorText";
+import { sendAssetTicker, sendAssetUsdPrice } from "../../wallets/tx-display";
+import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
+import { useSendQuote } from "./useSendQuote";
+import { useSendAssetType } from "./sendAssetStore";
 
 type Tier = "slow" | "normal" | "fast";
 
-export function SendModal({
-  adapter,
-  fromAddress,
-  sendTo,
-  setSendTo,
-  sendAmount,
-  setSendAmount,
-  sending,
-  onSend,
-  onClose,
-  assetLabel,
-  usdPrice,
-}: {
+export interface SendModalProps {
   adapter: ChainAdapter;
   /**
    * The address the send leaves FROM. Needed to answer whether it can pay the
@@ -32,18 +31,42 @@ export function SendModal({
   setSendAmount: (v: string) => void;
   sending: boolean;
   /** `feeRate`: the selected tier as a per-(v)byte rate, when the chain's
-   *  estimate is one (`feeRateForSend`); otherwise undefined. */
-  onSend: (feeRate?: number) => void;
+   *  estimate is one (`feeRateForSend`); otherwise undefined. `quote`: the
+   *  priced quote, for adapters with `quoteSend` (useSend relays it only if it
+   *  still matches the send). */
+  onSend: (feeRate?: number, quote?: SendQuote) => void;
   onClose: () => void;
-  /** Overrides the asset shown in the title/amount unit. Used when sending a
-   *  Zephyr ecosystem asset (ZEPHUSD/ZEPHRSV/ZEPHYRS) where the adapter ticker
-   *  (ZEPH) would otherwise mislabel the send. Defaults to `adapter.ticker`. */
+  /** Overrides the asset shown in the title/amount unit. Defaults to the label
+   *  for `assetType` (`sendAssetTicker`), i.e. `adapter.ticker` for every chain
+   *  without per-send assets. */
   assetLabel?: string;
+  /** The per-send asset selector `useSend` sends with (Zephyr: ZSD/ZRS/ZYS;
+   *  undefined = the chain's native asset). Priced and labelled as such. */
+  assetType?: string;
   /** USD price of the coin that PAYS the fee (`adapter.ticker`), for the
    *  fee total. Absent → the total is shown in the coin only. */
   usdPrice?: number;
-}) {
-  const sendTicker = assetLabel ?? adapter.ticker;
+  /** USD price of `assetType` when it is not the adapter's own coin (a Zephyr
+   *  ecosystem asset's oracle price). Used for a fee charged in that asset. */
+  assetUsdPrice?: number;
+}
+
+export function SendModal({
+  adapter,
+  fromAddress,
+  sendTo,
+  setSendTo,
+  sendAmount,
+  setSendAmount,
+  sending,
+  onSend,
+  onClose,
+  assetLabel,
+  assetType,
+  usdPrice,
+  assetUsdPrice,
+}: SendModalProps) {
+  const sendTicker = assetLabel ?? sendAssetTicker(adapter.chain, adapter.ticker, assetType);
 
   // ── USD entry (2026-09-12) ────────────────────────────────────────────────
   //
@@ -55,7 +78,7 @@ export function SendModal({
   // The typed text is shown verbatim only while `sendAmount` is still what it
   // produced; editing the coin field makes it stale and the USD field follows.
   const amountUsdPrice =
-    (!assetLabel || assetLabel === adapter.ticker) && usdPrice != null && usdPrice > 0
+    sendTicker === adapter.ticker && usdPrice != null && usdPrice > 0
       ? usdPrice
       : undefined;
   const [usdEdit, setUsdEdit] = useState<{ text: string; forAmount: string } | null>(null);
@@ -72,6 +95,49 @@ export function SendModal({
     setUsdEdit({ text, forAmount: amt });
     setSendAmount(amt);
   };
+
+  // ── Quote-driven fee (2026-09-15) ─────────────────────────────────────────
+  //
+  // Adapters that implement `quoteSend` (Zephyr) price THIS send by building it
+  // without broadcasting; the tier estimate below is never fetched for them.
+  // Zephyr's estimate called a daemon method its wallet-rpc does not have, so
+  // the box showed an error forever and no fee was ever priced. Every other
+  // chain keeps the tier UI exactly as it was.
+  const quoteDriven = typeof adapter.quoteSend === "function";
+  const priced = useSendQuote({
+    adapter,
+    to: sendTo,
+    amount: sendAmount,
+    assetType,
+    enabled: quoteDriven && !sending,
+  });
+
+  // What the send can draw on right now, for adapters that can say (Zephyr:
+  // unlocked vs total of the asset being sent). A full-balance send used to
+  // fail only after the press, because the modal showed no spendable figure.
+  const [sendable, setSendable] = useState<SendableBalance | null>(null);
+  useEffect(() => {
+    if (!adapter.getSendableBalance) {
+      setSendable(null);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const b = await adapter.getSendableBalance!(assetType);
+        if (!cancelled) setSendable(b);
+      } catch (e) {
+        if (!cancelled) setSendable(null);
+        console.warn("[SendModal] sendable balance failed:", errorText(e));
+      }
+    };
+    void load();
+    const id = window.setInterval(() => void load(), 30_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [adapter, assetType]);
 
   const [fee, setFee] = useState<FeeEstimate | null>(null);
   const [feeError, setFeeError] = useState<string | null>(null);
@@ -125,6 +191,7 @@ export function SendModal({
   // throw `not initialized` for sidecar chains until the wallet is open;
   // we surface that as a one-line note rather than a hard error.
   const loadFee = useCallback(async () => {
+    if (quoteDriven) return;
     setFeeLoading(true);
     try {
       const r = await adapter.getFeeEstimate();
@@ -147,9 +214,10 @@ export function SendModal({
     } finally {
       setFeeLoading(false);
     }
-  }, [adapter]);
+  }, [adapter, quoteDriven]);
 
   useEffect(() => {
+    if (quoteDriven) return;
     let cancelled = false;
     void (async () => {
       await loadFee();
@@ -162,7 +230,7 @@ export function SendModal({
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [loadFee]);
+  }, [loadFee, quoteDriven]);
 
   // Truthy when we have a usable fee value for the currently-selected
   // tier. Send is blocked when this is false (per UXS-20260516-112
@@ -181,9 +249,18 @@ export function SendModal({
    *
    * Chains that DO submit a fee keep the gate: there, no fee means no
    * correctly-constructed transaction, and blocking is the right answer.
+   * Quote-driven adapters are gated on the quote instead (`quoteBlocks`).
    */
   const feeIsAdvisory = adapter.networkComputesFee === true;
-  const feeReady = feeIsAdvisory || (!!selectedTierFee && selectedTierFee !== "—");
+  const feeReady =
+    quoteDriven || feeIsAdvisory || (!!selectedTierFee && selectedTierFee !== "—");
+
+  /**
+   * A quote failure that refuses the send: not enough unlocked funds for amount
+   * plus fee, or an invalid recipient. Any other quote failure is advisory,
+   * because the network sets the fee (`isDefinitiveQuoteError`).
+   */
+  const quoteBlocks = quoteDriven && priced.failure?.definitive === true;
 
   const tiers: Array<{ id: Tier; label: string; eta?: string; value?: string }> = [];
   if (fee?.slow)
@@ -198,8 +275,9 @@ export function SendModal({
     // A fallback is the adapter's built-in default, not an estimate — say so.
     // Until 2026-09-12 LTC's hardcoded 10 sat/vB rendered as "ESTIMATED".
     label: fee?.isFallback ? "Default" : tiers.length ? "Normal" : "Estimated",
-    eta: fee?.normal.eta,
-    value: fee?.normal.value,
+    // `?.` on `normal` too: an estimate without it used to crash the modal.
+    eta: fee?.normal?.eta,
+    value: fee?.normal?.value,
   });
   if (fee?.fast)
     tiers.push({
@@ -211,6 +289,18 @@ export function SendModal({
 
   // Whether any tier can be priced as a total (per-byte rate + typical size).
   const showsTotals = tiers.some((t) => feeTotalFor(fee, t.value, usdPrice) != null);
+
+  // USD price of the coin a quoted fee is charged in: ZEPH at `usdPrice`, a
+  // Zephyr ecosystem asset at its oracle price, anything else unpriced.
+  const quotedFeeTicker = priced.quote?.feeTicker ?? null;
+  const quotedFeeUsdPrice =
+    quotedFeeTicker == null
+      ? undefined
+      : quotedFeeTicker === adapter.ticker
+        ? usdPrice
+        : quotedFeeTicker === sendTicker
+          ? assetUsdPrice
+          : undefined;
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -233,6 +323,22 @@ export function SendModal({
             value={sendAmount}
             onChange={(e) => setSendAmount(e.target.value)}
           />
+          {sendable && (
+            <div
+              data-sendable
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 9,
+                color: "var(--text-dim)",
+                marginTop: 4,
+              }}
+            >
+              Spendable now: {sendable.unlocked} {sendTicker}
+              {sendable.total !== sendable.unlocked
+                ? ` of ${sendable.total} (the rest is still locked; received funds unlock after confirmations)`
+                : ""}
+            </div>
+          )}
         </div>
 
         {amountUsdPrice != null && (
@@ -265,7 +371,15 @@ export function SendModal({
 
         <div className="form-group">
           <label>Network fee</label>
-          {/* UXS-20260516-112: fee section used to render a silent "—"
+          {quoteDriven ? (
+            <QuotedFee
+              priced={priced}
+              networkTicker={adapter.ticker}
+              sendTicker={sendTicker}
+              feeUsdPrice={quotedFeeUsdPrice}
+            />
+          ) : (
+          /* UXS-20260516-112: fee section used to render a silent "—"
               forever when the fee fetch quietly failed. Now: show
               "fetching…" only while we have no data, show an explicit
               error + Retry button when the fetch failed, and block Send
@@ -273,8 +387,8 @@ export function SendModal({
               chain needs one from us. Chains where the NETWORK sets the fee
               (`networkComputesFee`, e.g. Monero) are never blocked by a
               display failure — that conflation made XMR unsendable on
-              2026-08-29. No more silent em-dashes. */}
-          {feeLoading && !fee ? (
+              2026-08-29. No more silent em-dashes. */
+          feeLoading && !fee ? (
             <div style={{ fontFamily: "var(--mono)", fontSize: 10, color: "var(--text-dim)" }}>
               Fetching current network fee…
             </div>
@@ -419,6 +533,7 @@ export function SendModal({
                 </div>
               )}
             </>
+          )
           )}
         </div>
 
@@ -477,8 +592,14 @@ export function SendModal({
             className="btn-primary"
             // The selected tier reaches the signer (2026-09-12). Wrapped in an
             // arrow on purpose: `onClick={onSend}` would hand the MouseEvent to
-            // `handleSend` as its fee-rate argument.
-            onClick={() => onSend(feeRateForSend(fee, selectedTierFee ?? undefined))}
+            // `handleSend` as its fee-rate argument. Quote-driven adapters pass
+            // the priced quote instead (2026-09-15); `useSend` relays it only if
+            // it is still exactly this send.
+            onClick={() =>
+              quoteDriven
+                ? onSend(undefined, priced.quote ?? undefined)
+                : onSend(feeRateForSend(fee, selectedTierFee ?? undefined))
+            }
             // UXS-20260516-112 AC #3: block Send until we actually
             // have a fee number to charge against. Title attribute
             // gives keyboard / screen-reader users an explanation
@@ -489,16 +610,18 @@ export function SendModal({
             // `null` — unestimable, non-zero balance — deliberately does not
             // block: refusing a send on a guess is its own bug.
             disabled={
-              sending || !sendTo || !sendAmount || !feeReady || gasShort
+              sending || !sendTo || !sendAmount || !feeReady || gasShort || quoteBlocks
             }
             title={
-              gasShort
-                ? gas?.includesAmount
-                  ? `This address does not hold enough ${gas?.ticker ?? "funds"} to cover the amount plus the network fee.`
-                  : `This address has no ${gas?.ticker ?? "gas"} on ${gas?.chainName ?? "this network"} to pay the fee with.`
-                : !feeReady
-                  ? "Network fee isn't available yet — Send is disabled until the fee fetch succeeds."
-                  : undefined
+              quoteBlocks
+                ? priced.failure?.message
+                : gasShort
+                  ? gas?.includesAmount
+                    ? `This address does not hold enough ${gas?.ticker ?? "funds"} to cover the amount plus the network fee.`
+                    : `This address has no ${gas?.ticker ?? "gas"} on ${gas?.chainName ?? "this network"} to pay the fee with.`
+                  : !feeReady
+                    ? "Network fee isn't available yet — Send is disabled until the fee fetch succeeds."
+                    : undefined
             }
           >
             {sending ? "Sending…" : "► Send"}
@@ -506,5 +629,132 @@ export function SendModal({
         </div>
       </div>
     </div>
+  );
+}
+
+const quoteRetryStyle = {
+  background: "transparent",
+  border: "1px solid rgba(255,170,0,0.4)",
+  color: "var(--warn)",
+  cursor: "pointer",
+  fontFamily: "var(--mono)",
+  fontSize: 10,
+  padding: "2px 8px",
+} as const;
+
+/**
+ * The fee box for quote-driven adapters: the fee of the transaction that will
+ * actually be sent, in the asset that pays it, never a tier.
+ */
+function QuotedFee({
+  priced,
+  networkTicker,
+  sendTicker,
+  feeUsdPrice,
+}: {
+  priced: ReturnType<typeof useSendQuote>;
+  /** The adapter's own coin (ZEPH), for the "set by the network" wording. */
+  networkTicker: string;
+  sendTicker: string;
+  feeUsdPrice?: number;
+}) {
+  const { inputs, quote, failure, pending, retry } = priced;
+  const base = { fontFamily: "var(--mono)", fontSize: 10, lineHeight: 1.5 } as const;
+
+  if (!inputs) {
+    return (
+      <div data-send-quote="idle" style={{ ...base, color: "var(--text-dim)" }}>
+        Enter a recipient and an amount to see the exact fee for this send.
+      </div>
+    );
+  }
+  if (failure) {
+    return (
+      <div
+        data-send-quote="error"
+        data-send-quote-kind={failure.kind}
+        style={{
+          ...base,
+          color: "var(--warn)",
+          display: "flex",
+          alignItems: "baseline",
+          gap: 8,
+          flexWrap: "wrap",
+        }}
+      >
+        <span style={{ flex: "1 1 auto" }}>
+          {failure.message}{" "}
+          {failure.definitive
+            ? "Send is disabled until this is fixed."
+            : `${networkTicker} fees are set by the network when the transaction is built, so this does not block sending.`}
+        </span>
+        {!failure.definitive && (
+          <button type="button" onClick={retry} disabled={pending} style={quoteRetryStyle}>
+            {pending ? "Retrying…" : "Retry"}
+          </button>
+        )}
+      </div>
+    );
+  }
+  if (!quote) {
+    return (
+      <div data-send-quote="pending" style={{ ...base, color: "var(--text-dim)" }}>
+        Pricing this send…
+      </div>
+    );
+  }
+  const usd = formatUsd(Number(quote.fee), feeUsdPrice);
+  const note = feeNoteText(quote);
+  return (
+    <div data-send-quote="ready" style={base}>
+      <div style={{ fontSize: 12 }} data-fee-total>
+        {quote.fee}{" "}
+        <span style={{ fontSize: 9, opacity: 0.75 }}>
+          {quote.feeTicker ?? "(charged by the network)"}
+        </span>
+        {usd && <span style={{ fontSize: 9, opacity: 0.75 }}> · {usd}</span>}
+      </div>
+      {/* Whatever the adapter says about THIS fee (2026-09-15). Generic on
+          purpose: Xelis is the first quote to carry one, for the one-off
+          charge on a recipient account that is not on chain yet. */}
+      {note && (
+        <div data-fee-note style={{ fontSize: 10, color: "var(--text)", marginTop: 3 }}>
+          {note}
+        </div>
+      )}
+      <div style={{ fontSize: 9, color: "var(--text-dim)", marginTop: 2 }}>
+        {quote.feeTicker && quote.feeTicker !== networkTicker && quote.feeTicker === sendTicker
+          ? `Paid in ${sendTicker}, the asset being sent, not in ${networkTicker}. `
+          : ""}
+        Exact fee of this transaction. Sent within 90 s it is broadcast as priced; after that it
+        is rebuilt and the fee can differ slightly.{pending ? " Refreshing…" : ""}
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The Send modal for the asset the send flow is on, as BOTH layouts mount it.
+ *
+ * Reads the asset from `sendAssetStore`, the same value `useSend` sends with,
+ * and derives the label and the asset's oracle price from it. Portrait used to
+ * mount `SendModal` with no asset at all, so a ZEPHUSD send would have been
+ * titled "Send ZEPH"; landscape computed its own label. One wrapper, one
+ * derivation (2026-09-15).
+ */
+export function ActiveSendModal({
+  zphStats,
+  ...props
+}: Omit<SendModalProps, "assetType" | "assetLabel" | "assetUsdPrice"> & {
+  /** Zephyr oracle prices, for a fee charged in ZEPHUSD/ZEPHRSV/ZEPHYRS. */
+  zphStats?: ZphLiveStats | null;
+}) {
+  const assetType = useSendAssetType();
+  return (
+    <SendModal
+      {...props}
+      assetType={assetType}
+      assetUsdPrice={sendAssetUsdPrice(props.adapter.chain, assetType, zphStats)}
+    />
   );
 }

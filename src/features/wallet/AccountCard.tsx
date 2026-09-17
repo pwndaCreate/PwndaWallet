@@ -2,6 +2,8 @@ import { ST } from "../../components/Primitives";
 import { Card, MiniSpark } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { placeholderSparkFor } from "./spark-fallback";
+import { AssetMarketBlock, priceSparkFor } from "./AssetMarketBlock";
+import { assetUsdValue, formatAssetBalance, formatAssetUsd } from "./wallet-surface";
 import type {
   ChainAdapter,
   ChainType,
@@ -122,6 +124,10 @@ export function AccountCard({
       : positionDirection === "down"
         ? "var(--warn, #ffae42)"
         : "var(--text-dim)";
+  // Shared with landscape (`wallet-surface.ts`): "—" is unknown, "$0.00" a
+  // known zero, and the balance is trimmed the same way in both layouts.
+  const balanceText = formatAssetBalance(balance);
+  const usdValue = assetUsdValue(balance, usdPrice);
   return (
     <Card
       title="ACCOUNT"
@@ -160,6 +166,11 @@ export function AccountCard({
         const labelText = showSubaddress || showUtxoRotated ? "RCV" : "ADDR";
         const truncated =
           addr.length > 20 ? `${addr.slice(0, 10)}…${addr.slice(-8)}` : addr;
+        // A wallet can exist before its address is known: a Xelis wallet whose
+        // address this build cannot derive offline gets it from the running
+        // wallet (2026-09-15). Say so, and offer nothing to copy, since copying
+        // "" does nothing and looks like it worked.
+        const addressKnown = addr.length > 0;
         return (
           <>
             <div
@@ -178,36 +189,41 @@ export function AccountCard({
                 {labelText}
               </span>
               <span
-                title={addr}
+                title={addressKnown ? addr : undefined}
+                data-address-pending={addressKnown ? undefined : true}
                 style={{
-                  color: "var(--text)",
+                  color: addressKnown ? "var(--text)" : "var(--text-dim)",
                   flex: 1,
                   overflow: "hidden",
                   textOverflow: "ellipsis",
                   whiteSpace: "nowrap",
                 }}
               >
-                {truncated}
+                {addressKnown ? truncated : "shown once the wallet opens"}
               </span>
-              <button
-                className="btn-icon btn-small"
-                onClick={() => onCopy(addr, labelKey)}
-                title="Copy address"
-                style={
-                  copiedKey === labelKey
-                    ? { color: "var(--accent)", borderColor: "var(--accent)" }
-                    : undefined
-                }
-              >
-                {copiedKey === labelKey ? "✓" : "⎘"}
-              </button>
-              <button
-                className="btn-icon btn-small"
-                onClick={() => onCopy(addr, "qr")}
-                title="QR — copies address (modal coming in v2.1)"
-              >
-                ▦
-              </button>
+              {addressKnown && (
+                <>
+                  <button
+                    className="btn-icon btn-small"
+                    onClick={() => onCopy(addr, labelKey)}
+                    title="Copy address"
+                    style={
+                      copiedKey === labelKey
+                        ? { color: "var(--accent)", borderColor: "var(--accent)" }
+                        : undefined
+                    }
+                  >
+                    {copiedKey === labelKey ? "✓" : "⎘"}
+                  </button>
+                  <button
+                    className="btn-icon btn-small"
+                    onClick={() => onCopy(addr, "qr")}
+                    title="QR — copies address (modal coming in v2.1)"
+                  >
+                    ▦
+                  </button>
+                </>
+              )}
             </div>
             {utxoReceiveAddress && (
               <div
@@ -282,20 +298,20 @@ export function AccountCard({
             {adapter.displayName}
           </div>
           <div className="hero-num tnum" style={{ fontSize: 26, lineHeight: 1.1, marginTop: 2 }}>
-            <ST speed={18} delay={120}>{balance}</ST>
+            <ST speed={18} delay={120}>{balanceText}</ST>
             <span style={{ fontSize: 11, color: "var(--text-muted)", marginLeft: 8 }}>
               {adapter.ticker}
             </span>
           </div>
-          {usdPrice !== undefined && balance !== "--" && (
-            <div className="tnum" style={{
-              fontSize: 11, color: "var(--text-muted)", marginTop: 2,
-              fontFamily: "var(--font-mono)",
-            }}>
-              ≈ ${(parseFloat(balance.replace(/,/g, "") || "0") * usdPrice)
-                .toLocaleString("en-US", { maximumFractionDigits: 2 })}
-            </div>
-          )}
+          {/* Always shown, as landscape's focal line is: "—" when the value
+              is unknown. This used to be hidden while the balance was "--"
+              and printed "$NaN" for any other non-number (2026-09-16). */}
+          <div className="tnum" style={{
+            fontSize: 11, color: "var(--text-muted)", marginTop: 2,
+            fontFamily: "var(--font-mono)",
+          }}>
+            ≈ {formatAssetUsd(usdValue)}
+          </div>
         </div>
         {/* Per-asset spark — wired through `priceHistory` (24h USD
             series for the active chain's ticker). Renders position
@@ -318,6 +334,18 @@ export function AccountCard({
           {networkInfo.label}: {networkInfo.value} {networkInfo.unit}
         </div>
       )}
+
+      {/* Price / balance / value — the block landscape shows in its right
+          rail. Portrait had no price row at all until 2026-09-16. */}
+      <AssetMarketBlock
+        compact
+        ticker={adapter.ticker}
+        price={usdPrice ?? null}
+        balanceText={balanceText}
+        usd={usdValue}
+        priceSpark={priceSparkFor(adapter.ticker, priceHistory)}
+        sparkColor={adapter.color}
+      />
     </Card>
   );
 }

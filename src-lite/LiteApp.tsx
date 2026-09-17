@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useMiner } from "../src/features/mining/useMiner";
+import { pickMiningCoin } from "../src/features/mining/pickCoin";
 import { toMiningFocus } from "../src/features/mining/featureFocus";
 import { useMemoryTracker, usePeriodicGc } from "../src/features/mining/useMemoryTrace";
 import { LiteMiningView } from "./views/LiteMiningView";
@@ -73,7 +74,13 @@ export function LiteApp() {
     if (seededRef.current) return;
     seededRef.current = true;
     if (miner.miningCoin !== persistedMiningCoin) {
-      miner.setMiningCoin(persistedMiningCoin);
+      // Through the shared pick rule, not a bare `setMiningCoin`. That left the
+      // hardware on useMiner's default CPU lane, so a Lite user whose last coin
+      // was a GPU coin (RVN, say) reopened to a CPU lane asking for
+      // `ravencoin/randomx` — "No pools for this coin/algo". The same class as
+      // the 2026-08-28 ZANO SIMPLE-view bug, in Lite's seed path; found
+      // 2026-09-15 while adding XEL to Lite.
+      pickMiningCoin(persistedMiningCoin, miner);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -92,7 +99,10 @@ export function LiteApp() {
 
   useEffect(() => {
     let cancelled = false;
-    const tickers = ["XMR", "ZEPH", "RVN", "CFX"];
+    // Every rostered coin. `fetchUsdPrices` drops a ticker it has no price id
+    // for (XEL until the wallet layer maps one), so listing it is harmless and
+    // the XEL tile starts pricing the moment the id exists.
+    const tickers = ["XMR", "ZEPH", "ZANO", "XEL", "RVN", "CFX", "ERG"];
     const refresh = async () => {
       try {
         const prices = await fetchUsdPrices(tickers);

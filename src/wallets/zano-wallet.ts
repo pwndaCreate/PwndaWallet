@@ -174,8 +174,12 @@ export async function initZanoSession(
 
   const binaryExists = await checkZanoBinaryExists();
   if (!binaryExists) {
+    // "Download it from Settings first" until 2026-09-16; no such control
+    // existed. The Zano card's own button and Settings ▸ Wallet binaries both
+    // install it now. Keep "binary" + "missing": ZanoSyncCard matches them.
     throw new Error(
-      "The Zano wallet binary is missing. Download it from Settings first."
+      "The Zano wallet binary is missing. Use the download button below, or " +
+        "Settings ▸ Wallet binaries."
     );
   }
 
@@ -268,6 +272,20 @@ export async function closeZanoWallet(): Promise<void> {
   session = null;
 }
 
+/**
+ * Lock: end this app's Zano session without taking the wallet away from the
+ * swap node. While the node is using Main, Rust stores the wallet and leaves
+ * it serving; otherwise this stops Main exactly as `closeZanoWallet` does.
+ * A wallet switch and wallet removal still use `closeZanoWallet`.
+ *
+ * 2026-09-15: Lock used `closeZanoWallet`, which killed Main under any ZANO
+ * swap in flight, and under any offer that took a bid after the lock.
+ */
+export async function lockZanoWallet(): Promise<void> {
+  await stopZanoRpc({ lock: true }).catch(() => {});
+  session = null;
+}
+
 export function getZanoReceiveAddress(): string | null {
   return session?.currentAddress ?? null;
 }
@@ -318,12 +336,50 @@ export async function getZanoAllAssetBalances(): Promise<ZanoAssetBalance[]> {
   return getAllBalances();
 }
 
+/**
+ * The last 50 transfers, THROWING on an RPC failure.
+ *
+ * The session's poll uses this so a failed read keeps the list it already
+ * shows. `getZanoTransactionHistory` answers `[]` on failure, which is
+ * indistinguishable from "no transfers" and would blank the history card
+ * for one tick every time the sidecar hiccups.
+ */
+export async function readZanoTransactionHistory(): Promise<ZanoTransferEntry[]> {
+  return getRecentTransfers(0, 50);
+}
+
 export async function getZanoTransactionHistory(): Promise<ZanoTransferEntry[]> {
   try {
-    return await getRecentTransfers(0, 50);
+    return await readZanoTransactionHistory();
   } catch {
     return [];
   }
+}
+
+/**
+ * Zano transfers as the generic history rows Activity renders.
+ *
+ * One mapping for both paths: the adapter's `getTransactionHistory`, and
+ * App.tsx, which since 2026-09-16 feeds Activity from the Zano session's own
+ * read instead of polling the sidecar a second time through the adapter.
+ */
+export function zanoTransfersToChainTx(
+  entries: readonly ZanoTransferEntry[],
+  limit?: number,
+): ChainTx[] {
+  const rows = limit == null ? entries : entries.slice(0, limit);
+  return rows.map((e) => ({
+    chain: "zano",
+    hash: e.txHash ?? "",
+    direction: e.isIncome ? "in" : "out",
+    amount: atomicToZano(
+      e.amount,
+      e.assetId === ZANO_NATIVE_ASSET_ID ? ZANO_NATIVE_DECIMALS : 12
+    ),
+    timestamp: e.timestamp,
+    height: e.height,
+    meta: { assetId: e.assetId },
+  }));
 }
 
 // =========================================================================
@@ -420,19 +476,7 @@ export const zanoAdapter: ChainAdapter = {
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
     const entries = await getZanoTransactionHistory();
-    const items: ChainTx[] = entries.slice(0, limit).map((e) => ({
-      chain: "zano",
-      hash: e.txHash ?? "",
-      direction: e.isIncome ? "in" : "out",
-      amount: atomicToZano(
-        e.amount,
-        e.assetId === ZANO_NATIVE_ASSET_ID ? ZANO_NATIVE_DECIMALS : 12
-      ),
-      timestamp: e.timestamp,
-      height: e.height,
-      meta: { assetId: e.assetId },
-    }));
-    return { items };
+    return { items: zanoTransfersToChainTx(entries, limit) };
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

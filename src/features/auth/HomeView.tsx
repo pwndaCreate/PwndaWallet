@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { formatAppVersion } from "../../lib/appVersion";
 import { Glow } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { TermBox } from "../../components/TermBox";
@@ -57,7 +58,7 @@ export function HomeView({
               "0 0 5px rgba(242,242,242,0.4), 0 0 10px rgba(242,242,242,0.2)",
           }}
         >
-          <Glow>Welcome to PWNDA — Wallet Terminal v2.0.1</Glow>
+          <Glow>Welcome to PWNDA — Wallet Terminal {formatAppVersion()}</Glow>
         </div>
         <div
           style={{

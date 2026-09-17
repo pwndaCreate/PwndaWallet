@@ -33,3 +33,10 @@ export { formatActualReceived } from "./swap-actual-received";
 // read it without a BOUNDARIES.md amendment.
 export { useDeskTracker, type DeskTrackerState } from "./useDeskTracker";
 export { DeskSwapTrackerModal } from "./DeskSwapTrackerModal";
+
+// The swap registry, read-only, so the wallet can tell whether ANY router
+// carries a ticker before it enables a Swap button (`wallet/wallet-surface.ts`,
+// `hasSwapVenue`, 2026-09-16). Exported here rather than imported from
+// `asset-capabilities.ts` directly, because that file is private to this
+// folder. Consumers read it; only this folder may change what it says.
+export { ASSET_CAPABILITIES } from "./asset-capabilities";

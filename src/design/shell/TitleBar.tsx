@@ -8,6 +8,7 @@
  */
 
 import type { CSSProperties, ReactNode } from "react";
+import { formatAppVersion } from "../../lib/appVersion";
 import { Dot } from "../primitives/Dot";
 import { PwndaWordmark } from "../primitives/PwndaWordmark";
 import { isTauri } from "../env";
@@ -29,7 +30,7 @@ export function TitleBar({
   syncColor = "green",
   onMin,
   onClose,
-  version = "v2.0.1",
+  version = formatAppVersion(),
   middle,
 }: {
   syncLabel?: string;

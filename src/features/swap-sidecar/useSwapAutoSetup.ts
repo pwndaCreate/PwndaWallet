@@ -307,9 +307,10 @@ export function useSwapAutoSetup(
   // cannot restart on its own: the wallet key is cleared at every stop (C5
   // hygiene), and only this unlocked app can supply it again — the same
   // stop → key → start sequence the Settings card's buttons perform. The
-  // supervisor caps attempts per coin per session, so a wallet that keeps
-  // failing cannot turn this into a restart loop. `listen` rejects without
-  // a Tauri runtime (browser sandbox): no doorbell, not an error.
+  // supervisor backs off between restarts that happened and still left the
+  // coin parked (`swap_bid.rs::UnparkBackoff`), so a wallet that keeps failing
+  // cannot turn this into a restart loop. `listen` rejects without a Tauri
+  // runtime (browser sandbox): no doorbell, not an error.
   useEffect(() => {
     if (!optedIn || !deriveSwapMaterial) return;
     let unlisten: (() => void) | null = null;
@@ -322,7 +323,7 @@ export function useSwapAutoSetup(
       void (async () => {
         try {
           console.warn(
-            `[useSwapAutoSetup] unpark: restarting the swap node to add ${req.coin} (attempt ${req.attempt} of ${req.max})`,
+            `[useSwapAutoSetup] unpark: restarting the swap node to add ${req.coin} (attempt ${req.attempt}${req.max > 0 ? ` of ${req.max}` : ""})`,
           );
           // Say it on screen, not only to a console nobody has open. The
           // operator watched the node go to STOPPING mid-session and asked
@@ -348,7 +349,7 @@ export function useSwapAutoSetup(
         } catch (e) {
           console.error("[useSwapAutoSetup] unpark restart failed:", e);
           setUnparkNotice(
-            `Could not add ${req.coin.toUpperCase()} to the swap node. It will stay off until the next start.`,
+            `Could not add ${req.coin.toUpperCase()} to the swap node. If the node stopped, start it from Settings; otherwise it tries again in a few minutes.`,
           );
         } finally {
           busy = false;

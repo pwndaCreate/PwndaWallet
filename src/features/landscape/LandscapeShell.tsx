@@ -1,4 +1,5 @@
 import { CSSProperties, ReactNode, useEffect, useState } from "react";
+import { formatAppVersion } from "../../lib/appVersion";
 import { Dot } from "../../components/Primitives";
 import { useAppState } from "../../state/AppStateContext";
 import { shouldShowSwitcher, contextForWallet } from "../../vault-schema";
@@ -212,7 +213,7 @@ export function LandscapeShell({
           </span>
           <span style={{ fontFamily: "var(--mono)", fontSize: 9,
             color: "var(--text-dim)", letterSpacing: 0.5, paddingRight: 8 }}>
-            v2.0.1
+            {formatAppVersion()}
           </span>
           {/* Window controls */}
           <button onClick={handleMinimize} title="Minimize"

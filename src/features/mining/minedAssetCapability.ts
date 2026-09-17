@@ -103,6 +103,13 @@ const CAPABILITY: Partial<Record<ChainType, MinedAssetCapability>> = {
     kind: "unavailable",
     note: "ERG has no swap route out of mining — daily revenue shown instead",
   },
+  // XEL stays out of swap (xelis-integration-plan defaults, 2026-09-15): no
+  // BasicSwap, NEAR Intents, THORChain or SwapKit venue, so there is no route
+  // to project through. Daily revenue is the honest number.
+  xelis: {
+    kind: "unavailable",
+    note: "XEL has no swap route out of mining — daily revenue shown instead",
+  },
 };
 
 export const DEFAULT_CAPABILITY: MinedAssetCapability = {

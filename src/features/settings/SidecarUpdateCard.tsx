@@ -1,34 +1,35 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "../../lib/tauri";
 import { Card } from "../../components/PrimitivesV2";
+import {
+  WALLET_BINARIES,
+  describeWalletBinary,
+  installWalletBinary,
+  type WalletBinaryId,
+  type WalletBinaryStatus,
+} from "./walletBinaries";
 
 interface SidecarUpdateStatus {
   enabled: boolean;
   /** Unix seconds; 0 = never checked. */
   lastCheck: number;
-  moneroInstalled: string | null;
-  zephyrInstalled: string | null;
-  moneroBundled: string | null;
-  zephyrBundled: string | null;
+  wallets: WalletBinaryStatus[];
 }
 
 /**
- * "WALLET-RPC UPDATES" — visibility into, and a kill switch for, the
- * background sidecar updater (`src-tauri/src/sidecar_update.rs`).
+ * "WALLET BINARIES" — what each privacy wallet runs, and the background
+ * updater's switch (`src-tauri/src/sidecar_update.rs`).
  *
- * The updater is deliberately quiet, which is exactly why it needs a surface:
- * it replaces executables on disk, so the user should be able to see what
- * version they're on and turn the networked half off.
+ * All four wallet programs ship inside the installer, gzipped, and stay
+ * dormant until that wallet is first opened. Each row says whether the program
+ * is unpacked, which version the installer carries, and offers Unpack (or
+ * Download, for a build that carries none) when it is not unpacked yet. Until 2026-09-16 the card listed Monero and Zephyr
+ * only, while the Zano and Xelis wallets told users to "Download it from
+ * Settings first" — a control that did not exist.
  *
  * The toggle governs **upstream checks only** (tier 2, Monero). Reconciling
- * against the payload the installer already shipped (tier 1) always runs —
- * it's finishing an update the user chose by upgrading the wallet, and
- * disabling it would just strand them on a superseded binary. The copy below
- * says so rather than implying the toggle stops everything.
- *
- * Zephyr pins its release at compile time (no signed hash file upstream to
- * verify against), so its sidecar only moves when the wallet does. Shown
- * explicitly so "why does Zephyr never update?" is answered in place.
+ * against the payload the installer already shipped (tier 1, all four) always
+ * runs; the copy says so rather than implying the toggle stops everything.
  *
  * `SidecarUpdateList` is the wrapper-agnostic content (for the landscape
  * `<Panel>`); `SidecarUpdateCard` wraps it in the portrait `<Card>` — same
@@ -37,6 +38,7 @@ interface SidecarUpdateStatus {
 export function SidecarUpdateList() {
   const [status, setStatus] = useState<SidecarUpdateStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const [installing, setInstalling] = useState<WalletBinaryId | null>(null);
   const [err, setErr] = useState("");
 
   const refresh = useCallback(async () => {
@@ -77,21 +79,18 @@ export function SidecarUpdateList() {
     }
   };
 
-  const rows: { label: string; installed: string | null; bundled: string | null; note: string }[] =
-    [
-      {
-        label: "Monero wallet-RPC",
-        installed: status?.moneroInstalled ?? null,
-        bundled: status?.moneroBundled ?? null,
-        note: "checked against upstream daily",
-      },
-      {
-        label: "Zephyr wallet-RPC",
-        installed: status?.zephyrInstalled ?? null,
-        bundled: status?.zephyrBundled ?? null,
-        note: "pinned to the wallet release",
-      },
-    ];
+  const install = async (id: WalletBinaryId) => {
+    setInstalling(id);
+    setErr("");
+    try {
+      await installWalletBinary(id);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : String(e));
+    } finally {
+      setInstalling(null);
+      await refresh();
+    }
+  };
 
   const lastCheck =
     !status || status.lastCheck === 0
@@ -101,47 +100,65 @@ export function SidecarUpdateList() {
   return (
     <>
       <p style={{ fontSize: 12, color: "var(--text-dim)", margin: "0 0 10px", lineHeight: 1.5 }}>
-        The Monero and Zephyr sections each need a wallet-RPC helper. It ships
-        inside the installer, compressed, and is only unpacked the first time
-        you open that chain — so it stays dormant if you never use it.
+        Monero, Zephyr, Zano and Xelis each run a wallet program. All four ship
+        inside the installer, compressed, and are only unpacked the first time
+        you open that wallet — so they stay dormant if you never use them.
       </p>
-      {rows.map((r) => (
-        <div
-          key={r.label}
-          style={{
-            background: "var(--surface-2)",
-            border: "1px solid var(--border)",
-            padding: "8px 10px",
-            marginBottom: 6,
-            fontFamily: "var(--font-mono)",
-          }}
-        >
+      {!status && !err && (
+        <div style={{ fontSize: 11, color: "var(--text-dim)" }}>Reading…</div>
+      )}
+      {status?.wallets.map((w) => {
+        const meta = WALLET_BINARIES[w.id];
+        if (!meta) return null;
+        return (
           <div
+            key={w.id}
+            data-wallet-binary={w.id}
             style={{
-              fontSize: 10,
-              color: "var(--text-dim)",
-              letterSpacing: 0.5,
-              textTransform: "uppercase",
+              background: "var(--surface-2)",
+              border: "1px solid var(--border)",
+              padding: "8px 10px",
+              marginBottom: 6,
+              fontFamily: "var(--font-mono)",
+              display: "flex",
+              alignItems: "center",
+              gap: 10,
             }}
           >
-            {r.label} · {r.note}
-          </div>
-          <div style={{ fontSize: 11, color: "var(--text)", marginTop: 2 }}>
-            {r.installed ? (
-              <>
-                in use: {r.installed}
-                {r.bundled && r.bundled !== r.installed && (
-                  <span style={{ color: "var(--text-dim)" }}> · shipped: {r.bundled}</span>
-                )}
-              </>
-            ) : (
-              <span style={{ color: "var(--text-dim)" }}>
-                not unpacked yet{r.bundled ? ` · shipped: ${r.bundled}` : ""}
-              </span>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div
+                style={{
+                  fontSize: 10,
+                  color: "var(--text-dim)",
+                  letterSpacing: 0.5,
+                  textTransform: "uppercase",
+                }}
+              >
+                {meta.label} · {meta.note}
+              </div>
+              <div
+                style={{
+                  fontSize: 11,
+                  color: w.present ? "var(--text)" : "var(--text-dim)",
+                  marginTop: 2,
+                }}
+              >
+                {describeWalletBinary(w)}
+              </div>
+            </div>
+            {!w.present && (
+              <button
+                className="btn-primary"
+                style={{ flexShrink: 0, fontSize: 11 }}
+                onClick={() => void install(w.id)}
+                disabled={installing !== null}
+              >
+                {installing === w.id ? "Installing…" : w.bundled ? "► Unpack" : "► Download"}
+              </button>
             )}
           </div>
-        </div>
-      ))}
+        );
+      })}
 
       <label
         style={{
@@ -163,9 +180,9 @@ export function SidecarUpdateList() {
       </label>
       <p style={{ fontSize: 11, color: "var(--text-dim)", margin: "6px 0 0", lineHeight: 1.5 }}>
         Downloads are verified against Monero&rsquo;s signed hash list before
-        anything is replaced, and never while the helper is running. Turning
-        this off stops the update checks; the helper that came with your
-        installer is still used.
+        anything is replaced, and never while the wallet is running. Turning
+        this off stops the update checks; the programs that came with your
+        installer are still used, and a newer installer still replaces them.
       </p>
 
       <div style={{ display: "flex", alignItems: "center", gap: 10, marginTop: 10 }}>
@@ -188,7 +205,7 @@ export function SidecarUpdateList() {
 
 export function SidecarUpdateCard() {
   return (
-    <Card title="WALLET-RPC UPDATES" style={{ marginTop: 14 }}>
+    <Card title="WALLET BINARIES" style={{ marginTop: 14 }}>
       <SidecarUpdateList />
     </Card>
   );

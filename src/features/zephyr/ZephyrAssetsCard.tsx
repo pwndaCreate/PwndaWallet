@@ -39,16 +39,32 @@ const fmtUsd = (n: number) =>
  * price) and the card foots a total; both are omitted until the stats
  * land, so nothing ever shows a bogus $0. (Phase 4 will add a
  * ZYS-specific APY/share-price line.)
+ *
+ * # Send (2026-09-15)
+ *
+ * Portrait had no way to SEND ZEPHUSD / ZEPHRSV / ZEPHYRS: the dashboard's Send
+ * button carries no asset, and these rows only opened the swap modal. Landscape
+ * has sent them since 2026-06-18 (asset row → focal panel → Send). `onSendAsset`
+ * gives each held ecosystem-asset row a Send button that opens the SAME
+ * `SendModal` through the same `openSendModal(asset)` call landscape makes, so
+ * pricing, gating and relay are one implementation in both layouts. ZEPH is not
+ * given one here: the dashboard's own Send button already sends it.
  */
 export function ZephyrAssetsCard({
   assetBalances,
   liveStats,
   onOpenSwap,
+  onSendAsset,
+  sendDisabled,
 }: {
   assetBalances: ZphAssetBalance[] | null;
   /** Live Zephyr oracle prices (from `useZphReserveInfo`); null until loaded. */
   liveStats: ZphLiveStats | null;
   onOpenSwap: (sourceAsset: ZphAssetType) => void;
+  /** Open the Send modal for this ecosystem asset. Absent → no Send buttons. */
+  onSendAsset?: (asset: ZphAssetType) => void;
+  /** True while the wallet cannot send yet (not synced). */
+  sendDisabled?: boolean;
 }) {
   if (!assetBalances) return null;
 
@@ -91,6 +107,7 @@ export function ZephyrAssetsCard({
             const isZero = total === 0;
             const price = zphAssetPrice(liveStats, asset);
             const usd = price != null ? (total / ZPH_ATOMIC) * price : null;
+            const canSend = !!onSendAsset && asset !== "ZPH" && !isZero;
             return (
               <tr
                 key={asset}
@@ -166,12 +183,45 @@ export function ZephyrAssetsCard({
                 <td
                   style={{
                     padding: "8px 0 8px 8px",
-                    width: 24,
+                    width: canSend ? 64 : 24,
                     textAlign: "right",
+                    verticalAlign: "top",
                     color: "var(--text-dim)",
+                    whiteSpace: "nowrap",
                   }}
                 >
-                  ›
+                  {canSend ? (
+                    <button
+                      type="button"
+                      data-zph-asset-send={asset}
+                      disabled={sendDisabled}
+                      title={
+                        sendDisabled
+                          ? "Available once the Zephyr wallet has synced"
+                          : `Send ${ZPH_UI_TICKER[asset]}`
+                      }
+                      onClick={(e) => {
+                        // The row itself opens the swap modal; this button must not.
+                        e.stopPropagation();
+                        onSendAsset?.(asset);
+                      }}
+                      style={{
+                        background: "transparent",
+                        border: "1px solid rgba(255,255,255,0.25)",
+                        color: "var(--text)",
+                        cursor: sendDisabled ? "default" : "pointer",
+                        opacity: sendDisabled ? 0.4 : 1,
+                        fontFamily: "var(--mono)",
+                        fontSize: 10,
+                        padding: "3px 8px",
+                        letterSpacing: 0.4,
+                      }}
+                    >
+                      ▲ Send
+                    </button>
+                  ) : (
+                    "›"
+                  )}
                 </td>
               </tr>
             );
@@ -199,8 +249,9 @@ export function ZephyrAssetsCard({
       )}
       <p className="gas-info" style={{ marginTop: 8, marginBottom: 0 }}>
         Click any asset to open the swap panel pre-filled with that asset
-        as the source. USD values use the Zephyr protocol oracle (ZSD = $1
-        peg, ZYS = accrued yield value).
+        as the source.{onSendAsset ? " Send moves the asset itself, with no conversion." : ""}{" "}
+        All four assets are received at your Zephyr address. USD values use
+        the Zephyr protocol oracle (ZSD = $1 peg, ZYS = accrued yield value).
       </p>
     </Card>
   );

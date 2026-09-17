@@ -6,7 +6,9 @@ import {
   buildCredentials,
   poolHostPort,
   HOUSE_DEFAULT_POOL,
+  poolWorkerName,
   resolveDefaultPool,
+  workerFlagFor,
 } from "./pools";
 import { getStatsAdapter } from "./pool-stats";
 
@@ -120,8 +122,9 @@ describe("Pwnda Zano pool (zano.pwnda.org:17706)", () => {
 });
 
 describe("HOUSE_DEFAULT_POOL — a policy override, not a fabricated payout", () => {
-  it("names exactly ZEPH and ZANO, each pointing at a real registered pool", () => {
-    expect(Object.keys(HOUSE_DEFAULT_POOL).sort()).toEqual(["zano", "zephyr"]);
+  it("names exactly ZEPH, ZANO and XEL, each pointing at a real registered pool", () => {
+    // XEL joined 2026-09-16 (pwnda-xelis).
+    expect(Object.keys(HOUSE_DEFAULT_POOL).sort()).toEqual(["xelis", "zano", "zephyr"]);
     for (const [coin, id] of Object.entries(HOUSE_DEFAULT_POOL)) {
       expect(getPoolById(id as string)?.coin).toBe(coin);
     }
@@ -236,5 +239,175 @@ describe("resolveDefaultPool — house default must survive real usage history",
       mostUsed: null,
     });
     expect(next).toBe(getPoolsForCoin("ravencoin", "kawpow")[0]?.id);
+  });
+});
+
+/**
+ * Xelis pools, verified live 2026-09-15 (stratum probe + real SRBMiner-MULTI
+ * 3.6.2 sessions). Every endpoint here passed; the combos that failed that day
+ * are named in the XELIS_POOLS header and must stay absent. `pwnda-xelis`
+ * (2026-09-16) is the one exception to "probed from here": its evidence is the
+ * pool crediting the operator's own session (see its entry in pools.ts).
+ */
+describe("Xelis pools", () => {
+  // Throwaway, offline-created, never-funded mainnet address.
+  const XEL_ADDR = "xel:teqlmzt7nmxnpte48zxd0a666qfs6hjncvtsh6xtt7gp7hjgss5squv8r2a";
+
+  it("registers exactly the endpoints that passed the probe, TLS where it was TLS", () => {
+    expect(
+      getPoolsForCoin("xelis", "xelishashv3").map((p) => [p.id, p.endpoint, p.ssl])
+    ).toEqual([
+      ["kryptex-xelis", "stratum+tcp://xel.kryptex.network:7019", false],
+      ["kryptex-xelis-ssl", "stratum+ssl://xel.kryptex.network:8019", true],
+      ["k1pool-xelis-cpu", "stratum+tcp://eu.xel.k1pool.com:9350", false],
+      ["k1pool-xelis-gpu", "stratum+tcp://eu.xel.k1pool.com:9351", false],
+      ["k1pool-xelis-ssl", "stratum+ssl://eu.xel.k1pool.com:9352", true],
+      ["herominers-xelis", "stratum+tcp://de.xelis.herominers.com:1225", false],
+      ["pwnda-xelis", "stratum+ssl://xel.pwnda.org:17706", true],
+    ]);
+  });
+
+  it("pins K1Pool's CPU and GPU ports to their lanes", () => {
+    const cpu = getPoolsForCoin("xelis", "xelishashv3", "cpu").map((p) => p.id);
+    const gpu = getPoolsForCoin("xelis", "xelishashv3", "gpu").map((p) => p.id);
+    expect(cpu).toContain("k1pool-xelis-cpu");
+    expect(cpu).not.toContain("k1pool-xelis-gpu");
+    expect(cpu).not.toContain("k1pool-xelis-ssl");
+    expect(gpu).toContain("k1pool-xelis-gpu");
+    expect(gpu).toContain("k1pool-xelis-ssl");
+    expect(gpu).not.toContain("k1pool-xelis-cpu");
+    // Single-port pools serve both lanes.
+    for (const id of ["kryptex-xelis", "kryptex-xelis-ssl", "herominers-xelis", "pwnda-xelis"]) {
+      expect(cpu).toContain(id);
+      expect(gpu).toContain(id);
+    }
+  });
+
+  it("the lane filter changes nothing for single-lane coins", () => {
+    expect(getPoolsForCoin("monero", "randomx", "cpu")).toEqual(
+      getPoolsForCoin("monero", "randomx")
+    );
+    expect(getPoolsForCoin("ravencoin", "kawpow", "gpu")).toEqual(
+      getPoolsForCoin("ravencoin", "kawpow")
+    );
+  });
+
+  // Replaced 2026-09-16. This test was "has no house pool — pwnda runs no XEL
+  // pool (operator decision D4)"; pwnda now runs one.
+  it("defaults to the pwnda pool on BOTH lanes, over stale usage history", () => {
+    // Kryptex is registry[0] and serves both lanes, so a registry-order
+    // default could never produce pwnda-xelis. Only the house policy can.
+    expect(getPoolsForCoin("xelis", "xelishashv3")[0]?.id).not.toBe("pwnda-xelis");
+    for (const lane of ["cpu", "gpu"] as const) {
+      expect(getDefaultPoolId("xelis", "xelishashv3", lane)).toBe("pwnda-xelis");
+      expect(
+        resolveDefaultPool({
+          coin: "xelis",
+          algorithm: "xelishashv3",
+          hardware: lane,
+          liveLanePool: null,
+          remembered: null,
+          mostUsed: lane === "cpu" ? "k1pool-xelis-cpu" : "k1pool-xelis-gpu",
+        })
+      ).toBe("pwnda-xelis");
+    }
+    // An in-session pick still wins.
+    expect(
+      resolveDefaultPool({
+        coin: "xelis",
+        algorithm: "xelishashv3",
+        hardware: "cpu",
+        liveLanePool: null,
+        remembered: "k1pool-xelis-cpu",
+        mostUsed: null,
+      })
+    ).toBe("k1pool-xelis-cpu");
+  });
+
+  it("pwnda-xelis: TLS, both lanes, min payout from pwnda.org", () => {
+    const pool = getPoolById("pwnda-xelis")!;
+    expect(pool.coin).toBe("xelis");
+    expect(pool.algorithm).toBe("xelishashv3");
+    expect(pool.ssl).toBe(true); // → SRBMiner `--tls true` on both lanes
+    expect(pool.hardware).toBeUndefined(); // one port, both lanes
+    expect(poolHostPort(pool.endpoint)).toBe("xel.pwnda.org:17706");
+    expect(pool.minPayout).toBe("0.05 XEL");
+  });
+
+  it("pwnda-xelis logs in as `xel:address.worker` / `x`, as pwnda.org documents", () => {
+    const pool = getPoolById("pwnda-xelis")!;
+    expect(
+      buildCredentials({ pool, address: XEL_ADDR, worker: " rig1 ", coinPrefix: "XEL" })
+    ).toEqual({ user: `${XEL_ADDR}.rig1`, pass: "x" });
+    // The `xel:` prefix stays: the pool requires it.
+    expect(
+      buildCredentials({ pool, address: XEL_ADDR, worker: "", coinPrefix: "XEL" }).user
+    ).toBe(`${XEL_ADDR}.worker1`);
+  });
+
+  it("pwnda-xelis never sends an all-digit worker, which the pool reads as a fixed difficulty", () => {
+    // pwnda.org/start: "append to the address - YOUR_XELIS_ADDRESS.2000000".
+    // A rig named "1" would otherwise mine at difficulty 1.
+    const pool = getPoolById("pwnda-xelis")!;
+    for (const [worker, sent] of [
+      ["1", "rig1"],
+      [" 2000000 ", "rig2000000"],
+      ["rig7", "rig7"],
+      ["7rig", "7rig"],
+      ["", "worker1"],
+    ] as const) {
+      expect(poolWorkerName(pool, worker)).toBe(sent);
+      expect(
+        buildCredentials({ pool, address: XEL_ADDR, worker, coinPrefix: "XEL" }).user
+      ).toBe(`${XEL_ADDR}.${sent}`);
+    }
+    // Only a pool that declares the rule is affected.
+    const hero = getPoolById("herominers-conflux")!;
+    expect(hero.userFormat).toBe("address.worker");
+    expect(poolWorkerName(hero, "42")).toBe("42");
+  });
+
+  it("pwnda-xelis sends the worker once, in the wallet: no separate --worker", () => {
+    // The operator's working session sent ["xel:….OutsideRig","SRBMiner","x"]
+    // (captured 2026-09-16): the worker only in the wallet, SRBMiner's default
+    // in the worker field. Omitting --worker reproduces that shape.
+    expect(workerFlagFor(getPoolById("pwnda-xelis")!, "rig1", true)).toBeNull();
+    for (const pool of getPoolsForCoin("xelis", "xelishashv3")) {
+      if (pool.id === "pwnda-xelis") continue;
+      expect(workerFlagFor(pool, " rig1 ", true)).toBe("rig1");
+      expect(workerFlagFor(pool, "", true)).toBe("worker1");
+    }
+    // A protocol with no worker field never gets the flag.
+    expect(workerFlagFor(getPoolById("herominers-conflux")!, "rig1", false)).toBeNull();
+    expect(workerFlagFor(getPoolById("k1pool-xelis-cpu")!, "rig1", false)).toBeNull();
+  });
+
+  it("the third-party pools log in with the bare address and password x; the worker is a separate flag", () => {
+    for (const pool of getPoolsForCoin("xelis", "xelishashv3")) {
+      if (pool.id === "pwnda-xelis") continue; // pinned above
+      const { user, pass } = buildCredentials({
+        pool,
+        address: XEL_ADDR,
+        worker: "rig1",
+        coinPrefix: "XEL",
+      });
+      expect(user).toBe(XEL_ADDR);
+      expect(pass).toBe("x");
+    }
+  });
+
+  it("does not list Suprnova (account pool; wallet-login crediting unverified)", () => {
+    expect(
+      getPoolsForCoin("xelis", "xelishashv3").some((p) => p.endpoint.includes("suprnova"))
+    ).toBe(false);
+  });
+
+  it("has live stats only where the API was verified (K1Pool, Pwnda)", () => {
+    expect(getStatsAdapter("pwnda-xelis")).not.toBeNull();
+    expect(getStatsAdapter("k1pool-xelis-cpu")).not.toBeNull();
+    expect(getStatsAdapter("k1pool-xelis-gpu")).not.toBeNull();
+    expect(getStatsAdapter("k1pool-xelis-ssl")).not.toBeNull();
+    expect(getStatsAdapter("kryptex-xelis")).toBeNull();
+    expect(getStatsAdapter("herominers-xelis")).toBeNull();
   });
 });

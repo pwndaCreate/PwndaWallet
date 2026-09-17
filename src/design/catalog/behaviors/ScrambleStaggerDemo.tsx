@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { formatAppVersion } from "../../../lib/appVersion";
 import { ST } from "../../primitives";
 import { staggerDelay } from "../../behaviors";
 
@@ -10,7 +11,7 @@ const ROWS = [
   "› mining hashrate      142.3 H/s",
   "› dev fee              3%",
   "› node                 node.community.rino.io",
-  "› version              v2.0.1",
+  `› version              ${formatAppVersion()}`,
 ];
 
 export function ScrambleStaggerDemo() {

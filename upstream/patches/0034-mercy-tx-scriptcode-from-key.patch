@@ -78,6 +78,11 @@ requires v0.18.7 + this patch.
 
 Applies to: basicswap v0.18.7 only.
 
+Still needed on v0.18.9 (checked 2026-09-17): upstream still slices
+`prevout_script[2:22]`, and v0.18.9's new swipe-payout sweep
+(`_spendSwipePayout`) builds its spend with the same `createMercyTx`, so this
+fix now covers the sweep too. The patch applies unchanged there.
+
 diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
 --- a/basicswap/interface/btc/btc.py
 +++ b/basicswap/interface/btc/btc.py

@@ -1,15 +1,36 @@
 import type { ChainType } from "../wallets";
 
 export type MiningHardware = "cpu" | "gpu";
-export type CpuAlgorithm = "randomx";
-export type GpuAlgorithm = "kawpow" | "octopus" | "autolykos" | "progpowz";
 /**
- * CPU intensity (xmrig thread/priority control, see
- * `src/features/mining/utils/devicePower.ts::cpuThreadArgsForIntensity`).
- * `low` → 2 fixed threads + BelowNormal OS priority; `medium` → xmrig's
- * own `--cpu-max-threads-hint=50` cache/topology-aware autoconfig +
- * reduced priority; `high` → no thread cap, default priority (auto/all
- * threads). See `wiki/concepts/mining-process-management.md`.
+ * CPU-lane algorithms. `randomx` runs on xmrig (elevated, MSR); `xelishashv3`
+ * runs on SRBMiner-MULTI's CPU lane, unelevated, in its own process slot. The
+ * binary per algorithm is `src/features/mining/algorithms.ts::CPU_MINER`.
+ */
+export type CpuAlgorithm = "randomx" | "xelishashv3";
+/**
+ * GPU-lane algorithms. `xelishashv3` is the SAME id as the CPU lane's: Xelis
+ * mines on both lanes (see `miningCoins.ts::LaneAlgorithms`). Binary per
+ * algorithm: `algorithms.ts::GPU_MINER`.
+ */
+export type GpuAlgorithm =
+  | "kawpow"
+  | "octopus"
+  | "autolykos"
+  | "progpowz"
+  | "xelishashv3";
+/**
+ * CPU intensity. Two miners read it differently:
+ *
+ * - **xmrig** (RandomX; `src/features/mining/utils/devicePower.ts::cpuThreadArgsForIntensity`):
+ *   `low` → 2 fixed threads + BelowNormal OS priority; `medium` → xmrig's own
+ *   `--cpu-max-threads-hint=50` cache/topology-aware autoconfig + reduced
+ *   priority; `high` → no thread cap, default priority (auto/all threads).
+ * - **SRBMiner-MULTI CPU lane** (XelisHash v3; Rust
+ *   `miners.rs::srb_cpu_thread_args`): `low` → 2 threads + lowest worker-thread
+ *   priority + below-normal process priority; `medium` → half the logical
+ *   processors; `high` → every logical processor.
+ *
+ * See `wiki/concepts/mining-process-management.md`.
  */
 export type MiningIntensity = "low" | "medium" | "high";
 /**
@@ -121,6 +142,7 @@ export const CHAIN_MINING_PREFIX: Record<ChainType, string> = {
   near: "NEAR",
   aptos: "APT",
   zano: "ZANO",
+  xelis: "XEL",
 };
 
 /**

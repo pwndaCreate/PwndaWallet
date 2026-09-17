@@ -149,6 +149,9 @@ fn agent_for_algo(algorithm: &str) -> &'static str {
         "kawpow" => "SRBMiner-MULTI/3.1.8",
         "autolykos" | "autolykos2" => "SRBMiner-MULTI/3.1.8",
         "octopus" => "lolMiner/1.96",
+        // The agent SRBMiner-MULTI 3.6.2 was captured sending for xelishashv3
+        // (2026-09-15). K1Pool refuses a XELIS subscribe that carries none.
+        "xelishashv3" | "xel/v3" => "SRBMiner-MULTI/3.6.2",
         _ => "PwndaWallet-smoke/1.0",
     }
 }
@@ -197,6 +200,20 @@ fn build_l1_frame(endpoint: &str, algorithm: &str) -> Vec<u8> {
                 quirks.subscribe_params_shape,
             )
         }
+        "xelishashv3" | "xel/v3" => {
+            // XELIS stratum. Algorithm-level, like RandomX's `login`: the exact
+            // frame SRBMiner-MULTI 3.6.2 sends (agent-only subscribe, no
+            // jsonrpc), whatever the host — see
+            // `pool_dialects::build_xelis_subscribe`.
+            //
+            // NOT the unknown-algo `Empty` fallback below. K1Pool answers that
+            // with `{"error":{"code":-3,"message":"Please update your miner
+            // software"}}` and closes, and `accept_reply` scores ANY JSON as
+            // proof of life — so the fallback passed K1Pool for the wrong
+            // reason: a check that could not fail for the reason it runs.
+            // Captured 2026-09-15.
+            crate::pool_dialects::build_xelis_subscribe(1, agent_for_algo(algorithm))
+        }
         _ => {
             // Future-proof fallback. Empty-params subscribe was the
             // 2026-05-12 dialect-survey winner across all V1 pools.
@@ -215,6 +232,19 @@ fn build_l2_authorize_frame(algorithm: &str) -> Option<Vec<u8>> {
     let algo_lc = algorithm.to_ascii_lowercase();
     match algo_lc.as_str() {
         "randomx" | "rx/0" => None,
+        "xelishashv3" | "xel/v3" => {
+            // XELIS authorize carries the worker as its own field; the V1
+            // `[user.worker, pass]` shape below is not this protocol's.
+            let value = crate::pool_dialects::build_xelis_authorize(
+                2,
+                PROBE_ADDRESS,
+                PROBE_WORKER,
+                "x",
+            );
+            let mut bytes = serde_json::to_vec(&value).expect("JSON serialization is infallible");
+            bytes.push(b'\n');
+            Some(bytes)
+        }
         _ => {
             // Neutral probe placeholder. The pool's reply (success OR
             // `Invalid address`) proves the authorize handler is alive.
@@ -424,16 +454,20 @@ const ALLOWED_POOL_HOSTS: &[&str] = &[
     "de.ergo.herominers.com",
     "de.monero.herominers.com",
     "de.ravencoin.herominers.com",
+    "de.xelis.herominers.com",
     "de.zano.herominers.com",
     "de.zephyr.herominers.com",
     "ergo-eu1.nanopool.org",
     "ergo-us-east1.nanopool.org",
+    "eu.xel.k1pool.com",
     "mine.pwnda.org",
     "miner.ntminer.vip",
     "pool.hashvault.pro",
     "pool.woolypooly.com",
     "pool.zephyr.hashvault.pro",
     "rvn.ntminer.vip",
+    "xel.kryptex.network",
+    "xel.pwnda.org",
     "zano.pwnda.org",
     "zeph.ntminer.vip",
 ];
@@ -1322,5 +1356,56 @@ mod tests {
     fn accept_reply_rejects_non_json_garbage() {
         let s = b"HTTP/1.1 200 OK\r\nContent-Type:";
         assert!(accept_reply(s.len(), s).is_err());
+    }
+
+    // ── XELIS (2026-09-15) ────────────────────────────────────────────
+
+    #[test]
+    fn xelis_pool_hosts_are_allowlisted() {
+        for h in ["xel.kryptex.network", "eu.xel.k1pool.com", "de.xelis.herominers.com"] {
+            assert!(is_host_allowed(h), "xelis host missing from allowlist: {h}");
+        }
+    }
+
+    #[test]
+    fn l1_frame_for_xelis_is_the_srbminer_agent_subscribe_on_every_xel_pool() {
+        for ep in [
+            "stratum+tcp://xel.kryptex.network:7019",
+            "stratum+ssl://xel.kryptex.network:8019",
+            "stratum+tcp://eu.xel.k1pool.com:9350",
+            "stratum+ssl://eu.xel.k1pool.com:9352",
+            "stratum+tcp://de.xelis.herominers.com:1225",
+        ] {
+            let frame = build_l1_frame(ep, "xelishashv3");
+            let v: serde_json::Value =
+                serde_json::from_str(std::str::from_utf8(&frame).unwrap().trim()).unwrap();
+            assert_eq!(v["method"], "mining.subscribe", "{ep}");
+            assert_eq!(v["params"], serde_json::json!(["SRBMiner-MULTI/3.6.2"]), "{ep}");
+            assert!(frame.ends_with(b"\n"), "{ep}");
+        }
+    }
+
+    #[test]
+    fn l1_frame_for_xelis_is_not_the_empty_fallback_k1pool_would_pass_wrongly() {
+        // K1Pool, 2026-09-15: `params: []` is answered with
+        // {"code":-3,"message":"Please update your miner software"} and a close.
+        // `accept_reply` scores that JSON as a PASS, so the unknown-algo
+        // fallback could never fail against K1Pool for the reason it is run.
+        let xel = build_l1_frame("stratum+tcp://eu.xel.k1pool.com:9350", "xelishashv3");
+        let fallback = build_l1_frame("stratum+tcp://eu.xel.k1pool.com:9350", "some-future-algo");
+        assert_ne!(xel, fallback);
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&xel).unwrap().trim()).unwrap();
+        assert!(!v["params"].as_array().unwrap().is_empty());
+    }
+
+    #[test]
+    fn l2_authorize_for_xelis_carries_wallet_worker_password_separately() {
+        let frame = build_l2_authorize_frame("xelishashv3").expect("xelis has an L2 frame");
+        let v: serde_json::Value =
+            serde_json::from_str(std::str::from_utf8(&frame).unwrap().trim()).unwrap();
+        assert_eq!(v["method"], "mining.authorize");
+        assert_eq!(v["params"], serde_json::json!([PROBE_ADDRESS, PROBE_WORKER, "x"]));
+        assert!(frame.ends_with(b"\n"));
     }
 }

@@ -89,6 +89,31 @@ export function cpuThreadsPreLaunchLabel(
 }
 
 /**
+ * Pre-launch thread label for the SRBMiner-MULTI CPU lane (XelisHash v3).
+ *
+ * Mirrors the Rust mapping `miners.rs::srb_cpu_thread_args`, which is the one
+ * that actually builds the argv: `low` → 2 threads, `medium` → half the
+ * logical processors (at least 1), `high` → all of them. Display-only, like
+ * `cpuThreadsPreLaunchLabel` is for xmrig; once mining, the real count comes
+ * from SRBMiner's own `total_cpu_workers` via the snapshot.
+ */
+export function srbCpuThreadsPreLaunchLabel(
+  intensity: MiningIntensity,
+  cpuThreadCount: number
+): string {
+  switch (intensity) {
+    case "low":
+      return "2 threads";
+    case "medium":
+      return cpuThreadCount > 0
+        ? `${Math.max(1, Math.floor(cpuThreadCount / 2))} threads`
+        : "half the threads";
+    case "high":
+      return cpuThreadCount > 0 ? `${cpuThreadCount} threads` : "all threads";
+  }
+}
+
+/**
  * Convert a GPU intensity tier to the numeric `--gpu-intensity` value
  * passed to SRBMiner. Returns `null` for `"auto"` which causes the
  * caller (and Rust `build_gpu_miner_args`) to omit the flag entirely

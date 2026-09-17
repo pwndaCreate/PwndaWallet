@@ -23,8 +23,9 @@ import { dateStringToMoneroHeight } from "../../utils/heightFromDate";
  *     25-word Monero seed. Format is detected automatically; the
  *     creation-date input only appears for legacy seeds.
  *
- * Owns local form state. Async flow: validate → derive → cache seed
- * → persist to vault → start sidecar sync. Errors surface via the
+ * Owns local form state. Async flow: validate → derive → persist to
+ * vault (which names the wallet file) → cache seed → start sidecar sync
+ * on that file. Errors surface via the
  * shared error banner; the in-flight flag toggles the button label
  * and disables inputs.
  */
@@ -42,8 +43,15 @@ export function XmrImportPanel({
     React.SetStateAction<Partial<Record<ChainType, WalletInfo>>>
   >;
   setXmrSeedLoaded: (seed: string | null) => void;
-  saveXmrSeedToVault: (seed: string, restoreHeight: number | null) => Promise<void>;
-  startXmrSync: (seed: string, masterPassword: string, restoreHeight?: number) => void;
+  /** Resolves the saved entry's wallet file, or null when nothing was saved
+   *  (the vault hook has already reported why). */
+  saveXmrSeedToVault: (seed: string, restoreHeight: number | null) => Promise<string | null>;
+  startXmrSync: (
+    seed: string,
+    masterPassword: string,
+    restoreHeight?: number,
+    walletFilename?: string
+  ) => void;
 }) {
   const [importValue, setImportValue] = useState("");
   const [importing, setImporting] = useState(false);
@@ -77,11 +85,11 @@ export function XmrImportPanel({
         setError("Invalid Monero seed — " + validation.error);
         return;
       }
+      if (!sessionPassword) {
+        setError("Session password missing — please lock and unlock the wallet.");
+        return;
+      }
       const xmrWallet = await xmrAdapter.deriveFromOwnSeed!(seed);
-      setWalletsByChain((prev) => ({ ...prev, monero: xmrWallet }));
-      setXmrSeedLoaded(seed);
-      setActiveXmrSeed(seed);
-      setImportValue("");
 
       // Choose a restore height per format:
       //  - polyseed: the seed encodes a ~2-week birthday
@@ -95,16 +103,25 @@ export function XmrImportPanel({
         const h = dateStringToMoneroHeight(importCreationDate);
         if (h > 0) xmrRestoreHeight = h;
       }
-      setImportCreationDate("");
+      /**
+       * Save FIRST (with the session password — no second prompt): the saved
+       * entry is what names the wallet file this session opens, and nothing
+       * else can answer that.
+       *
+       * Until 2026-09-16 this started the session with no file, which
+       * `initXmrSession` reads as the PRIMARY wallet's `pwnda-active` — and an
+       * address mismatch there makes it delete that file and restore this seed
+       * into it. The same defect, and fix, as `ZanoImportPanel`; see log.md.
+       */
+      const walletFile = await saveXmrSeedToVault(seed, xmrRestoreHeight);
+      if (!walletFile) return; // nothing saved; the vault hook said why
 
-      // Persist the XMR seed into the vault using the session password
-      // — no second prompt.
-      await saveXmrSeedToVault(seed, xmrRestoreHeight);
-      if (!sessionPassword) {
-        setError("Session password missing — please lock and unlock the wallet.");
-        return;
-      }
-      startXmrSync(seed, sessionPassword, xmrRestoreHeight ?? 0);
+      setWalletsByChain((prev) => ({ ...prev, monero: xmrWallet }));
+      setXmrSeedLoaded(seed);
+      setActiveXmrSeed(seed);
+      setImportValue("");
+      setImportCreationDate("");
+      startXmrSync(seed, sessionPassword, xmrRestoreHeight ?? 0, walletFile);
     } catch (e: any) {
       console.error("[XmrImportPanel] import threw:", e);
       setError("XMR import failed: " + (e?.message || String(e)));

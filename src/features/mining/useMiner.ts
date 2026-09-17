@@ -14,6 +14,13 @@ import {
   type HashrateFixStatus,
 } from "../../types/mining";
 import type { MiningFocus } from "./featureFocus";
+import { algorithmFor, coinMinesOn } from "./miningCoins";
+import {
+  CPU_MINER,
+  CPU_SENDS_WORKER,
+  GPU_ALGORITHM_COIN,
+  GPU_MINER,
+} from "./algorithms";
 import {
   buildCredentials,
   getDefaultPoolId,
@@ -21,6 +28,7 @@ import {
   getPoolsForCoin,
   parseMinPayoutValue,
   resolveDefaultPool,
+  workerFlagFor,
   type PoolDef,
   type PoolId,
 } from "./pools";
@@ -54,6 +62,22 @@ import {
   writeGpuSelection,
   type GpuSelection,
 } from "./gpuSelection";
+import {
+  clampCpuThreads,
+  clampGpuIntensity,
+  cpuThreadsForPreset,
+  cpuTierForThreads,
+  gpuIntensityForPreset,
+  gpuTierForIntensity,
+  readCpuThreads,
+  readGpuIntensitySetting,
+  reconcileGpuSelection,
+  writeCpuThreads,
+  writeGpuIntensitySetting,
+  xmrigThreadArgs,
+  type CpuThreads,
+  type GpuIntensitySetting,
+} from "./miningTuning";
 import {
   AUTO_PING_STALENESS_MS,
   activeSessionPingResult,
@@ -111,6 +135,10 @@ interface GpuMinerSnapshotWire {
   accepted: number;
   rejected: number;
   diff_current: number | null;
+  /** Stratum latency, when the miner reports one. SRBMiner does
+   *  (`pool.latency`); lolMiner has no equivalent and sends null, so the
+   *  view falls back to the pre-mine TCP probe. */
+  ping_ms: number | null;
   uptime_secs: number;
 }
 
@@ -214,7 +242,9 @@ export function useMiner(args: {
         // Reconcile against the CURRENT count now that we know it — a
         // selection saved against a since-changed rig must not survive as an
         // out-of-range or wrong-card index. See gpuSelection.ts's header.
-        setGpuSelectionState(readGpuSelection(list.length));
+        // Then against the DEDICATED set: only a rig with 2+ dedicated GPUs
+        // has a choice to make (miningTuning.ts::reconcileGpuSelection).
+        setGpuSelectionState(reconcileGpuSelection(readGpuSelection(list.length), list));
       })
       .catch((e: unknown) => {
         // Absence means "assume one GPU" — the picker simply won't show,
@@ -225,35 +255,51 @@ export function useMiner(args: {
       cancelled = true;
     };
   }, []);
-  const setGpuSelection = useCallback((next: GpuSelection) => {
-    setGpuSelectionState(next);
-    writeGpuSelection(next);
-  }, []);
+  const setGpuSelection = useCallback(
+    (next: GpuSelection) => {
+      // An explicit list that covers every dedicated GPU is "all" (`null`):
+      // the byte-identical argv every install had before the picker.
+      const reconciled = gpus.length > 0 ? reconcileGpuSelection(next, gpus) : next;
+      setGpuSelectionState(reconciled);
+      writeGpuSelection(reconciled);
+    },
+    [gpus],
+  );
 
-  // Per-hardware coin memory. RandomX maps to TWO CPU coins (monero OR
-  // zephyr), so the single displayed `miningCoin` can't by itself remember
-  // which CPU coin the user was on once they toggle to the GPU lane (which
-  // overwrites `miningCoin`) and back. `lastCpuCoinRef` tracks it; the GPU
-  // coin is instead derived 1:1 from `gpuAlgorithm` (its own persisted
-  // state). Seeded on rehydration from the CPU descriptor so a Zephyr CPU
-  // session survives a mem_guard reload instead of falling back to Monero.
-  // (Centralized here 2026-06-13 — was MiningView-local — so the landscape
-  // hardware toggle shares the same logic via `switchHardware`.)
+  // Per-hardware coin memory. The CPU lane mines more than one coin (monero,
+  // zephyr, xelis), so the single displayed `miningCoin` can't by itself
+  // remember which CPU coin the user was on once they toggle to the GPU lane
+  // (which overwrites `miningCoin`) and back. `lastCpuCoinRef` tracks it; the
+  // GPU coin is instead derived 1:1 from `gpuAlgorithm` via the exhaustive
+  // `GPU_ALGORITHM_COIN` table. Seeded on rehydration from the CPU descriptor
+  // so a Zephyr CPU session survives a mem_guard reload instead of falling
+  // back to Monero. (Centralized here 2026-06-13 — was MiningView-local — so
+  // the landscape hardware toggle shares the same logic via `switchHardware`.)
+  //
+  // Recorded only while the CPU lane is DISPLAYED: XEL mines on both lanes, so
+  // "the coin is CPU-capable" no longer means "the user picked it for the CPU"
+  // — picking XEL on the GPU lane must not make the CPU lane restore to XEL.
   const lastCpuCoinRef = useRef<ChainType>("monero");
   useEffect(() => {
-    if (miningCoin === "monero" || miningCoin === "zephyr") {
+    if (miningHardware === "cpu" && coinMinesOn(miningCoin, "cpu")) {
       lastCpuCoinRef.current = miningCoin;
     }
-  }, [miningCoin]);
+  }, [miningCoin, miningHardware]);
 
   // Switch the DISPLAYED hardware lane, restoring that lane's coin so the
   // earnings card / payout / active-coin tile match what that lane mines.
-  // CPU restores the remembered monero/zephyr; GPU derives its coin from
-  // the current `gpuAlgorithm` (each GPU algo maps 1:1 to a coin). This
-  // NEVER stops or alters the other lane's miner — it's purely a display
-  // switch (CPU and GPU are independent backend processes). Both the
-  // portrait and landscape hardware toggles call this so they behave
-  // identically (landscape previously had no toggle at all — BUG 2).
+  // CPU restores the remembered CPU coin; GPU derives its coin from the
+  // current `gpuAlgorithm`. This NEVER stops or alters the other lane's
+  // miner — it's purely a display switch (CPU and GPU are independent backend
+  // processes). Both the portrait and landscape hardware toggles call this so
+  // they behave identically (landscape previously had no toggle at all — BUG 2).
+  //
+  // 2026-09-15: the GPU branch used to be
+  //   `kawpow ? "ravencoin" : octopus ? "conflux" : "ergo"`
+  // — a fallthrough, so a GPU ZANO session toggled back into view as ERGO, and
+  // XEL would have too. `GPU_ALGORITHM_COIN` is a
+  // `Record<GpuAlgorithm, ChainType>`: an unmapped algorithm is now a compile
+  // error instead of a wrong coin.
   const switchHardware = useCallback(
     (hw: MiningHardware) => {
       if (hw === miningHardware) return;
@@ -261,13 +307,7 @@ export function useMiner(args: {
       if (hw === "cpu") {
         setMiningCoin(lastCpuCoinRef.current);
       } else {
-        const gpuCoin: ChainType =
-          gpuAlgorithm === "kawpow"
-            ? "ravencoin"
-            : gpuAlgorithm === "octopus"
-              ? "conflux"
-              : "ergo";
-        setMiningCoin(gpuCoin);
+        setMiningCoin(GPU_ALGORITHM_COIN[gpuAlgorithm]);
       }
     },
     [miningHardware, gpuAlgorithm]
@@ -310,6 +350,14 @@ export function useMiner(args: {
    *  flipped the algorithm dropdown after launching. */
   const [runningGpuMiner, setRunningGpuMiner] =
     useState<"SRBMiner-MULTI" | "lolMiner" | null>(null);
+  /** Which binary the running CPU session uses — xmrig (RandomX) or
+   *  SRBMiner-MULTI's CPU lane (XelisHash v3). Picks the snapshot command the
+   *  poll calls. Set from the backend's own `is_mining` /
+   *  `is_srbminer_cpu_mining` answers, not from `cpuAlgorithm`, so a reload
+   *  that lost its descriptor still polls the right process. `null` while the
+   *  CPU lane is idle. */
+  const [runningCpuMiner, setRunningCpuMiner] =
+    useState<"xmrig" | "SRBMiner-MULTI" | null>(null);
   /** Pool IDs that are *currently* held open by a running miner process,
    *  one slot per hardware. Captured at `startMining` time so we know
    *  which pool xmrig/SRBMiner is talking to even after the user changes
@@ -321,14 +369,44 @@ export function useMiner(args: {
   const [activeGpuPoolId, setActiveGpuPoolId] = useState<PoolId | null>(null);
 
   const [workerName, setWorkerName] = useState("worker1");
-  const [miningIntensity, setMiningIntensity] = useState<MiningIntensity>("high");
-  // SRBMiner GPU intensity tier. `auto` is the safe default (no
-  // `--gpu-intensity` flag → SRBMiner self-tunes). Low/Medium/High map
-  // to numeric intensities below. Only used for SRBMiner paths
-  // (KawPow / Autolykos2); lolMiner Octopus ignores it. See
-  // `wiki/concepts/srbminer-flags.md`.
-  const [gpuIntensity, setGpuIntensity] = useState<GpuIntensity>("auto");
   const [cpuThreadCount, setCpuThreadCount] = useState<number>(0);
+  // CPU thread slider (2026-09-16). `null` = every logical processor, the old
+  // MAX tier and the default. The value is what launches: xmrig `--threads=N`
+  // or SRBMiner `--cpu-threads N` (`miningTuning.ts`). Persisted.
+  const [cpuThreadsRaw, setCpuThreadsRaw] = useState<CpuThreads>(() => readCpuThreads());
+  const cpuThreads = clampCpuThreads(cpuThreadsRaw, cpuThreadCount);
+  const setCpuThreads = useCallback(
+    (next: CpuThreads) => {
+      const v = clampCpuThreads(next, cpuThreadCount);
+      setCpuThreadsRaw(v);
+      writeCpuThreads(v);
+    },
+    [cpuThreadCount],
+  );
+  // The LOW / MED / MAX tier is now DERIVED from the slider (labels, and the
+  // Rust tier fallback); setting a tier moves the slider to that preset.
+  const miningIntensity: MiningIntensity = cpuTierForThreads(cpuThreads, cpuThreadCount);
+  const setMiningIntensity = useCallback(
+    (tier: MiningIntensity) => setCpuThreads(cpuThreadsForPreset(tier, cpuThreadCount)),
+    [setCpuThreads, cpuThreadCount],
+  );
+  // SRBMiner GPU intensity slider, 1-31, or `null` = AUTO (no
+  // `--gpu-intensity` flag, SRBMiner self-tunes — the default). lolMiner
+  // (Octopus) has no such flag and ignores it. Persisted. See
+  // `wiki/concepts/srbminer-flags.md`.
+  const [gpuIntensityValueState, setGpuIntensityValueState] = useState<GpuIntensitySetting>(
+    () => readGpuIntensitySetting(),
+  );
+  const setGpuIntensityLevel = useCallback((next: GpuIntensitySetting) => {
+    const v = clampGpuIntensity(next);
+    setGpuIntensityValueState(v);
+    writeGpuIntensitySetting(v);
+  }, []);
+  const gpuIntensity: GpuIntensity = gpuTierForIntensity(gpuIntensityValueState);
+  const setGpuIntensity = useCallback(
+    (tier: GpuIntensity) => setGpuIntensityLevel(gpuIntensityForPreset(tier)),
+    [setGpuIntensityLevel],
+  );
 
   const [minerError, setMinerError] = useState("");
 
@@ -574,33 +652,39 @@ export function useMiner(args: {
     [enableMsr]
   );
 
-  // Each GPU-mineable coin has exactly one PoW algorithm — RVN is
-  // KawPow, CFX is Octopus. If the user switches the mining coin while
-  // the algorithm dropdown is on a value that doesn't apply to the new
-  // coin (e.g. they had RVN/kawpow and switch to CFX), the pool list
-  // would silently empty out (filtered by both coin AND algorithm). Map
-  // the coin to its required GPU algo and snap the dropdown so the pool
-  // list always has matches.
+  // Each coin mines ONE algorithm per lane (`miningCoins.ts::algorithmFor`).
+  // If the user switches the coin — or the displayed lane — while that lane's
+  // algorithm state is on a value that doesn't apply (e.g. RVN/kawpow → CFX),
+  // the pool list would silently empty out (filtered by coin AND algorithm).
+  // Snap the DISPLAYED lane's algorithm to the coin's so the pool list always
+  // has matches.
+  //
+  // 2026-09-15: this was a GPU-only if/else chain keyed on `miningCoin` alone.
+  // The CPU lane now has two algorithms (RandomX, XelisHash v3) and XEL mines
+  // on both lanes, so the lane is part of the key: picking XEL while the GPU
+  // is displayed sets `gpuAlgorithm` and leaves the CPU lane's algorithm
+  // alone. A lane that is mining is never touched — its algorithm belongs to
+  // its session.
   useEffect(() => {
-    let nextAlgo: GpuAlgorithm | null = null;
-    if (miningCoin === "ravencoin") nextAlgo = "kawpow";
-    else if (miningCoin === "conflux") nextAlgo = "octopus";
-    else if (miningCoin === "ergo") nextAlgo = "autolykos";
-    else if (miningCoin === "zano") nextAlgo = "progpowz";
-    if (nextAlgo && nextAlgo !== gpuAlgorithm && !isMiningGpu) {
-      setGpuAlgorithm(nextAlgo);
+    if (miningHardware === "cpu") {
+      const next = algorithmFor(miningCoin, "cpu");
+      if (next && next !== cpuAlgorithm && !isMiningCpu) setCpuAlgorithm(next);
+    } else {
+      const next = algorithmFor(miningCoin, "gpu");
+      if (next && next !== gpuAlgorithm && !isMiningGpu) setGpuAlgorithm(next);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [miningCoin]);
+  }, [miningCoin, miningHardware]);
 
   const activeAlgorithm: CpuAlgorithm | GpuAlgorithm =
     miningHardware === "cpu" ? cpuAlgorithm : gpuAlgorithm;
 
-  // Raw pool list filtered by coin/algorithm — order is the static
-  // `ALL_POOLS` order (PWNDA first).
+  // Raw pool list filtered by coin, algorithm AND lane — order is the static
+  // `ALL_POOLS` order (PWNDA first). The lane only narrows endpoints that
+  // declare one (K1Pool's XEL CPU/GPU ports); every other list is unchanged.
   const rawPools = useMemo(
-    () => getPoolsForCoin(miningCoin, activeAlgorithm),
-    [miningCoin, activeAlgorithm]
+    () => getPoolsForCoin(miningCoin, activeAlgorithm, miningHardware),
+    [miningCoin, activeAlgorithm, miningHardware]
   );
 
   // User-facing pool order: ascending minimum-payout (lowest threshold
@@ -655,16 +739,32 @@ export function useMiner(args: {
   // preferred pool, not a one-frame default flash. See [[pool-preference-store]].
   useEffect(() => {
     if (!poolPrefsLoaded) return;
-    const laneKey = `${miningCoin}/${activeAlgorithm}`;
-    if (selectedPoolId && availablePools.some((p) => p.id === selectedPoolId)) {
-      lastSelectedPoolByLaneRef.current[laneKey] = selectedPoolId;
-      return;
-    }
+    // The lane is part of the key (2026-09-15): XEL mines on both lanes with
+    // one algorithm id, so `${coin}/${algo}` alone would share one memory
+    // between the CPU and GPU lanes.
+    const laneKey = `${miningCoin}/${activeAlgorithm}/${miningHardware}`;
     const inList = (id: PoolId | null | undefined): PoolId | null =>
       id && availablePools.some((p) => p.id === id) ? id : null;
     const liveLanePool = inList(
       miningHardware === "cpu" ? activeCpuPoolId : activeGpuPoolId
     );
+    // A MINING lane always shows the pool its miner is actually on — even
+    // when the current pick is also valid for it. Before XEL the two could not
+    // diverge: switching lanes always changed coin or algorithm, which
+    // invalidated the pick and fell through to `liveLanePool` in the priority
+    // chain below. A dual-lane coin keeps coin + algorithm across the toggle,
+    // so a pick made on one lane (Kryptex, say) stayed "valid" on the other
+    // while that lane's miner ran K1Pool — the dropdown-disagrees-with-the-
+    // session bug `lastSelectedPoolByLaneRef` exists to prevent.
+    if (liveLanePool && selectedPoolId !== liveLanePool) {
+      setSelectedPoolId(liveLanePool);
+      lastSelectedPoolByLaneRef.current[laneKey] = liveLanePool;
+      return;
+    }
+    if (selectedPoolId && availablePools.some((p) => p.id === selectedPoolId)) {
+      lastSelectedPoolByLaneRef.current[laneKey] = selectedPoolId;
+      return;
+    }
     const remembered = inList(lastSelectedPoolByLaneRef.current[laneKey]);
     const mostUsed = inList(
       mostUsedPoolFor(poolPrefs, miningCoin, activeAlgorithm)
@@ -678,6 +778,7 @@ export function useMiner(args: {
       resolveDefaultPool({
         coin: miningCoin,
         algorithm: activeAlgorithm,
+        hardware: miningHardware,
         liveLanePool,
         remembered,
         mostUsed,
@@ -842,7 +943,10 @@ export function useMiner(args: {
     const pool =
       (selectedPoolId ? getPoolById(selectedPoolId) : undefined) ??
       (() => {
-        const fallbackId = getDefaultPoolId(miningCoin, activeAlgorithm);
+        // Lane-aware: K1Pool runs SEPARATE XELIS ports for CPU (9350) and
+        // GPU (9351/9352) with different difficulties, so "the default pool
+        // for this coin" is only answerable per lane.
+        const fallbackId = getDefaultPoolId(miningCoin, activeAlgorithm, target);
         return fallbackId ? getPoolById(fallbackId) : undefined;
       })();
     if (!pool) {
@@ -902,23 +1006,51 @@ export function useMiner(args: {
         }
       }
       if (target === "cpu") {
-        const cpuArgs = getCpuThreadArgsForIntensity(miningIntensity);
-
-        await launchXmrig({
-          pool: pool.endpoint,
-          userString,
-          pass,
-          enableTls: pool.ssl,
-          threads: cpuArgs.threads,
-          cpuMaxThreadsHint: cpuArgs.cpuMaxThreadsHint,
-          cpuPriority: cpuArgs.cpuPriority,
-          proxy: proxyActive ? (torHostPort ?? proxy.selectedProxy!.hostPort) : null,
-        });
-        setMsrStatus(enableMsr ? "unknown" : "disabled");
+        // The CPU lane has two binaries: xmrig for RandomX (elevated, MSR) and
+        // SRBMiner-MULTI's CPU lane for XelisHash v3 (unelevated, its own
+        // process slot and API port). `CPU_MINER` is exhaustive over
+        // `CpuAlgorithm`, so a new CPU algorithm cannot silently land on xmrig.
+        const cpuMiner = CPU_MINER[cpuAlgorithm];
+        const cpuProxy = proxyActive
+          ? (torHostPort ?? proxy.selectedProxy!.hostPort)
+          : null;
+        if (cpuMiner.miner === "xmrig") {
+          // The thread slider's exact count (or no flag for "all").
+          const cpuArgs = xmrigThreadArgs(cpuThreads, cpuThreadCount);
+          await launchXmrig({
+            pool: pool.endpoint,
+            userString,
+            pass,
+            enableTls: pool.ssl,
+            threads: cpuArgs.threads,
+            cpuMaxThreadsHint: cpuArgs.cpuMaxThreadsHint,
+            cpuPriority: cpuArgs.cpuPriority,
+            proxy: cpuProxy,
+          });
+          setMsrStatus(enableMsr ? "unknown" : "disabled");
+        } else {
+          // Thread count comes from the slider (`threads`, exact, clamped in
+          // Rust by `srb_cpu_thread_args_for_count`); "all" sends `null` and
+          // the MAX tier, which Rust resolves against the detected core count. TLS follows the pool URL's `ssl://` scheme,
+          // the same rule the GPU lane uses. A SOCKS5/Tor proxy is honoured
+          // via SRBMiner's own `--proxy` (verified to dial the pool through a
+          // local SOCKS5 on 2026-09-15).
+          await invoke("start_srbminer_cpu", {
+            pool: pool.endpoint,
+            userString,
+            algorithm: cpuMiner.algorithm,
+            pass,
+            proxy: cpuProxy,
+            worker: workerFlagFor(pool, workerName, CPU_SENDS_WORKER[cpuAlgorithm]),
+            intensity: miningIntensity,
+            threads: cpuThreads,
+          });
+        }
+        setRunningCpuMiner(cpuMiner.miner);
         setIsMiningCpu(true);
         setActiveCpuPoolId(pool.id);
         // Persist the running-session descriptor so the Mining view can
-        // rehydrate (correct hardware lane, coin, algo, pool) if the
+        // rehydrate (correct hardware lane, coin, algo, miner, pool) if the
         // WebView2 renderer reloads mid-session — e.g. the `mem_guard`
         // memory circuit-breaker. See [[webview2-memory-management]]
         // Round 13 + `activeSessionStore.ts`.
@@ -926,6 +1058,7 @@ export function useMiner(args: {
           hardware: "cpu",
           coin: miningCoin,
           cpuAlgorithm,
+          miner: cpuMiner.miner,
           poolId: pool.id,
         });
         // Bump the persisted pool-usage counter so the next session
@@ -949,39 +1082,23 @@ export function useMiner(args: {
         //                                  Lower binary dev fee (1.0% vs
         //                                  1.5%) and works with SOCKS5.)
         //
-        // Per-miner algorithm-flag casing:
-        //   lolMiner wants UPPER (`AUTOLYKOS2`/`OCTOPUS`/`KAWPOW`);
-        //   SRBMiner wants lower (`autolykos2`/`kawpow`).
-        // The Rust `build_gpu_miner_args` passes the algorithm string
-        // verbatim — frontend picks the right casing here.
-        // Exhaustive by construction, and deliberately not an if/else chain
-        // ending in `else { lolMiner OCTOPUS }`. That shape was here until
-        // 2026-08-28 and it meant ANY new GPU algorithm silently became
-        // Octopus on lolMiner — type-checking cleanly the whole way, because
-        // a fallthrough else cannot be exhaustiveness-checked. Adding
-        // `progpowz` for Zano is exactly the change that would have hit it.
-        // A Record keyed on GpuAlgorithm makes a missing entry a COMPILE
-        // error instead of a wrong miner.
-        const GPU_MINER: Record<GpuAlgorithm, { miner: "SRBMiner-MULTI" | "lolMiner"; algorithm: string }> = {
-          // Per-miner casing: lolMiner wants UPPER, SRBMiner wants lower.
-          kawpow: { miner: "SRBMiner-MULTI", algorithm: "kawpow" },
-          autolykos: { miner: "SRBMiner-MULTI", algorithm: "autolykos2" },
-          octopus: { miner: "lolMiner", algorithm: "OCTOPUS" },
-          // Zano. WoolyPooly names SRBMiner (AMD) and T-Rex (Nvidia) as the
-          // supported miners; SRBMiner is the one this wallet ships, and it
-          // takes the algorithm as lowercase `progpowz`.
-          progpowz: { miner: "SRBMiner-MULTI", algorithm: "progpowz" },
-        };
+        // Which binary mines this algorithm, and the exact spelling that
+        // binary wants (lolMiner takes UPPER, SRBMiner lower). The table
+        // lives in `algorithms.ts` — one Record keyed on `GpuAlgorithm`,
+        // shared with the snapshot poll below, so the two can never disagree
+        // about which miner is running. It replaced an if/else chain ending
+        // in `else { lolMiner OCTOPUS }`, which meant ANY new GPU algorithm
+        // silently became Octopus while type-checking cleanly (a fallthrough
+        // else cannot be exhaustiveness-checked). A missing entry is now a
+        // COMPILE error instead of a wrong miner.
         const sel = GPU_MINER[gpuAlgorithm];
         const miner = sel.miner;
         const algorithm = sel.algorithm;
-        // SRBMiner gets the user-picked intensity numeric (16/22/28);
-        // lolMiner doesn't have a `--gpu-intensity` flag, so we send
-        // null on that branch — the Rust side drops it silently.
+        // SRBMiner gets the slider's value (1-31, null = AUTO); lolMiner has
+        // no `--gpu-intensity` flag, so that branch sends null — and Rust
+        // drops it for lolMiner regardless.
         const gpuIntensityValue =
-          miner === "SRBMiner-MULTI"
-            ? getGpuIntensityValue(gpuIntensity)
-            : null;
+          miner === "SRBMiner-MULTI" ? clampGpuIntensity(gpuIntensityValueState) : null;
         await invoke("start_gpu_miner", {
           miner,
           pool: pool.endpoint,
@@ -991,6 +1108,13 @@ export function useMiner(args: {
           proxy: proxyActive ? (torHostPort ?? proxy.selectedProxy!.hostPort) : null,
           gpuIntensity: gpuIntensityValue,
           gpuIndices: gpuSelection,
+          // XELIS authorizes as `[wallet, worker, pass]` — three params, the
+          // worker in its own field — so SRBMiner needs `--worker` instead of
+          // the `address.worker` string every other pool here takes. Verified
+          // against a live SRBMiner→pool relay capture on 2026-09-15.
+          // `workerFlagFor` returns null for a pool whose login already
+          // carries `.worker` (pwnda-xelis), so the worker is sent once.
+          worker: workerFlagFor(pool, workerName, sel.sendsWorker),
         });
         setRunningGpuMiner(miner);
         setIsMiningGpu(true);
@@ -1023,11 +1147,18 @@ export function useMiner(args: {
     workerName,
     miningHardware,
     miningIntensity,
+    // Until 2026-09-16 these three were missing, so a GPU intensity or device
+    // change made after the last re-render of this callback launched with
+    // the PREVIOUS value.
+    cpuThreads,
+    cpuThreadCount,
+    gpuIntensityValueState,
+    gpuSelection,
     enableMsr,
     defenderExcluded,
+    cpuAlgorithm,
     gpuAlgorithm,
     launchXmrig,
-    getCpuThreadArgsForIntensity,
     selectedPoolId,
     activeAlgorithm,
     statsOptIns,
@@ -1042,8 +1173,26 @@ export function useMiner(args: {
     // hardware toggle stays clickable while either is mining.
     try {
       if (miningHardware === "cpu") {
-        await invoke("stop_xmrig");
+        // The CPU lane has two possible backends (xmrig / SRBMiner) and only
+        // one is ever live. Stop BOTH, each with its own catch, so a lane
+        // whose descriptor was lost still comes down — and so a throw from
+        // the idle one can't skip the running one. Neither is an image-name
+        // kill: `stop_srbminer_cpu` kills its own child handle, leaving a
+        // concurrent SRBMiner GPU session alone.
+        let stopError: unknown = null;
+        try {
+          await invoke("stop_xmrig");
+        } catch (e) {
+          stopError = e;
+        }
+        try {
+          await invoke("stop_srbminer_cpu");
+        } catch (e) {
+          stopError ??= e;
+        }
+        if (stopError) throw stopError;
         setIsMiningCpu(false);
+        setRunningCpuMiner(null);
         setCpuHashrateSamples([]);
         setCpuSession(null);
         setActiveCpuPoolId(null);
@@ -1078,11 +1227,13 @@ export function useMiner(args: {
   const stopAllMining = useCallback(async () => {
     setMinerError("");
     try { await invoke("stop_xmrig"); } catch { /* not running */ }
+    try { await invoke("stop_srbminer_cpu"); } catch { /* not running */ }
     try { await invoke("stop_gpu_miner"); } catch { /* not running */ }
     setIsMiningCpu(false);
     setIsMiningGpu(false);
     setCpuSession(null);
     setGpuSession(null);
+    setRunningCpuMiner(null);
     setRunningGpuMiner(null);
     setActiveCpuPoolId(null);
     setActiveGpuPoolId(null);
@@ -1204,10 +1355,14 @@ export function useMiner(args: {
         if (code === "MINER_PROCESS_DIED") {
           const kind = event.payload?.kind;
           if (kind === "cpu") {
+            // Both CPU backends: the death watch reports the LANE, not the
+            // binary, so "cpu" can mean either process.
             invoke("stop_xmrig", {
               reason: "stopped: miner process died",
             }).catch(() => {});
+            invoke("stop_srbminer_cpu").catch(() => {});
             setIsMiningCpu(false);
+            setRunningCpuMiner(null);
           } else if (kind === "gpu") {
             invoke("stop_gpu_miner").catch(() => {});
             setIsMiningGpu(false);
@@ -1219,9 +1374,11 @@ export function useMiner(args: {
             invoke("stop_xmrig", {
               reason: "stopped: miner process died (unknown kind)",
             }).catch(() => {});
+            invoke("stop_srbminer_cpu").catch(() => {});
             invoke("stop_gpu_miner").catch(() => {});
             setIsMiningCpu(false);
             setIsMiningGpu(false);
+            setRunningCpuMiner(null);
           }
           setMinerError(message);
           return;
@@ -1411,11 +1568,19 @@ export function useMiner(args: {
     if (focus !== "mining" && focus !== "miner-setup") return;
     const interval = setInterval(async () => {
       try {
-        const [cpu, gpu] = await Promise.all([
+        // Three questions, two lanes: the CPU lane is "mining" when EITHER
+        // backend is up. Asking only `is_mining` (xmrig's PID check) would
+        // read a live XelisHash session as idle.
+        const [xmrigCpu, srbCpu, gpu] = await Promise.all([
           invoke<boolean>("is_mining").catch(() => false),
+          invoke<boolean>("is_srbminer_cpu_mining").catch(() => false),
           invoke<boolean>("is_gpu_mining").catch(() => false),
         ]);
+        const cpu = xmrigCpu || srbCpu;
         setIsMiningCpu(cpu);
+        // The backend's own answer decides which process the snapshot poll
+        // talks to — never the algorithm state, which a reload resets.
+        setRunningCpuMiner(xmrigCpu ? "xmrig" : srbCpu ? "SRBMiner-MULTI" : null);
         setIsMiningGpu(gpu);
         // Backend reports the GPU miner is gone — clear the
         // "which miner was running" tag so a future re-start picks up
@@ -1472,11 +1637,15 @@ export function useMiner(args: {
     // nothing. The ref guard alone makes this run exactly once; the run
     // that proceeds applies the restored state to the live component.
     void (async () => {
-      const [cpu, gpu, sessions] = await Promise.all([
+      const [xmrigCpu, srbCpu, gpu, sessions] = await Promise.all([
         invoke<boolean>("is_mining").catch(() => false),
+        invoke<boolean>("is_srbminer_cpu_mining").catch(() => false),
         invoke<boolean>("is_gpu_mining").catch(() => false),
         loadActiveSessions(),
       ]);
+      // Either CPU backend counts as a live CPU lane (see the status poll).
+      const cpu = xmrigCpu || srbCpu;
+      setRunningCpuMiner(xmrigCpu ? "xmrig" : srbCpu ? "SRBMiner-MULTI" : null);
 
       // Restore the per-lane booleans immediately so the running hero
       // shows without waiting for the 5 s status poll's first tick.
@@ -1495,17 +1664,25 @@ export function useMiner(args: {
       // to the Monero default because only the displayed GPU lane was
       // restored and the CPU coin memory was never seeded.
       if (gpu) {
-        if (sessions.gpu?.miner) setRunningGpuMiner(sessions.gpu.miner);
+        // The descriptor's `miner` now also spells "xmrig" (the CPU lane
+        // writes the same field), so narrow before restoring: only a GPU
+        // binary may become `runningGpuMiner`.
+        const gpuMiner = sessions.gpu?.miner;
+        if (gpuMiner && gpuMiner !== "xmrig") setRunningGpuMiner(gpuMiner);
         if (sessions.gpu?.poolId) setActiveGpuPoolId(sessions.gpu.poolId);
         if (sessions.gpu?.gpuAlgorithm) setGpuAlgorithm(sessions.gpu.gpuAlgorithm);
       }
       if (cpu) {
         if (sessions.cpu?.poolId) setActiveCpuPoolId(sessions.cpu.poolId);
         if (sessions.cpu?.cpuAlgorithm) setCpuAlgorithm(sessions.cpu.cpuAlgorithm);
-        // Seed the CPU coin memory so the hardware toggle restores Zephyr
-        // (not the Monero default) when the user switches to the CPU lane.
-        if (sessions.cpu?.coin === "monero" || sessions.cpu?.coin === "zephyr") {
-          lastCpuCoinRef.current = sessions.cpu.coin;
+        // Seed the CPU coin memory so the hardware toggle restores the coin
+        // that was actually mining (Zephyr, Xelis) instead of the Monero
+        // default. Asks the roster rather than listing coins inline — the
+        // hardcoded `monero || zephyr` pair here is exactly the shape that
+        // would have dropped XEL on the floor.
+        const cpuCoin = sessions.cpu?.coin;
+        if (cpuCoin && coinMinesOn(cpuCoin, "cpu")) {
+          lastCpuCoinRef.current = cpuCoin;
         }
       }
 
@@ -1715,6 +1892,16 @@ export function useMiner(args: {
   // depends on the unconditional poll".
   useEffect(() => {
     if (!isMiningCpu) return;
+    // WHICH CPU backend to poll. xmrig and SRBMiner's CPU lane are different
+    // processes with different APIs; Rust normalises both into the same wire
+    // shape, so only the command name differs here. `runningCpuMiner` is set
+    // from the backend's own `is_mining` / `is_srbminer_cpu_mining` answers,
+    // so a renderer reload mid-session polls the process that is actually
+    // running rather than whatever the algorithm state happens to say.
+    const cpuCommand =
+      runningCpuMiner === "SRBMiner-MULTI"
+        ? "get_srbminer_cpu_snapshot"
+        : "get_xmrig_snapshot";
     // Single-poll helper — used by both the setInterval timer AND the
     // visibility-resume catch-up. Stores every snapshot, including
     // zeros and nulls (treated as 0). The 1 HR chart already smooths
@@ -1731,9 +1918,7 @@ export function useMiner(args: {
     // ~2 s of the user's actual focus, regardless of throttling.
     const pollOnce = async () => {
       try {
-        const snap = await invoke<XmrigSnapshotWire | null>(
-          "get_xmrig_snapshot"
-        );
+        const snap = await invoke<XmrigSnapshotWire | null>(cpuCommand);
         if (!snap) return;
         const raw = snap.hashrate ?? 0;
         const value = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 0;
@@ -1767,9 +1952,13 @@ export function useMiner(args: {
 
   useEffect(() => {
     if (!isMiningGpu) return;
-    const minerName =
-      runningGpuMiner ??
-      (gpuAlgorithm === "kawpow" ? "SRBMiner-MULTI" : "lolMiner");
+    // Fall back to the SAME table `startMining` launched from, so the poll
+    // parses the shape the running binary actually emits. The old fallback
+    // (`kawpow ? SRBMiner : lolMiner`) guessed lolMiner for Autolykos2, Zano
+    // and Xelis — all of which run on SRBMiner — so a reload that lost
+    // `runningGpuMiner` parsed a live session with the wrong parser and
+    // rendered zeros.
+    const minerName = runningGpuMiner ?? GPU_MINER[gpuAlgorithm].miner;
     // Same shape as the CPU poller — store every snapshot, with
     // visibility-resume catch-up. See the long comment on the CPU
     // poll effect above for the reasoning.
@@ -1788,13 +1977,15 @@ export function useMiner(args: {
             return next.slice(-MAX_HASHRATE_SAMPLES);
           return next;
         });
-        // GPU miners don't expose stratum ping; fall back to whatever
-        // the most recent TCP probe found for the active pool.
+        // SRBMiner DOES report stratum latency (`pool.latency`), so prefer
+        // the miner's own live number; lolMiner has none, and any miner's
+        // first polls arrive before it connects, so fall back to whatever the
+        // most recent TCP probe found for the active pool.
         const fallbackPing =
           activeGpuPoolId && poolPings[activeGpuPoolId]?.ok
             ? poolPings[activeGpuPoolId]?.latencyMs ?? null
             : null;
-        setGpuSession(toSession(snap, fallbackPing));
+        setGpuSession(toSession(snap, snap.ping_ms ?? fallbackPing));
       } catch {
         /* ignore */
       }
@@ -1826,7 +2017,11 @@ export function useMiner(args: {
     isMiningGpu,
     cpuHashrateSamples,
     gpuHashrateSamples,
-    runningGpuMiner,
+    // Both lanes' algorithms, not the miner name: calibration is keyed by
+    // (device, algorithm), and passing `runningGpuMiner` meant every CPU
+    // sample was saved as randomx and every GPU sample as kawpow — so a
+    // Zephyr or Xelis session overwrote the Monero/Ravencoin calibration.
+    cpuAlgorithm,
     gpuAlgorithm,
   });
 
@@ -1851,6 +2046,10 @@ export function useMiner(args: {
     isMining,
     isMiningCpu,
     isMiningGpu,
+    /** Which binary holds the CPU lane ("xmrig" | "SRBMiner-MULTI" | null).
+     *  Surfaces let the view label the lane honestly and gate the xmrig-only
+     *  controls (MSR) without re-deriving it from the algorithm. */
+    runningCpuMiner,
     isAnyMining,
     miningStarting,
     cpuStarting,
@@ -1863,6 +2062,12 @@ export function useMiner(args: {
     setGpuIntensity,
     getGpuIntensityValue,
     cpuThreadCount,
+    // Slider values (2026-09-16): exact thread count (null = all) and SRBMiner
+    // GPU intensity (null = AUTO). The tiers above are derived from these.
+    cpuThreads,
+    setCpuThreads,
+    gpuIntensityLevel: gpuIntensityValueState,
+    setGpuIntensityLevel,
     minerStatuses,
     minersReady,
     downloadingMiners,

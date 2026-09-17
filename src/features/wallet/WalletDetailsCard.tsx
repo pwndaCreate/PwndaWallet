@@ -52,6 +52,11 @@ export function WalletDetailsCard(props: {
   zanoSeedPassphrase?: string | null;
   showZanoSeed?: boolean;
   setShowZanoSeed?: (v: boolean) => void;
+  /** Xelis seed (2026-09-15). Its words are also a valid Monero or Zephyr
+   *  seed, which is why the reveal below says which coin to label it as. */
+  xelisSeedLoaded?: string | null;
+  showXelisSeed?: boolean;
+  setShowXelisSeed?: (v: boolean) => void;
   /** Live `derivationChoice.solana` from the vault. Used by the SOL
    *  panel to highlight the active path; null when no vault is loaded. */
   currentSolanaDerivationChoice?: string;
@@ -78,6 +83,7 @@ export function WalletDetailsCard(props: {
     xmrSeedLoaded, showXmrSeed, setShowXmrSeed,
     zphSeedLoaded, showZphSeed, setShowZphSeed,
     zanoSeedLoaded, zanoSeedPassphrase, showZanoSeed, setShowZanoSeed,
+    xelisSeedLoaded, showXelisSeed, setShowXelisSeed,
     currentSolanaDerivationChoice,
     onChangeSolanaDerivation,
     currentLitecoinDerivationChoice,
@@ -221,6 +227,35 @@ export function WalletDetailsCard(props: {
 
                 <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 6 }}>
                   <button className="btn-icon" onClick={() => onCopy(zanoSeedLoaded)}>
+                    Copy
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+        {xelisSeedLoaded && setShowXelisSeed && (
+          <div className="secret-row">
+            <div className="secret-header">
+              <span className="label"><ST delay={235} speed={20}>Xelis Seed (25 words)</ST></span>
+              <button className="btn-icon" onClick={() => setShowXelisSeed(!showXelisSeed)}>
+                {showXelisSeed ? "Hide" : "Show"}
+              </button>
+            </div>
+            {showXelisSeed && (
+              <div className="secret-value" style={{ flexDirection: "column", alignItems: "stretch" }}>
+                <MnemonicGrid phrase={xelisSeedLoaded} />
+                {/* The words do not name their coin. XELIS's English wordlist
+                    is Monero's and its checksum word is chosen the same way,
+                    so the label is the only thing that says these are Xelis
+                    words (2026-09-15, seed-kind.ts). */}
+                <p className="hint" style={{ marginTop: 8, lineHeight: 1.5 }} data-xelis-backup-label>
+                  Label this backup as a Xelis seed. These 25 words are also a
+                  valid Monero or Zephyr seed, and restored as either they open
+                  a different, empty wallet.
+                </p>
+                <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 6 }}>
+                  <button className="btn-icon" onClick={() => onCopy(xelisSeedLoaded)}>
                     Copy
                   </button>
                 </div>

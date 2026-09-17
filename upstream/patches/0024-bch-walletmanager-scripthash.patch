@@ -57,11 +57,13 @@ non-empty for BCH -- both with falsification against the pre-patch tree.
 Applies on top of PATCH-23. Touches basicswap/, so it counts toward the engine
 patch level (p22 -> p23).
 
+Rebased 2026-09-17 onto basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4): the context moved with upstream's typing cleanup in wallet_manager.py. The diff below is regenerated; the change it makes is the same.
+
 diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
-index e48dab0..23f1515 100644
+index 4148ea8..31227c4 100644
 --- a/basicswap/wallet_manager.py
 +++ b/basicswap/wallet_manager.py
-@@ -309,11 +309,15 @@ class WalletManager:
+@@ -308,11 +308,15 @@ class WalletManager:
              # both shapes as this unit's SECONDARY gate.
              from basicswap.interface.bch.contrib.cashaddress import Address
  
@@ -79,7 +81,7 @@ index e48dab0..23f1515 100644
              return address, scripthash, pubkey
          # PWNDA-PATCH-19 (Grove-only, BCH account-key glue -- this patch's
          # entire reason to exist): the `if coin_type == Coins.BCH:` branch
-@@ -1368,7 +1372,69 @@ class WalletManager:
+@@ -1385,7 +1389,69 @@ class WalletManager:
          # Legacy two-time-pad XOR format.
          return bytes(a ^ b for a, b in zip(encrypted_key, self._getXorKey(coin_type)))
  

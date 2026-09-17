@@ -54,9 +54,13 @@ export interface MiningSessionDescriptor {
   cpuAlgorithm?: CpuAlgorithm;
   /** Present on the GPU lane. */
   gpuAlgorithm?: GpuAlgorithm;
-  /** GPU miner binary, so the snapshot poll parses the right JSON shape
-   *  without guessing from a (possibly reset) algorithm value. */
-  miner?: "SRBMiner-MULTI" | "lolMiner";
+  /** Miner binary, so the snapshot poll parses the right JSON shape without
+   *  guessing from a (possibly reset) algorithm value. GPU lane:
+   *  SRBMiner-MULTI or lolMiner. CPU lane (since 2026-09-15): xmrig for
+   *  RandomX, SRBMiner-MULTI for XelisHash v3. Older CPU descriptors have no
+   *  `miner`; the backend's own `is_srbminer_cpu_mining` answer is what the
+   *  rehydration trusts. */
+  miner?: "xmrig" | "SRBMiner-MULTI" | "lolMiner";
   /** The pool the miner is actually talking to. */
   poolId: PoolId;
 }

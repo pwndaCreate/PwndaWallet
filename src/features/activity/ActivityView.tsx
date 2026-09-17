@@ -10,6 +10,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Panel, Mono } from "../../components/Primitives";
 import { getAdapter } from "../../wallets";
+import { txDisplayTicker } from "../../wallets/tx-display";
 import { explorerTxUrl } from "../../wallets/explorers";
 import type { ChainTx, ChainType } from "../../wallets";
 import { openExternal } from "../../utils/openExternal";
@@ -408,7 +409,7 @@ function TxRow({ tx }: { tx: ChainTx }) {
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
       <span style={{ fontFamily: "var(--mono)", fontSize: 9, color: adapter.color }}>
-        {adapter.ticker}
+        {txDisplayTicker(tx, adapter.ticker)}
       </span>
       <Mono size={9} color="var(--text-dim)">
         {date}
@@ -447,7 +448,7 @@ function TxRow({ tx }: { tx: ChainTx }) {
       </code>
       <Mono size={9} color={isIn ? "var(--success)" : "var(--text)"}>
         {isIn ? "+" : "-"}
-        {tx.amount} {adapter.ticker}
+        {tx.amount} {txDisplayTicker(tx, adapter.ticker)}
         {tx.fee && !isIn && (
           <span style={{ color: "var(--text-dim)", marginLeft: 4 }}>(fee {tx.fee})</span>
         )}

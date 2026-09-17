@@ -49,6 +49,7 @@
  */
 
 import { invoke } from "./tauri";
+import { APP_VERSION } from "./appVersion";
 
 export interface UpdateInfo {
   version: string;
@@ -120,7 +121,10 @@ export async function checkForUpdate(): Promise<UpdateInfo | null> {
     console.log(`[updater] VITE_MOCK_UPDATE active — pretending v${version} is available`);
     return {
       version,
-      currentVersion: "0.0.0-sandbox",
+      // The real plugin reports tauri.conf.json's version here; APP_VERSION is
+      // pinned to that by appVersion.test.ts, so the banner's "you have" line
+      // shows the same number a shipped build would.
+      currentVersion: APP_VERSION,
       notes: "Synthetic update from VITE_MOCK_UPDATE. Nothing is downloadable.",
     };
   }

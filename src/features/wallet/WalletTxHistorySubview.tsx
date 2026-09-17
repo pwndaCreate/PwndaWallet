@@ -19,11 +19,13 @@ import { Card } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { XmrTxHistoryCard } from "../monero/XmrTxHistoryCard";
 import { ZanoTxHistoryCard } from "../zano/ZanoTxHistoryCard";
+import { XelisTxHistoryCard, type XelisSessionApi } from "../xelis";
 import { ChainTxCard } from "./ChainTxCard";
 import { getAdapter, type ChainType, type ChainTx } from "../../wallets";
 import type { XmrTransfer } from "../../wallets/xmr-wallet";
 import type { ZanoTransferEntry } from "../../wallets/zano-rpc";
 import { mergeChainTx } from "../activity/useTxHistory";
+import { historySurfaceFor } from "./wallet-surface";
 
 type SyncState =
   | "idle"
@@ -45,10 +47,14 @@ interface ZanoSlice {
   txLoading: boolean;
 }
 
+/** Xelis history comes from its own wallet process, like Zano's. */
+type XelisSlice = Pick<XelisSessionApi, "syncState" | "txHistory" | "txLoading" | "txError">;
+
 export function WalletTxHistorySubview({
   activeChain,
   xmrSession,
   zanoSession,
+  xelisSession,
   chainTxByKey,
   chainTxLoading,
   chainTxErrors,
@@ -59,6 +65,7 @@ export function WalletTxHistorySubview({
   activeChain: ChainType;
   xmrSession: XmrSlice;
   zanoSession: ZanoSlice;
+  xelisSession: XelisSlice;
   chainTxByKey: Record<string, ChainTx[]>;
   chainTxLoading: Record<string, boolean>;
   chainTxErrors: Record<string, string | null>;
@@ -67,6 +74,7 @@ export function WalletTxHistorySubview({
   onBack: () => void;
 }) {
   const adapter = getAdapter(activeChain);
+  const surface = historySurfaceFor(activeChain);
   const merged = mergeChainTx(
     { txByChain: chainTxByKey, loading: chainTxLoading, errors: chainTxErrors },
     activeChain
@@ -152,11 +160,15 @@ export function WalletTxHistorySubview({
         </div>
       </Card>
 
-      {/* The same per-chain tx history cards that used to render
-          inline on the dashboard — moved here unchanged. XMR has its
-          own card with sync-state UI; everything else uses the
-          generic ChainTxCard. */}
-      {activeChain === "monero" && xmrSession.syncState !== "idle" && (
+      {/* One card per history source, chosen by `historySurfaceFor` — the
+          rule landscape follows too. Monero, Zano and Xelis read history
+          from their own wallet session and render in every sync state: each
+          card says itself that history appears once the wallet connects or
+          syncs. (Monero and Zano had an idle-only card here telling the user
+          to "import your seed", which this page cannot be reached without —
+          it opens only for a chain that has a wallet. Landscape now renders
+          the same cards ungated, 2026-09-16.) */}
+      {surface === "monero" && (
         <XmrTxHistoryCard
           syncState={xmrSession.syncState}
           txHistory={xmrSession.txHistory}
@@ -164,16 +176,7 @@ export function WalletTxHistorySubview({
           onCopy={onCopy}
         />
       )}
-      {activeChain === "monero" && xmrSession.syncState === "idle" && (
-        <Card>
-          <p className="no-wallet-msg">
-            Monero session hasn't started yet. Import your Monero seed
-            from the wallet dashboard, then return here once sync
-            begins to view transaction history.
-          </p>
-        </Card>
-      )}
-      {activeChain === "zano" && zanoSession.syncState !== "idle" && (
+      {surface === "zano" && (
         <ZanoTxHistoryCard
           syncState={zanoSession.syncState}
           txHistory={zanoSession.txHistory}
@@ -181,16 +184,16 @@ export function WalletTxHistorySubview({
           onCopy={onCopy}
         />
       )}
-      {activeChain === "zano" && zanoSession.syncState === "idle" && (
-        <Card>
-          <p className="no-wallet-msg">
-            Zano session hasn't started yet. Import your Zano seed from
-            the wallet dashboard, then return here once the wallet
-            connects to view transaction history.
-          </p>
-        </Card>
+      {surface === "xelis" && (
+        <XelisTxHistoryCard
+          syncState={xelisSession.syncState}
+          txHistory={xelisSession.txHistory}
+          txLoading={xelisSession.txLoading}
+          txError={xelisSession.txError}
+          onCopy={onCopy}
+        />
       )}
-      {activeChain !== "monero" && activeChain !== "zano" && (
+      {surface === "generic" && (
         <ChainTxCard
           chain={activeChain}
           txs={merged.txs}

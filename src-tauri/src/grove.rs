@@ -58,7 +58,7 @@ pub const DISTRO_SLUG: &str = "pwnda-grove";
 /// `PIN_BASICSWAP_TAG`. Kept honest by [`tests::expected_version_matches_the_pin`]
 /// — the constant cannot drift from the pin without a test going red, which is the
 /// whole point: a *restated* version in a comment is what went stale before.
-pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.6";
+pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.9";
 
 /// How many patches the series carries. Kept honest by
 /// [`tests::expected_patch_level_matches_the_series`], which counts
@@ -123,7 +123,19 @@ pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.6";
 /// had simply not been run. The reinstall is now also refused when the
 /// installed runtime is AHEAD of this constant (`reinstall_refusal`), so a
 /// stale constant can never again drive a downgrade.
-pub const EXPECTED_PATCH_LEVEL: u32 = 33;
+/// 33 -> 34 on 2026-09-15: 0035 (ZANO confirms its host wallet's identity at
+/// unlock and on the periodic wallet read). It touches `basicswap/`, so it
+/// counts. Without it every spend from a shared ZANO wallet refused with
+/// "expected confirmed identity None" — the first funded ZANO<>LTC swap failed
+/// that way on 2026-09-13.
+/// 34 -> 35 on 2026-09-15: 0036 (a coin that is not active this session
+/// defers a bid instead of erroring it and deleting its queued actions). It
+/// touches `basicswap/`, so it counts. The same swap lost its queued ZANO-lock
+/// retry that way when ZANO was parked at a restart.
+/// 35 -> 36 on 2026-09-15: 0037 (a restarted node refuses to confirm a
+/// different XMR/ZEPH/ZANO host wallet while swaps on that coin are in
+/// progress). It touches `basicswap/`, so it counts.
+pub const EXPECTED_PATCH_LEVEL: u32 = 36;
 
 /// The identifier this build expects a correctly-patched runtime to carry,
 /// e.g. `pwnda-grove 0.18.5+p26`.

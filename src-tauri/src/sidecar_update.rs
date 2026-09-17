@@ -1,9 +1,11 @@
-//! Background updater for the Monero / Zephyr `wallet-rpc` sidecars.
+//! Background updater for the bundled wallet binaries: Monero and Zephyr
+//! `wallet-rpc`, Zano `simplewallet`, Xelis `xelis_wallet`.
 //!
-//! Companion to the bundling work in [[sidecar-bundling]]: the installer now
-//! ships both sidecars gzipped and dormant, and `resolve_rpc_binary` wakes one
-//! into `<app_data>/<chain>/` the first time the user opens that chain. This
-//! module keeps that woken copy current afterwards.
+//! Companion to the bundling work in [[sidecar-bundling]]: the installer
+//! ships all four gzipped and dormant, and `resolve_rpc_binary` wakes one into
+//! `<app_data>/<chain>/` the first time the user opens that chain. This module
+//! keeps that woken copy current afterwards. Zano and Xelis joined tier 1 on
+//! 2026-09-16; before that an app upgrade never replaced either of them.
 //!
 //! # Why this exists at all
 //!
@@ -186,26 +188,47 @@ pub fn set_installed_version(dir: &Path, version: &str) {
 
 /// Per-chain wiring, so the two tiers don't repeat chain-specific literals.
 struct Chain {
-    /// Manifest key + binaries/<which>-wallet-rpc.gz stem.
+    /// Manifest key (`sidecars.json`) and `sidecar_naming` id.
     which: &'static str,
     /// Sub-directory under app-data.
     dir: &'static str,
-    /// Loopback port the sidecar binds when running.
-    port: u16,
+    /// Loopback ports the sidecar binds when running.
+    ports: &'static [u16],
 }
 
-const CHAINS: [Chain; 2] = [
+const CHAINS: [Chain; 4] = [
     Chain {
         which: "monero",
         dir: "monero",
-        port: crate::xmr_rpc::XMR_RPC_PORT,
+        ports: &[crate::xmr_rpc::XMR_RPC_PORT],
     },
     Chain {
         which: "zephyr",
         dir: "zephyr",
-        port: crate::zph_rpc::ZPH_RPC_PORT,
+        ports: &[crate::zph_rpc::ZPH_RPC_PORT],
+    },
+    Chain {
+        which: "zano",
+        dir: "zano",
+        // Main and Scratch both run the one binary in `<app_data>/zano/`.
+        ports: &[crate::zano_rpc::ZANO_RPC_PORT, crate::zano_rpc::ZANO_SCRATCH_RPC_PORT],
+    },
+    Chain {
+        which: "xelis",
+        dir: "xelis",
+        // Only the preferred port: a collision retries on an ephemeral one,
+        // which `sidecar_busy` covers through the child slot and the recorded
+        // port instead.
+        ports: &[crate::xelis_rpc::XELIS_RPC_PORT_PREFERRED],
     },
 ];
+
+fn chain(which: &str) -> &'static Chain {
+    CHAINS
+        .iter()
+        .find(|c| c.which == which)
+        .expect("chain is in CHAINS")
+}
 
 /// True if the sidecar looks live and must not be swapped.
 ///
@@ -215,7 +238,9 @@ const CHAINS: [Chain; 2] = [
 /// also just fails on Windows (file lock) — these checks make that a
 /// deliberate skip rather than a confusing write error.
 async fn sidecar_busy(app: &AppHandle, chain: &Chain) -> bool {
-    // Scoped so no MutexGuard is alive across the await below.
+    // Scoped so no MutexGuard is alive across the await below. Zano and Xelis
+    // keep their state in a tokio mutex; a lock someone else holds means a
+    // start or stop is in progress, which counts as busy.
     let child_present = {
         match chain.which {
             "monero" => app
@@ -226,13 +251,31 @@ async fn sidecar_busy(app: &AppHandle, chain: &Chain) -> bool {
                 .try_state::<crate::zph_rpc::ZphRpcChild>()
                 .and_then(|s| s.0.lock().ok().map(|g| g.child.is_some()))
                 .unwrap_or(false),
+            "zano" => app
+                .try_state::<crate::zano_rpc::ZanoRpcChild>()
+                .map(|s| s.0.try_lock().map(|g| g.child.is_some()).unwrap_or(true))
+                .unwrap_or(false),
+            "xelis" => app
+                .try_state::<crate::xelis_rpc::XelisRpcChild>()
+                .map(|s| s.0.try_lock().map(|g| g.child.is_some()).unwrap_or(true))
+                .unwrap_or(false),
             _ => false,
         }
     };
     if child_present {
         return true;
     }
-    crate::wallet_rpc_common::port_is_bound(chain.port).await
+    let mut ports: Vec<u16> = chain.ports.to_vec();
+    if chain.which == "xelis" {
+        // A wallet left running by a crash may hold an ephemeral port.
+        ports.extend(crate::xelis_rpc::recorded_rpc_port(app));
+    }
+    for port in ports {
+        if crate::wallet_rpc_common::port_is_bound(port).await {
+            return true;
+        }
+    }
+    false
 }
 
 // ── Tier 1: reconcile against the bundled payload ────────────────────────
@@ -332,7 +375,7 @@ async fn check_upstream_monero(app: &AppHandle) {
     let Ok(app_data) = app.path().app_data_dir() else {
         return;
     };
-    let chain = &CHAINS[0]; // monero
+    let chain = chain("monero");
     let dir = app_data.join(chain.dir);
 
     let Some(installed) = installed_version(&dir) else {
@@ -450,12 +493,35 @@ pub fn start(app: AppHandle) {
 pub struct SidecarUpdateStatus {
     pub enabled: bool,
     pub last_check: u64,
-    /// Installed version per chain, `null` when dormant or hand-placed.
-    pub monero_installed: Option<String>,
-    pub zephyr_installed: Option<String>,
-    /// Version this build ships, `null` when nothing was staged.
-    pub monero_bundled: Option<String>,
-    pub zephyr_bundled: Option<String>,
+    /// One row per bundled wallet binary, in `CHAINS` order.
+    pub wallets: Vec<WalletBinaryStatus>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WalletBinaryStatus {
+    /// `monero` | `zephyr` | `zano` | `xelis`.
+    pub id: String,
+    /// Version marker beside the app-data copy; `null` when nothing is
+    /// unpacked or the copy predates markers.
+    pub installed: Option<String>,
+    /// Whether a real binary sits in app-data, marker or not. A Zano binary
+    /// downloaded before markers existed is `present` with no `installed`.
+    pub present: bool,
+    /// Version this build ships, `null` when nothing usable was staged for
+    /// this platform.
+    pub bundled: Option<String>,
+}
+
+/// A copy in app-data big enough to be the real thing. Every wallet binary
+/// here is well over 5 MB; this only has to reject an empty or partial file.
+fn binary_present(dir: &Path, which: &str) -> bool {
+    let Some(name) = crate::wallet_rpc_common::sidecar_binary_file_name(which) else {
+        return false;
+    };
+    std::fs::metadata(dir.join(name))
+        .map(|m| m.len() >= 1024 * 1024)
+        .unwrap_or(false)
 }
 
 #[tauri::command]
@@ -463,23 +529,24 @@ pub async fn sidecar_update_status(app: AppHandle) -> Result<SidecarUpdateStatus
     let prefs = read_prefs(&app);
     let app_data = app.path().app_data_dir().ok();
     let resource_dir = app.path().resource_dir().ok();
-    let installed = |sub: &str| {
-        app_data
-            .as_ref()
-            .and_then(|d| installed_version(&d.join(sub)))
-    };
-    let bundled = |which: &str| {
-        resource_dir
-            .as_ref()
-            .and_then(|d| crate::wallet_rpc_common::bundled_sidecar_version(d, which))
-    };
+    let wallets = CHAINS
+        .iter()
+        .map(|c| {
+            let dir = app_data.as_ref().map(|d| d.join(c.dir));
+            WalletBinaryStatus {
+                id: c.which.to_string(),
+                installed: dir.as_deref().and_then(installed_version),
+                present: dir.as_deref().map(|d| binary_present(d, c.which)).unwrap_or(false),
+                bundled: resource_dir
+                    .as_ref()
+                    .and_then(|d| crate::wallet_rpc_common::bundled_sidecar_version(d, c.which)),
+            }
+        })
+        .collect();
     Ok(SidecarUpdateStatus {
         enabled: prefs.enabled,
         last_check: prefs.last_check,
-        monero_installed: installed("monero"),
-        zephyr_installed: installed("zephyr"),
-        monero_bundled: bundled("monero"),
-        zephyr_bundled: bundled("zephyr"),
+        wallets,
     })
 }
 
@@ -527,6 +594,35 @@ mod tests {
     fn handles_real_pinned_tags() {
         assert!(is_newer("v2.4.0", "v2.3.0"));
         assert!(!is_newer("v2.3.0", "v2.4.0"));
+    }
+
+    /// Every bundled wallet binary is reconciled after an upgrade, not only the
+    /// two the updater was written for. Zano and Xelis were absent until
+    /// 2026-09-16, so a new installer's Xelis payload would never have
+    /// replaced an older unpacked copy.
+    #[test]
+    fn every_bundled_wallet_is_reconciled() {
+        let ids: Vec<&str> = CHAINS.iter().map(|c| c.which).collect();
+        assert_eq!(ids, ["monero", "zephyr", "zano", "xelis"]);
+        for c in CHAINS.iter() {
+            assert!(
+                crate::wallet_rpc_common::sidecar_binary_file_name(c.which).is_some(),
+                "{} has no binary name",
+                c.which
+            );
+            assert!(!c.ports.is_empty(), "{} has no port to check", c.which);
+            assert_eq!(c.dir, c.which, "app-data dir and id drifted for {}", c.which);
+        }
+        assert_eq!(chain("monero").which, "monero");
+    }
+
+    /// Tags as the four pins spell them, including Zano's Linux build tag.
+    #[test]
+    fn handles_every_pinned_tag_shape() {
+        assert!(is_newer("v1.26.0", "v1.25.0"));
+        assert!(!is_newer("v1.25.0", "v1.25.0"));
+        assert!(is_newer("v2.2.1.507", "v2.2.1.506"));
+        assert!(!is_newer("v2.2.1.506+src.ee3de1e", "v2.2.1.506"));
     }
 
     #[test]

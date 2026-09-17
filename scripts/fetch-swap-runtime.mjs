@@ -95,8 +95,8 @@ const LOG = "[swap-runtime]";
 
 // Upstream source pins. These MUST match upstream/README.md's pin table — that
 // file is the human-readable copy of the same contract.
-const PIN_BASICSWAP_TAG = "v0.18.7";
-const PIN_BASICSWAP_COMMIT = "079a0d43ed16590eecda2f3d6a3481f847360175";
+const PIN_BASICSWAP_TAG = "v0.18.9";
+const PIN_BASICSWAP_COMMIT = "5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4";
 const PIN_COINCURVE_TAG = "basicswap_v0.4";
 const PIN_COINCURVE_COMMIT = "ff375ce4ac551afc99f359da784ffceeda03203f";
 
@@ -354,9 +354,13 @@ const LOCAL_WHEELS = [
   },
   {
     name: "basicswap",
-    version: "0.18.6",
-    file: "basicswap-0.18.6-py3-none-any.whl",
-    // Rebuilt 2026-09-12 from upstream/basicswap @ v0.18.7 with the buildCmd
+    version: "0.18.9",
+    file: "basicswap-0.18.9-py3-none-any.whl",
+    // Rebuilt 2026-09-17 from upstream/basicswap @ v0.18.9 with the buildCmd
+    // below (pip reported sha256=54880aba..., matching the file). v0.18.9 bumps
+    // basicswap/__init__.py itself, so the file name tracks the release again.
+    //
+    // Previous entry, kept for the history below: rebuilt 2026-09-12 from upstream/basicswap @ v0.18.7 with the buildCmd
     // below; hash computed from the produced file, not taken from pip's log
     // (they agreed, which is the point of checking rather than the reason to
     // skip it). `reproducible: false` (below) is why this is "what we built and
@@ -369,8 +373,8 @@ const LOCAL_WHEELS = [
     // basicswap/__init__.py", and a user whose UI keeps telling him to update an
     // already-updated node. The file name is therefore NOT evidence of which
     // source built it -- the sha256 is.
-    sha256: "f864e6d3d30f5ac14252525fb5ee9ee5662a3ca0967b0ae12c7794ac00d6770b",
-    bytes: 5218782,
+    sha256: "54880abad3ae4843f6490b6d099c7cddc4aff17cd1671368835585ca5424fabb",
+    bytes: 5209393,
     buildFrom: `upstream/basicswap @ ${PIN_BASICSWAP_TAG} (${PIN_BASICSWAP_COMMIT})`,
     buildBackend: "hatchling",
     buildCmd: "python -m pip wheel . --no-deps -w <wheelhouse>",
@@ -1243,7 +1247,7 @@ async function runFull() {
     },
     pins: {
       cpython: PIN_CPYTHON,
-      basicswap: { tag: PIN_BASICSWAP_TAG, commit: PIN_BASICSWAP_COMMIT, version: "0.18.7" },
+      basicswap: { tag: PIN_BASICSWAP_TAG, commit: PIN_BASICSWAP_COMMIT, version: "0.18.9" },
       coincurve: { tag: PIN_COINCURVE_TAG, commit: PIN_COINCURVE_COMMIT, version: "21.0.4", fork: true },
       cores: Object.fromEntries(COIN_CORES.map((c) => [c.coin, c.version])),
     },

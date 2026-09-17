@@ -49,6 +49,19 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
       // Note the singular "transaction", not "tx" — different from every
       // other CryptoNote-family explorer here. Verified live 2026-08-27.
       return `https://explorer.zano.org/transaction/${hash}`;
+    case "xelis":
+      // `/tx/<hash>`, verified live 2026-09-15 (HTTP 200, title
+      // "Transaction ca283...34a5b - XELIS Explorer"). The plural `/txs/<hash>`
+      // that several other explorers accept is a 404 here, so this route is not
+      // interchangeable with the list route. Routes come from
+      // `xelis-explorer/src/client/app/router.ts`.
+      //
+      // Mainnet only: a testnet hash lives at testnet-explorer.xelis.io and a
+      // mainnet tx 404s there (also verified). `ChainType` carries no network,
+      // and shipped builds are always mainnet (`xelisNetworkFromEnv`), so the
+      // mainnet host is the correct answer for every link this function is
+      // asked for. A dev server on testnet gets a 404 rather than a wrong tx.
+      return `https://explorer.xelis.io/tx/${hash}`;
     case "dogecoin":
       return `https://dogechain.info/tx/${hash}`;
     case "ravencoin":

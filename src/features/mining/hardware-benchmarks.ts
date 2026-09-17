@@ -19,7 +19,7 @@
 
 import type { ChainType } from "../../wallets";
 
-export type BenchAlgorithm = "randomx" | "kawpow" | "octopus";
+export type BenchAlgorithm = "randomx" | "kawpow" | "octopus" | "xelishashv3";
 export type Confidence = "exact" | "class" | "calibrated" | "unknown";
 
 /* ─────────── CPU table ─────────────────────────────────────────────
@@ -30,6 +30,16 @@ export type Confidence = "exact" | "class" | "calibrated" | "unknown";
    numbers — calibration via the Mine Setup panel will overwrite the
    prediction with the user's actual measurement.
    Calibrated 2026-04-30 against Kryptex's 13900K = 11.75 KH/s figure.
+
+   XelisHash v3 (`xelishashv3`, SRBMiner-MULTI CPU lane, added
+   2026-09-15). Only rows with a real source carry a value; everything
+   else stays unknown and gets the Calibrate CTA rather than a guess:
+     - 7950X ~20–25 KH/s and 5950X ~10–11 KH/s: public figures collected
+       for the Xelis integration plan (hashrate.no listing).
+     - 13900K 12.4 KH/s: MEASURED on the dev box 2026-09-15 with
+       SRBMiner-MULTI 3.6.2, `--cpu-threads 32`, unelevated, no MSR,
+       60 s average 12.40–12.75 KH/s (an auto-thread run read 11.0–11.5,
+       and 2 threads read 1.43–1.51 KH/s).
    ───────────────────────────────────────────────────────────────── */
 
 export const CPU_BENCHMARKS: Record<
@@ -39,7 +49,7 @@ export const CPU_BENCHMARKS: Record<
   // Intel — Raptor Lake / Raptor Lake Refresh (13th & 14th gen)
   "Intel Core i9-14900K":   { randomx: 12_500 },
   "Intel Core i9-14900KS":  { randomx: 13_000 },
-  "Intel Core i9-13900K":   { randomx: 11_750 }, // ← matches Kryptex baseline
+  "Intel Core i9-13900K":   { randomx: 11_750, xelishashv3: 12_400 }, // ← RandomX matches Kryptex baseline; XEL measured
   "Intel Core i9-13900KS":  { randomx: 12_200 },
   "Intel Core i7-14700K":   { randomx: 10_500 },
   "Intel Core i7-13700K":   { randomx:  9_500 },
@@ -54,7 +64,7 @@ export const CPU_BENCHMARKS: Record<
   "Intel Core i9-11900K":   { randomx:  6_000 },
   "Intel Core i9-10900K":   { randomx:  5_500 },
   // AMD — Zen 4 (Ryzen 7000) — Zen 4 punches above Intel on RandomX
-  "AMD Ryzen 9 7950X":      { randomx: 16_500 },
+  "AMD Ryzen 9 7950X":      { randomx: 16_500, xelishashv3: 22_500 },
   "AMD Ryzen 9 7950X3D":    { randomx: 14_500 },
   "AMD Ryzen 9 7900X":      { randomx: 13_500 },
   "AMD Ryzen 9 7900":       { randomx: 12_500 },
@@ -69,7 +79,7 @@ export const CPU_BENCHMARKS: Record<
   "AMD Ryzen 7 9700X":      { randomx: 10_000 },
   "AMD Ryzen 5 9600X":      { randomx:  7_500 },
   // AMD — Zen 3 (Ryzen 5000)
-  "AMD Ryzen 9 5950X":      { randomx: 15_500 },
+  "AMD Ryzen 9 5950X":      { randomx: 15_500, xelishashv3: 10_500 },
   "AMD Ryzen 9 5900X":      { randomx: 11_000 },
   "AMD Ryzen 7 5800X3D":    { randomx: 10_500 },
   "AMD Ryzen 7 5800X":      { randomx:  9_500 },
@@ -91,6 +101,17 @@ export const CPU_BENCHMARKS: Record<
    we run (KawPoW + Octopus); the JS side multiplies by detected card
    count. KawPoW prefers high memory bandwidth (so high-end Ada beats
    even Hopper here); Octopus is similar but more sensitive to clock.
+
+   XelisHash v3 on GPU (added 2026-09-15). GPUs do NOT beat CPUs on
+   this algorithm, which is why the CPU lane exists:
+     - RTX 4090 ~11.6 KH/s, RTX 3080 Ti ~8.3 KH/s: public figures
+       collected for the Xelis integration plan.
+     - RTX 5060 Ti 7.0 KH/s and RX 6700 XT 4.3 KH/s: MEASURED on the dev
+       box 2026-09-15, SRBMiner-MULTI 3.6.2, AUTO intensity, 90–105 s
+       runs. The 5060 Ti read 3.0–3.3 KH/s before SRBMiner's saved
+       autotune existed and 7.0 KH/s once it loaded; the 6700 XT read
+       3.9–4.7 KH/s across three runs. Calibrate or a live session
+       replaces either with the user's own number.
    ───────────────────────────────────────────────────────────────── */
 
 export const GPU_BENCHMARKS: Record<
@@ -102,10 +123,10 @@ export const GPU_BENCHMARKS: Record<
   "NVIDIA GeForce RTX 5080":      { kawpow: 50_000_000, octopus: 110_000_000 },
   "NVIDIA GeForce RTX 5070 Ti":   { kawpow: 40_000_000, octopus:  85_000_000 },
   "NVIDIA GeForce RTX 5070":      { kawpow: 36_000_000, octopus:  75_000_000 },
-  "NVIDIA GeForce RTX 5060 Ti":   { kawpow: 25_930_000, octopus:  51_940_000 },
+  "NVIDIA GeForce RTX 5060 Ti":   { kawpow: 25_930_000, octopus:  51_940_000, xelishashv3: 7_000 },
   "NVIDIA GeForce RTX 5060":      { kawpow: 22_500_000, octopus:  45_000_000 },
   // NVIDIA — Ada Lovelace (RTX 40-series)
-  "NVIDIA GeForce RTX 4090":      { kawpow: 62_000_000, octopus: 115_000_000 },
+  "NVIDIA GeForce RTX 4090":      { kawpow: 62_000_000, octopus: 115_000_000, xelishashv3: 11_600 },
   "NVIDIA GeForce RTX 4080 Super":{ kawpow: 50_000_000, octopus:  90_000_000 },
   "NVIDIA GeForce RTX 4080":      { kawpow: 48_000_000, octopus:  85_000_000 },
   "NVIDIA GeForce RTX 4070 Ti Super": { kawpow: 42_000_000, octopus: 75_000_000 },
@@ -117,7 +138,7 @@ export const GPU_BENCHMARKS: Record<
   // NVIDIA — Ampere (RTX 30-series)
   "NVIDIA GeForce RTX 3090 Ti":   { kawpow: 53_000_000, octopus: 105_000_000 },
   "NVIDIA GeForce RTX 3090":      { kawpow: 50_000_000, octopus: 100_000_000 },
-  "NVIDIA GeForce RTX 3080 Ti":   { kawpow: 47_000_000, octopus:  92_000_000 },
+  "NVIDIA GeForce RTX 3080 Ti":   { kawpow: 47_000_000, octopus:  92_000_000, xelishashv3: 8_300 },
   "NVIDIA GeForce RTX 3080":      { kawpow: 42_000_000, octopus:  85_000_000 },
   "NVIDIA GeForce RTX 3070 Ti":   { kawpow: 35_000_000, octopus:  68_000_000 },
   "NVIDIA GeForce RTX 3070":      { kawpow: 32_000_000, octopus:  62_000_000 },
@@ -145,7 +166,7 @@ export const GPU_BENCHMARKS: Record<
   "AMD Radeon RX 6900 XT":        { kawpow: 30_000_000, octopus:  70_000_000 },
   "AMD Radeon RX 6800 XT":        { kawpow: 28_000_000, octopus:  62_000_000 },
   "AMD Radeon RX 6800":           { kawpow: 26_000_000, octopus:  56_000_000 },
-  "AMD Radeon RX 6700 XT":        { kawpow: 23_900_000, octopus:  46_340_000 },
+  "AMD Radeon RX 6700 XT":        { kawpow: 23_900_000, octopus:  46_340_000, xelishashv3: 4_300 },
   "AMD Radeon RX 6700":           { kawpow: 21_000_000, octopus:  42_000_000 },
   "AMD Radeon RX 6600 XT":        { kawpow: 16_000_000, octopus:  32_000_000 },
   "AMD Radeon RX 6600":           { kawpow: 14_000_000, octopus:  28_000_000 },
@@ -159,6 +180,10 @@ export const GPU_BENCHMARKS: Record<
    When the user has a card we don't have an exact entry for, we
    match against the family name (`RTX 40`, `RX 7`, etc.) and return
    the median of the family. Ordered most-specific first.
+
+   No `xelishashv3` medians on purpose: three or four data points per
+   lane are not a family median, and an invented one would read as a
+   real prediction. Unlisted devices show "unknown" + Calibrate.
    ───────────────────────────────────────────────────────────────── */
 
 interface ClassFallback {
@@ -291,7 +316,29 @@ export const CHAIN_MINING_PROFILES: ChainMiningProfile[] = [
   { chain: "zephyr",    ticker: "ZEPH", algo: "randomx", hardware: ["cpu"], miner: "xmrig" },
   { chain: "ravencoin", ticker: "RVN",  algo: "kawpow",  hardware: ["gpu"], miner: "SRBMiner-MULTI" },
   { chain: "conflux",   ticker: "CFX",  algo: "octopus", hardware: ["gpu"], miner: "lolMiner" },
+  // Xelis mines on BOTH lanes, each as its own SRBMiner-MULTI process. The
+  // benchmark tables key CPU and GPU devices separately, so one profile with
+  // both kinds gives each device row its own prediction.
+  { chain: "xelis",     ticker: "XEL",  algo: "xelishashv3", hardware: ["cpu", "gpu"], miner: "SRBMiner-MULTI" },
 ];
+
+/**
+ * Whether the device panel can run an on-device Calibrate for this profile.
+ *
+ * Only the paths that exist: xmrig's offline RandomX bench (CPU), lolMiner's
+ * offline Octopus bench and SRBMiner's pool-backed KawPoW probe (GPU). There
+ * is no offline XelisHash bench in SRBMiner, and pointing the KawPoW probe's
+ * Ravencoin pool at `xelishashv3` would measure nothing, so XEL rows are
+ * calibrated by a live session instead (`hooks/useCalibration.ts` saves the
+ * measured rate after ~60 s of stable mining).
+ */
+export function canCalibrate(
+  kind: "cpu" | "gpu",
+  profile: Pick<ChainMiningProfile, "algo" | "miner">,
+): boolean {
+  if (kind === "cpu") return profile.miner === "xmrig" && profile.algo === "randomx";
+  return profile.algo === "kawpow" || profile.algo === "octopus";
+}
 
 /** Look up the mining profile for a chain. Returns null for chains
  *  PwndaWallet doesn't mine. */

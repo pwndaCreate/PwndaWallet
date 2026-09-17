@@ -20,24 +20,28 @@
  * PwndaLite ships this feature as a standalone product. Absent props are the
  * Lite case and degrade to: native XMR hero, no EARN promo.
  */
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import type { ChainType } from "../../wallets";
 import type { MiningProjection } from "../../types/mining";
 import type { useMiner } from "./useMiner";
-import { MINING_COINS } from "./miningCoins";
+import { MINING_COINS, isDualLaneCoin, lanesLabel } from "./miningCoins";
 import { coinTileLocked, pickMiningCoin } from "./pickCoin";
-import { capabilityFor } from "./minedAssetCapability";
-import { estimateEarningsForChain } from "./earnings";
+import { useMinedAssetView } from "./minedAssetView";
+import { useMiningEarnings } from "./useMiningEarnings";
+import { laneHasIntensity, startBlocker } from "./miningLane";
+import { presetForCpuThreads, presetForGpuIntensity } from "./miningTuning";
+import { GpuDevicePicker } from "./components/GpuDevicePicker";
 import { algorithmHashUnit, formatHashrateParts } from "./pool-stats/format";
 import { CoinIcon } from "../../components/CoinIcon";
 import {
   BalanceHero,
-  EarnPromoStrip,
   MicroLabel,
   Mark,
   Panel,
   ViewModeChip,
 } from "./components/mine-simple";
+import { EarnCapabilityBlock } from "./components/EarnCapabilityBlock";
+import { MineRunButton, MinerStatusBanner } from "./components/MineRunControls";
 
 type MinerApi = ReturnType<typeof useMiner>;
 
@@ -60,7 +64,8 @@ function Segmented<T extends string>({
   disabled,
 }: {
   options: readonly { value: T; label: string }[];
-  value: T;
+  /** `null` highlights nothing (a PRO slider set between presets). */
+  value: T | null;
   onChange: (v: T) => void;
   disabled?: boolean;
 }) {
@@ -103,6 +108,14 @@ function Segmented<T extends string>({
 
 export interface MineSimpleViewProps {
   miner: MinerApi;
+  /**
+   * Payout address for a coin — the same seam both PRO views take. Without it
+   * SIMPLE could not tell a lane with no address from one that can start, and
+   * START looked live and did nothing (parity audit, 2026-09-16).
+   */
+  addressFor: (coin: ChainType) => string | null;
+  /** Open Miner Setup from a "Set up miners" run control. Absent in PwndaLite. */
+  onSetup?: () => void;
   /** Portrait stacks; landscape uses the three-column arrangement. */
   compact?: boolean;
   /** Spot USD prices by ticker — used for the no-route daily-revenue line. */
@@ -133,6 +146,8 @@ export interface MineSimpleViewProps {
 
 export function MineSimpleView({
   miner,
+  addressFor,
+  onSetup,
   compact = false,
   pricesByTicker,
   reachableTickers,
@@ -151,8 +166,13 @@ export function MineSimpleView({
     switchHardware,
     isMining,
     miningStarting,
-    miningIntensity,
     setMiningIntensity,
+    cpuThreads,
+    cpuThreadCount,
+    gpuIntensityLevel,
+    setGpuIntensity,
+    isMiningCpu,
+    isMiningGpu,
     minersReady,
     hashrateSamples,
     startMining,
@@ -167,56 +187,30 @@ export function MineSimpleView({
     gpus,
     gpuSelection,
     setGpuSelection,
+    minerError,
+    minerInfo,
   } = miner;
 
   const [showAllTargets, setShowAllTargets] = useState(false);
 
   /**
-   * The hero always speaks about MINED XMR, whatever coin is being mined.
+   * What the mined coin may claim, decided once for every Mine surface.
    *
-   * When the user mines ZEPH or RVN, the XMR-denominated projection would be
-   * meaningless, so the effective projection falls back to native. Getting
-   * this wrong would show a ZEPH miner an ETH figure derived from an XMR
-   * balance they are not accumulating.
+   * The mined coin is NOT always XMR (caught 2026-08-28: an Ergo GPU session
+   * read `mined — XMR`), and the injected projection is an XMR→target rate,
+   * so only a coin with a route out may be projected. XMR is routed and
+   * projected; ZEPH/ZANO have a price and no route yet; RVN/CFX/ERG/XEL have
+   * neither and show daily revenue instead. `useMinedAssetView` owns that
+   * decision so the PRO views cannot make a different one — landscape PRO
+   * did, until 2026-09-16.
    */
-  /**
-   * The mined coin, which is NOT always XMR.
-   *
-   * Caught in the sandbox on 2026-08-28: with the GPU lane on Ergo, the hero
-   * read `mined — XMR` above a pool paying out in ERG. The projection is
-   * defined as "mined-XMR balance × XMR→target rate" (the EARN pipeline only
-   * routes XMR), so for any other target it does not apply at all — and
-   * showing an ETH figure derived from an XMR balance the user is not
-   * accumulating would be inventing a number about their money.
-   *
-   * So a non-XMR session falls back to speaking natively about the coin it is
-   * actually mining, with no projection and no conversion chip.
-   */
-  const minedSym =
-    MINING_COINS.find((c) => c.chain === miningCoin)?.sym ?? "XMR";
-
-  /**
-   * What this coin is allowed to claim.
-   *
-   * Replaces the earlier `isXmrSession` boolean, which collapsed three
-   * genuinely different situations into one: XMR can be routed and projected;
-   * ZEPH/ZANO have a price but no route yet; RVN/CFX/ERG have neither and
-   * should show daily revenue instead. Treating the last two the same way
-   * told a ZEPH miner nothing about what their coin is worth.
-   */
-  const capability = capabilityFor(miningCoin as ChainType);
-  const canProject = capability.kind === "route";
-
-  const effectiveProjection: MiningProjection = useMemo(
-    () =>
-      (canProject ? projection : null) ?? {
-        targetTicker: minedSym,
-        ratePerXmr: 1,
-        xmrPriceUsd: null,
-        fromEarnTarget: false,
-      },
-    [projection, canProject, minedSym],
-  );
+  const asset = useMinedAssetView({
+    miningCoin: miningCoin as ChainType,
+    projection,
+    minedAmount,
+    pricesByTicker,
+  });
+  const { canProject, minedTicker: minedSym } = asset;
 
   // `hashrateSamples` is `{ t, value }[]` — same read as
   // `MineLandscapeView` (`hashrateSamples[n - 1].value`). Taking the object
@@ -225,17 +219,19 @@ export function MineSimpleView({
     ? hashrateSamples[hashrateSamples.length - 1].value
     : 0;
 
-  const earnings = useMemo(
-    () =>
-      current > 0
-        ? estimateEarningsForChain(miningCoin as ChainType, current, {})
-        : null,
-    [miningCoin, current],
-  );
+  // Same live chain parameters as the PRO console. SIMPLE priced this from
+  // the hardcoded defaults until 2026-09-16, so the two could disagree about
+  // one session's "per day".
+  const { earnings } = useMiningEarnings(miningCoin as ChainType, current);
 
   const perPeriod = earnings
     ? { day: earnings.day, week: earnings.week, month: earnings.month }
     : null;
+
+  const blockedBy = startBlocker({
+    minersReady,
+    payoutAddress: addressFor(miningCoin as ChainType),
+  });
 
   const targets = showAllTargets
     ? MINING_COINS
@@ -261,14 +257,6 @@ export function MineSimpleView({
    * only because JSX accepts almost anything in a text slot.
    */
   const payoutLabel = selectedPool ? displayMinPayout(selectedPool) : null;
-
-  /**
-   * Spot price of the coin being MINED, for the no-route revenue line.
-   *
-   * `pricesByTicker` is already injected for the profitability strip, so this
-   * needs no new plumbing and no swap import — it is a price, not a route.
-   */
-  const minedPriceUsd = pricesByTicker?.[minedSym] ?? null;
 
   /**
    * Scaled hashrate, via the same formatter the PRO console uses.
@@ -305,8 +293,8 @@ export function MineSimpleView({
             disabled={coinTileLocked(c.chain, miner)}
             title={
               coinTileLocked(c.chain, miner)
-                ? `Stop the ${c.hardware.toUpperCase()} session before switching target`
-                : `Mine ${c.sym} with ${c.algo} on ${c.hardware.toUpperCase()}`
+                ? `Stop the ${lanesLabel(c.chain)} session${isDualLaneCoin(c.chain) ? "s" : ""} before switching target`
+                : `Mine ${c.sym} with ${c.algo} on ${lanesLabel(c.chain)}`
             }
             style={{
               fontFamily: "var(--font-mono)",
@@ -396,45 +384,59 @@ export function MineSimpleView({
         }}
       >
         <MicroLabel>load</MicroLabel>
-        <Segmented
-          // The mock labels these LOW / MED / MAX; the hook's vocabulary is
-          // low | medium | high. Labels follow the mock, values follow the
-          // hook — inventing a third vocabulary here is how a segmented
-          // control ends up setting nothing.
-          options={[
-            { value: "low" as const, label: "LOW" },
-            { value: "medium" as const, label: "MED" },
-            { value: "high" as const, label: "MAX" },
-          ]}
-          value={miningIntensity}
-          onChange={(v) => setMiningIntensity(v)}
-        />
+        {/* SIMPLE keeps three coarse presets per lane; PRO has the exact
+            sliders (LaneTuningControls). Each preset MOVES the lane's slider,
+            and none is highlighted when PRO left it between presets. Locked
+            while the displayed lane mines — the values are launch args.
+            Until 2026-09-16 this row set the CPU tier even on the GPU lane. */}
+        {miningHardware === "cpu" ? (
+          <Segmented
+            // The mock labels these LOW / MED / MAX; the hook's vocabulary is
+            // low | medium | high. Labels follow the mock, values follow the
+            // hook — inventing a third vocabulary here is how a segmented
+            // control ends up setting nothing.
+            options={[
+              { value: "low" as const, label: "LOW" },
+              { value: "medium" as const, label: "MED" },
+              { value: "high" as const, label: "MAX" },
+            ]}
+            value={presetForCpuThreads(cpuThreads, cpuThreadCount)}
+            onChange={(v) => setMiningIntensity(v)}
+            disabled={isMiningCpu}
+          />
+        ) : laneHasIntensity("gpu", gpuAlgorithm) ? (
+          <Segmented
+            options={[
+              { value: "auto" as const, label: "AUTO" },
+              { value: "low" as const, label: "LOW" },
+              { value: "medium" as const, label: "MED" },
+              { value: "high" as const, label: "MAX" },
+            ]}
+            value={presetForGpuIntensity(gpuIntensityLevel)}
+            onChange={(v) => setGpuIntensity(v)}
+            disabled={isMiningGpu}
+          />
+        ) : (
+          <span style={{ fontSize: 8, color: "var(--text-dim)" }}>miner default</span>
+        )}
       </div>
       <div style={{ fontSize: 8, color: "var(--text-dim)", marginTop: 8 }}>
-        med keeps your pc usable while mining
+        {miningHardware === "cpu"
+          ? "med keeps your pc usable while mining · exact threads in pro"
+          : laneHasIntensity("gpu", gpuAlgorithm)
+            ? "auto lets the miner tune itself · exact intensity in pro"
+            : "lolMiner has no intensity setting"}
       </div>
-      {miningHardware === "gpu" && gpus.length >= 2 && (
-        <div
-          style={{
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "space-between",
-            gap: 8,
-            marginTop: 10,
-          }}
-        >
-          <MicroLabel>device</MicroLabel>
-          <Segmented
-            // Single-select covers the actual ask: mine on GPU 1 only, GPU 2
-            // only, or ALL (both) — the last one is what a 2-GPU rig gets
-            // today with no picker at all, so it stays the default (`null`).
-            options={[
-              { value: "all", label: "ALL" },
-              ...gpus.map((_, i) => ({ value: String(i), label: `GPU ${i + 1}` })),
-            ]}
-            value={gpuSelection == null ? "all" : String(gpuSelection[0])}
-            onChange={(v) => setGpuSelection(v === "all" ? null : [Number(v)])}
-            disabled={isMining}
+      {miningHardware === "gpu" && (
+        <div style={{ marginTop: 10 }}>
+          {/* The shared picker PRO mounts too: fixed for one dedicated GPU,
+              GPU 0 / GPU 1 / BOTH for two, and so on. */}
+          <GpuDevicePicker
+            gpus={gpus}
+            selection={gpuSelection}
+            onChange={setGpuSelection}
+            disabled={isMiningGpu}
+            variant="simple"
           />
         </div>
       )}
@@ -511,25 +513,21 @@ export function MineSimpleView({
 
   const hero = (
     <BalanceHero
-      projection={effectiveProjection}
+      projection={asset.projection}
       minedTicker={minedSym}
-      minedAmount={canProject ? minedAmount : null}
+      minedAmount={asset.minedAmount}
       mining={isMining}
       hashrateLabel={hashLabel}
       perPeriod={perPeriod}
       nextPayout={payoutLabel ? { threshold: payoutLabel, eta: null } : null}
-      capabilityNote={canProject ? null : capability.note}
-      routeLoading={canProject ? projection?.routeLoading === true : false}
-      routeFailureText={canProject ? (projection?.routeFailureText ?? null) : null}
-      routeSourceNote={canProject ? (projection?.routeSourceNote ?? null) : null}
-      onRetryRoute={onRetryRoute ?? projection?.retryRoute}
+      capabilityNote={asset.capabilityNote}
+      routeLoading={asset.routeLoading}
+      routeFailureText={asset.routeFailureText}
+      routeSourceNote={asset.routeSourceNote}
+      onRetryRoute={onRetryRoute ?? asset.retryRoute}
       // For a coin with no route, the useful answer to "is this worth
       // running" is revenue, not a balance it cannot convert into.
-      dailyUsd={
-        !canProject && perPeriod && minedPriceUsd != null
-          ? perPeriod.day * minedPriceUsd
-          : null
-      }
+      dailyUsd={canProject ? null : asset.usdPerDay(perPeriod?.day)}
       onSelectDisplayCoin={canProject ? (onSelectDisplayCoin ?? (() => {})) : null}
       reachableTickers={reachableTickers}
       compact={compact}
@@ -537,30 +535,35 @@ export function MineSimpleView({
   );
 
   const cta = (
-    <button
-      type="button"
-      onClick={() => (isMining ? void stopMining() : void startMining())}
-      disabled={!minersReady || miningStarting}
+    <MineRunButton
+      variant="pixel"
+      labels="long"
+      mining={isMining}
+      starting={miningStarting}
+      blockedBy={blockedBy}
+      coinTicker={minedSym}
+      onStart={() => void startMining()}
+      onStop={() => void stopMining()}
+      onSetup={onSetup}
+      fontSize={compact ? 11 : 15}
       style={{
-        fontFamily: "var(--font-pixel)",
         flex: compact ? undefined : 2.2,
         width: compact ? "100%" : undefined,
-        border: "1px solid var(--accent)",
-        background: "var(--accent-dim)",
-        color: "var(--accent)",
         padding: compact ? "16px 12px" : "26px 12px",
-        fontSize: compact ? 11 : 15,
-        letterSpacing: 1,
-        cursor: !minersReady || miningStarting ? "not-allowed" : "pointer",
-        opacity: !minersReady || miningStarting ? 0.55 : 1,
       }}
-    >
-      {miningStarting
-        ? "starting…"
-        : isMining
-          ? "■ STOP MINING"
-          : "► START MINING"}
-    </button>
+    />
+  );
+
+  // Errors from `useMiner` (no address, proxy pre-flight, spawn failures) and
+  // the hint under a blocked START. SIMPLE rendered none of these before
+  // 2026-09-16, so a refused start was silent here.
+  const status = (
+    <MinerStatusBanner
+      error={minerError}
+      info={minerInfo}
+      blockedBy={blockedBy}
+      mining={isMining}
+    />
   );
 
   const sparkCard = (
@@ -623,13 +626,17 @@ export function MineSimpleView({
   );
 
   // The EARN pipeline only routes XMR, so the promo is meaningless on a
-  // ZEPH/RVN/CFX/ERG session and is not offered there.
-  const promo = !canProject ? null : (
-    <EarnPromoStrip
-      targetTicker={effectiveProjection.targetTicker}
+  // ZEPH/RVN/CFX/ERG/XEL session; the shared block owns that gate. The hero
+  // already carries the chips and the capability note, so the block renders
+  // only the promo here.
+  const promo = (
+    <EarnCapabilityBlock
+      asset={asset}
       onOpenEarn={onOpenEarn}
       conversionRunning={conversionRunning}
       compact={compact}
+      showChips={false}
+      showNote={false}
     />
   );
 
@@ -647,6 +654,7 @@ export function MineSimpleView({
       >
         {hero}
         {cta}
+        {status}
         {sparkCard}
         {targetsCard}
         {hardwareCard}
@@ -677,6 +685,7 @@ export function MineSimpleView({
           {cta}
           {sparkCard}
         </div>
+        {status}
         {promo}
       </div>
     </div>

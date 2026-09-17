@@ -67,8 +67,8 @@ export function MiningSetupWizard({
           <p style={{ marginTop: 0 }}>
             Mining is <strong>optional and off by default</strong>. Turn it on
             to put your CPU or GPU to work mining supported coins
-            (<strong>XMR · ZEPH · RVN · CFX · ERG</strong>) straight to your own
-            wallet address. Here's what setting it up does:
+            (<strong>XMR · ZEPH · ZANO · XEL · RVN · CFX · ERG</strong>) straight
+            to your own wallet address. Here's what setting it up does:
           </p>
 
           <ul style={{ margin: "10px 0 12px", paddingLeft: 18 }}>
@@ -89,9 +89,10 @@ export function MiningSetupWizard({
                 Windows Defender flags miner executables by default, so the
                 setup screen will <em>offer</em> to add an exclusion for the
                 miners folder — your call, and only for the mining folder. The
-                installer never touches your antivirus. Starting a session
-                prompts a one-time <em>per-session</em> UAC elevation (the miner
-                needs it for full RandomX hashrate).
+                installer never touches your antivirus. Starting a RandomX
+                (XMR/ZEPH) session prompts a one-time <em>per-session</em> UAC
+                elevation (xmrig needs it for full RandomX hashrate); XelisHash
+                and GPU sessions run without elevation.
               </li>
             )}
             {isLinux && (

@@ -41,20 +41,80 @@ from `upstream/patches/README.md`, `PwndaWalletVault/log.md`, and the code
 itself -- accurate, but not the original wording. See log.md 2026-09-03
 "patch-series recovery".
 
+Rebased 2026-09-17 onto basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4): upstream dropped `from typing import Union` from bch.py, which this patch's context included. The diff below is regenerated; the change it makes is the same.
+
+diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 7710261..095963f 100644
+--- a/basicswap/basicswap.py
++++ b/basicswap/basicswap.py
+@@ -1289,7 +1289,23 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+         elif coin == Coins.BCH:
+             from .interface.bch.bch import BCHInterface
+ 
+-            return BCHInterface(self.coin_clients[coin], self.chain, self)
++            # PWNDA-PATCH-18: BTC and LTC both gate on connection_type here and
++            # call _initElectrumBackend() for "electrum" (see the two branches
++            # immediately around this one) -- BCH's own branch never did, so
++            # BCHInterface.useBackend() was unconditionally False regardless of
++            # connection_type, and every electrum-aware method BCHInterface
++            # inherits fell through to an RPC call against a daemon that does
++            # not exist in electrum mode. Found live (2026-09-03, Grove
++            # expansion master plan Phase E unit E2): a real running node
++            # crashed immediately after "WalletManager initialized for BCH"
++            # with no wired backend. Mirrors BTC/LTC exactly.
++            connection_type = self.coin_clients[coin].get("connection_type", "rpc")
++            interface = BCHInterface(self.coin_clients[coin], self.chain, self)
++
++            if connection_type == "electrum":
++                self._initElectrumBackend(coin, interface)
++
++            return interface
+         elif coin == Coins.LTC:
+             from .interface.ltc.ltc import LTCInterface, LTCInterfaceMWEB
+ 
+diff --git a/basicswap/bin/prepare.py b/basicswap/bin/prepare.py
+index 7fcab6a..924f038 100644
+--- a/basicswap/bin/prepare.py
++++ b/basicswap/bin/prepare.py
+@@ -1576,11 +1576,24 @@ def main():
+         "navcoin": nav_prepare.getConfigSegment(prepare_ctx),
+         "bitcoincash": bch_prepare.getConfigSegment(prepare_ctx),
+         "dogecoin": doge_prepare.getConfigSegment(prepare_ctx),
++        # PWNDA-PATCH-16: this is the dict `basicswap-prepare` writes into
++        # `settings["chainclients"]` -- required for `--withcoins=zano
++        # --nocores` to write a chainclients.zano block.
++        "zano": zano_prepare.getConfigSegment(prepare_ctx),
+     }
+ 
+     electrum_supported_coins = {
+         "bitcoin": "btc",
+         "litecoin": "ltc",
++        # PWNDA-PATCH-18: this is the entire fix needed here -- --bch-mode
++        # and --bch-electrum-server already parse generically (any
++        # "--<prefix>-mode"/"--<prefix>-electrum-server" flag is accepted
++        # by the argv loop above), they just had no prefix registered to
++        # attach to. This one line is what makes coin_modes["bch"] /
++        # electrum_servers["bch"] reachable by the loop just below, which
++        # is what actually writes connection_type/manage_daemon/
++        # electrum_clearnet_servers into chainclients["bitcoincash"].
++        "bitcoincash": "bch",
+     }
+ 
+     for coin_name, coin_prefix in electrum_supported_coins.items():
 diff --git a/basicswap/interface/bch/bch.py b/basicswap/interface/bch/bch.py
-index 5115e9c..dcdf664 100644
+index ae67105..f17e65d 100644
 --- a/basicswap/interface/bch/bch.py
 +++ b/basicswap/interface/bch/bch.py
-@@ -6,7 +6,7 @@
+@@ -5,7 +5,7 @@
+ # file LICENSE or http://www.opensource.org/licenses/mit-license.php.
  
- from typing import Union
  from basicswap.contrib.test_framework.messages import COutPoint, CTransaction, CTxIn
 -from basicswap.util import b2i, ensure, i2b
 +from basicswap.util import b2i, ensure, i2b, i2h
  from basicswap.util.script import decodePushData, decodeScriptNum
  from basicswap.interface.btc.btc import BTCInterface, ensure_op, findOutput
  from basicswap.chainparams import Coins
-@@ -43,7 +43,11 @@ from basicswap.interface.bch.contrib.script import (
+@@ -42,7 +42,11 @@ from basicswap.interface.bch.contrib.script import (
      OP_CHECKSIG,
      OP_HASH256,
  )
@@ -67,7 +127,7 @@ index 5115e9c..dcdf664 100644
  from coincurve.keys import (
      PrivateKey,
      PublicKey,
-@@ -55,6 +59,14 @@ from coincurve.ecdsaotves import (
+@@ -54,6 +58,14 @@ from coincurve.ecdsaotves import (
      ecdsaotves_rec_enc_key,
  )
  
@@ -82,7 +142,7 @@ index 5115e9c..dcdf664 100644
  
  class BCHInterface(BTCInterface):
      """
-@@ -77,9 +89,19 @@ class BCHInterface(BTCInterface):
+@@ -76,9 +88,19 @@ class BCHInterface(BTCInterface):
      def xmr_swap_a_lock_spend_tx_vsize() -> int:
          return 302
  
@@ -105,7 +165,7 @@ index 5115e9c..dcdf664 100644
          return True
  
      def __init__(self, coin_settings, network, swap_client=None, **kwargs):
-@@ -101,6 +123,17 @@ class BCHInterface(BTCInterface):
+@@ -100,6 +122,17 @@ class BCHInterface(BTCInterface):
      def getNewAddress(
          self, use_segwit: bool = False, label: str = "swap_receive"
      ) -> str:
@@ -123,7 +183,7 @@ index 5115e9c..dcdf664 100644
          args = [label]
          return self.rpc_wallet("getnewaddress", args)
  
-@@ -118,6 +151,10 @@ class BCHInterface(BTCInterface):
+@@ -117,6 +150,10 @@ class BCHInterface(BTCInterface):
          return unspent_addr
  
      def createWallet(self, wallet_name: str, password: str = ""):
@@ -134,7 +194,7 @@ index 5115e9c..dcdf664 100644
          self.rpc("createwallet", [wallet_name, False])
          if password != "":
              self.rpc(
-@@ -129,6 +166,10 @@ class BCHInterface(BTCInterface):
+@@ -128,6 +165,10 @@ class BCHInterface(BTCInterface):
              )
  
      def newKeypool(self) -> None:
@@ -145,7 +205,7 @@ index 5115e9c..dcdf664 100644
          self._log.debug("Refreshing keypool.")
  
          # Use up current keypool
-@@ -152,6 +193,41 @@ class BCHInterface(BTCInterface):
+@@ -151,6 +192,41 @@ class BCHInterface(BTCInterface):
      def decodeSegwitAddress(self, addr):
          raise ValueError("Segwit not supported")
  
@@ -187,7 +247,7 @@ index 5115e9c..dcdf664 100644
      def getSCLockScriptAddress(self, lock_script: bytes) -> str:
          lock_tx_dest = self.getScriptDest(lock_script)
          address = self.encodeScriptDest(lock_tx_dest)
-@@ -165,8 +241,42 @@ class BCHInterface(BTCInterface):
+@@ -164,8 +240,42 @@ class BCHInterface(BTCInterface):
          return address
  
      def importWatchOnlyAddress(self, address: str, label: str):
@@ -230,7 +290,7 @@ index 5115e9c..dcdf664 100644
      def createRawFundedTransaction(
          self,
          addr_to: str | bytes,
-@@ -175,6 +285,36 @@ class BCHInterface(BTCInterface):
+@@ -174,6 +284,36 @@ class BCHInterface(BTCInterface):
          lock_unspents: bool = True,
          feerate: int = None,
      ) -> str:
@@ -267,7 +327,7 @@ index 5115e9c..dcdf664 100644
  
          if isinstance(addr_to, bytes):
              # addr_to is script_pubkey
-@@ -267,6 +407,12 @@ class BCHInterface(BTCInterface):
+@@ -266,6 +406,12 @@ class BCHInterface(BTCInterface):
          return lock_tx_vout, actual_value
  
      def findConfirmedTxnByHash(self, txid_hex: str):
@@ -280,7 +340,7 @@ index 5115e9c..dcdf664 100644
          # Only works for wallet txns
          try:
              rv = self.rpc("gettransaction", [txid_hex])
-@@ -290,6 +436,13 @@ class BCHInterface(BTCInterface):
+@@ -289,6 +435,13 @@ class BCHInterface(BTCInterface):
          vout: int = -1,
          return_invalid_txids: bool = False,
      ) -> dict | None:
@@ -294,7 +354,7 @@ index 5115e9c..dcdf664 100644
          # Currently, for BCH, importing the watchonly address only works if rescanblockchain is run on every iteration
          if txid is None:
              self._log.debug("TODO: getLockTxHeight")
-@@ -460,6 +613,50 @@ class BCHInterface(BTCInterface):
+@@ -459,6 +612,50 @@ class BCHInterface(BTCInterface):
              ]
          )
  
@@ -533,27 +593,6 @@ index 5115e9c..dcdf664 100644
          return "transaction already in block chain" in err_str
  
      def lockNonSegwitPrevouts(self) -> None:
-diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
-index 54f1b1c..4f97ad8 100644
---- a/basicswap/wallet_manager.py
-+++ b/basicswap/wallet_manager.py
-@@ -38,11 +38,15 @@ _AEAD_MAC_LEN = 16
- 
- class WalletManager:
- 
--    SUPPORTED_COINS = {Coins.BTC, Coins.LTC}
-+    SUPPORTED_COINS = {Coins.BTC, Coins.LTC, Coins.BCH}
- 
-     BIP84_COIN_TYPES = {
-         Coins.BTC: 0,
-         Coins.LTC: 2,
-+        # PWNDA-PATCH-18: this dict is actually the BIP-44 coin type (an
-+        # upstream PR could rename it; Grove leaves the name alone to keep
-+        # the diff minimal) -- 145 is BCH's registered SLIP-44 coin type.
-+        Coins.BCH: 145,
-     }
- 
-     HRP = {
 diff --git a/basicswap/interface/electrumx.py b/basicswap/interface/electrumx.py
 index a2dd0ce..2f84810 100644
 --- a/basicswap/interface/electrumx.py
@@ -653,61 +692,24 @@ index a2dd0ce..2f84810 100644
      try:
          addr_data = decodeAddress(address)
          addr_type = addr_data[0]
-diff --git a/basicswap/bin/prepare.py b/basicswap/bin/prepare.py
-index 77a8341..10bf1bb 100644
---- a/basicswap/bin/prepare.py
-+++ b/basicswap/bin/prepare.py
-@@ -1577,11 +1577,24 @@ def main():
-         "navcoin": nav_prepare.getConfigSegment(prepare_ctx),
-         "bitcoincash": bch_prepare.getConfigSegment(prepare_ctx),
-         "dogecoin": doge_prepare.getConfigSegment(prepare_ctx),
-+        # PWNDA-PATCH-16: this is the dict `basicswap-prepare` writes into
-+        # `settings["chainclients"]` -- required for `--withcoins=zano
-+        # --nocores` to write a chainclients.zano block.
-+        "zano": zano_prepare.getConfigSegment(prepare_ctx),
+diff --git a/basicswap/wallet_manager.py b/basicswap/wallet_manager.py
+index 923e7dd..0f59622 100644
+--- a/basicswap/wallet_manager.py
++++ b/basicswap/wallet_manager.py
+@@ -37,11 +37,15 @@ _AEAD_MAC_LEN = 16
+ 
+ class WalletManager:
+ 
+-    SUPPORTED_COINS = {Coins.BTC, Coins.LTC}
++    SUPPORTED_COINS = {Coins.BTC, Coins.LTC, Coins.BCH}
+ 
+     BIP84_COIN_TYPES = {
+         Coins.BTC: 0,
+         Coins.LTC: 2,
++        # PWNDA-PATCH-18: this dict is actually the BIP-44 coin type (an
++        # upstream PR could rename it; Grove leaves the name alone to keep
++        # the diff minimal) -- 145 is BCH's registered SLIP-44 coin type.
++        Coins.BCH: 145,
      }
  
-     electrum_supported_coins = {
-         "bitcoin": "btc",
-         "litecoin": "ltc",
-+        # PWNDA-PATCH-18: this is the entire fix needed here -- --bch-mode
-+        # and --bch-electrum-server already parse generically (any
-+        # "--<prefix>-mode"/"--<prefix>-electrum-server" flag is accepted
-+        # by the argv loop above), they just had no prefix registered to
-+        # attach to. This one line is what makes coin_modes["bch"] /
-+        # electrum_servers["bch"] reachable by the loop just below, which
-+        # is what actually writes connection_type/manage_daemon/
-+        # electrum_clearnet_servers into chainclients["bitcoincash"].
-+        "bitcoincash": "bch",
-     }
- 
-     for coin_name, coin_prefix in electrum_supported_coins.items():
-diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
-index f79ee29..23d99c6 100644
---- a/basicswap/basicswap.py
-+++ b/basicswap/basicswap.py
-@@ -1286,7 +1286,23 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
-         elif coin == Coins.BCH:
-             from .interface.bch.bch import BCHInterface
- 
--            return BCHInterface(self.coin_clients[coin], self.chain, self)
-+            # PWNDA-PATCH-18: BTC and LTC both gate on connection_type here and
-+            # call _initElectrumBackend() for "electrum" (see the two branches
-+            # immediately around this one) -- BCH's own branch never did, so
-+            # BCHInterface.useBackend() was unconditionally False regardless of
-+            # connection_type, and every electrum-aware method BCHInterface
-+            # inherits fell through to an RPC call against a daemon that does
-+            # not exist in electrum mode. Found live (2026-09-03, Grove
-+            # expansion master plan Phase E unit E2): a real running node
-+            # crashed immediately after "WalletManager initialized for BCH"
-+            # with no wired backend. Mirrors BTC/LTC exactly.
-+            connection_type = self.coin_clients[coin].get("connection_type", "rpc")
-+            interface = BCHInterface(self.coin_clients[coin], self.chain, self)
-+
-+            if connection_type == "electrum":
-+                self._initElectrumBackend(coin, interface)
-+
-+            return interface
-         elif coin == Coins.LTC:
-             from .interface.ltc.ltc import LTCInterface, LTCInterfaceMWEB
- 
+     HRP = {

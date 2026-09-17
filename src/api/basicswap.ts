@@ -141,6 +141,13 @@ export interface SidecarStatus {
    * Absent (undefined) on a status from a build that predates the flag.
    */
   particlUnpruned?: boolean;
+  /**
+   * The node's last reading of swaps in progress (2026-09-15), for the lock
+   * screen. A locked engine answers nothing, so this is what the node had in
+   * progress when the janitor last checked. Absent before the first reading
+   * and on an older backend.
+   */
+  swapsLastSeen?: { inProgress: number; at: number } | null;
 }
 
 /**
@@ -1375,7 +1382,9 @@ export const UNPARK_EVENT = "swap-sidecar-unpark";
 
 export interface UnparkRequest {
   coin: string;
+  /** 1 + the restarts that already happened and left the coin parked. */
   attempt: number;
+  /** 0 since 2026-09-15: requests back off instead of stopping at a cap. */
   max: number;
 }
 

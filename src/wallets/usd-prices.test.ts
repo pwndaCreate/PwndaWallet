@@ -137,6 +137,69 @@ describe("fetchUsdPrices — last-known-good never regresses", () => {
 });
 
 /**
+ * A ticker asked for inside the cache window is fetched, not ignored.
+ *
+ * Found 2026-09-16 in the sandbox: switching into a wallet that held more
+ * coins (Xelis among them) left every newly held coin at "—", and after a
+ * layout flip the whole portfolio read "$0.00 · +31 more not loaded", until a
+ * refresh a minute later filled everything in. The 60s TTL check served
+ * `spotCache` to ANY caller, whatever tickers it asked for, so a coin that
+ * became held within the window was never requested until the window closed.
+ */
+describe("fetchUsdPrices — the cache answers only what it was asked", () => {
+  it("fetches a ticker the cached round never requested", async () => {
+    const asked: string[] = [];
+    const book: Record<string, number> = { ergo: 0.22, "zephyr-protocol": 0.41 };
+    mockProxy.mockImplementation((url: string) => {
+      if (url.includes("/simple/price")) {
+        // Answer ONLY the ids requested, like the real endpoint. A mock that
+        // answered everything would price ZEPH in round one and hide the bug.
+        const ids = decodeURIComponent(/[?&]ids=([^&]+)/.exec(url)![1]).split(",");
+        asked.push(ids.join(","));
+        const out: Record<string, number> = {};
+        for (const id of ids) if (book[id] != null) out[id] = book[id];
+        return Promise.resolve(cgBody(out));
+      }
+      throw new Error(`should not reach ${url}`);
+    });
+
+    const first = await fetchUsdPrices(["ERG"]);
+    expect(first.ERG).toBeCloseTo(0.22);
+
+    // Same TTL window, one more ticker — the wallet just gained ZEPH.
+    const second = await fetchUsdPrices(["ERG", "ZEPH"]);
+    expect(second.ZEPH, "ZEPH was never fetched: the cache answered for it").toBeCloseTo(0.41);
+    expect(asked).toHaveLength(2);
+  });
+
+  it("still serves the cache when nothing new is asked", async () => {
+    mockProxy.mockImplementation((url: string) => {
+      if (url.includes("/simple/price")) return Promise.resolve(cgBody({ ergo: 0.22 }));
+      throw new Error(`should not reach ${url}`);
+    });
+    await fetchUsdPrices(["ERG"]);
+    await fetchUsdPrices(["ERG"]);
+    await fetchUsdPrices(["erg"]);
+    expect(mockProxy).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refetch every call for a ticker no provider can price", async () => {
+    // An unmappable ticker must not defeat the cache: it was ASKED, the answer
+    // was "no price", and asking again within the window changes nothing.
+    mockProxy.mockImplementation((url: string) => {
+      if (url.includes("/simple/price")) return Promise.resolve(cgBody({ ergo: 0.22 }));
+      if (url.includes("coinpaprika")) return Promise.resolve(paprikaBody([]));
+      if (url.includes("cryptocompare")) return Promise.resolve({});
+      throw new Error(`unexpected url ${url}`);
+    });
+    await fetchUsdPrices(["ERG", "NOTACOIN"]);
+    const callsAfterFirst = mockProxy.mock.calls.length;
+    await fetchUsdPrices(["ERG", "NOTACOIN"]);
+    expect(mockProxy.mock.calls.length).toBe(callsAfterFirst);
+  });
+});
+
+/**
  * History fallback must stay bounded.
  *
  * The per-ticker fallback is sequential with a 1.5s sleep between calls, and

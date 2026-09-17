@@ -14,7 +14,7 @@ In a Tauri build, the bar has `data-tauri-drag-region` for window drag and rende
 | `syncColor` | `"green" \| "red" \| "amber" \| "gray"` | `"green"` | Maps to `<Dot color>` |
 | `onMin` | `() => void` | — | Minimize handler (Tauri only) |
 | `onClose` | `() => void` | — | Close handler (Tauri only) |
-| `version` | `string` | `"v2.0.1"` | Shown after `wallet · ` |
+| `version` | `string` | `formatAppVersion()` (this build, from `package.json`, e.g. `"v0.6.3"`) | Shown after `wallet · ` |
 | `middle` | `ReactNode` | — | Optional middle slot (e.g. breadcrumb) |
 
 ## Behaviors

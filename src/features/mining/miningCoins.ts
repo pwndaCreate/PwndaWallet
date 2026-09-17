@@ -14,19 +14,38 @@
  * array's first three ARE the three a fresh user sees without an extra click.
  *
  * As of 2026-08-29: XMR, ZANO, ZEPH lead — the pwnda-pool-backed coins (see
- * `HOUSE_DEFAULT_POOL` in `pools.ts`) — followed by the remaining GPU coins.
+ * `HOUSE_DEFAULT_POOL` in `pools.ts`) — followed by the remaining coins.
  * RVN/CFX/ERG moving behind the fold is intentional, not a demotion by
- * omission: they are still fully mineable via "3 more ▾", same as ZANO was
- * before this change.
+ * omission: they are still fully mineable via "N more ▾", same as ZANO was
+ * before that change. XEL (added 2026-09-15) is the first coin behind the
+ * fold. It gained a house pool on 2026-09-16 (`pwnda-xelis`) and was left
+ * here: the top three are full, and which coin gives up its slot is the
+ * operator's call.
  */
 import type { ChainType } from "../../wallets";
+import type {
+  CpuAlgorithm,
+  GpuAlgorithm,
+  MiningHardware,
+} from "../../types/mining";
+
+/**
+ * The algorithm each lane mines a coin with. A present key means the coin
+ * mines on that lane.
+ *
+ * The union makes "at least one lane" a type fact: `{}` does not type-check.
+ */
+export type LaneAlgorithms =
+  | { cpu: CpuAlgorithm; gpu?: GpuAlgorithm }
+  | { cpu?: CpuAlgorithm; gpu: GpuAlgorithm };
 
 export interface MiningCoinOption {
   sym: string;
   chain: ChainType;
+  /** Display label for the coin's algorithm. */
   algo: string;
   /**
-   * Which lane mines this coin.
+   * Which lanes mine this coin, and with which algorithm on each.
    *
    * Declared per coin rather than inferred at each call site. Until
    * 2026-08-28 four separate places asked
@@ -34,29 +53,77 @@ export interface MiningCoinOption {
    * ZANO put a GPU coin outside all four lists at once: picking it left the
    * hardware on CPU, so the pool lookup asked for `zano/randomx`, found
    * nothing, and the console showed "No pools for this coin/algo" and
-   * "Setup miners first" for a coin that was perfectly mineable. A required
-   * field makes the next coin declare its lane instead of inheriting a
-   * silent default.
+   * "Setup miners first" for a coin that was perfectly mineable.
+   *
+   * 2026-09-15: this replaced a single `hardware: "cpu" | "gpu"` field, which
+   * could not describe Xelis — a coin that mines on BOTH lanes at once, as two
+   * separate SRBMiner processes. Carrying the algorithm per lane also removes
+   * the coin→algorithm if/else chains `useMiner` used to keep in sync by hand.
    */
-  hardware: "cpu" | "gpu";
+  algorithms: LaneAlgorithms;
 }
 
-export const MINING_COINS: MiningCoinOption[] = [
-  { sym: "XMR",  chain: "monero",    algo: "RandomX",    hardware: "cpu" },
-  { sym: "ZANO", chain: "zano",      algo: "ProgPowZ",   hardware: "gpu" },
-  { sym: "ZEPH", chain: "zephyr",    algo: "RandomX",    hardware: "cpu" },
-  { sym: "RVN",  chain: "ravencoin", algo: "KAWPOW",     hardware: "gpu" },
-  { sym: "CFX",  chain: "conflux",   algo: "Octopus",    hardware: "gpu" },
-  { sym: "ERG",  chain: "ergo",      algo: "Autolykos2", hardware: "gpu" },
+export const MINING_COINS: readonly MiningCoinOption[] = [
+  { sym: "XMR",  chain: "monero",    algo: "RandomX",      algorithms: { cpu: "randomx" } },
+  { sym: "ZANO", chain: "zano",      algo: "ProgPowZ",     algorithms: { gpu: "progpowz" } },
+  { sym: "ZEPH", chain: "zephyr",    algo: "RandomX",      algorithms: { cpu: "randomx" } },
+  { sym: "XEL",  chain: "xelis",     algo: "XelisHash v3", algorithms: { cpu: "xelishashv3", gpu: "xelishashv3" } },
+  { sym: "RVN",  chain: "ravencoin", algo: "KAWPOW",       algorithms: { gpu: "kawpow" } },
+  { sym: "CFX",  chain: "conflux",   algo: "Octopus",      algorithms: { gpu: "octopus" } },
+  { sym: "ERG",  chain: "ergo",      algo: "Autolykos2",   algorithms: { gpu: "autolykos" } },
 ];
 
+const LANE_ORDER: readonly MiningHardware[] = ["cpu", "gpu"];
+
+function findCoin(chain: ChainType): MiningCoinOption | undefined {
+  return MINING_COINS.find((c) => c.chain === chain);
+}
+
 /**
- * Which lane mines this coin. `true` = GPU.
+ * The lanes that can mine this coin, CPU first.
  *
- * The single answer to a question four call sites used to answer for
- * themselves with a hardcoded ticker list. An unknown coin is treated as CPU
- * — the conservative direction, since a CPU lane always exists.
+ * An unknown coin is treated as CPU-only — the conservative direction, since
+ * a CPU lane always exists. (`algorithmFor` still returns `null` for it, so
+ * nothing can actually start mining an unrostered coin.)
  */
-export function isGpuCoin(chain: ChainType): boolean {
-  return MINING_COINS.find((c) => c.chain === chain)?.hardware === "gpu";
+export function coinLanes(chain: ChainType): readonly MiningHardware[] {
+  const coin = findCoin(chain);
+  if (!coin) return ["cpu"];
+  return LANE_ORDER.filter((lane) => coin.algorithms[lane] !== undefined);
+}
+
+/** Whether `lane` can mine `chain`. */
+export function coinMinesOn(chain: ChainType, lane: MiningHardware): boolean {
+  return coinLanes(chain).includes(lane);
+}
+
+/** True for a coin that mines on both lanes (XEL). */
+export function isDualLaneCoin(chain: ChainType): boolean {
+  return coinLanes(chain).length > 1;
+}
+
+/**
+ * The algorithm `lane` mines `chain` with, or `null` when that lane cannot mine
+ * it (or the coin is not on the roster).
+ */
+export function algorithmFor(chain: ChainType, lane: "cpu"): CpuAlgorithm | null;
+export function algorithmFor(chain: ChainType, lane: "gpu"): GpuAlgorithm | null;
+export function algorithmFor(
+  chain: ChainType,
+  lane: MiningHardware,
+): CpuAlgorithm | GpuAlgorithm | null;
+export function algorithmFor(
+  chain: ChainType,
+  lane: MiningHardware,
+): CpuAlgorithm | GpuAlgorithm | null {
+  const coin = findCoin(chain);
+  if (!coin) return null;
+  return (lane === "cpu" ? coin.algorithms.cpu : coin.algorithms.gpu) ?? null;
+}
+
+/** `"CPU"`, `"GPU"` or `"CPU/GPU"` — for tooltips and row captions. */
+export function lanesLabel(chain: ChainType): string {
+  return coinLanes(chain)
+    .map((lane) => lane.toUpperCase())
+    .join("/");
 }

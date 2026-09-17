@@ -2,6 +2,7 @@ import { Card } from "../../components/PrimitivesV2";
 import { explorerTxUrl } from "../../wallets/explorers";
 import type { ChainTx, ChainType } from "../../wallets";
 import { getAdapter } from "../../wallets";
+import { txDisplayTicker } from "../../wallets/tx-display";
 import { openExternal } from "../../utils/openExternal";
 
 /**
@@ -16,6 +17,10 @@ import { openExternal } from "../../utils/openExternal";
  * Click-to-explorer behaviour matches the landscape ActivityView:
  *   - click txid → open in chain explorer (or fall back to copy)
  *   - shift-click txid → copy
+ *
+ * Amounts carry the ticker of the asset the row moved (`txDisplayTicker`):
+ * a Zephyr row can be ZEPH, ZEPHUSD, ZEPHRSV or ZEPHYRS, and until 2026-09-15
+ * every one of them was printed as ZEPH.
  */
 
 export function ChainTxCard({
@@ -86,7 +91,7 @@ export function ChainTxCard({
                   </span>
                   <span style={{ fontWeight: "bold" }}>
                     {isIn ? "+" : "-"}
-                    {tx.amount} {adapter.ticker}
+                    {tx.amount} {txDisplayTicker(tx, adapter.ticker)}
                   </span>
                 </div>
                 <div

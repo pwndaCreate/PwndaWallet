@@ -66,6 +66,18 @@ fn shape_for(endpoint: &str) -> SubscribeShape {
     let port = endpoint
         .rsplit_once(':')
         .and_then(|(_, p)| p.parse::<u16>().ok());
+    // XELIS subdomains (mirrors `pool_dialects::is_xelis_pool_host`, first
+    // arm of `classify_host`). Subdomain-scoped, so the brand rules below
+    // still own every other coin on the same parent domains.
+    if host == "xel.kryptex.network"
+        || (host.starts_with("xel-") && host.ends_with(".kryptex.network"))
+        || host.ends_with(".xel.k1pool.com")
+        || host.ends_with(".xel.k1pool.org")
+        || host == "xelis.herominers.com"
+        || host.ends_with(".xelis.herominers.com")
+    {
+        return SubscribeShape::Agent;
+    }
     if host.ends_with("woolypooly.com") {
         return match port {
             Some(3094) => SubscribeShape::WalletWithPass,
@@ -98,6 +110,7 @@ fn agent_for(algorithm: &str) -> &'static str {
     match algorithm.to_ascii_lowercase().as_str() {
         "kawpow" | "autolykos" | "autolykos2" => "SRBMiner-MULTI/3.1.8",
         "octopus" => "lolMiner/1.96",
+        "xelishashv3" | "xel/v3" => "SRBMiner-MULTI/3.6.2",
         _ => "PwndaWallet-smoke/1.0",
     }
 }
@@ -298,4 +311,65 @@ fn jsonrpc_field_is_present_on_v1_subscribe() {
     );
     let v = parse(&frame);
     assert_eq!(v["jsonrpc"], "2.0");
+}
+
+// ============================================================
+// XELIS stratum (2026-09-15)
+// ============================================================
+
+/// Mirrors `pool_dialects::build_xelis_subscribe`: the frame SRBMiner-MULTI
+/// 3.6.2 was captured sending for xelishashv3 through a logging relay —
+/// `{"id":1, "method":"mining.subscribe", "params":["SRBMiner-MULTI/3.6.2"]}`.
+fn build_xelis_l1_contract(algorithm: &str) -> Vec<u8> {
+    let body = serde_json::json!({
+        "id": 1,
+        "method": "mining.subscribe",
+        "params": [agent_for(algorithm)],
+    });
+    let mut bytes = serde_json::to_vec(&body).unwrap();
+    bytes.push(b'\n');
+    bytes
+}
+
+#[test]
+fn xelis_pool_hosts_classify_as_agent_subscribe() {
+    for ep in [
+        "stratum+tcp://xel.kryptex.network:7019",
+        "stratum+ssl://xel.kryptex.network:8019",
+        "stratum+tcp://eu.xel.k1pool.com:9350",
+        "stratum+tcp://eu.xel.k1pool.com:9351",
+        "stratum+ssl://eu.xel.k1pool.com:9352",
+        "stratum+tcp://de.xelis.herominers.com:1225",
+    ] {
+        assert_eq!(shape_for(ep), SubscribeShape::Agent, "{}", ep);
+    }
+    // Same brands, other coins: untouched by the XELIS rule.
+    assert_eq!(
+        shape_for("stratum+tcp://de.ravencoin.herominers.com:1140"),
+        SubscribeShape::Empty
+    );
+}
+
+#[test]
+fn xelis_l1_sends_the_agent_never_empty_params_k1pool_regression_lock() {
+    // K1Pool, 2026-09-15: a subscribe with `params: []` is answered with
+    // {"code":-3,"message":"Please update your miner software"} and the socket
+    // closes. That reply is still JSON, which the L1 acceptance rule scores as
+    // proof of life — so an Empty probe passed for the wrong reason. The probe
+    // must send the agent, exactly as SRBMiner-MULTI 3.6.2 does.
+    let v = parse(&build_xelis_l1_contract("xelishashv3"));
+    assert_eq!(v["method"], "mining.subscribe");
+    assert_eq!(v["params"], serde_json::json!(["SRBMiner-MULTI/3.6.2"]));
+    assert!(
+        v.get("jsonrpc").is_none(),
+        "SRBMiner's XELIS subscribe carries no jsonrpc field"
+    );
+}
+
+#[test]
+fn xelis_l1_frame_ends_with_newline() {
+    assert_eq!(
+        build_xelis_l1_contract("xelishashv3").last().copied(),
+        Some(b'\n')
+    );
 }

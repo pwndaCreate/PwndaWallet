@@ -70,6 +70,15 @@ pub struct MinerHandle(pub Mutex<Option<ElevatedHandle>>);
 /// Global state to hold the running GPU miner process (SRBMiner or lolMiner)
 pub struct GpuMinerProcess(pub Mutex<Option<tokio::process::Child>>);
 
+/// The SRBMiner-MULTI **CPU lane** process (XelisHash v3). Added 2026-09-15.
+///
+/// Its own slot — not `MinerProcess` (xmrig's elevated watcher) and not
+/// `GpuMinerProcess` — so XEL-on-CPU and any GPU session (XEL included) run as
+/// two independent SRBMiner processes. Every stop path takes the `Child` out of
+/// THIS slot and kills that handle; nothing in this module kills SRBMiner by
+/// image name, which would take the other lane down with it.
+pub struct SrbCpuMinerProcess(pub Mutex<Option<tokio::process::Child>>);
+
 /// 2026-05-18 — paths to the active miner-process log files (the
 /// miner's OWN log output, written by the miner itself via its
 /// `--log-file` / `--logfile` flag). Captures what the miner thinks
@@ -105,14 +114,19 @@ pub(crate) fn miner_logging_active() -> bool {
 /// Which mining lane a death-watch task monitors.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MinerLane {
+    /// xmrig (RandomX), elevated on Windows.
     Cpu,
+    /// SRBMiner-MULTI's CPU lane (XelisHash v3), unelevated. Reported to the
+    /// frontend as `"cpu"` as well — it IS the CPU lane; which binary runs it
+    /// is the backend's business.
+    CpuSrb,
     Gpu,
 }
 
 impl MinerLane {
     fn as_str(self) -> &'static str {
         match self {
-            MinerLane::Cpu => "cpu",
+            MinerLane::Cpu | MinerLane::CpuSrb => "cpu",
             MinerLane::Gpu => "gpu",
         }
     }
@@ -154,6 +168,23 @@ fn poll_lane(app: &AppHandle, lane: MinerLane) -> LaneState {
             // child, so ITS exit is exactly "the elevated xmrig exited".
             let proc_state = app.state::<MinerProcess>();
             let mut guard = match proc_state.0.lock() {
+                Ok(g) => g,
+                Err(_) => return LaneState::Running,
+            };
+            match guard.as_mut() {
+                None => LaneState::UserStopped,
+                Some(child) => match child.try_wait() {
+                    Ok(Some(_)) => LaneState::Died,
+                    _ => LaneState::Running,
+                },
+            }
+        }
+        MinerLane::CpuSrb => {
+            // `stop_srbminer_cpu` takes the child out of its slot before
+            // killing it — the same "empty slot = intentional stop" rule the
+            // GPU lane uses below.
+            let state = app.state::<SrbCpuMinerProcess>();
+            let mut guard = match state.0.lock() {
                 Ok(g) => g,
                 Err(_) => return LaneState::Running,
             };
@@ -226,6 +257,13 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
                             let pid_state = app.state::<MinerPid>();
                             let pid_lock = pid_state.0.lock();
                             if let Ok(mut g) = pid_lock {
+                                *g = None;
+                            }
+                        }
+                        MinerLane::CpuSrb => {
+                            let srb_state = app.state::<SrbCpuMinerProcess>();
+                            let srb_lock = srb_state.0.lock();
+                            if let Ok(mut g) = srb_lock {
                                 *g = None;
                             }
                         }
@@ -340,23 +378,68 @@ static XMRIG_API_PORT: std::sync::atomic::AtomicU16 =
 /// TOCTOU window between this probe and xmrig's bind is acceptable for a
 /// loopback monitoring socket.
 fn pick_xmrig_http_port() -> u16 {
-    use std::net::TcpListener;
-    if TcpListener::bind(("127.0.0.1", XMRIG_HTTP_PORT)).is_ok() {
-        return XMRIG_HTTP_PORT;
-    }
-    TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|a| a.port())
-        .unwrap_or(XMRIG_HTTP_PORT)
+    pick_loopback_api_port(XMRIG_HTTP_PORT, &[])
 }
 
-/// Fixed HTTP API port for the GPU miner (SRBMiner or lolMiner). Picked
+/// Pick a loopback port a miner's stats API can actually bind: `preferred`
+/// when a bind to it succeeds and it is not in `avoid`, otherwise an
+/// OS-assigned free port that is not in `avoid`.
+///
+/// A failed bind is not only "an orphan miner is squatting on it" (the
+/// 2026-06-30 xmrig case). On Windows with Hyper-V / WSL2 / Docker, whole port
+/// RANGES are reserved by the OS (`netsh interface ipv4 show excludedportrange
+/// protocol=tcp`), re-drawn at boot, and a bind inside one fails with
+/// WSAEACCES although nothing is listening. On the dev box on 2026-09-15 the
+/// range 21515–21614 was reserved; it contains `GPU_HTTP_PORT` (21558), so
+/// SRBMiner logged `HTTP API enabled on port …` and then `API daemon failed to
+/// start`, and every stats poll came back empty while the miner hashed
+/// normally. An OS-assigned port is never handed out from an excluded range.
+///
+/// `avoid` keeps two lanes resolving at the same moment from both falling back
+/// to one ephemeral port.
+pub(crate) fn pick_loopback_api_port(preferred: u16, avoid: &[u16]) -> u16 {
+    use std::net::TcpListener;
+    if !avoid.contains(&preferred) && TcpListener::bind(("127.0.0.1", preferred)).is_ok() {
+        return preferred;
+    }
+    for _ in 0..8 {
+        let candidate = TcpListener::bind(("127.0.0.1", 0))
+            .ok()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.port());
+        match candidate {
+            Some(port) if !avoid.contains(&port) => return port,
+            Some(_) => continue,
+            None => break,
+        }
+    }
+    preferred
+}
+
+/// PREFERRED HTTP API port for the GPU miner (SRBMiner or lolMiner). Picked
 /// to avoid SRBMiner's default 21550 in case the user has another tool
 /// already bound there. Both miners are launched with `--apiport=...`
-/// (lolMiner) or `--api-enable --api-port=...` (SRBMiner) referencing
-/// this port; `get_gpu_miner_hashrate` polls the same port for either.
+/// (lolMiner) or `--api-enable --api-port=...` (SRBMiner).
+///
+/// Since 2026-09-15 this is only a preference: each launch resolves it through
+/// [`pick_loopback_api_port`] and records the port it really used in
+/// [`GPU_API_PORT`], which `get_gpu_miner_hashrate` / `get_gpu_miner_snapshot`
+/// poll. See that function for the excluded-port-range failure that made a
+/// fixed port wrong.
 pub const GPU_HTTP_PORT: u16 = 21558;
+
+/// The API port the CURRENT GPU miner session was launched with.
+static GPU_API_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(GPU_HTTP_PORT);
+
+/// PREFERRED API port for the SRBMiner-MULTI CPU lane (XelisHash v3) — a
+/// different one from the GPU lane's, since the two run concurrently. Resolved
+/// per launch exactly like the GPU port.
+pub const SRB_CPU_HTTP_PORT: u16 = 21559;
+
+/// The API port the CURRENT SRBMiner CPU-lane session was launched with.
+static SRB_CPU_API_PORT: std::sync::atomic::AtomicU16 =
+    std::sync::atomic::AtomicU16::new(SRB_CPU_HTTP_PORT);
 
 /// MSR status for frontend
 #[derive(Clone, Serialize)]
@@ -1868,6 +1951,29 @@ pub struct CpuThreadArgs {
     pub cpu_priority: Option<u8>,
 }
 
+/// Clamp an explicit thread count from the UI's thread slider to
+/// `1..=logical`. `logical == 0` means detection failed: the count is then
+/// only floored at 1, never guessed at from nothing. Shared by both CPU miners
+/// (xmrig `-t, --threads=N`; SRBMiner `--cpu-threads`).
+pub(crate) fn clamp_cpu_thread_count(threads: usize, logical: usize) -> usize {
+    let n = threads.max(1);
+    if logical > 0 {
+        n.min(logical)
+    } else {
+        n
+    }
+}
+
+/// Whether an explicit thread count is a "background" footprint that should
+/// also lower scheduling priority: at most `max(2, logical / 4)` threads and
+/// fewer than all of them. This keeps the old LOW tier's behaviour (2 threads
+/// at lowered priority on any machine) for every slider position near it.
+/// Mirrored by `miningTuning.ts::cpuThreadsLowPriority`.
+pub(crate) fn cpu_threads_low_priority(threads: usize, logical: usize) -> bool {
+    let below_all = logical == 0 || threads < logical;
+    below_all && threads <= std::cmp::max(2, logical / 4)
+}
+
 /// Append the CPU thread-selection flags described by [`CpuThreadArgs`] to
 /// an xmrig argv. Pure function — no spawn/state — so it's covered by
 /// `cpu_thread_args_tests` below without needing a real xmrig binary.
@@ -1977,6 +2083,33 @@ mod cpu_thread_args_tests {
             },
         );
         assert_eq!(args2, vec!["--cpu-max-threads-hint=100"]);
+    }
+
+    #[test]
+    fn slider_thread_count_is_clamped_to_the_detected_processors() {
+        use super::clamp_cpu_thread_count;
+        assert_eq!(clamp_cpu_thread_count(0, 32), 1);
+        assert_eq!(clamp_cpu_thread_count(12, 32), 12);
+        assert_eq!(clamp_cpu_thread_count(64, 32), 32);
+        // Detection failed: floor only, never an invented ceiling.
+        assert_eq!(clamp_cpu_thread_count(64, 0), 64);
+        assert_eq!(clamp_cpu_thread_count(0, 0), 1);
+    }
+
+    #[test]
+    fn only_a_small_partial_footprint_lowers_priority() {
+        use super::cpu_threads_low_priority;
+        // The old LOW tier: 2 threads, lowered, on any machine with more.
+        assert!(cpu_threads_low_priority(2, 32));
+        assert!(cpu_threads_low_priority(2, 4));
+        assert!(cpu_threads_low_priority(8, 32));
+        assert!(!cpu_threads_low_priority(9, 32));
+        // All threads is never "background", however small the CPU.
+        assert!(!cpu_threads_low_priority(2, 2));
+        assert!(!cpu_threads_low_priority(32, 32));
+        // Unknown core count: the fixed floor of 2 still applies.
+        assert!(cpu_threads_low_priority(2, 0));
+        assert!(!cpu_threads_low_priority(3, 0));
     }
 
     #[test]
@@ -2091,6 +2224,28 @@ pub async fn start_xmrig(
         }
     } // MutexGuard dropped here
 
+    // …and refuse while the OTHER CPU backend holds the lane. There is one
+    // CPU lane and one CPU session; without this, starting RandomX during a
+    // XelisHash session would run two CPU miners that each think they own
+    // every core, and the frontend (which tracks one CPU session) would show
+    // one of them. The mirror of this check lives in `start_srbminer_cpu`.
+    {
+        let state = app.state::<SrbCpuMinerProcess>();
+        let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref mut child) = *process {
+            match child.try_wait() {
+                Ok(Some(_)) => *process = None,
+                Ok(None) => {
+                    return Err(
+                        "The CPU is already mining with SRBMiner. Stop that session first."
+                            .to_string(),
+                    )
+                }
+                Err(_) => *process = None,
+            }
+        }
+    } // MutexGuard dropped here
+
     // -------------------------------------------------------------------
     // Direct pool connection. The dev-fee stratum proxy was removed
     // 2026-07-06 (pure-wallet cutover) — xmrig connects straight to the
@@ -2183,6 +2338,13 @@ pub async fn start_xmrig(
     xmrig_args.push("--retry-pause=1".to_string());
     xmrig_args.push("--retries=100".to_string());
 
+    // The thread slider sends an exact count; never hand xmrig more threads
+    // than the machine has (a stale persisted value from a bigger CPU, or a
+    // caller bug). Detection only runs when a count was actually sent.
+    let threads = match threads {
+        Some(n) if n > 0 => Some(clamp_cpu_thread_count(n, detect_logical_processors().await)),
+        other => other,
+    };
     push_cpu_thread_args(
         &mut xmrig_args,
         CpuThreadArgs {
@@ -2468,21 +2630,15 @@ pub async fn stop_xmrig(app: AppHandle, reason: Option<String>) -> Result<(), St
 ///   conversion per algorithm.
 ///
 /// Returns Some(H/s) when hashrate > 0, None if API unreachable or no shares yet.
+///
+/// Polls the port the current session actually bound ([`GPU_API_PORT`]), not
+/// the fixed preference — see [`pick_loopback_api_port`].
 #[tauri::command]
 pub async fn get_gpu_miner_hashrate(miner: String) -> Result<Option<f64>, String> {
-    let url = format!("http://127.0.0.1:{}", GPU_HTTP_PORT);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("HTTP client: {}", e))?;
-    let res = match client.get(&url).send().await {
-        Ok(r) if r.status().is_success() => r,
-        _ => return Ok(None),
-    };
-    let body = res.text().await.map_err(|e| format!("Body: {}", e))?;
-    let v: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(j) => j,
-        Err(_) => return Ok(None),
+    let port = GPU_API_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let v = match fetch_miner_api_json(port).await? {
+        Some(v) => v,
+        None => return Ok(None),
     };
 
     let h = if miner == "lolMiner" {
@@ -2492,39 +2648,19 @@ pub async fn get_gpu_miner_hashrate(miner: String) -> Result<Option<f64>, String
         perf * factor
     } else {
         // Default branch covers "SRBMiner-MULTI" and any other JSON of that shape
-        let algo = &v["algorithms"][0]["hashrate"];
-        let one_min = algo["1min"].as_f64().unwrap_or(0.0);
-        if one_min > 0.0 {
-            one_min
-        } else {
-            algo["gpu"]["total"].as_f64().unwrap_or(0.0)
-        }
+        parse_srbminer_api(&v, SrbLane::Gpu).hashrate.unwrap_or(0.0)
     };
 
     Ok(if h > 0.0 { Some(h) } else { None })
 }
 
-/// Snapshot of session-scope numbers from a GPU miner's HTTP API. Same
-/// shape as `XmrigSnapshot` so the JS-side hook can treat both miners
-/// uniformly. Pool diff is exposed by both SRBMiner and lolMiner; ping
-/// is not, so `ping_ms` here is always None — the JS layer falls back
-/// to the pre-mine TCP-probe latency for that field on GPU.
-#[derive(Serialize, Default)]
-pub struct GpuMinerSnapshot {
-    pub hashrate: Option<f64>,
-    pub accepted: u64,
-    pub rejected: u64,
-    pub diff_current: Option<u64>,
-    pub uptime_secs: u64,
-}
-
-/// Snapshot fetch for SRBMiner-MULTI / lolMiner. Uses the same single-
-/// HTTP-call pattern as `get_xmrig_snapshot`. SRBMiner exposes a
-/// flatter `algorithms[0]` shape; lolMiner uses `Session.*` fields.
-/// Pool diff lives at different paths per miner — handled inline.
-#[tauri::command]
-pub async fn get_gpu_miner_snapshot(miner: String) -> Result<Option<GpuMinerSnapshot>, String> {
-    let url = format!("http://127.0.0.1:{}", GPU_HTTP_PORT);
+/// GET `http://127.0.0.1:<port>/` and parse the body as JSON.
+///
+/// `Ok(None)` when the API is unreachable, answers non-2xx, or returns
+/// something that is not JSON: every stats poll treats absence as "keep the
+/// last snapshot" rather than an error.
+async fn fetch_miner_api_json(port: u16) -> Result<Option<serde_json::Value>, String> {
+    let url = format!("http://127.0.0.1:{}", port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(2))
         .build()
@@ -2534,9 +2670,37 @@ pub async fn get_gpu_miner_snapshot(miner: String) -> Result<Option<GpuMinerSnap
         _ => return Ok(None),
     };
     let body = res.text().await.map_err(|e| format!("Body: {}", e))?;
-    let v: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(j) => j,
-        Err(_) => return Ok(None),
+    Ok(serde_json::from_str(&body).ok())
+}
+
+/// Snapshot of session-scope numbers from a GPU miner's HTTP API. Same
+/// shape as `XmrigSnapshot` so the JS-side hook can treat both miners
+/// uniformly.
+///
+/// `ping_ms` (2026-09-15): SRBMiner DOES report its pool latency
+/// (`algorithms[0].pool.latency`, captured live), so SRBMiner sessions fill
+/// it; lolMiner exposes none and leaves it `None`, where the JS layer falls
+/// back to the pre-mine TCP-probe latency.
+#[derive(Serialize, Default)]
+pub struct GpuMinerSnapshot {
+    pub hashrate: Option<f64>,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub diff_current: Option<u64>,
+    pub uptime_secs: u64,
+    pub ping_ms: Option<u64>,
+}
+
+/// Snapshot fetch for SRBMiner-MULTI / lolMiner. Uses the same single-
+/// HTTP-call pattern as `get_xmrig_snapshot`. SRBMiner exposes a
+/// flatter `algorithms[0]` shape; lolMiner uses `Session.*` fields.
+/// Pool diff lives at different paths per miner — handled inline.
+#[tauri::command]
+pub async fn get_gpu_miner_snapshot(miner: String) -> Result<Option<GpuMinerSnapshot>, String> {
+    let port = GPU_API_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let v = match fetch_miner_api_json(port).await? {
+        Some(v) => v,
+        None => return Ok(None),
     };
 
     if miner == "lolMiner" {
@@ -2618,47 +2782,29 @@ pub async fn get_gpu_miner_snapshot(miner: String) -> Result<Option<GpuMinerSnap
             accepted,
             rejected,
             diff_current,
+            // lolMiner's API exposes no stratum latency, so the frontend
+            // falls back to its own TCP probe of the active pool.
+            ping_ms: None,
             uptime_secs,
         }));
     }
 
-    // Default branch — SRBMiner-MULTI shape:
-    //   algorithms[0].hashrate.{1min, gpu.total}
-    //   algorithms[0].shares.{accepted, rejected}
-    //   algorithms[0].difficulty
-    //   algorithms[0].mining_started (unix seconds, sometimes "uptime")
-    let algo = &v["algorithms"][0];
-    let one_min = algo["hashrate"]["1min"].as_f64().unwrap_or(0.0);
-    let h = if one_min > 0.0 {
-        one_min
-    } else {
-        algo["hashrate"]["gpu"]["total"].as_f64().unwrap_or(0.0)
-    };
-    let accepted = algo["shares"]["accepted"].as_u64().unwrap_or(0);
-    let rejected = algo["shares"]["rejected"].as_u64().unwrap_or(0);
-    let diff_current = algo["difficulty"]
-        .as_u64()
-        .or_else(|| algo["pool_difficulty"].as_u64());
-    let uptime_secs = algo["uptime"]
-        .as_u64()
-        .or_else(|| {
-            // Some SRBMiner builds expose mining_started (epoch sec) instead;
-            // compute uptime by diffing against now.
-            let started = algo["mining_started"].as_u64()?;
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .ok()?
-                .as_secs();
-            Some(now.saturating_sub(started))
-        })
-        .unwrap_or(0);
-
+    // Default branch — SRBMiner-MULTI. Shares ONE parser with the CPU lane
+    // and `get_gpu_miner_hashrate` (`parse_srbminer_api`), which is what
+    // fixed the paths this branch used to read: `algorithms[0].difficulty`
+    // and `algorithms[0].uptime`/`mining_started` do not exist in SRBMiner
+    // 3.6.2's document — the real ones are `pool.difficulty` (a FLOAT, so
+    // `as_u64()` returned None) and `pool.uptime`. POOL DIFF therefore
+    // rendered "—" for every SRBMiner session, and uptime stayed 0, which
+    // also kept shares/min (gated on uptime ≥ 30 s) permanently null.
+    let s = parse_srbminer_api(&v, SrbLane::Gpu);
     Ok(Some(GpuMinerSnapshot {
-        hashrate: if h > 0.0 { Some(h) } else { None },
-        accepted,
-        rejected,
-        diff_current,
-        uptime_secs,
+        hashrate: s.hashrate,
+        accepted: s.accepted,
+        rejected: s.rejected,
+        diff_current: s.diff_current,
+        ping_ms: s.ping_ms,
+        uptime_secs: s.uptime_secs,
     }))
 }
 
@@ -3154,6 +3300,16 @@ pub async fn run_gpu_miner_benchmark(
         ));
     }
 
+    // Same translation as the mining path: the app's index is not the
+    // miner's device id.
+    let gpu_index = match gpu_index {
+        None => None,
+        Some(i) => resolve_miner_gpu_ids(&exe_path, &miner, &miners_dir, Some(&[i][..]))
+            .await
+            .map_err(|e| format!("GPU selection: {}", e))?
+            .and_then(|ids| ids.first().copied()),
+    };
+
     #[cfg(target_os = "windows")]
     let mut cmd = hidden_command(exe_path.to_string_lossy().as_ref());
     #[cfg(not(target_os = "windows"))]
@@ -3355,6 +3511,299 @@ pub async fn run_gpu_miner_benchmark(
 ///   It keyed the dev-fee wallet registry + GPU time-slice scheduler,
 ///   both removed 2026-07-06 (pure-wallet cutover). The GPU miner now
 ///   connects direct to the user's pool with the user's own wallet.
+// =========================================================================
+// GPU selection → the miner's OWN device ids
+// =========================================================================
+//
+// Reported 2026-09-16: the picker showed "GPU 0 · RTX 5060 Ti", the operator
+// left it there, and the session mined on the RX 6700 XT. The app's index is a
+// position in `get_gpu_info` (Windows registry order: 5060 Ti = 0), and it was
+// passed to the miner verbatim. The two miners number the same two cards
+// differently — captured on the dev box with the pinned binaries:
+//
+//   SRBMiner 3.6.2 --list-devices    (OpenCL devices first, then CUDA)
+//     GPU0  [0][0] [06:00.0] : amd_radeon_rx_6700_xt [gfx1031] [12272 MB] ...
+//     GPU1  [CUDA][0] [0000:01:00.0] : nvidia_geforce_rtx_5060_ti [blackwell] ...
+//   lolMiner 1.98a --list-devices    (CUDA first)
+//     Device 0: Name: NVIDIA GeForce RTX 5060 Ti   Address: 1:0
+//     Device 1: Name: Radeon RX 6700XT             Address: 6:0
+//
+// So `--gpu-id 0` meant the 6700 XT to SRBMiner. Selected cards are now
+// matched by model and vendor against the miner's own list and translated to
+// its id; a card that cannot be matched refuses to start rather than mining on
+// another one.
+
+/// One GPU as a miner enumerates it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MinerGpuDevice {
+    /// The id the miner's own device flag takes.
+    pub id: u32,
+    pub name: String,
+    /// "nvidia" | "amd" | "intel" | "other", as `device_info` spells it.
+    pub vendor: String,
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for n in chars.by_ref() {
+                    if n.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn vendor_from_text(text: &str) -> String {
+    let l = text.to_ascii_lowercase();
+    if l.contains("nvidia") || l.contains("geforce") || l.contains("cuda") {
+        "nvidia".into()
+    } else if l.contains("amd") || l.contains("radeon") || l.contains("advanced micro") {
+        "amd".into()
+    } else if l.contains("intel") {
+        "intel".into()
+    } else {
+        "other".into()
+    }
+}
+
+/// Parse `SRBMiner-MULTI --list-devices`. Lines look like
+/// `GPU1  [CUDA][0] [0000:01:00.0] : nvidia_geforce_rtx_5060_ti [blackwell] ...`
+/// under `OPENCL devices` / `CUDA devices` headers.
+pub fn parse_srbminer_list_devices(output: &str) -> Vec<MinerGpuDevice> {
+    let mut section = String::new();
+    let mut out = Vec::new();
+    for line in strip_ansi(output).lines() {
+        let t = line.trim();
+        if t.ends_with("devices") && !t.starts_with("GPU") {
+            section = t.to_ascii_lowercase();
+            continue;
+        }
+        let Some(rest) = t.strip_prefix("GPU") else { continue };
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        let Ok(id) = digits.parse::<u32>() else { continue };
+        let Some((_, after)) = rest.split_once(" : ") else { continue };
+        let name = after.split_whitespace().next().unwrap_or("").to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let mut vendor = vendor_from_text(&name);
+        if vendor == "other" && section.contains("cuda") {
+            vendor = "nvidia".into();
+        }
+        out.push(MinerGpuDevice { id, name, vendor });
+    }
+    out
+}
+
+/// Parse `lolMiner --list-devices`: `Device N:` blocks with `Name:` and
+/// `Vendor:` lines.
+pub fn parse_lolminer_list_devices(output: &str) -> Vec<MinerGpuDevice> {
+    let mut out: Vec<MinerGpuDevice> = Vec::new();
+    for line in strip_ansi(output).lines() {
+        let t = line.trim();
+        if let Some(rest) = t.strip_prefix("Device ") {
+            if let Some(num) = rest.strip_suffix(':') {
+                if let Ok(id) = num.trim().parse::<u32>() {
+                    out.push(MinerGpuDevice { id, name: String::new(), vendor: "other".into() });
+                }
+            }
+            continue;
+        }
+        let Some(cur) = out.last_mut() else { continue };
+        if let Some(v) = t.strip_prefix("Name:") {
+            cur.name = v.trim().to_string();
+            if cur.vendor == "other" {
+                cur.vendor = vendor_from_text(&cur.name);
+            }
+        } else if let Some(v) = t.strip_prefix("Vendor:") {
+            let from_vendor = vendor_from_text(v);
+            if from_vendor != "other" {
+                cur.vendor = from_vendor;
+            }
+        }
+    }
+    out.retain(|d| !d.name.is_empty());
+    out
+}
+
+/// A GPU model reduced to what both miners and the OS agree on:
+/// `NVIDIA GeForce RTX 5060 Ti`, `nvidia_geforce_rtx_5060_ti` → `rtx5060ti`;
+/// `AMD Radeon RX 6700 XT`, `Radeon RX 6700XT` → `rx6700xt`.
+pub fn gpu_model_key(name: &str) -> String {
+    const NOISE: &[&str] = &[
+        "nvidia", "geforce", "amd", "ati", "radeon", "intel", "corporation", "tm", "r",
+        "advanced", "micro", "devices", "inc", "graphics",
+    ];
+    let lowered = name.to_ascii_lowercase();
+    let spaced: String = lowered
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { ' ' })
+        .collect();
+    spaced
+        .split_whitespace()
+        .filter(|w| !NOISE.contains(w))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+/// Translate app GPU indices (positions in `app_gpus`, i.e. `get_gpu_info`)
+/// into the miner's own ids.
+///
+/// Per selected card, the first tier with any candidate wins:
+/// 1. same vendor and the same [`gpu_model_key`];
+/// 2. same vendor and one key containing the other (Linux names carry the
+///    chip code: `AD106 [GeForce RTX 4060 Ti]`);
+/// 3. same vendor, when app and miner see the same number of that vendor's
+///    cards — matched by order.
+///
+/// Identical cards are matched in order (the k-th such card in the app list
+/// takes the k-th candidate). Anything unmatched, or two selections landing on
+/// one device, is an error.
+pub fn map_gpu_indices_to_miner(
+    app_gpus: &[crate::device_info::GpuInfo],
+    selected: &[u32],
+    miner_devices: &[MinerGpuDevice],
+) -> Result<Vec<u32>, String> {
+    let mut mapped: Vec<u32> = Vec::new();
+    for &sel in selected {
+        let target = app_gpus
+            .get(sel as usize)
+            .ok_or_else(|| format!("GPU {} is not in the detected device list", sel))?;
+        let t_key = gpu_model_key(&target.name);
+        let same_vendor = |d: &&MinerGpuDevice| d.vendor == target.vendor;
+        // How many earlier app cards would compete for the same candidates.
+        let rank_among = |pred: &dyn Fn(&crate::device_info::GpuInfo) -> bool| {
+            app_gpus[..sel as usize].iter().filter(|g| pred(g)).count()
+        };
+
+        let exact: Vec<&MinerGpuDevice> = miner_devices
+            .iter()
+            .filter(same_vendor)
+            .filter(|d| gpu_model_key(&d.name) == t_key)
+            .collect();
+        let pick = if !exact.is_empty() {
+            let k = rank_among(&|g| g.vendor == target.vendor && gpu_model_key(&g.name) == t_key);
+            exact.get(k).copied()
+        } else {
+            let contained: Vec<&MinerGpuDevice> = miner_devices
+                .iter()
+                .filter(same_vendor)
+                .filter(|d| {
+                    let k = gpu_model_key(&d.name);
+                    !k.is_empty() && !t_key.is_empty() && (k.contains(&t_key) || t_key.contains(&k))
+                })
+                .collect();
+            if contained.len() == 1 {
+                Some(contained[0])
+            } else {
+                let vendor_devs: Vec<&MinerGpuDevice> = miner_devices.iter().filter(same_vendor).collect();
+                let app_same = app_gpus.iter().filter(|g| g.vendor == target.vendor).count();
+                if !vendor_devs.is_empty() && vendor_devs.len() == app_same {
+                    let k = rank_among(&|g| g.vendor == target.vendor);
+                    vendor_devs.get(k).copied()
+                } else {
+                    None
+                }
+            }
+        };
+        let dev = pick.ok_or_else(|| {
+            format!(
+                "could not find the selected GPU \"{}\" in the miner's device list ({}). \
+                 Choose ALL GPUs, or check the card's driver.",
+                target.name,
+                miner_devices
+                    .iter()
+                    .map(|d| format!("{}={}", d.id, d.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        })?;
+        if mapped.contains(&dev.id) {
+            return Err(format!(
+                "two selected GPUs resolved to the same miner device {} ({})",
+                dev.id, dev.name
+            ));
+        }
+        mapped.push(dev.id);
+    }
+    Ok(mapped)
+}
+
+/// Run `<miner> --list-devices` (read-only; no pool, no mining) and parse it.
+async fn list_miner_gpu_devices(
+    exe_path: &std::path::Path,
+    miner: &str,
+    cwd: &std::path::Path,
+) -> Result<Vec<MinerGpuDevice>, String> {
+    #[cfg(target_os = "windows")]
+    let mut cmd = hidden_command(exe_path.to_string_lossy().as_ref());
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = tokio::process::Command::new(exe_path);
+    cmd.arg("--list-devices");
+    if miner == "lolMiner" {
+        cmd.args(["--nocolor", "on"]);
+    }
+    cmd.current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    let out = tokio::time::timeout(std::time::Duration::from_secs(30), cmd.output())
+        .await
+        .map_err(|_| format!("{} --list-devices did not finish in 30 s", miner))?
+        .map_err(|e| format!("{} --list-devices failed to run: {}", miner, e))?;
+    let text = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let devices = if miner == "lolMiner" {
+        parse_lolminer_list_devices(&text)
+    } else {
+        parse_srbminer_list_devices(&text)
+    };
+    if devices.is_empty() {
+        return Err(format!("{} --list-devices reported no GPUs", miner));
+    }
+    Ok(devices)
+}
+
+/// The miner ids for an app GPU selection. `None`/empty passes through
+/// (every GPU, no device flag). Anything else is translated, or refused.
+async fn resolve_miner_gpu_ids(
+    exe_path: &std::path::Path,
+    miner: &str,
+    cwd: &std::path::Path,
+    selected: Option<&[u32]>,
+) -> Result<Option<Vec<u32>>, String> {
+    let Some(sel) = selected.filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let app_gpus = crate::device_info::get_gpu_info()
+        .await
+        .map_err(|e| format!("could not read the GPU list to match your selection: {}", e))?;
+    let devices = list_miner_gpu_devices(exe_path, miner, cwd).await?;
+    let ids = map_gpu_indices_to_miner(&app_gpus, sel, &devices)?;
+    eprintln!(
+        "[gpu-select] {}: app GPU(s) {:?} -> miner id(s) {:?} ({})",
+        miner,
+        sel,
+        ids,
+        devices.iter().map(|d| format!("{}={}", d.id, d.name)).collect::<Vec<_>>().join(", ")
+    );
+    Ok(Some(ids))
+}
+
 #[tauri::command]
 pub async fn start_gpu_miner(
     app: AppHandle,
@@ -3366,14 +3815,18 @@ pub async fn start_gpu_miner(
     proxy: Option<String>,
     chain_ticker: Option<String>,
     // `gpu_intensity`: SRBMiner `--gpu-intensity` (None = AUTO). Frontend
-    // maps Low/Medium/Max UI buttons to 16/22/28 in useMiner.ts. Ignored
-    // for lolMiner. See [[srbminer-flags]].
+    // sends the GPU intensity slider's value (1-31; the LOW/MED/MAX presets
+    // are 16/22/28 — `miningTuning.ts`). Clamped in `srb_gpu_intensity_arg`.
+    // Ignored for lolMiner. See [[srbminer-flags]].
     gpu_intensity: Option<u32>,
     // Which physical GPU(s) to mine on — positions into the SAME device list
     // `get_gpu_info` returns. `None`/empty = every GPU (unchanged default).
-    // See `build_gpu_miner_args`'s doc comment for the full contract and the
-    // known residual risk (index alignment with the miner's OWN enumeration).
+    // Translated into the miner's own ids by `resolve_miner_gpu_ids` before
+    // `build_gpu_miner_args` sees them (the two numberings differ; 2026-09-16).
     gpu_indices: Option<Vec<u32>>,
+    // A worker name carried as its OWN stratum field rather than appended to
+    // the wallet. XELIS only — see `build_gpu_miner_args`.
+    worker: Option<String>,
 ) -> Result<(), String> {
     // RAII "already starting" sentinel — same pattern as `start_xmrig`.
     // Prevents duplicate concurrent sessions if the user click-spams
@@ -3440,6 +3893,12 @@ pub async fn start_gpu_miner(
 
     let show_miner_window = read_show_miner_window(&app);
 
+    // The app's GPU indices are positions in `get_gpu_info`; each miner
+    // numbers devices its own way. Translate before anything is spawned.
+    let gpu_indices = resolve_miner_gpu_ids(&exe_path, &miner, &miners_dir, gpu_indices.as_deref())
+        .await
+        .map_err(|e| format!("GPU selection: {}", e))?;
+
     // Spawn the miner pointed straight at the user's pool with the
     // user's wallet. No proxy wrap, no time-slice scheduler — the miner
     // owns the pool connection for the whole session.
@@ -3450,6 +3909,7 @@ pub async fn start_gpu_miner(
         &user_string,
         &algorithm,
         &pass,
+        worker.as_deref(),
         proxy.as_deref(),
         show_miner_window,
         gpu_intensity,
@@ -3464,8 +3924,8 @@ pub async fn start_gpu_miner(
 /// function — no spawn, no state. Used both by the initial start path
 /// and by the time-slice scheduler when it restarts the miner with a
 /// different wallet.
-/// `gpu_intensity` — SRBMiner `--gpu-intensity` value (0-31, or >31 = raw).
-/// `None` means "let SRBMiner pick (AUTO)". Ignored for lolMiner — it has
+/// `gpu_intensity` — SRBMiner `--gpu-intensity` value, clamped to 1-31 by
+/// [`srb_gpu_intensity_arg`]. `None` means "let SRBMiner pick (AUTO)". Ignored for lolMiner — it has
 /// no equivalent flag, so the param is silently dropped on that branch.
 /// See [[srbminer-flags]] for the full intensity-tuning reference.
 ///
@@ -3478,24 +3938,66 @@ pub async fn start_gpu_miner(
 /// miner process (and the multi-process plumbing that would need) is never
 /// required, even for "both".
 ///
-/// Indices are positions into the SAME `Vec<GpuInfo>` `get_gpu_info` (Rust)
-/// returns and the frontend's device picker renders. This is the ordering
-/// already used, unverified against the miners' own enumeration, by the
-/// existing GPU benchmark path (`run_gpu_miner_benchmark`'s `gpu_index`) — see
-/// that function's doc comment and [[srbminer-flags]] §"GPU device selection"
-/// for the residual risk (OS-level enumeration order and a miner's own
-/// CUDA/OpenCL/HIP device order are not GUARANTEED to agree) and why it is
-/// accepted here rather than solved: verified flag syntax, an existing
-/// same-shape precedent, and a request scoped to exactly this indexing.
+/// Indices here are the MINER's own device ids. Callers translate the app's
+/// `get_gpu_info` positions first with [`resolve_miner_gpu_ids`]. Until
+/// 2026-09-16 the app's positions were passed through unchanged, on the
+/// assumption that the orderings agreed. They do not: SRBMiner lists OpenCL
+/// (AMD) before CUDA (NVIDIA) and lolMiner the reverse, so on the dev box
+/// app GPU 0 (RTX 5060 Ti) became SRBMiner's RX 6700 XT.
+///
+/// `worker` — a SEPARATE worker name, for pools whose protocol carries it as
+/// its own stratum field instead of appending it to the wallet. XELIS is the
+/// only one today: its `mining.authorize` takes `[wallet, worker, pass]`, which
+/// SRBMiner fills from `--worker` (captured from a live session 2026-09-15).
+/// `None` for every other algorithm, which keeps taking `address.worker` in
+/// `user_string` exactly as before.
+///
+/// `api_port` — the miner's HTTP API port, resolved by the CALLER rather than
+/// hardcoded to [`GPU_HTTP_PORT`]. Windows reserves whole TCP ranges for
+/// Hyper-V/WSL2, and one of them (21515–21614) contains 21558: binding inside
+/// it fails with WSAEACCES although nothing is listening, so SRBMiner logged
+/// "API daemon failed to start" and every hashrate poll silently returned
+/// nothing while the miner hashed normally. See `pick_loopback_api_port`.
+/// SRBMiner-MULTI 3.6.2 `--help`: `--gpu-intensity value (gpu intensity,
+/// 0-31 or if > 31 it's treated as raw intensity, separate values with ',')`.
+///
+/// The UI only offers 1-31. Anything above 31 is clamped DOWN rather than
+/// forwarded, because SRBMiner would read it as a raw intensity (a different
+/// unit entirely) — a caller bug must not silently become a raw value. 0 is
+/// clamped up to 1: the help text lists it as valid but never says what it
+/// means, and "no flag" is already how AUTO is expressed.
+pub(crate) const SRB_GPU_INTENSITY_MIN: u32 = 1;
+pub(crate) const SRB_GPU_INTENSITY_MAX: u32 = 31;
+
+/// The `--gpu-intensity` argument value: clamped to
+/// [`SRB_GPU_INTENSITY_MIN`]..=[`SRB_GPU_INTENSITY_MAX`], and repeated once
+/// per card when the caller named 2+ cards with `--gpu-id` (the flag takes a
+/// per-device list; with an explicit list we never rely on SRBMiner's
+/// undocumented handling of a single value for several cards). With no
+/// explicit device list (every GPU) the single value is sent as before.
+pub(crate) fn srb_gpu_intensity_arg(intensity: u32, explicit_devices: usize) -> String {
+    let v = intensity
+        .clamp(SRB_GPU_INTENSITY_MIN, SRB_GPU_INTENSITY_MAX)
+        .to_string();
+    if explicit_devices > 1 {
+        vec![v; explicit_devices].join(",")
+    } else {
+        v
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_gpu_miner_args(
     miner: &str,
     pool: &str,
     user_string: &str,
     algorithm: &str,
     pass: &str,
+    worker: Option<&str>,
     socks5_proxy: Option<&str>,
     gpu_intensity: Option<u32>,
     gpu_indices: Option<&[u32]>,
+    api_port: u16,
     log_path: Option<&std::path::Path>,
 ) -> Vec<String> {
     // Shared by both branches below: empty and absent are the same "every
@@ -3522,7 +4024,7 @@ fn build_gpu_miner_args(
             "--pass".to_string(),
             pass.to_string(),
             "--apiport".to_string(),
-            GPU_HTTP_PORT.to_string(),
+            api_port.to_string(),
             "--apihost".to_string(),
             "127.0.0.1".to_string(),
             // Fast reconnect on pool-disconnect. lolMiner defaults are
@@ -3559,7 +4061,7 @@ fn build_gpu_miner_args(
         //   --wallet ADDR.WORKER   : payout address / worker
         //   --password x           : pool password (SRBMiner uses --password, not --pass)
         //   --send-stales true     : submit stale shares (prevents dropped shares on some pools)
-        //   --tls-sni <host>       : SNI hostname (only added for stratum+ssl pools)
+        //   --tls true             : TLS (only added for stratum+ssl pools)
         let is_ssl = pool.contains("ssl://");
 
         let mut srb_args = vec![
@@ -3577,7 +4079,7 @@ fn build_gpu_miner_args(
             // Statistics API for hashrate polling. Binds to 127.0.0.1 by default.
             "--api-enable".to_string(),
             "--api-port".to_string(),
-            GPU_HTTP_PORT.to_string(),
+            api_port.to_string(),
             // Fast reconnect on pool-disconnect. SRBMiner-MULTI defaults
             // to ~5s retry-time; retry-time=1 + a high give-up-limit
             // reconnect within ~1s and tolerate transient pool
@@ -3589,18 +4091,27 @@ fn build_gpu_miner_args(
         ];
 
         if is_ssl {
-            // Extract hostname for SNI:
-            // "stratum+ssl://ravencoin.pwnda.org:17706" → "ravencoin.pwnda.org"
-            let tls_sni = pool
-                .split("://")
-                .nth(1)
-                .unwrap_or(pool)
-                .split(':')
-                .next()
-                .unwrap_or(pool)
-                .to_string();
-            srb_args.push("--tls-sni".to_string());
-            srb_args.push(tls_sni);
+            // `--tls true` is SRBMiner's documented TLS flag, and the one the
+            // CPU lane (`build_srbminer_cpu_args`) already sends. SRBMiner
+            // also infers TLS from the `ssl://` scheme, so this states it
+            // rather than enabling it.
+            //
+            // Until 2026-09-16 this sent `--tls-sni <host>`, which does
+            // nothing. It is not in the `--help` of 3.1.1 or 3.6.2, and a
+            // local TLS listener saw no SNI from 3.6.2 (Windows and Linux)
+            // with it, without it, or with `--tls true` added. SRBMiner sends
+            // no SNI at all, so no pool here can depend on one.
+            srb_args.push("--tls".to_string());
+            srb_args.push("true".to_string());
+        }
+
+        // `--worker <name>` — only for a protocol that authorizes the worker
+        // as its own field (XELIS). Every other pool here gets the worker
+        // appended to the wallet in `user_string`, so this stays absent and
+        // their argv is byte-identical to before.
+        if let Some(w) = worker.map(str::trim).filter(|w| !w.is_empty()) {
+            srb_args.push("--worker".to_string());
+            srb_args.push(w.to_string());
         }
 
         // SRBMiner accepts a SOCKS5 proxy via `--proxy host:port` (no
@@ -3615,13 +4126,15 @@ fn build_gpu_miner_args(
         }
 
         // `--gpu-intensity N` — when None we omit the flag and let
-        // SRBMiner pick AUTO (its built-in self-tuning default).
-        // Frontend maps Low/Medium/Max → 16/22/28; raw values >31 are
-        // also valid per the SRBMiner Parameters file (see
-        // wiki/concepts/srbminer-flags.md §"--gpu-intensity").
+        // SRBMiner pick AUTO (its built-in self-tuning default). The value
+        // comes from the frontend's intensity slider (1-31) and is clamped
+        // here by `srb_gpu_intensity_arg`, which also repeats it once per
+        // explicitly selected card (SRBMiner 3.6.2 `--help`: "separate
+        // values with ','"). See wiki/concepts/srbminer-flags.md.
         if let Some(intensity) = gpu_intensity {
+            let explicit_devices = gpu_indices.map(|ids| ids.len()).unwrap_or(0);
             srb_args.push("--gpu-intensity".to_string());
-            srb_args.push(intensity.to_string());
+            srb_args.push(srb_gpu_intensity_arg(intensity, explicit_devices));
         }
 
         // `--gpu-id 0,1` — indices "from --list-devices" per SRBMiner's own
@@ -3647,7 +4160,7 @@ fn build_gpu_miner_args(
 
 #[cfg(test)]
 mod gpu_device_selection_tests {
-    use super::build_gpu_miner_args;
+    use super::{build_gpu_miner_args, GPU_HTTP_PORT};
 
     // No existing test covered `build_gpu_miner_args` at all before this
     // module — the only exercise it got was the real caller. Reported
@@ -3670,9 +4183,102 @@ mod gpu_device_selection_tests {
             "x",
             None,
             None,
+            None,
             gpu_indices,
+            GPU_HTTP_PORT,
             None,
         )
+    }
+
+    /// The XELIS shape: a bare wallet plus a separate `--worker`, and an API
+    /// port the caller resolved rather than the hardcoded default.
+    fn xelis_args(worker: Option<&str>, api_port: u16) -> Vec<String> {
+        build_gpu_miner_args(
+            "SRBMiner-MULTI",
+            "stratum+tcp://de.xelis.herominers.com:1225",
+            "xel:addr",
+            "xelishashv3",
+            "x",
+            worker,
+            None,
+            None,
+            None,
+            api_port,
+            None,
+        )
+    }
+
+    #[test]
+    fn a_separate_worker_is_passed_as_its_own_flag_only_when_present() {
+        let a = xelis_args(Some("pwnda-gpu"), GPU_HTTP_PORT);
+        assert!(a.windows(2).any(|w| w[0] == "--worker" && w[1] == "pwnda-gpu"));
+        // The wallet stays bare — appending `.worker` here as well would send
+        // the worker twice, in two different places.
+        assert!(a.windows(2).any(|w| w[0] == "--wallet" && w[1] == "xel:addr"));
+        for empty in [Some("  "), Some(""), None] {
+            assert!(
+                !xelis_args(empty, GPU_HTTP_PORT).iter().any(|s| s == "--worker"),
+                "{empty:?} must not produce a --worker flag"
+            );
+        }
+        // And the algorithms that carry the worker in the wallet keep no flag.
+        assert!(!args("SRBMiner-MULTI", None).iter().any(|s| s == "--worker"));
+        assert!(!args("lolMiner", None).iter().any(|s| s == "--worker"));
+    }
+
+    /// The pwnda-xelis GPU shape, 2026-09-16: an `ssl://` pool gets
+    /// SRBMiner's documented `--tls true`, as the CPU lane does, and never the
+    /// `--tls-sni` flag this lane used to send. SRBMiner 3.1.1 and 3.6.2 don't
+    /// know that flag, and a local TLS listener saw no SNI with or without it.
+    /// The worker rides in the wallet string, so the caller
+    /// (`pools.ts::workerFlagFor`) passes no `--worker`.
+    #[test]
+    fn an_ssl_pool_gets_tls_true_and_no_sni_flag() {
+        let ssl = build_gpu_miner_args(
+            "SRBMiner-MULTI",
+            "stratum+ssl://xel.pwnda.org:17706",
+            "xel:addr.rig1",
+            "xelishashv3",
+            "x",
+            None,
+            None,
+            None,
+            None,
+            GPU_HTTP_PORT,
+            None,
+        );
+        assert!(ssl.windows(2).any(|w| w[0] == "--tls" && w[1] == "true"));
+        assert!(ssl.windows(2).any(|w| w[0] == "--pool" && w[1] == "stratum+ssl://xel.pwnda.org:17706"));
+        assert!(ssl.windows(2).any(|w| w[0] == "--wallet" && w[1] == "xel:addr.rig1"));
+        assert!(!ssl.iter().any(|s| s == "--worker"));
+        assert!(!ssl.iter().any(|s| s == "--tls-sni"));
+        // A plain-TCP pool gets no TLS flag at all.
+        let plain = xelis_args(None, GPU_HTTP_PORT);
+        assert!(!plain.iter().any(|s| s == "--tls" || s == "--tls-sni"));
+    }
+
+    #[test]
+    fn the_api_port_comes_from_the_caller_on_both_miners() {
+        // Pins the 2026-09-15 fix: a port hardcoded to GPU_HTTP_PORT (21558)
+        // lands inside Windows' reserved 21515–21614 range on this machine,
+        // so the miner's API never binds and every poll reads nothing.
+        let srb = xelis_args(None, 34_201);
+        assert!(srb.windows(2).any(|w| w[0] == "--api-port" && w[1] == "34201"));
+        assert!(!srb.iter().any(|s| s == "21558"));
+        let lol = build_gpu_miner_args(
+            "lolMiner",
+            "stratum+tcp://pool.example:1234",
+            "wallet.worker",
+            "OCTOPUS",
+            "x",
+            None,
+            None,
+            None,
+            None,
+            34_202,
+            None,
+        );
+        assert!(lol.windows(2).any(|w| w[0] == "--apiport" && w[1] == "34202"));
     }
 
     #[test]
@@ -3750,12 +4356,70 @@ mod gpu_device_selection_tests {
             "kawpow",
             "x",
             None,
+            None,
             Some(22),
             Some(&[0]),
+            GPU_HTTP_PORT,
             None,
         );
         assert!(a.windows(2).any(|w| w[0] == "--gpu-intensity" && w[1] == "22"));
         assert!(a.windows(2).any(|w| w[0] == "--gpu-id" && w[1] == "0"));
+    }
+
+    fn with_intensity(miner: &str, intensity: Option<u32>, ids: Option<&[u32]>) -> Vec<String> {
+        build_gpu_miner_args(
+            miner,
+            "stratum+tcp://pool.example:1234",
+            "wallet.worker",
+            "kawpow",
+            "x",
+            None,
+            None,
+            intensity,
+            ids,
+            GPU_HTTP_PORT,
+            None,
+        )
+    }
+
+    fn intensity_value(a: &[String]) -> Option<String> {
+        a.iter()
+            .position(|s| s == "--gpu-intensity")
+            .map(|i| a[i + 1].clone())
+    }
+
+    #[test]
+    fn slider_intensity_is_clamped_to_srbminer_s_documented_1_31() {
+        // 2026-09-16 intensity slider. 0 has no documented meaning; >31 would
+        // be read by SRBMiner as a RAW intensity, a different unit.
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(0), None)).as_deref(), Some("1"));
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(1), None)).as_deref(), Some("1"));
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(31), None)).as_deref(), Some("31"));
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(32), None)).as_deref(), Some("31"));
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(u32::MAX), None)).as_deref(), Some("31"));
+    }
+
+    #[test]
+    fn auto_intensity_omits_the_flag() {
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", None, Some(&[0, 1]))), None);
+    }
+
+    #[test]
+    fn intensity_is_repeated_per_explicitly_selected_card() {
+        let a = with_intensity("SRBMiner-MULTI", Some(20), Some(&[0, 1]));
+        assert_eq!(intensity_value(&a).as_deref(), Some("20,20"));
+        // One card, or every card (no --gpu-id): the single value, as before.
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(20), Some(&[1]))).as_deref(), Some("20"));
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(20), None)).as_deref(), Some("20"));
+        assert_eq!(intensity_value(&with_intensity("SRBMiner-MULTI", Some(20), Some(&[]))).as_deref(), Some("20"));
+    }
+
+    #[test]
+    fn lolminer_never_receives_an_intensity_flag() {
+        // lolMiner 1.98a has no intensity flag; the slider is disabled for it
+        // in the UI and the value is dropped here regardless.
+        let a = with_intensity("lolMiner", Some(28), Some(&[0, 1]));
+        assert!(!a.iter().any(|s| s.contains("intensity")));
     }
 }
 
@@ -3780,6 +4444,7 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     user_string: &str,
     algorithm: &str,
     pass: &str,
+    worker: Option<&str>,
     socks5_proxy: Option<&str>,
     show_window: bool,
     gpu_intensity: Option<u32>,
@@ -3808,15 +4473,26 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     // without cross-contamination. Production cost: zero — the gate
     // dead-strips the call.
     let log_path = resolve_miner_log_path(app, algorithm, "gpu");
+    // Resolve the API port at spawn time instead of hardcoding 21558, and
+    // never take the port the SRBMiner CPU lane is already on — XEL runs both
+    // lanes at once as two SRBMiner processes, and two miners sharing an API
+    // port means one of them has no API at all. See `pick_loopback_api_port`
+    // for the Windows reserved-range failure this also works around.
+    let cpu_port = SRB_CPU_API_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let api_port = pick_loopback_api_port(GPU_HTTP_PORT, &[cpu_port]);
+    GPU_API_PORT.store(api_port, std::sync::atomic::Ordering::Relaxed);
+
     let args = build_gpu_miner_args(
         miner,
         pool,
         user_string,
         algorithm,
         pass,
+        worker,
         socks5_proxy,
         gpu_intensity,
         gpu_indices,
+        api_port,
         log_path.as_deref(),
     );
     if let Some(p) = log_path {
@@ -3920,6 +4596,698 @@ pub async fn is_gpu_mining(app: AppHandle) -> Result<bool, String> {
         }
     } else {
         Ok(false)
+    }
+}
+
+/* ─────────────────────────────────────────────────────────────────────
+   SRBMiner-MULTI CPU lane (XelisHash v3) — added 2026-09-15.
+
+   xmrig cannot mine XelisHash, so the CPU lane grew a second backend. It
+   gets its OWN process slot and API port, which is what lets XEL run on
+   both lanes at once as two SRBMiner processes. Every stop path here takes
+   the `Child` out of `SrbCpuMinerProcess` and kills that handle: nothing in
+   this module kills SRBMiner by image name, which would take the GPU lane
+   down with it.
+
+   The two CPU backends are mutually exclusive — there is one CPU lane and
+   one CPU session — so each start refuses while the other is live.
+   ───────────────────────────────────────────────────────────────────── */
+
+/// Algorithms this lane is allowed to launch. An allow-list rather than "any
+/// string the frontend sends": SRBMiner also implements CPU RandomX, and
+/// routing RandomX here would quietly bypass xmrig's elevation + MSR path.
+const SRB_CPU_ALGORITHMS: &[&str] = &["xelishashv3"];
+
+/// Which lane of an SRBMiner API document to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SrbLane {
+    Cpu,
+    Gpu,
+}
+
+/// The numbers one SRBMiner-MULTI API document carries for one lane.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct SrbApiSnapshot {
+    pub hashrate: Option<f64>,
+    pub accepted: u64,
+    pub rejected: u64,
+    pub diff_current: Option<u64>,
+    pub uptime_secs: u64,
+    pub ping_ms: Option<u64>,
+    pub threads_active: Option<usize>,
+}
+
+/// Parse SRBMiner-MULTI's `GET /` document.
+///
+/// Paths verified against captures from live 3.6.2 sessions on 2026-09-15 (a
+/// CPU lane on K1Pool and a GPU lane on HeroMiners, both with accepted
+/// shares):
+///
+/// ```text
+/// mining_time: 104, total_cpu_workers: 2,
+/// algorithms[0].hashrate.{1min, 1hr, cpu.{thread0,…,total}, gpu.{gpu0,…,total}}
+/// algorithms[0].shares.{total, accepted, rejected, avg_find_time}
+/// algorithms[0].pool.{pool, wallet, uptime, difficulty, latency}
+/// ```
+///
+/// Two paths the previous GPU-only parser read do not exist in that document,
+/// and had been yielding nothing for every SRBMiner session:
+/// `algorithms[0].difficulty` — the real one is `pool.difficulty` and it is a
+/// FLOAT (`as_u64()` returns None for `100000.0`) — and `algorithms[0].uptime`
+/// / `mining_started`, where the real ones are `pool.uptime` and top-level
+/// `mining_time`. So POOL DIFF rendered "—" and uptime stayed 0, which also
+/// kept `sharesPerMin` (gated on uptime ≥ 30 s) permanently null. SRBMiner
+/// does report its stratum latency (`pool.latency`), so `ping_ms` is real
+/// here even though lolMiner has no equivalent.
+pub(crate) fn parse_srbminer_api(v: &serde_json::Value, lane: SrbLane) -> SrbApiSnapshot {
+    let algo = &v["algorithms"][0];
+    let hashrate = {
+        let one_min = algo["hashrate"]["1min"].as_f64().unwrap_or(0.0);
+        let instant = match lane {
+            SrbLane::Cpu => algo["hashrate"]["cpu"]["total"].as_f64().unwrap_or(0.0),
+            SrbLane::Gpu => algo["hashrate"]["gpu"]["total"].as_f64().unwrap_or(0.0),
+        };
+        // Prefer the 60-second average (the number SRBMiner itself displays);
+        // fall back to the instantaneous lane total while it is still filling.
+        let h = if one_min > 0.0 { one_min } else { instant };
+        if h > 0.0 {
+            Some(h)
+        } else {
+            None
+        }
+    };
+    let pool = &algo["pool"];
+    let diff_current = pool["difficulty"]
+        .as_f64()
+        .filter(|d| *d > 0.0)
+        .map(|d| d.round() as u64)
+        // Older/other shapes, kept as a fallback rather than a replacement.
+        .or_else(|| algo["difficulty"].as_u64());
+    let uptime_secs = pool["uptime"]
+        .as_u64()
+        .or_else(|| v["mining_time"].as_u64())
+        .unwrap_or(0);
+    SrbApiSnapshot {
+        hashrate,
+        accepted: algo["shares"]["accepted"].as_u64().unwrap_or(0),
+        rejected: algo["shares"]["rejected"].as_u64().unwrap_or(0),
+        diff_current,
+        uptime_secs,
+        ping_ms: pool["latency"].as_u64(),
+        threads_active: match lane {
+            // SRBMiner's own resolved worker count — the CPU equivalent of
+            // xmrig's `hashrate.threads.len()`.
+            SrbLane::Cpu => v["total_cpu_workers"].as_u64().map(|n| n as usize),
+            SrbLane::Gpu => None,
+        },
+    }
+}
+
+/// CPU thread + priority flags for one mining-intensity tier.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct SrbCpuThreadArgs {
+    pub threads: Option<usize>,
+    pub threads_priority: Option<u8>,
+    pub miner_priority: Option<u8>,
+}
+
+/// Map an intensity tier to SRBMiner CPU flags, given the machine's logical
+/// processor count:
+///
+/// - `low` → 2 threads, lowest worker-thread priority (1) and a below-normal
+///   process priority (2), so the desktop stays responsive.
+/// - `medium` → half the logical processors at SRBMiner's own default
+///   priorities.
+/// - `high` → every logical processor.
+///
+/// Measured on the dev box 2026-09-15 (i9-13900K, SRBMiner 3.6.2,
+/// xelishashv3): 2 threads ≈ 1.45 kH/s, 32 threads ≈ 12.4 kH/s. SRBMiner's
+/// own auto (no `--cpu-threads` at all) also resolved to 32 threads, so
+/// "high" passing the count explicitly changes nothing except making the tier
+/// deterministic. An unknown tier lands on "high" for the same reason the
+/// xmrig mapping does: quieter-than-asked is the worse failure.
+pub(crate) fn srb_cpu_thread_args(intensity: &str, logical: usize) -> SrbCpuThreadArgs {
+    match intensity {
+        "low" => SrbCpuThreadArgs {
+            threads: Some(2),
+            threads_priority: Some(1),
+            miner_priority: Some(2),
+        },
+        "medium" => SrbCpuThreadArgs {
+            // Unknown core count → omit the flag and let SRBMiner decide,
+            // rather than inventing a number.
+            threads: if logical > 1 { Some(logical / 2) } else { None },
+            ..Default::default()
+        },
+        _ => SrbCpuThreadArgs {
+            threads: if logical > 0 { Some(logical) } else { None },
+            ..Default::default()
+        },
+    }
+}
+
+/// SRBMiner CPU flags for an EXACT thread count from the UI's thread slider
+/// (SRBMiner-MULTI 3.6.2 `--help`: `--cpu-threads (number of cpu threads to
+/// use for mining, ...)`). The count is clamped to `1..=logical`; a small
+/// partial footprint (see [`cpu_threads_low_priority`]) also gets the LOW
+/// tier's priorities (`--cpu-threads-priority 1`, `--miner-priority 2`), so a
+/// slider set near LOW behaves like LOW did.
+pub(crate) fn srb_cpu_thread_args_for_count(threads: usize, logical: usize) -> SrbCpuThreadArgs {
+    let n = clamp_cpu_thread_count(threads, logical);
+    if cpu_threads_low_priority(n, logical) {
+        SrbCpuThreadArgs {
+            threads: Some(n),
+            threads_priority: Some(1),
+            miner_priority: Some(2),
+        }
+    } else {
+        SrbCpuThreadArgs {
+            threads: Some(n),
+            ..Default::default()
+        }
+    }
+}
+
+/// Build the SRBMiner-MULTI **CPU lane** argv. Pure — no spawn, no state — so
+/// the tests below cover it without a binary.
+///
+/// Mirrors `build_gpu_miner_args`'s SRBMiner branch with the lanes swapped:
+/// `--algorithm-cpu <algo> --disable-gpu` instead of `--disable-cpu
+/// --algorithm <algo>`, so this process never initialises a GPU backend the
+/// GPU lane's process may be using.
+///
+/// TLS: SRBMiner infers it from a `stratum+ssl://` pool URL, and `--tls true`
+/// (its documented flag) states it explicitly — verified 2026-09-15 with a
+/// TLS 1.3 session to K1Pool 9352. `worker` is XELIS-specific: that protocol's
+/// `mining.authorize` carries the worker as its own field, which SRBMiner
+/// fills from `--worker` (captured: `["xel:…","pwnda-cpu","x"]`).
+#[allow(clippy::too_many_arguments)]
+fn build_srbminer_cpu_args(
+    pool: &str,
+    user_string: &str,
+    algorithm: &str,
+    pass: &str,
+    worker: Option<&str>,
+    socks5_proxy: Option<&str>,
+    threads: SrbCpuThreadArgs,
+    api_port: u16,
+    log_path: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--algorithm-cpu".to_string(),
+        algorithm.to_string(),
+        // GPU-free: this lane must not touch the cards the GPU lane uses.
+        "--disable-gpu".to_string(),
+        "--pool".to_string(),
+        pool.to_string(),
+        "--wallet".to_string(),
+        user_string.to_string(),
+        "--password".to_string(),
+        pass.to_string(),
+        "--send-stales".to_string(),
+        "true".to_string(),
+        "--api-enable".to_string(),
+        "--api-port".to_string(),
+        api_port.to_string(),
+        // Same fast-reconnect posture as the GPU lane.
+        "--retry-time".to_string(),
+        "1".to_string(),
+        "--give-up-limit".to_string(),
+        "100".to_string(),
+    ];
+
+    if pool.contains("ssl://") {
+        args.push("--tls".to_string());
+        args.push("true".to_string());
+    }
+
+    if let Some(w) = worker.map(str::trim).filter(|w| !w.is_empty()) {
+        args.push("--worker".to_string());
+        args.push(w.to_string());
+    }
+
+    if let Some(p) = socks5_proxy {
+        if let Some(host_port) = normalize_socks_proxy(p) {
+            args.push("--proxy".to_string());
+            args.push(host_port);
+        }
+    }
+
+    if let Some(n) = threads.threads.filter(|n| *n > 0) {
+        args.push("--cpu-threads".to_string());
+        args.push(n.to_string());
+    }
+    if let Some(p) = threads.threads_priority {
+        args.push("--cpu-threads-priority".to_string());
+        args.push(p.clamp(1, 5).to_string());
+    }
+    if let Some(p) = threads.miner_priority {
+        args.push("--miner-priority".to_string());
+        args.push(p.clamp(1, 5).to_string());
+    }
+
+    if let Some(p) = log_path {
+        args.push("--log-file".to_string());
+        args.push(p.to_string_lossy().to_string());
+    }
+
+    args
+}
+
+/// Logical processor count for the intensity mapping. Asks `device_info`
+/// first (the same detector the DEVICES panel shows the user, and the one
+/// that sums sockets), falling back to the std parallelism hint if that scan
+/// fails — the miner must still start when a diagnostic call does not.
+async fn detect_logical_processors() -> usize {
+    if let Ok(info) = crate::device_info::get_cpu_info().await {
+        if info.threads > 0 {
+            return info.threads as usize;
+        }
+    }
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0)
+}
+
+/// Start the SRBMiner-MULTI CPU lane (XelisHash v3). No elevation: MSR mod is
+/// an xmrig/RandomX concern and this lane never asks for it.
+#[tauri::command]
+pub async fn start_srbminer_cpu(
+    app: AppHandle,
+    pool: String,
+    user_string: String,
+    algorithm: String,
+    pass: String,
+    proxy: Option<String>,
+    worker: Option<String>,
+    intensity: Option<String>,
+    // Exact thread count from the thread slider (2026-09-16). When present
+    // and non-zero it wins over `intensity`; `None` keeps the tier mapping,
+    // which is also what "all threads" sends.
+    threads: Option<usize>,
+) -> Result<(), String> {
+    // Shares the CPU lane's "already starting" sentinel with `start_xmrig`,
+    // so click-spam cannot start two CPU sessions of either kind.
+    let starting_state = app.state::<MinerStarting>();
+    let _starting_guard = StartGuard::try_acquire(&starting_state.0).ok_or_else(|| {
+        "Mining is already starting. Wait for the current start to finish, or stop it first."
+            .to_string()
+    })?;
+
+    if !SRB_CPU_ALGORITHMS.contains(&algorithm.as_str()) {
+        return Err(format!(
+            "{} is not an SRBMiner CPU-lane algorithm (expected one of: {}).",
+            algorithm,
+            SRB_CPU_ALGORITHMS.join(", ")
+        ));
+    }
+
+    // One CPU lane: refuse while xmrig holds it.
+    {
+        let pid_state = app.state::<MinerPid>();
+        let pid = pid_state
+            .0
+            .lock()
+            .map_err(|e| format!("Lock error: {}", e))?;
+        if pid.is_some() {
+            return Err(
+                "The CPU is already mining with xmrig. Stop that session first.".to_string(),
+            );
+        }
+    }
+
+    // …and refuse if this lane is already running.
+    {
+        let state = app.state::<SrbCpuMinerProcess>();
+        let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref mut child) = *process {
+            match child.try_wait() {
+                Ok(Some(_)) => *process = None,
+                Ok(None) => {
+                    return Err("The CPU miner is already running. Stop it first.".to_string())
+                }
+                Err(_) => *process = None,
+            }
+        }
+    }
+
+    let miners_dir = get_miners_dir(&app)?;
+    let exe_name = format!("SRBMiner-MULTI{}", crate::platform::EXE_SUFFIX);
+    let exe_path = miners_dir.join(&exe_name);
+    if !exe_path.exists() {
+        return Err(format!(
+            "{} not found. Please download mining software first.",
+            exe_name
+        ));
+    }
+
+    let logical = detect_logical_processors().await;
+    let threads = match threads {
+        Some(n) if n > 0 => srb_cpu_thread_args_for_count(n, logical),
+        _ => srb_cpu_thread_args(intensity.as_deref().unwrap_or("high"), logical),
+    };
+
+    // Never the GPU lane's port, even if both fall back to an OS-assigned one.
+    let gpu_port = GPU_API_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let api_port = pick_loopback_api_port(SRB_CPU_HTTP_PORT, &[gpu_port]);
+    SRB_CPU_API_PORT.store(api_port, std::sync::atomic::Ordering::Relaxed);
+
+    let log_path = resolve_miner_log_path(&app, &algorithm, "cpu");
+    let args = build_srbminer_cpu_args(
+        &pool,
+        &user_string,
+        &algorithm,
+        &pass,
+        worker.as_deref(),
+        proxy.as_deref(),
+        threads,
+        api_port,
+        log_path.as_deref(),
+    );
+    if let Some(p) = log_path {
+        record_miner_log_path(&app, "cpu", p);
+    }
+
+    let show_window = read_show_miner_window(&app);
+    let mut cmd = miner_command(exe_path.to_string_lossy().as_ref(), show_window);
+    cmd.args(&args);
+    cmd.current_dir(miners_dir.to_string_lossy().to_string());
+
+    let child = cmd
+        .kill_on_drop(false)
+        .spawn()
+        .map_err(|e| format!("Failed to start the CPU miner: {}", e))?;
+
+    {
+        let state = app.state::<SrbCpuMinerProcess>();
+        let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+        *process = Some(child);
+    }
+
+    // Same brief health check as the GPU lane: an immediate exit is a bad
+    // argument or a missing DLL, and says so clearly instead of surfacing
+    // later as a generic "miner died".
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    {
+        let state = app.state::<SrbCpuMinerProcess>();
+        let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+        if let Some(ref mut child) = *process {
+            if let Ok(Some(status)) = child.try_wait() {
+                *process = None;
+                return Err(format!(
+                    "{} exited immediately (code: {:?}). Go to Miner Setup → Reinstall All to re-extract its support files, and check that the pool and address are valid.",
+                    exe_name,
+                    status.code()
+                ));
+            }
+        }
+    }
+
+    spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb);
+    Ok(())
+}
+
+/// Stop the SRBMiner CPU lane. Takes the child OUT of the slot first (so the
+/// death watch reads the empty slot as an intentional stop) and kills that
+/// handle — never an image-name kill, which would also stop a GPU session.
+#[tauri::command]
+pub async fn stop_srbminer_cpu(app: AppHandle) -> Result<(), String> {
+    let mut child = {
+        let state = app.state::<SrbCpuMinerProcess>();
+        let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+        process.take()
+    }; // lock dropped here
+
+    if let Some(ref mut c) = child {
+        let _ = c.kill().await;
+    }
+
+    Ok(())
+}
+
+/// Whether the SRBMiner CPU lane is running.
+#[tauri::command]
+pub async fn is_srbminer_cpu_mining(app: AppHandle) -> Result<bool, String> {
+    let state = app.state::<SrbCpuMinerProcess>();
+    let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+
+    if let Some(ref mut child) = *process {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                *process = None;
+                Ok(false)
+            }
+            Ok(None) => Ok(true),
+            Err(_) => {
+                *process = None;
+                Ok(false)
+            }
+        }
+    } else {
+        Ok(false)
+    }
+}
+
+/// Session snapshot for the SRBMiner CPU lane, in the SAME wire shape as
+/// `get_xmrig_snapshot` so the frontend poll only has to switch command name.
+#[tauri::command]
+pub async fn get_srbminer_cpu_snapshot() -> Result<Option<XmrigSnapshot>, String> {
+    let port = SRB_CPU_API_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    let v = match fetch_miner_api_json(port).await? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    let s = parse_srbminer_api(&v, SrbLane::Cpu);
+    Ok(Some(XmrigSnapshot {
+        hashrate: s.hashrate,
+        accepted: s.accepted,
+        rejected: s.rejected,
+        diff_current: s.diff_current,
+        ping_ms: s.ping_ms,
+        uptime_secs: s.uptime_secs,
+        threads_active: s.threads_active,
+    }))
+}
+
+#[cfg(test)]
+mod srbminer_cpu_tests {
+    use super::*;
+
+    /// Verbatim (whitespace-trimmed) from the CPU lane's own API during a live
+    /// SRBMiner-MULTI 3.6.2 session on 2026-09-15: `--algorithm-cpu
+    /// xelishashv3 --disable-gpu --cpu-threads 2`, K1Pool's CPU port, two
+    /// accepted shares.
+    const CPU_API: &str = r#"{"rig_name":"SRBMiner-Multi-Rig","miner_version":"3.6.2","mining_time":104,"total_cpu_workers":2,"total_gpu_workers":0,"total_workers":2,"cpu_devices":[{"id":0,"device":"cpu0","model":"13th Gen Intel(R) Core(TM) i9-13900K"}],"gpu_devices":[],"algorithms":[{"id":0,"name":"xelishashv3","pool":{"pool":"eu.xel.k1pool.com:9350","wallet":"xel:teq…","time_connected":"2026-09-15 17:59:53","uptime":102,"difficulty":100000.0,"last_job_received":2,"latency":133},"shares":{"total":2,"accepted":2,"rejected":0,"avg_find_time":51},"hashrate":{"1min":1468.17,"1hr":1371.34,"6hr":0.0,"12hr":0.0,"cpu":{"thread0":742.93,"thread1":764.78,"total":1507.71},"gpu":{"total":0.0}}}]}"#;
+
+    /// Same session pair, GPU lane: two cards on HeroMiners, three accepted.
+    const GPU_API: &str = r#"{"rig_name":"SRBMiner-Multi-Rig","miner_version":"3.6.2","mining_time":104,"total_cpu_workers":0,"total_gpu_workers":2,"algorithms":[{"id":0,"name":"xelishashv3","pool":{"pool":"de.xelis.herominers.com:1225","uptime":99,"difficulty":187500.0,"latency":130},"shares":{"total":3,"accepted":3,"rejected":0,"avg_find_time":33},"hashrate":{"1min":11404.45,"1hr":11312.31,"cpu":{"total":0.0},"gpu":{"gpu0":3883.1,"gpu1":7015.31,"total":10898.41}}}]}"#;
+
+    fn json(s: &str) -> serde_json::Value {
+        serde_json::from_str(s).expect("fixture parses")
+    }
+
+    #[test]
+    fn parses_the_cpu_lane_document() {
+        let s = parse_srbminer_api(&json(CPU_API), SrbLane::Cpu);
+        assert_eq!(s.hashrate, Some(1468.17), "prefers the 1min average");
+        assert_eq!(s.accepted, 2);
+        assert_eq!(s.rejected, 0);
+        assert_eq!(s.threads_active, Some(2), "SRBMiner's resolved worker count");
+    }
+
+    #[test]
+    fn reads_pool_difficulty_uptime_and_latency_where_they_actually_live() {
+        // The regression this pins: `algorithms[0].difficulty` does not exist
+        // (it is `pool.difficulty`) and it is a FLOAT, so the old `as_u64()`
+        // read returned None and POOL DIFF rendered "—" for every SRBMiner
+        // session. Same story for uptime, which also disabled shares/min.
+        for (doc, lane, diff, uptime, ping) in [
+            (CPU_API, SrbLane::Cpu, 100_000u64, 102u64, 133u64),
+            (GPU_API, SrbLane::Gpu, 187_500u64, 99u64, 130u64),
+        ] {
+            let s = parse_srbminer_api(&json(doc), lane);
+            assert_eq!(s.diff_current, Some(diff));
+            assert_eq!(s.uptime_secs, uptime);
+            assert_eq!(s.ping_ms, Some(ping));
+        }
+    }
+
+    #[test]
+    fn reads_the_lane_it_was_asked_for() {
+        // The GPU document's `hashrate.cpu.total` is 0.0 and the CPU
+        // document's `hashrate.gpu.total` is 0.0, so a lane mix-up would show
+        // a mining rig at zero.
+        let gpu = parse_srbminer_api(&json(GPU_API), SrbLane::Gpu);
+        assert_eq!(gpu.hashrate, Some(11404.45));
+        assert_eq!(gpu.threads_active, None, "GPU lane has no thread count");
+        // A document with no 1min average yet falls back to the lane total.
+        let warming = json(
+            r#"{"mining_time":4,"total_cpu_workers":32,"algorithms":[{"pool":{"uptime":3},"shares":{"accepted":0,"rejected":0},"hashrate":{"1min":0.0,"cpu":{"total":9000.5},"gpu":{"total":0.0}}}]}"#,
+        );
+        assert_eq!(parse_srbminer_api(&warming, SrbLane::Cpu).hashrate, Some(9000.5));
+    }
+
+    #[test]
+    fn an_unreachable_or_empty_document_yields_nothing_rather_than_zeros() {
+        let empty = parse_srbminer_api(&json("{}"), SrbLane::Cpu);
+        assert_eq!(empty.hashrate, None);
+        assert_eq!(empty.diff_current, None);
+        assert_eq!(empty.uptime_secs, 0);
+        assert_eq!(empty.ping_ms, None);
+    }
+
+    #[test]
+    fn intensity_tiers_map_to_threads_and_priorities() {
+        assert_eq!(
+            srb_cpu_thread_args("low", 32),
+            SrbCpuThreadArgs { threads: Some(2), threads_priority: Some(1), miner_priority: Some(2) }
+        );
+        assert_eq!(srb_cpu_thread_args("medium", 32).threads, Some(16));
+        assert_eq!(srb_cpu_thread_args("high", 32).threads, Some(32));
+        // Low is agnostic of the core count, exactly like xmrig's Low.
+        assert_eq!(srb_cpu_thread_args("low", 4).threads, Some(2));
+    }
+
+    #[test]
+    fn an_undetected_core_count_omits_the_thread_flag_instead_of_guessing() {
+        assert_eq!(srb_cpu_thread_args("medium", 0).threads, None);
+        assert_eq!(srb_cpu_thread_args("high", 0).threads, None);
+        // …but Low still means 2 threads, which needs no detection.
+        assert_eq!(srb_cpu_thread_args("low", 0).threads, Some(2));
+    }
+
+    #[test]
+    fn an_exact_slider_count_maps_to_cpu_threads_clamped() {
+        use super::srb_cpu_thread_args_for_count;
+        assert_eq!(
+            srb_cpu_thread_args_for_count(12, 32),
+            SrbCpuThreadArgs { threads: Some(12), threads_priority: None, miner_priority: None }
+        );
+        // Over the machine's count -> every processor, default priorities.
+        assert_eq!(
+            srb_cpu_thread_args_for_count(64, 32),
+            SrbCpuThreadArgs { threads: Some(32), threads_priority: None, miner_priority: None }
+        );
+        // Zero is floored to one thread, which is a background footprint.
+        assert_eq!(
+            srb_cpu_thread_args_for_count(0, 32),
+            SrbCpuThreadArgs { threads: Some(1), threads_priority: Some(1), miner_priority: Some(2) }
+        );
+        // The LOW preset (2 threads) is byte-identical to the old "low" tier...
+        assert_eq!(srb_cpu_thread_args_for_count(2, 32), srb_cpu_thread_args("low", 32));
+        // ...and "all threads" to the old "high" tier.
+        assert_eq!(srb_cpu_thread_args_for_count(32, 32), srb_cpu_thread_args("high", 32));
+    }
+
+    #[test]
+    fn a_slider_count_reaches_the_argv_as_cpu_threads() {
+        let a = build_srbminer_cpu_args(
+            "stratum+tcp://eu.xel.k1pool.com:9350",
+            "xel:addr",
+            "xelishashv3",
+            "x",
+            None,
+            None,
+            super::srb_cpu_thread_args_for_count(12, 32),
+            34201,
+            None,
+        );
+        assert!(a.windows(2).any(|w| w[0] == "--cpu-threads" && w[1] == "12"));
+        assert!(!a.iter().any(|s| s == "--cpu-threads-priority" || s == "--miner-priority"));
+    }
+
+    #[test]
+    fn an_unknown_tier_lands_on_high_not_on_something_quieter() {
+        assert_eq!(srb_cpu_thread_args("turbo", 16).threads, Some(16));
+    }
+
+    fn args(pool: &str, worker: Option<&str>, proxy: Option<&str>) -> Vec<String> {
+        build_srbminer_cpu_args(
+            pool,
+            "xel:addr",
+            "xelishashv3",
+            "x",
+            worker,
+            proxy,
+            srb_cpu_thread_args("low", 32),
+            34201,
+            None,
+        )
+    }
+
+    #[test]
+    fn cpu_argv_is_cpu_only_and_never_claims_a_gpu() {
+        let a = args("stratum+tcp://eu.xel.k1pool.com:9350", None, None);
+        assert!(a.windows(2).any(|w| w[0] == "--algorithm-cpu" && w[1] == "xelishashv3"));
+        assert!(a.iter().any(|s| s == "--disable-gpu"));
+        // The GPU lane's flags must never appear here: this process runs
+        // beside a GPU session.
+        assert!(!a.iter().any(|s| s == "--disable-cpu" || s == "--algorithm" || s == "--gpu-id"));
+    }
+
+    #[test]
+    fn cpu_argv_carries_its_own_api_port_and_thread_flags() {
+        let a = args("stratum+tcp://eu.xel.k1pool.com:9350", None, None);
+        assert!(a.windows(2).any(|w| w[0] == "--api-port" && w[1] == "34201"));
+        assert!(a.iter().any(|s| s == "--api-enable"));
+        assert!(a.windows(2).any(|w| w[0] == "--cpu-threads" && w[1] == "2"));
+        assert!(a.windows(2).any(|w| w[0] == "--cpu-threads-priority" && w[1] == "1"));
+        assert!(a.windows(2).any(|w| w[0] == "--miner-priority" && w[1] == "2"));
+    }
+
+    #[test]
+    fn tls_only_for_an_ssl_pool_url() {
+        let plain = args("stratum+tcp://eu.xel.k1pool.com:9350", None, None);
+        assert!(!plain.iter().any(|s| s == "--tls"));
+        let ssl = args("stratum+ssl://xel.kryptex.network:8019", None, None);
+        assert!(ssl.windows(2).any(|w| w[0] == "--tls" && w[1] == "true"));
+        // pwnda-xelis (2026-09-16): one TLS port serves both lanes, and the
+        // caller passes no worker (it is in the wallet string).
+        let pwnda = args("stratum+ssl://xel.pwnda.org:17706", None, None);
+        assert!(pwnda.windows(2).any(|w| w[0] == "--tls" && w[1] == "true"));
+        assert!(!pwnda.iter().any(|s| s == "--worker" || s == "--tls-sni"));
+    }
+
+    #[test]
+    fn worker_is_a_separate_flag_and_an_empty_one_is_omitted() {
+        // XELIS authorize carries the worker as its own field; the wallet
+        // stays a bare address (which is what K1Pool keys the account by).
+        let a = args("stratum+tcp://eu.xel.k1pool.com:9350", Some("rig1"), None);
+        assert!(a.windows(2).any(|w| w[0] == "--worker" && w[1] == "rig1"));
+        assert!(a.windows(2).any(|w| w[0] == "--wallet" && w[1] == "xel:addr"));
+        for empty in [Some("   "), Some(""), None] {
+            let b = args("stratum+tcp://eu.xel.k1pool.com:9350", empty, None);
+            assert!(!b.iter().any(|s| s == "--worker"), "{empty:?}");
+        }
+    }
+
+    #[test]
+    fn socks5_proxy_is_passed_normalized_and_omitted_when_absent() {
+        let a = args(
+            "stratum+tcp://eu.xel.k1pool.com:9350",
+            None,
+            Some("socks5://127.0.0.1:34300"),
+        );
+        assert!(a.windows(2).any(|w| w[0] == "--proxy" && w[1] == "127.0.0.1:34300"));
+        let b = args("stratum+tcp://eu.xel.k1pool.com:9350", None, None);
+        assert!(!b.iter().any(|s| s == "--proxy"));
+    }
+
+    #[test]
+    fn only_allow_listed_algorithms_may_use_this_lane() {
+        // RandomX must stay on xmrig (elevation + MSR); SRBMiner can mine it,
+        // which is exactly why the guard is an allow-list.
+        assert!(SRB_CPU_ALGORITHMS.contains(&"xelishashv3"));
+        assert!(!SRB_CPU_ALGORITHMS.contains(&"randomx"));
+        assert!(!SRB_CPU_ALGORITHMS.contains(&"rx/0"));
+    }
+
+    #[test]
+    fn the_two_lanes_never_share_an_api_port() {
+        assert_ne!(SRB_CPU_HTTP_PORT, GPU_HTTP_PORT);
+        assert_ne!(SRB_CPU_HTTP_PORT, XMRIG_HTTP_PORT);
+        // And the picker refuses to hand back a port it was told to avoid.
+        assert_ne!(pick_loopback_api_port(SRB_CPU_HTTP_PORT, &[SRB_CPU_HTTP_PORT]), SRB_CPU_HTTP_PORT);
     }
 }
 
@@ -4555,4 +5923,156 @@ fn normalize_socks_proxy(s: &str) -> Option<String> {
         return None;
     }
     Some(format!("{}:{}", host, port_str))
+}
+
+#[cfg(test)]
+mod gpu_device_map_tests {
+    use super::*;
+    use crate::device_info::GpuInfo;
+
+    fn gpu(name: &str, vendor: &str) -> GpuInfo {
+        GpuInfo {
+            name: name.to_string(),
+            vendor: vendor.to_string(),
+            vram_bytes: 8 << 30,
+            driver_version: String::new(),
+        }
+    }
+
+    /// Verbatim (ANSI and all colour stripped by the capture) from the dev box,
+    /// SRBMiner-MULTI 3.6.2 `--list-devices`, 2026-09-16.
+    const SRB: &str = "\u{1b}[1;37mOPENCL devices\u{1b}[0m
+GPU0  [0][0] [06:00.0] : amd_radeon_rx_6700_xt [gfx1031] [12272 MB] [CU: 40] [MaxBuf: 12272 MB]
+CUDA devices
+GPU1  [CUDA][0] [0000:01:00.0] : nvidia_geforce_rtx_5060_ti [blackwell] [CC: 12.0] [SM: 36] [16310 MB]
+";
+
+    /// Verbatim, lolMiner 1.98a `--list-devices`, same box and day.
+    const LOL: &str = "OpenCL driver detected. Number of OpenCL supported GPUs: 1
+Cuda driver detected. Number of Cuda supported GPUs: 1
+Device 0:
+    Name:    NVIDIA GeForce RTX 5060 Ti
+    Address: 1:0
+    Vendor:  NVIDIA Corporation
+    Drivers: Cuda
+    Memory:  16310 MByte
+Device 1:
+    Name:    Radeon RX 6700XT
+    Address: 6:0
+    Vendor:  Advanced Micro Devices (AMD)
+    Drivers: OpenCL
+    Memory:  12272 MByte (12257 MByte free)
+";
+
+    /// The operator's machine as `get_gpu_info` lists it: 5060 Ti first.
+    fn app() -> Vec<GpuInfo> {
+        vec![gpu("NVIDIA GeForce RTX 5060 Ti", "nvidia"), gpu("AMD Radeon RX 6700 XT", "amd")]
+    }
+
+    #[test]
+    fn both_device_lists_parse() {
+        let srb = parse_srbminer_list_devices(SRB);
+        assert_eq!(
+            srb.iter().map(|d| (d.id, d.vendor.as_str())).collect::<Vec<_>>(),
+            [(0, "amd"), (1, "nvidia")]
+        );
+        let lol = parse_lolminer_list_devices(LOL);
+        assert_eq!(
+            lol.iter().map(|d| (d.id, d.vendor.as_str())).collect::<Vec<_>>(),
+            [(0, "nvidia"), (1, "amd")]
+        );
+    }
+
+    #[test]
+    fn model_keys_agree_across_the_three_spellings() {
+        assert_eq!(gpu_model_key("NVIDIA GeForce RTX 5060 Ti"), "rtx5060ti");
+        assert_eq!(gpu_model_key("nvidia_geforce_rtx_5060_ti"), "rtx5060ti");
+        assert_eq!(gpu_model_key("AMD Radeon RX 6700 XT"), "rx6700xt");
+        assert_eq!(gpu_model_key("amd_radeon_rx_6700_xt"), "rx6700xt");
+        assert_eq!(gpu_model_key("Radeon RX 6700XT"), "rx6700xt");
+    }
+
+    /// THE reported bug: app GPU 0 is the 5060 Ti, which is SRBMiner's GPU1.
+    #[test]
+    fn the_5060_ti_is_srbminer_gpu1_and_lolminer_device0() {
+        let srb = parse_srbminer_list_devices(SRB);
+        let lol = parse_lolminer_list_devices(LOL);
+        assert_eq!(map_gpu_indices_to_miner(&app(), &[0], &srb).unwrap(), vec![1]);
+        assert_eq!(map_gpu_indices_to_miner(&app(), &[1], &srb).unwrap(), vec![0]);
+        assert_eq!(map_gpu_indices_to_miner(&app(), &[0], &lol).unwrap(), vec![0]);
+        assert_eq!(map_gpu_indices_to_miner(&app(), &[1], &lol).unwrap(), vec![1]);
+        assert_eq!(map_gpu_indices_to_miner(&app(), &[0, 1], &srb).unwrap(), vec![1, 0]);
+        // The old behaviour — the index verbatim — is exactly what went wrong.
+        assert_ne!(map_gpu_indices_to_miner(&app(), &[0], &srb).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn an_integrated_gpu_in_the_app_list_does_not_shift_the_mapping() {
+        let app = vec![
+            gpu("AMD Radeon(TM) Graphics", "amd"),
+            gpu("NVIDIA GeForce RTX 5060 Ti", "nvidia"),
+            gpu("AMD Radeon RX 6700 XT", "amd"),
+        ];
+        let srb = parse_srbminer_list_devices(SRB);
+        assert_eq!(map_gpu_indices_to_miner(&app, &[1], &srb).unwrap(), vec![1]);
+        assert_eq!(map_gpu_indices_to_miner(&app, &[2], &srb).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn identical_cards_map_in_order() {
+        let app = vec![gpu("NVIDIA GeForce RTX 3070", "nvidia"), gpu("NVIDIA GeForce RTX 3070", "nvidia")];
+        let devs = vec![
+            MinerGpuDevice { id: 0, name: "nvidia_geforce_rtx_3070".into(), vendor: "nvidia".into() },
+            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_3070".into(), vendor: "nvidia".into() },
+        ];
+        assert_eq!(map_gpu_indices_to_miner(&app, &[1], &devs).unwrap(), vec![1]);
+        assert_eq!(map_gpu_indices_to_miner(&app, &[0, 1], &devs).unwrap(), vec![0, 1]);
+    }
+
+    #[test]
+    fn linux_pci_names_match_by_containment_or_vendor_order() {
+        // lspci-style name carrying the chip code.
+        let app = vec![gpu("AD106 [GeForce RTX 4060 Ti]", "nvidia"), gpu("Navi 22 [Radeon RX 6700 XT]", "amd")];
+        let devs = vec![
+            MinerGpuDevice { id: 0, name: "amd_radeon_rx_6700_xt".into(), vendor: "amd".into() },
+            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_4060_ti".into(), vendor: "nvidia".into() },
+        ];
+        assert_eq!(map_gpu_indices_to_miner(&app, &[0], &devs).unwrap(), vec![1]);
+        assert_eq!(map_gpu_indices_to_miner(&app, &[1], &devs).unwrap(), vec![0]);
+        // A bare chip name with no model: one card of that vendor on each side.
+        let app2 = vec![gpu("Device 2803", "nvidia")];
+        assert_eq!(map_gpu_indices_to_miner(&app2, &[0], &devs).unwrap(), vec![1]);
+    }
+
+    #[test]
+    fn a_5060_is_not_taken_for_a_5060_ti() {
+        let app = vec![gpu("NVIDIA GeForce RTX 5060", "nvidia"), gpu("NVIDIA GeForce RTX 5060 Ti", "nvidia")];
+        let devs = vec![
+            MinerGpuDevice { id: 0, name: "nvidia_geforce_rtx_5060_ti".into(), vendor: "nvidia".into() },
+            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_5060".into(), vendor: "nvidia".into() },
+        ];
+        assert_eq!(map_gpu_indices_to_miner(&app, &[0], &devs).unwrap(), vec![1]);
+        assert_eq!(map_gpu_indices_to_miner(&app, &[1], &devs).unwrap(), vec![0]);
+    }
+
+    #[test]
+    fn an_unmatchable_selection_refuses_instead_of_guessing() {
+        let srb = parse_srbminer_list_devices(SRB);
+        let app = vec![gpu("Intel(R) Arc(TM) A770 Graphics", "intel")];
+        let err = map_gpu_indices_to_miner(&app, &[0], &srb).unwrap_err();
+        assert!(err.contains("could not find the selected GPU"), "{err}");
+        assert!(map_gpu_indices_to_miner(&app, &[5], &srb).is_err(), "out of range");
+    }
+
+    /// Both start paths translate before they build any argv.
+    #[test]
+    fn both_gpu_start_paths_translate_the_selection() {
+        let src = include_str!("miners.rs");
+        let start = &src[src.find("pub async fn start_gpu_miner(").unwrap()..];
+        let start = &start[..start.find("build_and_spawn_gpu_miner(").unwrap()];
+        assert!(start.contains("resolve_miner_gpu_ids("));
+        let bench = &src[src.find("pub async fn run_gpu_miner_benchmark(").unwrap()..];
+        let bench = &bench[..bench.find("\"--benchmark\"").unwrap()];
+        assert!(bench.contains("resolve_miner_gpu_ids("));
+    }
 }
