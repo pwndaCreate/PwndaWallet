@@ -4386,6 +4386,12 @@ const MOCKS: Record<string, (args: any) => unknown> = {
   },
   open_data_location: () => null,
 
+  // App self-update (src/lib/appUpdate.ts). The sandbox reports a bundled
+  // build so the install button renders; VITE_MOCK_UPDATE supplies the
+  // version. restart_app does nothing here: there is no process to replace.
+  updater_can_self_install: () => true,
+  restart_app: () => null,
+
   // Background updater + Settings ▸ Wallet binaries (sidecar_update.rs). One
   // wallet per row state, so every branch of `describeWalletBinary` renders:
   // Monero mid-reconcile (in use v0.18.5.0, shipped v0.18.5.1), Zephyr

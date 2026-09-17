@@ -60,6 +60,15 @@ export const isWindows = (): boolean => getOs() === "windows";
 export const isLinux = (): boolean => getOs() === "linux";
 export const isMac = (): boolean => getOs() === "macos";
 
+/** Human-readable OS name for the About sections. Portrait hardcoded
+ *  "Windows" until 2026-08-12; landscape did until 2026-09-17. */
+export function platformLabel(): string {
+  if (isWindows()) return "Windows";
+  if (isLinux()) return "Linux";
+  if (isMac()) return "macOS";
+  return "Unknown";
+}
+
 // Windows Defender is the only AV stack we know how to add exclusions for.
 export const supportsDefenderExclusion = (): boolean => isWindows();
 

@@ -3,13 +3,8 @@ import { formatAppVersion } from "../../lib/appVersion";
 import { WalletsCard } from "./WalletsCard";
 import type { AddWalletOpts, WalletKind } from "../../vault-schema";
 import type { ChainType } from "../../wallets/types";
-import { isWindows, isLinux, isMac } from "../../platform/os";
-import {
-  checkForUpdate,
-  installUpdate,
-  isUpdaterSupported,
-  type UpdateInfo,
-} from "../../lib/updater";
+import { platformLabel } from "../../platform/os";
+import { AppUpdateRow } from "../../components/AppUpdateControls";
 import { ST } from "../../components/Primitives";
 import { Btn, Card } from "../../components/PrimitivesV2";
 import { invoke } from "../../lib/tauri";
@@ -356,7 +351,7 @@ function SettingsAboutCard() {
           <span style={{ color: "var(--text-dim)" }}>Platform</span>
           <span>{platformLabel()} (Tauri)</span>
         </div>
-        <UpdateRow />
+        <AppUpdateRow />
         {devEnabled && (
           <div
             style={{
@@ -1372,106 +1367,5 @@ function ConnRow({
   );
 }
 
-/** Human-readable OS name for the ABOUT card. Was hardcoded to "Windows"
- *  until 2026-08-12, which read as a bug on the Linux builds. */
-function platformLabel(): string {
-  if (isWindows()) return "Windows";
-  if (isLinux()) return "Linux";
-  if (isMac()) return "macOS";
-  return "Unknown";
-}
 
-/**
- * Update check row inside the ABOUT card.
- *
- * Deliberately manual rather than a poll-on-launch: this is a wallet, and a
- * background process that can replace the running binary is a meaningful piece
- * of attack surface. The user asks, we check, we show what we found. Nothing
- * downloads without a second explicit click, and nothing restarts on its own —
- * the app may be mid-sync, mid-swap, or holding an unlocked vault.
- *
- * On `.deb` / `.rpm` installs we report the new version but don't offer to
- * install it: those files are owned by apt/dnf, and writing over them behind
- * the package manager's back corrupts its database. See `isUpdaterSupported`.
- */
-function UpdateRow() {
-  const [state, setState] = useState<
-    "idle" | "checking" | "current" | "found" | "installing" | "done" | "error"
-  >("idle");
-  const [info, setInfo] = useState<UpdateInfo | null>(null);
-  const [progress, setProgress] = useState(0);
-  const [err, setErr] = useState("");
-  const [canSelfInstall, setCanSelfInstall] = useState(false);
-
-  const doCheck = useCallback(async () => {
-    setState("checking");
-    setErr("");
-    const found = await checkForUpdate();
-    if (!found) {
-      setState("current");
-      return;
-    }
-    setCanSelfInstall(await isUpdaterSupported());
-    setInfo(found);
-    setState("found");
-  }, []);
-
-  const doInstall = useCallback(async () => {
-    setState("installing");
-    try {
-      await installUpdate((f) => setProgress(f));
-      setState("done");
-    } catch (e: unknown) {
-      setErr(e instanceof Error ? e.message : String(e));
-      setState("error");
-    }
-  }, []);
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span style={{ color: "var(--text-dim)" }}>Updates</span>
-        {state === "idle" && (
-          <button type="button" className="btn-link" style={{ fontSize: 10 }} onClick={doCheck}>
-            check now
-          </button>
-        )}
-        {state === "checking" && <span style={{ fontSize: 10 }}>checking…</span>}
-        {state === "current" && (
-          <span style={{ fontSize: 10, color: "var(--text-dim)" }}>no newer release found</span>
-        )}
-        {state === "found" && (
-          <span style={{ fontSize: 10, color: "var(--accent)" }}>
-            latest release v{info?.version} · this build{" "}
-            {formatAppVersion(info?.currentVersion || undefined)}
-          </span>
-        )}
-        {state === "installing" && (
-          <span className="tnum" style={{ fontSize: 10 }}>
-            {progress < 0 ? "downloading…" : `${Math.round(progress * 100)}%`}
-          </span>
-        )}
-        {state === "done" && (
-          <span style={{ fontSize: 10, color: "var(--accent)" }}>restart to apply</span>
-        )}
-        {state === "error" && <span style={{ fontSize: 10, color: "var(--danger)" }}>failed</span>}
-      </div>
-
-      {state === "found" && (
-        <div style={{ fontSize: 10, color: "var(--text-dim)" }}>
-          {canSelfInstall ? (
-            <button type="button" className="btn-link" style={{ fontSize: 10 }} onClick={doInstall}>
-              download &amp; install v{info?.version}
-            </button>
-          ) : (
-            <>Installed from a system package — update with your package manager.</>
-          )}
-        </div>
-      )}
-      {state === "error" && err && (
-        <div style={{ fontSize: 10, color: "var(--danger)" }}>{err}</div>
-      )}
-    </div>
-  );
-}
 

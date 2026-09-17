@@ -101,6 +101,7 @@ import type { SwapsWaiting } from "./features/auth/swapsWaitingNotice";
 import { ScanDateCard } from "./features/settings/ScanDateCard";
 import { TitleBar } from "./components/PrimitivesV2";
 import { ViewRouter } from "./ViewRouter";
+import { UpdateBanner } from "./components/UpdateBanner";
 
 /* ═══════════════════════════════════════════════════════════ */
 
@@ -1955,6 +1956,9 @@ function App() {
         </div>
         {error && <div className="alert alert-error">{error}</div>}
         {success && <div className="alert alert-success">{success}</div>}
+        {/* The lock screen renders ahead of both shells, so it needs its own
+            update notice. No Settings link: Settings is not reachable yet. */}
+        {view === "login" && <UpdateBanner />}
         <AuthRouter
           view={view}
           setView={setView}

@@ -70,9 +70,12 @@ describe("update banner parity", () => {
     // Toggling the layout unmounts one shell and mounts the other. Without a
     // module-level memo that would re-poll the release endpoint on every
     // layout flip.
-    const src = read(COMPONENT);
-    expect(src).toMatch(/let checkOnce: Promise<UpdateInfo \| null> \| null = null/);
-    expect(src).toMatch(/if \(!checkOnce\) checkOnce = checkForUpdate\(\)/);
+    // The memo moved to the shared store on 2026-09-17 (lib/appUpdate.ts),
+    // which the banner and both Settings rows read.
+    const store = read("src/lib/appUpdate.ts");
+    expect(store).toMatch(/let launchCheck: Promise<void> \| null = null/);
+    expect(store).toMatch(/if \(!launchCheck\) launchCheck = runCheck\(\)/);
+    expect(read(COMPONENT)).toMatch(/checkAppUpdate\(\)/);
   });
 
   it("remembers dismissal per version, so a new version can still be announced", () => {
@@ -81,7 +84,39 @@ describe("update banner parity", () => {
     // against the version just found.
     const src = read(COMPONENT);
     expect(src).toMatch(/localStorage\.setItem\(DISMISS_KEY, info\.version\)/);
-    expect(src).toMatch(/readDismissed\(\) === found\.version/);
+    expect(src).toMatch(/dismissed === info\.version/);
+  });
+
+  it("is also on the lock screen, which renders ahead of both shells", () => {
+    // 2026-09-17: a user who launched the app and stayed on the unlock screen
+    // was never told about an update — the auth views return before either
+    // shell (and its banner) mounts.
+    const app = read("src/App.tsx");
+    const auth = app.slice(app.indexOf("if (AUTH_VIEWS.has(view))"));
+    const block = auth.slice(0, auth.indexOf("<AuthRouter"));
+    expect(block).toMatch(/view === "login" && <UpdateBanner \/>/);
+  });
+
+  it("both layouts' Settings can install, not only portrait's", () => {
+    // 2026-09-17: landscape (the default layout) had a Version row and no
+    // update row, so the landscape banner's "View" led to nothing to click.
+    for (const settings of [
+      "src/features/settings/SettingsView.tsx",
+      "src/features/settings/SettingsLandscapeView.tsx",
+    ]) {
+      expect(read(settings), settings).toMatch(/<AppUpdateRow\b/);
+    }
+    // The banner itself carries the install/restart actions.
+    expect(read(COMPONENT)).toMatch(/<AppUpdateActions\b/);
+  });
+
+  it("restarts through the exit path that stops the miners", () => {
+    // `restart()` can skip RunEvent::ExitRequested, where lib.rs stops the
+    // miners and starts the swap node's shutdown ladder.
+    const rs = read("src-tauri/src/data_paths.rs");
+    const body = rs.slice(rs.indexOf("pub fn restart_app("));
+    expect(body.slice(0, body.indexOf("\n}"))).toMatch(/app\.request_restart\(\)/);
+    expect(read("src-tauri/src/lib.rs")).toMatch(/data_paths::restart_app,/);
   });
 
   it("cannot fire in a shipped build via the sandbox override", () => {
