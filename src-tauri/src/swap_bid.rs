@@ -60,6 +60,18 @@ use crate::swap_sidecar::{
 /// a constant, so there is no input that can redirect it.
 const BID_NEW_PATH: &str = "bids/new";
 
+/// How many `bids/new` POSTs this process has sent. A plain counter that the
+/// swap path bumps and never reads: anything that wants to react to a new
+/// taker bid (the interface-fee watcher does, 2026-09-18) polls it locally
+/// instead of sweeping the node's bid list on a timer. The dependency runs one
+/// way — this module knows nothing about its readers.
+static BIDS_SENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// See [`BIDS_SENT`].
+pub fn bids_sent() -> u64 {
+    BIDS_SENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// How far a bid's rate may differ from the offer's, as a fraction.
 ///
 /// 0.01 %, mirroring `offers.ts::RATE_TOLERANCE_FRACTION` and upstream's own
@@ -367,6 +379,9 @@ pub async fn swap_sidecar_place_bid(
         .send()
         .await
         .map_err(|e| format!("the bid could not be sent to the swap node: {}", e))?;
+    // Counted once the POST has gone out, whatever the reply: a reply that
+    // failed to parse can still belong to a bid the node created.
+    BIDS_SENT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let status = resp.status().as_u16();
     let text = resp
         .text()
@@ -814,6 +829,14 @@ pub const JANITOR_FIRST_DELAY: Duration = Duration::from_secs(45);
 /// Cadence after that. A swap leg is 30–90 minutes; there is nothing to gain
 /// from polling harder.
 pub const JANITOR_PERIOD: Duration = Duration::from_secs(600);
+
+/// While the node's wallet is locked the janitor retries this often instead of
+/// waiting a whole period, so the first real sweep lands soon after unlock.
+pub const JANITOR_LOCKED_RETRY: Duration = Duration::from_secs(60);
+
+/// The error `run_bid_janitor_once` returns when the node refuses because its
+/// wallet is still locked (`{"error": …, "locked": true}`) — boot, not a fault.
+pub const JANITOR_LOCKED: &str = "the swap wallet is locked";
 /// How often the loop looks at the node's phase between sweeps.
 const JANITOR_IDLE_POLL: Duration = Duration::from_secs(20);
 /// Automatic re-queues per bid per app session before the janitor leaves a
@@ -908,6 +931,9 @@ pub async fn run_bid_janitor_once(
     let state = app.state::<SwapSidecarState>();
     let (port, password) = api_context(&state)?;
     let sweep = engine_json(port, &password, "sentbids", ApiMethod::Post, None).await?;
+    if sweep.get("locked").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(JANITOR_LOCKED.to_string());
+    }
     let rows = sweep
         .as_array()
         .cloned()
@@ -1002,6 +1028,10 @@ pub fn spawn_bid_janitor(app: &AppHandle) {
     tauri::async_runtime::spawn(async move {
         let mut healthy_since: Option<Instant> = None;
         let mut last_sweep: Option<Instant> = None;
+        // Locked-wallet spell: said once, and the first-sweep report is kept
+        // for the first sweep that actually ran.
+        let mut locked = false;
+        let mut reported_first = false;
         let mut requeues: HashMap<String, u32> = HashMap::new();
         let mut unpark_backoff: HashMap<String, UnparkBackoff> = HashMap::new();
         let mut unlock_gen = unpark_unlock_gen();
@@ -1028,6 +1058,8 @@ pub fn spawn_bid_janitor(app: &AppHandle) {
                 }
                 healthy_since = None;
                 last_sweep = None;
+                reported_first = false;
+                locked = false;
                 continue;
             }
             let gen = unpark_unlock_gen();
@@ -1097,10 +1129,31 @@ pub fn spawn_bid_janitor(app: &AppHandle) {
                     continue;
                 }
             }
-            let first_sweep = last_sweep.is_none();
+            let first_sweep = !reported_first;
             last_sweep = Some(Instant::now());
-            supervisor_log(&app, "janitor: sweep starting (POST /json/sentbids)");
-            match run_bid_janitor_once(&app, &mut requeues).await {
+            if !locked {
+                supervisor_log(&app, "janitor: sweep starting (POST /json/sentbids)");
+            }
+            let result = run_bid_janitor_once(&app, &mut requeues).await;
+            if matches!(&result, Err(e) if e == JANITOR_LOCKED) {
+                if !locked {
+                    supervisor_log(
+                        &app,
+                        "janitor: the swap wallet is locked — sweeps resume once it is unlocked",
+                    );
+                    locked = true;
+                }
+                // Retry in a minute, not a period.
+                last_sweep = Instant::now()
+                    .checked_sub(JANITOR_PERIOD.saturating_sub(JANITOR_LOCKED_RETRY));
+                continue;
+            }
+            if locked {
+                supervisor_log(&app, "janitor: the swap wallet is unlocked — sweeping");
+                locked = false;
+            }
+            reported_first = true;
+            match result {
                 // The first sweep after a healthy transition is logged even when
                 // it found nothing: "the janitor saw N bids and none in Error" is
                 // the answer to "why is my old error swap still active", and a

@@ -136,6 +136,47 @@ use ledger::{FeeRecord, FeeState};
 const POLL: Duration = Duration::from_secs(15);
 /// How long to wait when the node is not up. Not an error — the ordinary state.
 const IDLE_POLL: Duration = Duration::from_secs(60);
+/// With no taker swap open, the watcher does not poll the node at all. It
+/// sweeps when this app sends a bid (`swap_bid::bids_sent`, checked locally
+/// every [`WAKE_CHECK`]) and otherwise once per `BACKSTOP` — for a bid placed
+/// some other way (the stock BasicSwap UI) or while the app was closed. A swap
+/// takes far longer than this to settle, and only a settled swap is charged,
+/// so the backstop costs no fee; it costs one request every ten minutes.
+///
+/// Until 2026-09-18 the sweep ran every 15 s all session with nothing in
+/// flight, and while the node's Particl wallet was still locked each pass
+/// printed `sentbids did not return a list` — a line every 15 s for as long
+/// as the login screen was up.
+const BACKSTOP: Duration = Duration::from_secs(10 * 60);
+/// How often the idle watcher checks the local bid counter. No I/O.
+const WAKE_CHECK: Duration = Duration::from_secs(5);
+
+/// What one pass found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// No node to ask.
+    NodeDown,
+    /// The node answered `{"locked": true}`: its wallet is not unlocked yet,
+    /// so it cannot list bids. Ordinary during boot, not a fault.
+    Locked,
+    /// Swept; `open` records still need the node (a swap in flight).
+    Swept { open: usize },
+}
+
+/// How long to sleep after a pass, and whether a new bid may cut it short.
+fn next_sleep(pass: Pass) -> (Duration, bool) {
+    match pass {
+        Pass::NodeDown | Pass::Locked => (IDLE_POLL, false),
+        Pass::Swept { open } if open > 0 => (POLL, false),
+        Pass::Swept { .. } => (BACKSTOP, true),
+    }
+}
+
+/// A locked-wallet refusal, as opposed to any other non-list body (which
+/// stays loud: silence on that path is how the role bug lived).
+fn is_locked_refusal(body: &serde_json::Value) -> bool {
+    body.get("locked").and_then(|v| v.as_bool()) == Some(true)
+}
 /// Give up deferring after this many attempts and close the record.
 ///
 /// It was 40 attempts at the 15-second poll — ten minutes — which is shorter
@@ -759,26 +800,49 @@ pub fn spawn(app: &AppHandle) {
         eprintln!(
             "[sidecar-fees] watcher started in {m:?} mode; charging only bids created              at or after unix {baseline}"
         );
+        let mut was_locked = false;
         loop {
-            let slept = match tick(&app, &dir, m, baseline).await {
-                Ok(true) => POLL,
-                Ok(false) => IDLE_POLL,
+            let seen = crate::swap_bid::bids_sent();
+            let pass = match tick(&app, &dir, m, baseline).await {
+                Ok(p) => p,
                 Err(e) => {
                     eprintln!("[sidecar-fees] tick failed: {e}");
-                    IDLE_POLL
+                    Pass::NodeDown
                 }
             };
-            tokio::time::sleep(slept).await;
+            // Said once per locked spell, not once per pass.
+            let locked = pass == Pass::Locked;
+            if locked && !was_locked {
+                eprintln!(
+                    "[sidecar-fees] the swap wallet is locked — paused until it is unlocked"
+                );
+            } else if !locked && was_locked {
+                eprintln!("[sidecar-fees] the swap wallet is unlocked — watching again");
+            }
+            was_locked = locked;
+
+            let (sleep, wakes_on_bid) = next_sleep(pass);
+            let until = tokio::time::Instant::now() + sleep;
+            loop {
+                let now = tokio::time::Instant::now();
+                if now >= until {
+                    break;
+                }
+                if wakes_on_bid && crate::swap_bid::bids_sent() != seen {
+                    break;
+                }
+                tokio::time::sleep((until - now).min(WAKE_CHECK)).await;
+            }
         }
     });
 }
 
-/// One pass. `Ok(false)` means the node was not up — an ordinary state, not an
-/// error, and the reason this backs off rather than logging noise.
-async fn tick(app: &AppHandle, dir: &PathBuf, m: Mode, baseline: i64) -> Result<bool, String> {
+/// One pass. `NodeDown` and `Locked` are ordinary states, not errors, and the
+/// reason this backs off rather than logging noise.
+async fn tick(app: &AppHandle, dir: &PathBuf, m: Mode, baseline: i64) -> Result<Pass, String> {
     let state = app.state::<SwapSidecarState>();
     let Ok((port, password)) = api_context(&state) else {
-        return Ok(false);
+        return Ok(Pass::NodeDown);
     };
 
     // 1. Sweep the taker's list, UNFILTERED. Roles and states: see the header.
@@ -789,10 +853,14 @@ async fn tick(app: &AppHandle, dir: &PathBuf, m: Mode, baseline: i64) -> Result<
             api_json(port, &password, endpoint, ApiMethod::Post, Some(serde_json::json!({})))
                 .await?;
         let Some(rows) = sweep.as_array() else {
-            // A non-array body is upstream REFUSING, not an empty book: a
-            // locked wallet answers `{"error": …, "locked": true}` with a 200.
-            // Silence on this path is what let the role bug live undetected —
-            // so say it, every pass, rather than treating it as "no swaps".
+            // A locked wallet answers `{"error": …, "locked": true}` with a
+            // 200. That is boot, not a fault: the caller says it once.
+            if is_locked_refusal(&sweep) {
+                return Ok(Pass::Locked);
+            }
+            // Any OTHER non-array body is upstream refusing, not an empty
+            // book. Silence on this path is what let the role bug live
+            // undetected — so say it, every pass, rather than "no swaps".
             eprintln!(
                 "[sidecar-fees] {endpoint} did not return a list; swept nothing from it: {sweep}"
             );
@@ -846,7 +914,19 @@ async fn tick(app: &AppHandle, dir: &PathBuf, m: Mode, baseline: i64) -> Result<
         let Some(bid) = parse_bid_for(src, &rec.bid_id) else { continue };
         act(app, dir, m, port, &password, &rec, &bid, parse_created_at(src), baseline).await?;
     }
-    Ok(true)
+    // What still needs the node: open records whose deferral (if any) has run
+    // out. A record deferred on the chain waits in the backstop, not at 15 s.
+    let (after, _) = ledger::load_all(dir);
+    let now_utc = chrono::Utc::now();
+    let open = after
+        .iter()
+        .filter(|r| r.is_open())
+        .filter(|r| match &r.state {
+            FeeState::Deferred { until, .. } => !deferral_pending(until, now_utc),
+            _ => true,
+        })
+        .count();
+    Ok(Pass::Swept { open })
 }
 
 /// Apply the decision for one bid.
@@ -1118,6 +1198,42 @@ pub async fn sidecar_fees_quote(ticker: String, amount: String) -> Result<Decisi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-18: with no taker swap open the watcher does not poll the
+    /// node; it waits for a sent bid or the ten-minute backstop. Only an open
+    /// record keeps the 15 s cadence.
+    #[test]
+    fn the_watcher_polls_only_while_a_taker_swap_is_open() {
+        assert_eq!(next_sleep(Pass::Swept { open: 1 }), (POLL, false));
+        assert_eq!(next_sleep(Pass::Swept { open: 0 }), (BACKSTOP, true));
+        assert_eq!(next_sleep(Pass::NodeDown), (IDLE_POLL, false));
+        assert_eq!(next_sleep(Pass::Locked), (IDLE_POLL, false));
+        assert!(BACKSTOP >= Duration::from_secs(5 * 60));
+        assert!(WAKE_CHECK < POLL);
+    }
+
+    /// The reported spam was this body, every 15 s. It is now a state (said
+    /// once per spell); any OTHER non-list body still logs every pass.
+    #[test]
+    fn a_locked_wallet_is_a_state_not_an_error() {
+        let locked = serde_json::json!({
+            "error": "Wallet must be unlocked to view bids. Please unlock your Particl wallet.",
+            "locked": true
+        });
+        assert!(is_locked_refusal(&locked));
+        assert!(!is_locked_refusal(&serde_json::json!({"error": "something else"})));
+        assert!(!is_locked_refusal(&serde_json::json!({"locked": false})));
+        assert!(!is_locked_refusal(&serde_json::json!([])));
+    }
+
+    /// The wake-up comes from the swap path's own counter; the swap path must
+    /// still know nothing about the fee (invariant 3 — the counter is read
+    /// here, never the other way round).
+    #[test]
+    fn the_watcher_wakes_on_the_swap_paths_bid_counter() {
+        let src = include_str!("mod.rs");
+        assert!(src.contains("crate::swap_bid::bids_sent()"));
+    }
 
     #[test]
     fn mode_defaults_to_off_for_anything_unrecognised() {
