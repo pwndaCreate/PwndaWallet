@@ -264,7 +264,12 @@ describe("#4 lane controls and labels are shared", () => {
       expect(src).toContain("<LaneTuningControls");
       expect(src).toContain("laneHasIntensity(");
       // Neither view builds its own copy of a control the block owns.
-      expect(src).not.toMatch(/<(LoadSlider|GpuIntensityControl|CpuThreadsControl|GpuDevicePicker)\b/);
+      expect(src).not.toMatch(/<(LoadSlider|GpuIntensityControl|GpuVramLimitControl|CpuThreadsControl|GpuDevicePicker)\b/);
+      // 2026-09-17: the XelisHash VRAM limit reaches the block from every mount.
+      for (const block of elements(src, "LaneTuningControls")) {
+        expect(block).toMatch(/gpuVramLimit=\{gpuVramLimit\}/);
+        expect(block).toMatch(/setGpuVramLimit=\{setGpuVramLimit\}/);
+      }
       // Portrait's four hand-written buttons are what landscape never got.
       expect(src).not.toMatch(/setGpuIntensity\(\s*"/);
     });
@@ -298,6 +303,16 @@ describe("#4 lane controls and labels are shared", () => {
     // 2026-09-17 — see `gpuIntensityUnsupportedReason`).
     expect(src).toMatch(/unsupportedReason=\{intensityLocked\}/);
     expect(src).toMatch(/gpuIntensityUnsupportedReason\(gpuAlgorithm\)/);
+    // XelisHash gets the VRAM limit in the intensity slot (2026-09-17),
+    // AUTO by default.
+    const vramAt = src.indexOf("<GpuVramLimitControl");
+    expect(vramAt).toBeGreaterThan(-1);
+    expect(src.slice(Math.max(0, vramAt - 200), vramAt)).toMatch(/gpuAlgorithm === "xelishashv3"/);
+  });
+
+  it("only a XelisHash start sends a VRAM limit", () => {
+    const src = code("src/features/mining/useMiner.ts");
+    expect(src).toMatch(/gpuVramLimitMb: algorithm === "xelishashv3" \? gpuVramLimitMb\(gpuVramLimitState\) : null/);
   });
 
   it("SIMPLE uses the shared GPU picker, not its own device list", () => {

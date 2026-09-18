@@ -271,3 +271,48 @@ export function readGpuIntensitySetting(): GpuIntensitySetting {
 export function writeGpuIntensitySetting(v: GpuIntensitySetting): void {
   writeNullable(GPU_INTENSITY_KEY, clampGpuIntensity(v));
 }
+
+// ── XelisHash GPU VRAM limit ──────────────────────────────────────────────
+//
+// XelisHash gives every GPU thread its own 531 KiB scratchpad, so SRBMiner's
+// 0-31 intensity is not offered on that lane (2026-09-17). What is offered is
+// an optional budget in GB: Rust turns it into a thread count per card and
+// never asks for more than 90% of a card (`srb_vram_limit_arg` in miners.rs).
+// `null` = AUTO, the default: nothing is sent and SRBMiner sizes itself.
+
+/** GB per card, or `null` for AUTO. */
+export type GpuVramLimitSetting = number | null;
+
+export const GPU_VRAM_LIMIT_MIN_GB = 1;
+/** Slider ceiling when no card's memory is known. */
+export const GPU_VRAM_LIMIT_FALLBACK_MAX_GB = 16;
+
+const GPU_VRAM_LIMIT_KEY = "pwnda.mine.xelisVramGb";
+
+/** Largest limit worth offering: the biggest dedicated card, in whole GB. */
+export function gpuVramLimitMaxGb(gpus: readonly GpuLike[]): number {
+  const most = Math.max(
+    0,
+    ...gpus.filter(isDedicatedGpu).map((g) => Math.floor((g.vram_bytes ?? 0) / 1024 ** 3)),
+  );
+  return most >= GPU_VRAM_LIMIT_MIN_GB ? most : GPU_VRAM_LIMIT_FALLBACK_MAX_GB;
+}
+
+export function clampGpuVramLimit(v: GpuVramLimitSetting): GpuVramLimitSetting {
+  if (v == null || !Number.isFinite(v) || v < GPU_VRAM_LIMIT_MIN_GB) return null;
+  return Math.min(Math.floor(v), 1024);
+}
+
+/** What Rust receives: MB, or `null` for AUTO. */
+export function gpuVramLimitMb(v: GpuVramLimitSetting): number | null {
+  const c = clampGpuVramLimit(v);
+  return c == null ? null : c * 1024;
+}
+
+export function readGpuVramLimit(): GpuVramLimitSetting {
+  return clampGpuVramLimit(readPositiveInt(GPU_VRAM_LIMIT_KEY));
+}
+
+export function writeGpuVramLimit(v: GpuVramLimitSetting): void {
+  writeNullable(GPU_VRAM_LIMIT_KEY, clampGpuVramLimit(v));
+}

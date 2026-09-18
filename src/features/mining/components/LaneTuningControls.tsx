@@ -8,7 +8,9 @@
  *
  *   - CPU lane → `CpuThreadsControl` (xmrig `--threads` / SRBMiner `--cpu-threads`);
  *   - GPU lane → `GpuDevicePicker`, then `GpuIntensityControl`, which is
- *     locked with a reason when the lane's miner is lolMiner (no flag).
+ *     locked with a reason when the lane's miner is lolMiner (no flag);
+ *   - XelisHash GPU lane → `GpuVramLimitControl` in the intensity slot
+ *     (AUTO by default; an optional per-card VRAM budget, 2026-09-17).
  *
  * Every control is locked while its lane mines; changes apply on next start.
  */
@@ -19,10 +21,16 @@ import {
   gpuIntensityUnsupportedReason,
   type CpuMinerBinary,
 } from "../miningLane";
-import type { CpuThreads, GpuIntensitySetting, GpuLike } from "../miningTuning";
+import type {
+  CpuThreads,
+  GpuIntensitySetting,
+  GpuLike,
+  GpuVramLimitSetting,
+} from "../miningTuning";
 import { CpuThreadsControl } from "./CpuThreadsControl";
 import { GpuDevicePicker } from "./GpuDevicePicker";
 import { GpuIntensityControl } from "./GpuIntensityControl";
+import { GpuVramLimitControl } from "./GpuVramLimitControl";
 
 // Re-exported: it moved to `miningLane` on 2026-09-17, when the reasons became
 // per-algorithm, and callers still import it from here.
@@ -38,6 +46,8 @@ export function LaneTuningControls({
   setCpuThreads,
   gpuIntensityLevel,
   setGpuIntensityLevel,
+  gpuVramLimit,
+  setGpuVramLimit,
   gpus,
   gpuSelection,
   setGpuSelection,
@@ -54,6 +64,9 @@ export function LaneTuningControls({
   setCpuThreads: (next: CpuThreads) => void;
   gpuIntensityLevel: GpuIntensitySetting;
   setGpuIntensityLevel: (next: GpuIntensitySetting) => void;
+  /** XelisHash lane only: GB per card, `null` = AUTO. */
+  gpuVramLimit: GpuVramLimitSetting;
+  setGpuVramLimit: (next: GpuVramLimitSetting) => void;
   gpus: readonly GpuLike[];
   gpuSelection: GpuSelection;
   setGpuSelection: (next: GpuSelection) => void;
@@ -89,14 +102,26 @@ export function LaneTuningControls({
         disabled={laneMining}
         variant={variant}
       />
-      <GpuIntensityControl
-        value={gpuIntensityLevel}
-        onChange={setGpuIntensityLevel}
-        disabled={laneMining}
-        unsupportedReason={intensityLocked}
-        variant={variant}
-        delayBase={delayBase}
-      />
+      {gpuAlgorithm === "xelishashv3" ? (
+        // Per-thread scratchpad: a memory budget instead of an intensity.
+        <GpuVramLimitControl
+          value={gpuVramLimit}
+          onChange={setGpuVramLimit}
+          gpus={gpus}
+          disabled={laneMining}
+          variant={variant}
+          delayBase={delayBase}
+        />
+      ) : (
+        <GpuIntensityControl
+          value={gpuIntensityLevel}
+          onChange={setGpuIntensityLevel}
+          disabled={laneMining}
+          unsupportedReason={intensityLocked}
+          variant={variant}
+          delayBase={delayBase}
+        />
+      )}
     </div>
   );
 }
