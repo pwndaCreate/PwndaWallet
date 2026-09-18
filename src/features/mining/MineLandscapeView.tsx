@@ -142,6 +142,8 @@ export function MineLandscapeView({
     gpuIntensity,
     gpuIntensityLevel,
     setGpuIntensityLevel,
+    gpuVramLimit,
+    setGpuVramLimit,
     gpus,
     gpuSelection,
     setGpuSelection,
@@ -910,6 +912,8 @@ export function MineLandscapeView({
           setCpuThreads={setCpuThreads}
           gpuIntensityLevel={gpuIntensityLevel}
           setGpuIntensityLevel={setGpuIntensityLevel}
+          gpuVramLimit={gpuVramLimit}
+          setGpuVramLimit={setGpuVramLimit}
           gpus={gpus}
           gpuSelection={gpuSelection}
           setGpuSelection={setGpuSelection}

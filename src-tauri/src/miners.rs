@@ -3543,7 +3543,7 @@ pub struct MinerGpuDevice {
     pub vendor: String,
     /// Total device memory in MB, as the miner reports it. `None` when the
     /// line carried no `[<n> MB]` field. Used to cap a memory-hard
-    /// algorithm's intensity — see [`max_gpu_intensity_for_memory`].
+    /// algorithm's VRAM limit per card — see [`srb_vram_limit_arg`].
     pub memory_mb: Option<u32>,
 }
 
@@ -3842,6 +3842,10 @@ pub async fn start_gpu_miner(
     // A worker name carried as its OWN stratum field rather than appended to
     // the wallet. XELIS only — see `build_gpu_miner_args`.
     worker: Option<String>,
+    // Optional VRAM budget (MB) per card for a memory-hard algorithm
+    // (XelisHash). `None` = AUTO: no thread count is sent and SRBMiner sizes
+    // itself to the card. See `srb_vram_limit_arg`.
+    gpu_vram_limit_mb: Option<u32>,
 ) -> Result<(), String> {
     // RAII "already starting" sentinel — same pattern as `start_xmrig`.
     // Prevents duplicate concurrent sessions if the user click-spams
@@ -3929,6 +3933,7 @@ pub async fn start_gpu_miner(
         show_miner_window,
         gpu_intensity,
         gpu_indices.as_deref(),
+        gpu_vram_limit_mb,
     )
     .await?;
 
@@ -3992,37 +3997,6 @@ pub(crate) const SRB_GPU_INTENSITY_MAX: u32 = 31;
 /// unusable here.
 pub(crate) const XELISHASH_V3_SCRATCHPAD_BYTES: u64 = 531 * 128 * 8;
 
-/// Fraction of a card's memory the scratchpads may use. The rest is the
-/// miner's own buffers, the display, and the driver's headroom; a card filled
-/// to the brim is how Windows starts spilling to shared system memory and the
-/// desktop freezes.
-const GPU_MEMORY_HEADROOM: f64 = 0.80;
-
-/// Largest `--gpu-intensity` a card with `memory_mb` can hold for an algorithm
-/// that needs `bytes_per_thread` per thread.
-///
-/// SRBMiner's intensity is an EXPONENT: the thread count is `2^intensity`
-/// (its help calls anything above 31 a "raw intensity", i.e. the thread count
-/// itself, and 2^31 is where that scale ends). So the cap is the largest `n`
-/// with `2^n * bytes_per_thread <= memory * headroom`.
-///
-/// 2026-09-17: mining XELIS on two cards at intensity 20 asked for 2^20
-/// threads = 570 GB of scratchpad each. Both cards filled, SRBMiner reported
-/// "not enough memory", and the machine froze. The presets (16/22/28) were
-/// chosen for KawPow/Autolykos, which have no per-thread scratchpad at all.
-pub(crate) fn max_gpu_intensity_for_memory(memory_mb: u32, bytes_per_thread: u64) -> u32 {
-    if bytes_per_thread == 0 {
-        return SRB_GPU_INTENSITY_MAX;
-    }
-    let usable = (u64::from(memory_mb) * 1024 * 1024) as f64 * GPU_MEMORY_HEADROOM;
-    let threads = (usable / bytes_per_thread as f64).floor();
-    if threads < 2.0 {
-        return SRB_GPU_INTENSITY_MIN;
-    }
-    let n = threads.log2().floor() as u32;
-    n.clamp(SRB_GPU_INTENSITY_MIN, SRB_GPU_INTENSITY_MAX)
-}
-
 /// Bytes per GPU thread for `algorithm`, or `None` when it has no per-thread
 /// scratchpad worth capping (KawPow, Autolykos2, ProgPow — their memory is one
 /// shared DAG, so intensity does not scale allocation the same way).
@@ -4031,6 +4005,58 @@ pub(crate) fn gpu_scratchpad_bytes(algorithm: &str) -> Option<u64> {
         "xelishashv3" => Some(XELISHASH_V3_SCRATCHPAD_BYTES),
         _ => None,
     }
+}
+
+/// Share of a card a VRAM limit may ever claim, whatever the user picked. The
+/// rest is the miner's own buffers, the display and the driver.
+const VRAM_LIMIT_CARD_CEILING: f64 = 0.90;
+
+/// Thread counts are rounded down to this. SRBMiner's own auto-tune landed on
+/// multiples of 256 on the dev box (16384 and 14848 on the RX 6700 XT in two
+/// runs, 2026-09-17), and 256 is comfortably above 31, so the value
+/// is always read as a RAW intensity, never as the 0-31 scale.
+const VRAM_LIMIT_THREAD_STEP: u32 = 256;
+
+/// GPU threads that fit in `limit_mb` of scratchpad on a card with `card_mb`
+/// (when known), at `bytes_per_thread` each: `min(limit, 90% of the card) /
+/// bytes`, rounded down to [`VRAM_LIMIT_THREAD_STEP`], never below one step.
+pub(crate) fn gpu_threads_for_vram_limit(
+    limit_mb: u32,
+    card_mb: Option<u32>,
+    bytes_per_thread: u64,
+) -> u32 {
+    let mut budget_mb = f64::from(limit_mb);
+    if let Some(card) = card_mb {
+        budget_mb = budget_mb.min(f64::from(card) * VRAM_LIMIT_CARD_CEILING);
+    }
+    let threads = (budget_mb * 1024.0 * 1024.0 / bytes_per_thread.max(1) as f64).floor();
+    let threads = threads.min(f64::from(u32::MAX)) as u32;
+    (threads / VRAM_LIMIT_THREAD_STEP * VRAM_LIMIT_THREAD_STEP).max(VRAM_LIMIT_THREAD_STEP)
+}
+
+/// The `--gpu-intensity` value for a VRAM limit: SRBMiner's RAW intensity
+/// (a thread count; its help: "if > 31 it's treated as raw intensity"), which
+/// is exactly what its auto-tune reports ("GPU0 auto tune result 16384", and
+/// 16384 x 531 KiB is the ~8.5 GB the card then showed in use).
+///
+/// With 2+ explicitly selected cards and each card's memory known, one value
+/// per card, so a limit bigger than the smaller card is still capped per card.
+/// Otherwise one value, sized for the smallest known card.
+pub(crate) fn srb_vram_limit_arg(
+    limit_mb: u32,
+    card_memory_mb: &[u32],
+    bytes_per_thread: u64,
+    explicit_devices: usize,
+) -> String {
+    if explicit_devices > 1 && card_memory_mb.len() == explicit_devices {
+        return card_memory_mb
+            .iter()
+            .map(|mb| gpu_threads_for_vram_limit(limit_mb, Some(*mb), bytes_per_thread).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+    }
+    let smallest = card_memory_mb.iter().copied().min();
+    gpu_threads_for_vram_limit(limit_mb, smallest, bytes_per_thread).to_string()
 }
 
 /// The `--gpu-intensity` argument value: clamped to
@@ -4066,6 +4092,8 @@ fn build_gpu_miner_args(
     // Memory (MB) of the cards this session will use, in the same order as
     // `gpu_indices` (or every card when that is empty). Empty = unknown.
     card_memory_mb: &[u32],
+    // Optional per-card VRAM budget for a memory-hard algorithm. None = AUTO.
+    gpu_vram_limit_mb: Option<u32>,
 ) -> Vec<String> {
     // Shared by both branches below: empty and absent are the same "every
     // GPU" request, so callers (and tests) don't have to care which one a
@@ -4198,40 +4226,53 @@ fn build_gpu_miner_args(
         // here by `srb_gpu_intensity_arg`, which also repeats it once per
         // explicitly selected card (SRBMiner 3.6.2 `--help`: "separate
         // values with ','"). See wiki/concepts/srbminer-flags.md.
-        if let Some(intensity) = gpu_intensity {
-            let explicit_devices = gpu_indices.map(|ids| ids.len()).unwrap_or(0);
-            match gpu_scratchpad_bytes(algorithm) {
-                // Ordinary GPU algorithms (KawPow, Autolykos2, ProgPow): one
-                // shared DAG, so intensity does not multiply an allocation.
-                None => {
+        let explicit_devices = gpu_indices.map(|ids| ids.len()).unwrap_or(0);
+        match gpu_scratchpad_bytes(algorithm) {
+            // Ordinary GPU algorithms (KawPow, Autolykos2, ProgPow): one
+            // shared DAG, so intensity does not multiply an allocation.
+            None => {
+                if let Some(intensity) = gpu_intensity {
                     srb_args.push("--gpu-intensity".to_string());
                     srb_args.push(srb_gpu_intensity_arg(intensity, explicit_devices));
                 }
-                // Memory-hard (XelisHash): every thread in flight owns a
-                // scratchpad, so the request is a VRAM request. SRBMiner's
-                // 0-31 scale has no published mapping to a thread count (its
-                // whole documentation is one line in `Parameters`; the
-                // sgminer-lineage `1 << (shift + intensity)` is an inference,
-                // and any per-algorithm shift would move it), so a number sent
-                // here cannot be justified — and the miner self-tunes to the
-                // card, which is what upstream's own start-mining-xelis.bat
-                // relies on by passing no intensity at all.
-                //
-                // 2026-09-17: a two-card XELIS run at intensity 20 reported
-                // "not enough memory" on both, filled both cards, and froze
-                // the machine. The flag is not sent for these algorithms.
-                Some(bytes) => {
-                    let est: Vec<String> = card_memory_mb
-                        .iter()
-                        .map(|mb| format!("{mb} MB -> <= {}", max_gpu_intensity_for_memory(*mb, bytes)))
-                        .collect();
-                    eprintln!(
-                        "[gpu-mem] {algorithm} needs {bytes} B per thread; \
-                         ignoring intensity {intensity} and letting SRBMiner tune ({})",
-                        if est.is_empty() { "cards unread".to_string() } else { est.join(", ") }
-                    );
-                }
             }
+            // Memory-hard (XelisHash): every thread in flight owns a
+            // scratchpad, so the request is a VRAM request. SRBMiner's
+            // 0-31 scale has no published mapping to a thread count (its
+            // whole documentation is one line in `Parameters`; the
+            // sgminer-lineage `1 << (shift + intensity)` is an inference,
+            // and any per-algorithm shift would move it), so a number sent
+            // here cannot be justified — and the miner self-tunes to the
+            // card, which is what upstream's own start-mining-xelis.bat
+            // relies on by passing no intensity at all.
+            //
+            // 2026-09-17: a two-card XELIS run at intensity 20 reported
+            // "not enough memory" on both, filled both cards, and froze
+            // the machine. The 0-31 intensity is never sent for these.
+            //
+            // What IS sent, only when the user picked one, is a VRAM
+            // limit converted to a thread count (budget / bytes per
+            // thread), as SRBMiner's raw intensity — the same unit its
+            // auto-tune reports. No limit = no flag = AUTO.
+            Some(bytes) => match gpu_vram_limit_mb.filter(|mb| *mb > 0) {
+                Some(limit_mb) => {
+                    let value = srb_vram_limit_arg(limit_mb, card_memory_mb, bytes, explicit_devices);
+                    eprintln!(
+                        "[gpu-mem] {algorithm}: VRAM limit {limit_mb} MB -> raw intensity {value} \
+                         ({bytes} B per thread; cards {card_memory_mb:?} MB)"
+                    );
+                    srb_args.push("--gpu-intensity".to_string());
+                    srb_args.push(value);
+                }
+                None => {
+                    if let Some(intensity) = gpu_intensity {
+                        eprintln!(
+                            "[gpu-mem] {algorithm} needs {bytes} B per thread; \
+                             ignoring intensity {intensity} and letting SRBMiner tune"
+                        );
+                    }
+                }
+            },
         }
 
         // `--gpu-id 0,1` — indices "from --list-devices" per SRBMiner's own
@@ -4285,6 +4326,7 @@ mod gpu_device_selection_tests {
             GPU_HTTP_PORT,
             None,
             &[],
+            None,
         )
     }
 
@@ -4304,6 +4346,7 @@ mod gpu_device_selection_tests {
             api_port,
             None,
             &[],
+            None,
         )
     }
 
@@ -4346,6 +4389,7 @@ mod gpu_device_selection_tests {
             GPU_HTTP_PORT,
             None,
             &[],
+            None,
         );
         assert!(ssl.windows(2).any(|w| w[0] == "--tls" && w[1] == "true"));
         assert!(ssl.windows(2).any(|w| w[0] == "--pool" && w[1] == "stratum+ssl://xel.pwnda.org:17706"));
@@ -4378,6 +4422,7 @@ mod gpu_device_selection_tests {
             34_202,
             None,
             &[],
+            None,
         );
         assert!(lol.windows(2).any(|w| w[0] == "--apiport" && w[1] == "34202"));
     }
@@ -4463,6 +4508,7 @@ mod gpu_device_selection_tests {
             GPU_HTTP_PORT,
             None,
             &[],
+            None,
         );
         assert!(a.windows(2).any(|w| w[0] == "--gpu-intensity" && w[1] == "22"));
         assert!(a.windows(2).any(|w| w[0] == "--gpu-id" && w[1] == "0"));
@@ -4482,6 +4528,7 @@ mod gpu_device_selection_tests {
             GPU_HTTP_PORT,
             None,
             &[],
+            None,
         )
     }
 
@@ -4539,7 +4586,81 @@ mod gpu_device_selection_tests {
             GPU_HTTP_PORT,
             None,
             mem,
+            None,
         )
+    }
+
+    fn xelis_limited(limit_mb: Option<u32>, ids: Option<&[u32]>, mem: &[u32]) -> Vec<String> {
+        build_gpu_miner_args(
+            "SRBMiner-MULTI",
+            "stratum+tcp://pool.example:1234",
+            "wallet.worker",
+            "xelishashv3",
+            "x",
+            None,
+            None,
+            Some(20),
+            ids,
+            GPU_HTTP_PORT,
+            None,
+            mem,
+            limit_mb,
+        )
+    }
+
+    /// The optional VRAM limit (2026-09-17): a budget becomes a RAW thread
+    /// count (> 31), per card when 2+ cards are named, never more than 90% of
+    /// a card. No limit is AUTO — no flag, whatever the intensity slider says.
+    #[test]
+    fn a_vram_limit_becomes_a_raw_thread_count_per_card() {
+        use super::{gpu_threads_for_vram_limit, XELISHASH_V3_SCRATCHPAD_BYTES as B};
+        assert_eq!(B, 543_744, "xelis-hash v3: MEMORY_SIZE = 531 * 128 u64");
+        assert!(super::gpu_scratchpad_bytes("kawpow").is_none());
+        assert_eq!(super::gpu_scratchpad_bytes("xelishashv3"), Some(B));
+        // 4 GB: 4096 MiB / 531 KiB = 7899 threads, rounded down to 256s.
+        assert_eq!(gpu_threads_for_vram_limit(4096, None, B), 7680);
+        assert_eq!(gpu_threads_for_vram_limit(4096, Some(16310), B), 7680);
+        // A limit above the card is capped at 90% of it: 12272 MB -> 11044.8 MB.
+        assert_eq!(gpu_threads_for_vram_limit(64 * 1024, Some(12272), B), 21248);
+        // Tiny limits still send a raw value, never the 0-31 scale.
+        assert_eq!(gpu_threads_for_vram_limit(1, Some(12272), B), 256);
+
+        let two = xelis_limited(Some(4096), Some(&[0, 1]), &[12272, 16310]);
+        assert_eq!(intensity_value(&two).as_deref(), Some("7680,7680"));
+        let big = xelis_limited(Some(14 * 1024), Some(&[0, 1]), &[12272, 16310]);
+        assert_eq!(intensity_value(&big).as_deref(), Some("21248,27392"));
+        // One card, or cards unread: one value, sized for the smallest known.
+        assert_eq!(intensity_value(&xelis_limited(Some(14 * 1024), Some(&[1]), &[16310])).as_deref(), Some("27392"));
+        assert_eq!(intensity_value(&xelis_limited(Some(14 * 1024), None, &[12272, 16310])).as_deref(), Some("21248"));
+        assert_eq!(intensity_value(&xelis_limited(Some(4096), Some(&[0, 1]), &[])).as_deref(), Some("7680"));
+        // Every emitted value is raw (> 31).
+        for v in intensity_value(&big).unwrap().split(',') {
+            assert!(v.parse::<u32>().unwrap() > 31, "{v} would be read as the 0-31 scale");
+        }
+        // AUTO: no limit (or 0) sends nothing.
+        for limit in [None, Some(0)] {
+            assert_eq!(intensity_value(&xelis_limited(limit, Some(&[0, 1]), &[12272, 16310])), None);
+        }
+    }
+
+    #[test]
+    fn a_vram_limit_is_ignored_off_the_scratchpad_algorithms() {
+        let a = build_gpu_miner_args(
+            "SRBMiner-MULTI",
+            "stratum+tcp://pool.example:1234",
+            "wallet.worker",
+            "kawpow",
+            "x",
+            None,
+            None,
+            Some(22),
+            None,
+            GPU_HTTP_PORT,
+            None,
+            &[8192],
+            Some(4096),
+        );
+        assert_eq!(intensity_value(&a).as_deref(), Some("22"));
     }
 
     /// 2026-09-17: two cards at intensity 20 asked for 2^20 * 531 KiB each,
@@ -4567,23 +4688,6 @@ mod gpu_device_selection_tests {
         assert_eq!(a[i + 1], "0,1");
     }
 
-    /// The cap is still what a card could hold, for the log line and for any
-    /// future algorithm that wants it. 12272 MB at 531 KiB/thread: 80% of the
-    /// card is ~18.9k threads, so 2^14 fits and 2^15 does not.
-    #[test]
-    fn memory_cap_matches_the_cards_scratchpad_capacity() {
-        use super::{max_gpu_intensity_for_memory, XELISHASH_V3_SCRATCHPAD_BYTES as B};
-        assert_eq!(B, 543_744, "xelis-hash v3: MEMORY_SIZE = 531 * 128 u64");
-        assert_eq!(max_gpu_intensity_for_memory(12272, B), 14); // RX 6700 XT
-        assert_eq!(max_gpu_intensity_for_memory(16310, B), 14); // RTX 5060 Ti
-        assert_eq!(max_gpu_intensity_for_memory(80 * 1024, B), 16); // 80 GB: ~126k threads
-        // A card too small for two threads still reports the floor, never 0.
-        assert_eq!(max_gpu_intensity_for_memory(1, B), 1);
-        // No per-thread scratchpad: no cap.
-        assert_eq!(max_gpu_intensity_for_memory(8192, 0), 31);
-        assert!(super::gpu_scratchpad_bytes("kawpow").is_none());
-        assert_eq!(super::gpu_scratchpad_bytes("xelishashv3"), Some(B));
-    }
 }
 
 /// Spawn (or respawn) the GPU miner with the given parameters. Stores
@@ -4612,6 +4716,7 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     show_window: bool,
     gpu_intensity: Option<u32>,
     gpu_indices: Option<&[u32]>,
+    gpu_vram_limit_mb: Option<u32>,
 ) -> Result<(), String> {
     let miners_dir = get_miners_dir(app)?;
     let exe_name = if miner == "lolMiner" {
@@ -4649,7 +4754,9 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     // memory-hard algorithm. A failure to list them is not fatal: the builder
     // then leaves the flag off (AUTO) rather than sending a number it cannot
     // justify.
-    let card_memory_mb: Vec<u32> = if gpu_scratchpad_bytes(algorithm).is_some() {
+    let card_memory_mb: Vec<u32> = if gpu_scratchpad_bytes(algorithm).is_some()
+        && gpu_vram_limit_mb.is_some()
+    {
         match list_miner_gpu_devices(&exe_path, miner, &miners_dir).await {
             Ok(devices) => match gpu_indices.filter(|ids| !ids.is_empty()) {
                 Some(ids) => ids
@@ -4664,7 +4771,8 @@ pub(crate) async fn build_and_spawn_gpu_miner(
                 None => devices.iter().filter_map(|d| d.memory_mb).collect(),
             },
             Err(e) => {
-                eprintln!("[gpu-mem] could not list devices ({e}); intensity left on AUTO");
+                // The limit is still applied, just not capped per card.
+                eprintln!("[gpu-mem] could not list devices ({e}); VRAM limit not capped per card");
                 Vec::new()
             }
         }
@@ -4685,6 +4793,7 @@ pub(crate) async fn build_and_spawn_gpu_miner(
         api_port,
         log_path.as_deref(),
         &card_memory_mb,
+        gpu_vram_limit_mb,
     );
     if let Some(p) = log_path {
         record_miner_log_path(app, "gpu", p);

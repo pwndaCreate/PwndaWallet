@@ -179,6 +179,8 @@ export function MiningView({
     gpuIntensity,
     gpuIntensityLevel,
     setGpuIntensityLevel,
+    gpuVramLimit,
+    setGpuVramLimit,
     cpuThreadCount,
     cpuThreads,
     setCpuThreads,
@@ -803,6 +805,8 @@ export function MiningView({
               setCpuThreads={setCpuThreads}
               gpuIntensityLevel={gpuIntensityLevel}
               setGpuIntensityLevel={setGpuIntensityLevel}
+              gpuVramLimit={gpuVramLimit}
+              setGpuVramLimit={setGpuVramLimit}
               gpus={gpus}
               gpuSelection={gpuSelection}
               setGpuSelection={setGpuSelection}
@@ -910,6 +914,8 @@ export function MiningView({
               setCpuThreads={setCpuThreads}
               gpuIntensityLevel={gpuIntensityLevel}
               setGpuIntensityLevel={setGpuIntensityLevel}
+              gpuVramLimit={gpuVramLimit}
+              setGpuVramLimit={setGpuVramLimit}
               gpus={gpus}
               gpuSelection={gpuSelection}
               setGpuSelection={setGpuSelection}

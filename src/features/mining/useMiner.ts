@@ -71,12 +71,17 @@ import {
   gpuTierForIntensity,
   readCpuThreads,
   readGpuIntensitySetting,
+  readGpuVramLimit,
+  clampGpuVramLimit,
+  gpuVramLimitMb,
   reconcileGpuSelection,
   writeCpuThreads,
   writeGpuIntensitySetting,
+  writeGpuVramLimit,
   xmrigThreadArgs,
   type CpuThreads,
   type GpuIntensitySetting,
+  type GpuVramLimitSetting,
 } from "./miningTuning";
 import {
   AUTO_PING_STALENESS_MS,
@@ -407,6 +412,18 @@ export function useMiner(args: {
     (tier: GpuIntensity) => setGpuIntensityLevel(gpuIntensityForPreset(tier)),
     [setGpuIntensityLevel],
   );
+
+  // Optional per-card VRAM budget for the XelisHash GPU lane, which has no
+  // intensity control (531 KiB scratchpad per thread). null = AUTO: nothing
+  // is sent and SRBMiner sizes itself. Persisted. See `miningTuning.ts`.
+  const [gpuVramLimitState, setGpuVramLimitState] = useState<GpuVramLimitSetting>(
+    () => readGpuVramLimit(),
+  );
+  const setGpuVramLimit = useCallback((next: GpuVramLimitSetting) => {
+    const v = clampGpuVramLimit(next);
+    setGpuVramLimitState(v);
+    writeGpuVramLimit(v);
+  }, []);
 
   const [minerError, setMinerError] = useState("");
 
@@ -1108,6 +1125,8 @@ export function useMiner(args: {
           proxy: proxyActive ? (torHostPort ?? proxy.selectedProxy!.hostPort) : null,
           gpuIntensity: gpuIntensityValue,
           gpuIndices: gpuSelection,
+          // Only XelisHash takes a VRAM limit; everything else stays null.
+          gpuVramLimitMb: algorithm === "xelishashv3" ? gpuVramLimitMb(gpuVramLimitState) : null,
           // XELIS authorizes as `[wallet, worker, pass]` — three params, the
           // worker in its own field — so SRBMiner needs `--worker` instead of
           // the `address.worker` string every other pool here takes. Verified
@@ -1153,6 +1172,7 @@ export function useMiner(args: {
     cpuThreads,
     cpuThreadCount,
     gpuIntensityValueState,
+    gpuVramLimitState,
     gpuSelection,
     enableMsr,
     defenderExcluded,
@@ -2068,6 +2088,8 @@ export function useMiner(args: {
     setCpuThreads,
     gpuIntensityLevel: gpuIntensityValueState,
     setGpuIntensityLevel,
+    gpuVramLimit: gpuVramLimitState,
+    setGpuVramLimit,
     minerStatuses,
     minersReady,
     downloadingMiners,
