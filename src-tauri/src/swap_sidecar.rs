@@ -8123,6 +8123,88 @@ pub const AUTOSTART_READY_BUDGET: std::time::Duration = std::time::Duration::fro
 /// How often the readiness gate re-checks. Cheap — three local port probes.
 const AUTOSTART_READY_POLL: std::time::Duration = std::time::Duration::from_secs(1);
 
+/// The longest autostart waits on a LOCKED vault for a coin that would park.
+/// A safety valve, not a budget: past it the node starts and the coin parks,
+/// exactly as before 2026-09-18.
+pub const AUTOSTART_LOCKED_CAP: std::time::Duration = std::time::Duration::from_secs(60 * 60);
+
+/// What autostart does on this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutostartStep {
+    /// Everything it waits for is up.
+    Start,
+    /// Keep waiting.
+    Wait,
+    /// Out of budget: start anyway; coins not up park.
+    GiveUp,
+}
+
+/// The autostart budget, counted from UNLOCK rather than from launch
+/// (2026-09-18).
+///
+/// Until then the 300 s budget ran from app launch, while the vault was still
+/// locked — and nothing it waits for can come up before unlock, because the
+/// unlock path is what opens those wallets. A user who took longer than five
+/// minutes to type their password got a node started with ZANO parked, then an
+/// unpark restart after unlock that took ~3 min (two-minute stop ladder plus a
+/// ~45 s start; supervisor log 2026-09-17 23:33:51 -> 23:36:40 and 2026-09-18
+/// 03:02:33 -> 03:05:20), against ~45 s when the node starts after unlock.
+///
+/// * `missing` — what [`autostart_not_ready_because`] reported.
+/// * `zano_waited` — ZANO is among it. ZANO is the coin that PARKS when its
+///   wallet is not up at start (`connection_type none`); Monero and Zephyr are
+///   pinned to their wallet-rpc ports and connect when those come up.
+/// * `unlocked_for` — how long since a host wallet-rpc was first seen spawned
+///   ([`host_wallet_spawned`]), `None` while none has been.
+///
+/// While locked with ZANO waited on, there is no budget (up to
+/// [`AUTOSTART_LOCKED_CAP`]): starting then is what guarantees the restart.
+/// While locked without ZANO, the old launch-relative budget stands — a node
+/// with nothing to park may as well sync its chain behind the login screen.
+pub fn autostart_step(
+    missing: bool,
+    zano_waited: bool,
+    unlocked_for: Option<std::time::Duration>,
+    since_launch: std::time::Duration,
+) -> AutostartStep {
+    if !missing {
+        return AutostartStep::Start;
+    }
+    let out_of_budget = match unlocked_for {
+        Some(d) => d >= AUTOSTART_READY_BUDGET,
+        None if zano_waited => since_launch >= AUTOSTART_LOCKED_CAP,
+        None => since_launch >= AUTOSTART_READY_BUDGET,
+    };
+    if out_of_budget {
+        AutostartStep::GiveUp
+    } else {
+        AutostartStep::Wait
+    }
+}
+
+/// Whether any of this app's host wallet-rpcs (Monero, Zephyr, Zano) has been
+/// spawned. They are opened from the unlock path (`useVault` →
+/// `startZanoSync` and friends), so this is the "the user has unlocked" signal
+/// — one that does not depend on the node, unlike the wallet key, which
+/// deadlocked the boot when the gate waited on it (see
+/// [`autostart_not_ready_because`]). A spawn is seen the moment the process is
+/// launched, long before its port answers.
+pub async fn host_wallet_spawned(app: &AppHandle) -> bool {
+    let xmr = app
+        .state::<crate::xmr_rpc::XmrRpcChild>()
+        .0
+        .lock()
+        .map(|g| g.child.is_some() || g.starting)
+        .unwrap_or(false);
+    let zph = app
+        .state::<crate::zph_rpc::ZphRpcChild>()
+        .0
+        .lock()
+        .map(|g| g.child.is_some())
+        .unwrap_or(false);
+    xmr || zph || crate::zano_rpc::zano_rpc_child_spawned(app).await
+}
+
 /// What autostart is still waiting for, or `None` when nothing is missing.
 ///
 /// # Why the node must not start before this
@@ -8236,33 +8318,90 @@ pub fn on_app_ready(app: &AppHandle) {
         // `autostart_not_ready_because`. Starting first and restarting later
         // is what produced "zano parked this session" on every boot and a node
         // that stopped itself mid-session.
-        let deadline = std::time::Instant::now() + AUTOSTART_READY_BUDGET;
+        //
+        // The budget runs from UNLOCK, not launch (`autostart_step`, 2026-09-18):
+        // nothing waited for can come up before the vault is unlocked.
+        let launched = std::time::Instant::now();
+        let mut unlocked_at: Option<std::time::Instant> = None;
         let mut said: Option<String> = None;
+        let mut said_locked = false;
         loop {
-            match autostart_not_ready_because(&app).await {
-                None => {
-                    if said.is_some() {
+            // Started by hand (the Settings card) while this waited: the
+            // start's own claim would refuse a second one anyway, but an
+            // autostart that "fails" to start a running node reads as a fault.
+            let started_elsewhere = app
+                .state::<SwapSidecarState>()
+                .0
+                .lock()
+                .map(|g| g.phase.blocks_new_start())
+                .unwrap_or(false);
+            if started_elsewhere {
+                supervisor_log(&app, "autostart: the swap node was started by hand — nothing to do");
+                return;
+            }
+            let missing = autostart_not_ready_because(&app).await;
+            if unlocked_at.is_none() && missing.is_some() && host_wallet_spawned(&app).await {
+                unlocked_at = Some(std::time::Instant::now());
+                if said_locked {
+                    supervisor_log(
+                        &app,
+                        &format!(
+                            "autostart: the wallet was unlocked after {:.0}s — waiting up to {}s \
+                             for its wallets to open",
+                            launched.elapsed().as_secs_f64(),
+                            AUTOSTART_READY_BUDGET.as_secs()
+                        ),
+                    );
+                }
+            }
+            let zano_waited = missing
+                .as_deref()
+                .map(|m| m.split(", ").any(|l| l == "Zano"))
+                .unwrap_or(false);
+            match autostart_step(
+                missing.is_some(),
+                zano_waited,
+                unlocked_at.map(|t| t.elapsed()),
+                launched.elapsed(),
+            ) {
+                AutostartStep::Start => {
+                    if said.is_some() || said_locked {
                         supervisor_log(&app, "autostart: everything is ready — starting now");
                     }
                     break;
                 }
-                Some(missing) => {
-                    if std::time::Instant::now() >= deadline {
-                        supervisor_log(
-                            &app,
-                            &format!(
-                                "autostart: gave up waiting for {} after {}s — starting anyway; \
-                                 coins whose wallet is not up will park and be added by the \
-                                 unpark watcher later",
-                                missing,
-                                AUTOSTART_READY_BUDGET.as_secs()
-                            ),
-                        );
-                        break;
-                    }
-                    // Say it once, and again only when what we are waiting for
-                    // changes — a line a second for five minutes is not a log.
-                    if said.as_deref() != Some(missing.as_str()) {
+                AutostartStep::GiveUp => {
+                    supervisor_log(
+                        &app,
+                        &format!(
+                            "autostart: gave up waiting for {} after {:.0}s{} — starting anyway; \
+                             coins whose wallet is not up will park and be added by the \
+                             unpark watcher later",
+                            missing.as_deref().unwrap_or("?"),
+                            launched.elapsed().as_secs_f64(),
+                            if unlocked_at.is_some() { "" } else { " (the wallet is still locked)" }
+                        ),
+                    );
+                    break;
+                }
+                AutostartStep::Wait => {
+                    let missing = missing.unwrap_or_default();
+                    if unlocked_at.is_none() && zano_waited {
+                        // Locked: say so once. The per-coin line below would
+                        // repeat the same three names for as long as the
+                        // login screen is up.
+                        if !said_locked {
+                            supervisor_log(
+                                &app,
+                                "autostart: waiting for the wallet to be unlocked before starting \
+                                 the swap node — starting while locked parks ZANO until a restart \
+                                 (about 3 minutes after unlock)",
+                            );
+                            said_locked = true;
+                        }
+                    } else if said.as_deref() != Some(missing.as_str()) {
+                        // Say it once, and again only when what we are waiting
+                        // for changes — a line a second is not a log.
                         supervisor_log(
                             &app,
                             &format!(
@@ -13587,6 +13726,52 @@ mod tests {
     /// the whole session — and the unpark watcher then restarted the node
     /// mid-use to add them. Reported twice: "why does zano keep failing" and
     /// "the swap node started to stop/restart unprompted".
+    /// 2026-09-18: the budget runs from unlock. The reported boot sat on the
+    /// login screen past 300 s, the node started with ZANO parked, and the
+    /// unpark restart after unlock took ~3 min where a post-unlock start takes
+    /// ~45 s.
+    #[test]
+    fn autostart_budget_runs_from_unlock_when_zano_would_park() {
+        use std::time::Duration as D;
+        let budget = AUTOSTART_READY_BUDGET;
+        // Nothing missing: start, locked or not.
+        assert_eq!(autostart_step(false, false, None, D::ZERO), AutostartStep::Start);
+        assert_eq!(autostart_step(false, true, None, D::from_secs(9_999)), AutostartStep::Start);
+        // Locked, ZANO waited on: the old 300 s give-up no longer fires...
+        assert_eq!(
+            autostart_step(true, true, None, budget + D::from_secs(1)),
+            AutostartStep::Wait
+        );
+        assert_eq!(autostart_step(true, true, None, D::from_secs(40 * 60)), AutostartStep::Wait);
+        // ...up to the safety valve.
+        assert_eq!(autostart_step(true, true, None, AUTOSTART_LOCKED_CAP), AutostartStep::GiveUp);
+        // Unlocked: the budget counts from unlock, however long the login took.
+        assert_eq!(
+            autostart_step(true, true, Some(D::from_secs(10)), D::from_secs(50 * 60)),
+            AutostartStep::Wait
+        );
+        assert_eq!(autostart_step(true, true, Some(budget), D::from_secs(50 * 60)), AutostartStep::GiveUp);
+        // Locked but nothing that parks (no ZANO): the launch budget stands,
+        // so a node with nothing to lose still syncs behind the login screen.
+        assert_eq!(autostart_step(true, false, None, budget - D::from_secs(1)), AutostartStep::Wait);
+        assert_eq!(autostart_step(true, false, None, budget), AutostartStep::GiveUp);
+    }
+
+    /// The unlock signal is a SPAWNED host wallet-rpc, never the wallet key
+    /// (which deadlocked the boot: the key is pushed only once the node runs).
+    #[test]
+    fn the_unlock_signal_is_a_spawned_wallet_rpc_not_the_key() {
+        let f: &str = include_str!("swap_sidecar.rs");
+        let body = &f[f.find("pub async fn host_wallet_spawned(").expect("moved")..];
+        let body = &body[..body.find("
+}
+").expect("end")];
+        for probe in ["XmrRpcChild", "ZphRpcChild", "zano_rpc_child_spawned"] {
+            assert!(body.contains(probe), "missing {probe}");
+        }
+        assert!(!body.contains("wallet_pwd"), "the key is the deadlock");
+    }
+
     #[test]
     fn autostart_waits_for_the_wallets_the_node_needs() {
         // Pins D-81 (defect register): the gate must not wait on the wallet key.
