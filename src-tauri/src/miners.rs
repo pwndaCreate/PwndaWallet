@@ -8,6 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager};
 
+/// XelisHash GPU thread estimate from the card's cores and architecture.
+pub(crate) mod xelis_gpu_profile;
+
 /// Windows CREATE_NO_WINDOW flag — prevents helper processes from showing a console window
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
@@ -3545,6 +3548,13 @@ pub struct MinerGpuDevice {
     /// line carried no `[<n> MB]` field. Used to cap a memory-hard
     /// algorithm's VRAM limit per card — see [`srb_vram_limit_arg`].
     pub memory_mb: Option<u32>,
+    /// AMD `[CU: n]` / NVIDIA `[SM: n]` from SRBMiner's list. `None` for
+    /// lolMiner, or when the line has no such field.
+    pub compute_units: Option<u32>,
+    /// The field right after the name: `gfx1031`, `blackwell`, ...
+    pub arch: Option<String>,
+    /// NVIDIA `[CC: 12.0]`.
+    pub compute_capability: Option<String>,
 }
 
 fn strip_ansi(s: &str) -> String {
@@ -3615,7 +3625,36 @@ pub fn parse_srbminer_list_devices(output: &str) -> Vec<MinerGpuDevice> {
             let digits = seg.strip_suffix(" MB")?.trim();
             digits.parse::<u32>().ok()
         });
-        out.push(MinerGpuDevice { id, name, vendor, memory_mb });
+        let fields: Vec<&str> = after
+            .split('[')
+            .skip(1)
+            .map(|seg| seg.trim().trim_end_matches(']').trim())
+            .collect();
+        let tagged = |tag: &str| {
+            fields
+                .iter()
+                .find_map(|f| f.strip_prefix(tag).map(|v| v.trim().to_string()))
+        };
+        // `[CU: 40]` on OpenCL (AMD), `[SM: 36]` on CUDA.
+        let compute_units = tagged("CU:")
+            .or_else(|| tagged("SM:"))
+            .and_then(|v| v.parse::<u32>().ok());
+        let compute_capability = tagged("CC:");
+        // The first field is the architecture (`gfx1031`, `blackwell`),
+        // unless the line has none and it is already a tagged/MB field.
+        let arch = fields
+            .first()
+            .filter(|f| !f.contains(':') && !f.ends_with(" MB") && !f.is_empty())
+            .map(|f| f.to_string());
+        out.push(MinerGpuDevice {
+            id,
+            name,
+            vendor,
+            memory_mb,
+            compute_units,
+            arch,
+            compute_capability,
+        });
     }
     out
 }
@@ -3629,7 +3668,15 @@ pub fn parse_lolminer_list_devices(output: &str) -> Vec<MinerGpuDevice> {
         if let Some(rest) = t.strip_prefix("Device ") {
             if let Some(num) = rest.strip_suffix(':') {
                 if let Ok(id) = num.trim().parse::<u32>() {
-                    out.push(MinerGpuDevice { id, name: String::new(), vendor: "other".into(), memory_mb: None });
+                    out.push(MinerGpuDevice {
+                        id,
+                        name: String::new(),
+                        vendor: "other".into(),
+                        memory_mb: None,
+                        compute_units: None,
+                        arch: None,
+                        compute_capability: None,
+                    });
                 }
             }
             continue;
@@ -4059,6 +4106,24 @@ pub(crate) fn srb_vram_limit_arg(
     gpu_threads_for_vram_limit(limit_mb, smallest, bytes_per_thread).to_string()
 }
 
+/// The `--gpu-intensity` value for AUTO on a memory-hard algorithm: the
+/// per-card thread estimates from [`xelis_gpu_profile::estimate_threads`], as
+/// RAW intensity. One value per card when 2+ cards are named, and only when
+/// every one of them has an estimate; otherwise one value (the smallest) for a
+/// single card or an unnamed set. `None` = no estimate, SRBMiner tunes.
+pub(crate) fn srb_auto_threads_arg(auto_threads: &[u32], explicit_devices: usize) -> Option<String> {
+    if auto_threads.is_empty() {
+        return None;
+    }
+    if explicit_devices > 1 {
+        if auto_threads.len() != explicit_devices {
+            return None;
+        }
+        return Some(auto_threads.iter().map(u32::to_string).collect::<Vec<_>>().join(","));
+    }
+    auto_threads.iter().copied().min().map(|v| v.to_string())
+}
+
 /// The `--gpu-intensity` argument value: clamped to
 /// [`SRB_GPU_INTENSITY_MIN`]..=[`SRB_GPU_INTENSITY_MAX`], and repeated once
 /// per card when the caller named 2+ cards with `--gpu-id` (the flag takes a
@@ -4094,6 +4159,9 @@ fn build_gpu_miner_args(
     card_memory_mb: &[u32],
     // Optional per-card VRAM budget for a memory-hard algorithm. None = AUTO.
     gpu_vram_limit_mb: Option<u32>,
+    // AUTO's per-card thread estimates for a memory-hard algorithm, in the
+    // same order as `gpu_indices` (see `xelis_gpu_profile`). Empty = none.
+    auto_threads: &[u32],
 ) -> Vec<String> {
     // Shared by both branches below: empty and absent are the same "every
     // GPU" request, so callers (and tests) don't have to care which one a
@@ -4264,14 +4332,26 @@ fn build_gpu_miner_args(
                     srb_args.push("--gpu-intensity".to_string());
                     srb_args.push(value);
                 }
-                None => {
-                    if let Some(intensity) = gpu_intensity {
+                // AUTO: the estimate from each card's cores and
+                // architecture (2026-09-17). SRBMiner's own tune fills
+                // the card for no extra hashrate; a card the table cannot
+                // place still gets that tune (no flag).
+                None => match srb_auto_threads_arg(auto_threads, explicit_devices) {
+                    Some(value) => {
                         eprintln!(
-                            "[gpu-mem] {algorithm} needs {bytes} B per thread; \
-                             ignoring intensity {intensity} and letting SRBMiner tune"
+                            "[gpu-mem] {algorithm}: AUTO from card profile -> raw intensity {value} \
+                             ({bytes} B per thread)"
+                        );
+                        srb_args.push("--gpu-intensity".to_string());
+                        srb_args.push(value);
+                    }
+                    None => {
+                        eprintln!(
+                            "[gpu-mem] {algorithm}: no card profile estimate; letting SRBMiner tune \
+                             (slider intensity {gpu_intensity:?} ignored)"
                         );
                     }
-                }
+                },
             },
         }
 
@@ -4327,6 +4407,7 @@ mod gpu_device_selection_tests {
             None,
             &[],
             None,
+            &[],
         )
     }
 
@@ -4347,6 +4428,7 @@ mod gpu_device_selection_tests {
             None,
             &[],
             None,
+            &[],
         )
     }
 
@@ -4390,6 +4472,7 @@ mod gpu_device_selection_tests {
             None,
             &[],
             None,
+            &[],
         );
         assert!(ssl.windows(2).any(|w| w[0] == "--tls" && w[1] == "true"));
         assert!(ssl.windows(2).any(|w| w[0] == "--pool" && w[1] == "stratum+ssl://xel.pwnda.org:17706"));
@@ -4423,6 +4506,7 @@ mod gpu_device_selection_tests {
             None,
             &[],
             None,
+            &[],
         );
         assert!(lol.windows(2).any(|w| w[0] == "--apiport" && w[1] == "34202"));
     }
@@ -4509,6 +4593,7 @@ mod gpu_device_selection_tests {
             None,
             &[],
             None,
+            &[],
         );
         assert!(a.windows(2).any(|w| w[0] == "--gpu-intensity" && w[1] == "22"));
         assert!(a.windows(2).any(|w| w[0] == "--gpu-id" && w[1] == "0"));
@@ -4529,6 +4614,7 @@ mod gpu_device_selection_tests {
             None,
             &[],
             None,
+            &[],
         )
     }
 
@@ -4587,6 +4673,7 @@ mod gpu_device_selection_tests {
             None,
             mem,
             None,
+            &[],
         )
     }
 
@@ -4605,6 +4692,7 @@ mod gpu_device_selection_tests {
             None,
             mem,
             limit_mb,
+            &[],
         )
     }
 
@@ -4643,6 +4731,44 @@ mod gpu_device_selection_tests {
         }
     }
 
+    fn xelis_auto(ids: Option<&[u32]>, mem: &[u32], limit_mb: Option<u32>, auto: &[u32]) -> Vec<String> {
+        build_gpu_miner_args(
+            "SRBMiner-MULTI",
+            "stratum+tcp://pool.example:1234",
+            "wallet.worker",
+            "xelishashv3",
+            "x",
+            None,
+            None,
+            Some(20),
+            ids,
+            GPU_HTTP_PORT,
+            None,
+            mem,
+            limit_mb,
+            auto,
+        )
+    }
+
+    /// AUTO sends the card-profile estimate (2026-09-17): the dev box pair
+    /// gets 4352 (40 CU) and 3840 (36 SM) instead of SRBMiner's 15360-thread,
+    /// VRAM-filling tune, which measured no faster.
+    #[test]
+    fn auto_sends_the_card_profile_estimate_per_card() {
+        let both = xelis_auto(Some(&[0, 1]), &[12272, 16310], None, &[4352, 3840]);
+        assert_eq!(intensity_value(&both).as_deref(), Some("4352,3840"));
+        // One card, or no --gpu-id: one value, the smallest estimate.
+        assert_eq!(intensity_value(&xelis_auto(Some(&[1]), &[16310], None, &[3840])).as_deref(), Some("3840"));
+        assert_eq!(intensity_value(&xelis_auto(None, &[12272, 16310], None, &[4352, 3840])).as_deref(), Some("3840"));
+        // A selected card without an estimate: no flag at all, SRBMiner tunes
+        // both, rather than a value that fits one card and not the other.
+        assert_eq!(intensity_value(&xelis_auto(Some(&[0, 1]), &[12272, 16310], None, &[4352])), None);
+        assert_eq!(intensity_value(&xelis_auto(Some(&[0, 1]), &[], None, &[])), None);
+        // The user's VRAM limit wins over the estimate.
+        let limited = xelis_auto(Some(&[0, 1]), &[12272, 16310], Some(2048), &[4352, 3840]);
+        assert_eq!(intensity_value(&limited).as_deref(), Some("3840,3840"));
+    }
+
     #[test]
     fn a_vram_limit_is_ignored_off_the_scratchpad_algorithms() {
         let a = build_gpu_miner_args(
@@ -4659,6 +4785,7 @@ mod gpu_device_selection_tests {
             None,
             &[8192],
             Some(4096),
+            &[],
         );
         assert_eq!(intensity_value(&a).as_deref(), Some("22"));
     }
@@ -4754,31 +4881,48 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     // memory-hard algorithm. A failure to list them is not fatal: the builder
     // then leaves the flag off (AUTO) rather than sending a number it cannot
     // justify.
-    let card_memory_mb: Vec<u32> = if gpu_scratchpad_bytes(algorithm).is_some()
-        && gpu_vram_limit_mb.is_some()
-    {
+    //
+    // The same list carries each card's cores and architecture, which AUTO
+    // turns into a thread estimate (`xelis_gpu_profile`). Detected fresh on
+    // every start (0.65 s) so a swapped card is seen; saved to app data, and
+    // the saved copy is used when detection fails.
+    let cards: Vec<MinerGpuDevice> = if gpu_scratchpad_bytes(algorithm).is_some() && miner != "lolMiner" {
+        let profile_path = app
+            .path()
+            .app_data_dir()
+            .ok()
+            .map(|d| xelis_gpu_profile::profile_path(&d));
         match list_miner_gpu_devices(&exe_path, miner, &miners_dir).await {
-            Ok(devices) => match gpu_indices.filter(|ids| !ids.is_empty()) {
-                Some(ids) => ids
-                    .iter()
-                    .filter_map(|id| {
-                        devices
-                            .iter()
-                            .find(|d| d.id == *id)
-                            .and_then(|d| d.memory_mb)
-                    })
-                    .collect(),
-                None => devices.iter().filter_map(|d| d.memory_mb).collect(),
-            },
+            Ok(devices) => {
+                if let Some(p) = &profile_path {
+                    xelis_gpu_profile::save(p, &devices);
+                }
+                devices
+            }
             Err(e) => {
-                // The limit is still applied, just not capped per card.
-                eprintln!("[gpu-mem] could not list devices ({e}); VRAM limit not capped per card");
-                Vec::new()
+                let saved = profile_path.as_deref().and_then(xelis_gpu_profile::load);
+                eprintln!(
+                    "[gpu-mem] could not list devices ({e}); {}",
+                    if saved.is_some() { "using the saved GPU profile" } else { "no saved GPU profile either" }
+                );
+                saved.unwrap_or_default()
             }
         }
     } else {
         Vec::new()
     };
+    let selected: Vec<&MinerGpuDevice> = match gpu_indices.filter(|ids| !ids.is_empty()) {
+        Some(ids) => ids
+            .iter()
+            .filter_map(|id| cards.iter().find(|d| d.id == *id))
+            .collect(),
+        None => cards.iter().collect(),
+    };
+    let card_memory_mb: Vec<u32> = selected.iter().filter_map(|d| d.memory_mb).collect();
+    let auto_threads: Vec<u32> = selected
+        .iter()
+        .filter_map(|d| xelis_gpu_profile::estimate_threads(d))
+        .collect();
 
     let args = build_gpu_miner_args(
         miner,
@@ -4794,6 +4938,7 @@ pub(crate) async fn build_and_spawn_gpu_miner(
         log_path.as_deref(),
         &card_memory_mb,
         gpu_vram_limit_mb,
+        &auto_threads,
     );
     if let Some(p) = log_path {
         record_miner_log_path(app, "gpu", p);
@@ -6337,8 +6482,8 @@ Device 1:
     fn identical_cards_map_in_order() {
         let app = vec![gpu("NVIDIA GeForce RTX 3070", "nvidia"), gpu("NVIDIA GeForce RTX 3070", "nvidia")];
         let devs = vec![
-            MinerGpuDevice { id: 0, name: "nvidia_geforce_rtx_3070".into(), vendor: "nvidia".into(), memory_mb: None },
-            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_3070".into(), vendor: "nvidia".into(), memory_mb: None },
+            MinerGpuDevice { id: 0, name: "nvidia_geforce_rtx_3070".into(), vendor: "nvidia".into(), memory_mb: None, compute_units: None, arch: None, compute_capability: None },
+            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_3070".into(), vendor: "nvidia".into(), memory_mb: None, compute_units: None, arch: None, compute_capability: None },
         ];
         assert_eq!(map_gpu_indices_to_miner(&app, &[1], &devs).unwrap(), vec![1]);
         assert_eq!(map_gpu_indices_to_miner(&app, &[0, 1], &devs).unwrap(), vec![0, 1]);
@@ -6349,8 +6494,8 @@ Device 1:
         // lspci-style name carrying the chip code.
         let app = vec![gpu("AD106 [GeForce RTX 4060 Ti]", "nvidia"), gpu("Navi 22 [Radeon RX 6700 XT]", "amd")];
         let devs = vec![
-            MinerGpuDevice { id: 0, name: "amd_radeon_rx_6700_xt".into(), vendor: "amd".into(), memory_mb: None },
-            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_4060_ti".into(), vendor: "nvidia".into(), memory_mb: None },
+            MinerGpuDevice { id: 0, name: "amd_radeon_rx_6700_xt".into(), vendor: "amd".into(), memory_mb: None, compute_units: None, arch: None, compute_capability: None },
+            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_4060_ti".into(), vendor: "nvidia".into(), memory_mb: None, compute_units: None, arch: None, compute_capability: None },
         ];
         assert_eq!(map_gpu_indices_to_miner(&app, &[0], &devs).unwrap(), vec![1]);
         assert_eq!(map_gpu_indices_to_miner(&app, &[1], &devs).unwrap(), vec![0]);
@@ -6363,8 +6508,8 @@ Device 1:
     fn a_5060_is_not_taken_for_a_5060_ti() {
         let app = vec![gpu("NVIDIA GeForce RTX 5060", "nvidia"), gpu("NVIDIA GeForce RTX 5060 Ti", "nvidia")];
         let devs = vec![
-            MinerGpuDevice { id: 0, name: "nvidia_geforce_rtx_5060_ti".into(), vendor: "nvidia".into(), memory_mb: None },
-            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_5060".into(), vendor: "nvidia".into(), memory_mb: None },
+            MinerGpuDevice { id: 0, name: "nvidia_geforce_rtx_5060_ti".into(), vendor: "nvidia".into(), memory_mb: None, compute_units: None, arch: None, compute_capability: None },
+            MinerGpuDevice { id: 1, name: "nvidia_geforce_rtx_5060".into(), vendor: "nvidia".into(), memory_mb: None, compute_units: None, arch: None, compute_capability: None },
         ];
         assert_eq!(map_gpu_indices_to_miner(&app, &[0], &devs).unwrap(), vec![1]);
         assert_eq!(map_gpu_indices_to_miner(&app, &[1], &devs).unwrap(), vec![0]);

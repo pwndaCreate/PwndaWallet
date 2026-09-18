@@ -2,8 +2,13 @@
  * src/features/mining/components/GpuVramLimitControl.tsx
  *
  * The XelisHash GPU lane's one tuning knob, for both layouts: AUTO (far left,
- * the default: no flag, SRBMiner sizes itself to each card) then a per-card
- * VRAM budget in whole GB, up to the biggest dedicated card.
+ * the default) then a per-card VRAM budget in whole GB, up to the biggest
+ * dedicated card.
+ *
+ * AUTO is decided in Rust (`miners/xelis_gpu_profile.rs`, 2026-09-17): each
+ * card's cores and architecture, read from SRBMiner's device list at start,
+ * give a thread count (~112 per CU/SM); a card the table cannot place falls
+ * back to SRBMiner's own tune, which fills most of the VRAM.
  *
  * It replaces the intensity slider on that lane (2026-09-17). XelisHash gives
  * every GPU thread its own 531 KiB scratchpad, so a thread count IS a memory
@@ -76,14 +81,14 @@ export function GpuVramLimitControl({
       position: p.gb ?? AUTO_POSITION,
       title:
         p.gb == null
-          ? "no limit sent: SRBMiner sizes itself to each card (default)"
+          ? "sized from each card's cores at start (default); unrecognised cards use SRBMiner's own tune"
           : `up to ${p.gb} GB of VRAM per card (~${threadsForVramGb(p.gb).toLocaleString()} threads)`,
     }));
   const active = presets.find((p) => p.position === (shown ?? AUTO_POSITION))?.key ?? null;
   const caption =
     shown == null
-      ? "auto: SRBMiner sizes itself to each card and uses most of its VRAM · applies on next start"
-      : `up to ${shown} GB per card (~${threadsForVramGb(shown).toLocaleString()} threads), never over 90% of a card · lower = less VRAM, lower hashrate · applies on next start`;
+      ? "auto: sized from each card's cores (~112 threads per CU/SM, far below full VRAM) · applies on next start"
+      : `up to ${shown} GB per card (~${threadsForVramGb(shown).toLocaleString()} threads), never over 90% of a card · applies on next start`;
 
   return (
     <TuningSlider
