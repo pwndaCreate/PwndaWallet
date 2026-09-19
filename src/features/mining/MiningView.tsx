@@ -123,6 +123,7 @@ export function MiningView({
   projection,
   onSelectDisplayCoin,
   minedAmount = null,
+  walletBalanceFor,
   onOpenEarn,
   conversionRunning = false,
   reachableTickers,
@@ -153,6 +154,8 @@ export function MiningView({
   projection?: MiningProjection | null;
   onSelectDisplayCoin?: (ticker: string) => void;
   minedAmount?: number | null;
+  /** Any coin's wallet balance, for SIMPLE's "in wallet" line. */
+  walletBalanceFor?: (coin: ChainType) => number | null;
   onOpenEarn?: () => void;
   conversionRunning?: boolean;
   /** Assets reachable from mining, for the hero's asset dropdown. */
@@ -300,18 +303,12 @@ export function MiningView({
   // profile then runs each (device × coin) through estimateEarningsForChain.
   const xmrStats = useCoinStats("monero");
   const zphStats = useCoinStats("zephyr");
-  const rvnStats = useCoinStats("ravencoin");
-  const cfxStats = useCoinStats("conflux");
-  const ergStats = useCoinStats("ergo");
   const xelStats = useCoinStats("xelis");
   const profile = useDeviceProfile({
     pricesByTicker: pricesByTicker ?? {},
     liveCoinParams: {
       monero: xmrStats,
       zephyr: zphStats,
-      ravencoin: rvnStats,
-      conflux: cfxStats,
-      ergo: ergStats,
       xelis: xelStats,
     },
   });
@@ -394,6 +391,7 @@ export function MiningView({
             projection={projection}
             onSelectDisplayCoin={onSelectDisplayCoin}
             minedAmount={minedAmount}
+            walletBalanceFor={walletBalanceFor}
             onOpenEarn={onOpenEarn}
             conversionRunning={conversionRunning}
             onShowPro={() => setMode("pro")}
@@ -892,11 +890,14 @@ export function MiningView({
                 }}
                 disabled={isMining}
               >
-                <option value="kawpow">KawPow (RVN)</option>
-                <option value="octopus">Octopus (CFX)</option>
-                <option value="autolykos">Autolykos2 (ERG)</option>
-                <option value="progpowz">ProgPowZ (ZANO)</option>
-                <option value="xelishashv3">XelisHash v3 (XEL)</option>
+                {/* From the roster, not a hardcoded list: RVN/CFX/ERG were
+                    retired 2026-09-18 and this list was the one place they
+                    would have survived (PwndaLite mounts this view too). */}
+                {MINING_COINS.filter((c) => c.algorithms.gpu).map((c) => (
+                  <option key={c.chain} value={c.algorithms.gpu}>
+                    {ALGORITHM_LABEL[c.algorithms.gpu!]} ({c.sym})
+                  </option>
+                ))}
               </select>
             </div>
             {/* GPU device picker + intensity slider — the shared lane block

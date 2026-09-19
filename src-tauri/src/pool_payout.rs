@@ -37,9 +37,10 @@
 //! to the static `minPayout` in `pools.ts` (set to 100 CFX, matching
 //! what a brand-new account sees in the Nanopool dashboard).
 //!
-//! NTMiner, HashVault, PWNDA: no public per-account or pool-wide
-//! endpoint we've identified; return `Ok(None)`, frontend falls back to
-//! the static value.
+//! NTMiner, HashVault: no public per-account or pool-wide endpoint we've
+//! identified; return `Ok(None)`, frontend falls back to the static value.
+//! PWNDA (all three pools) publishes its pool-wide threshold since
+//! 2026-09-18 — see the entries at the end of `ENDPOINTS`.
 //!
 //! ## Allowlist + timeout
 //!
@@ -93,7 +94,15 @@ enum PayoutKind {
     /// `miner.payoutThreshold` in whole coins (3 for XEL, 2026-09-15). The
     /// account is keyed by the address WITHOUT its `xel:` prefix; the
     /// threshold comes back even for an address that has never mined.
+    ///
+    /// Corrected 2026-09-18 (pool audit): despite the per-account URL this is
+    /// NOT the account's own level. An account reporting 3 had 26 payouts of
+    /// ~0.234 XEL. Treat it as the pool minimum (`poolAccount.ts` does).
+    #[allow(dead_code)] // no endpoint uses it since 2026-09-18 (see ENDPOINTS)
     K1poolMinerJson,
+    /// Pwnda's XEL pool, pool-wide `GET /xelis-api/stats`: top-level
+    /// `payment_threshold` in whole XEL (0.05 on 2026-09-18).
+    PwndaXelisJson,
 }
 
 const ENDPOINTS: &[PayoutEndpoint] = &[
@@ -209,30 +218,54 @@ const ENDPOINTS: &[PayoutEndpoint] = &[
         ticker: "ERG",
         requires_address: true,
     },
-    // Xelis (XEL) — K1Pool's account endpoint carries the account's own
-    // `payoutThreshold`. Verified live 2026-09-15 (3 XEL for both a real active
-    // account and a never-used one). Three ports, one account backend. The
-    // `xel:` prefix is stripped before substitution — see `api_address`.
+    // Xelis (XEL) on K1Pool: REMOVED 2026-09-18. The account endpoint's
+    // `payoutThreshold` said 3 XEL for every account, but K1Pool pays from
+    // 0.2: miningpoolstats.stream lists `minpay: 0.2`, and the pool's own
+    // `/api/payments/xel` showed payouts of 0.376, 0.234 and 0.781 XEL. The
+    // live value was overriding a correct static fallback with a wrong number,
+    // and it sent the address to do it. `pools.ts` now carries 0.2 XEL.
+    // ── Pwnda pools (2026-09-18). ZEPH and ZANO run cryptonote-nodejs-pool,
+    // so their `/stats` carries the HeroMiners-shaped `config` block
+    // (`minPaymentThreshold` 10000000000 / `coinUnits` 1e12 = 0.01 ZEPH;
+    // 200000000000 / 1e12 = 0.2 ZANO, read live that day). XEL has its own
+    // server with a top-level `payment_threshold`. None of the three exposes a
+    // per-miner payout level publicly (`get_miner_payout_level` is not routed).
     PayoutEndpoint {
-        id: "k1pool-xelis-cpu",
-        url_template: "https://k1pool.com/api/miner/xel/{addr}",
-        kind: PayoutKind::K1poolMinerJson,
-        ticker: "XEL",
-        requires_address: true,
+        id: "pwnda-zephyr",
+        url_template: "https://pwnda.org/pool-api/stats",
+        kind: PayoutKind::HerominersJson,
+        ticker: "ZEPH",
+        requires_address: false,
     },
     PayoutEndpoint {
-        id: "k1pool-xelis-gpu",
-        url_template: "https://k1pool.com/api/miner/xel/{addr}",
-        kind: PayoutKind::K1poolMinerJson,
-        ticker: "XEL",
-        requires_address: true,
+        id: "pwnda-zano",
+        url_template: "https://pwnda.org/zano-api/stats",
+        kind: PayoutKind::HerominersJson,
+        ticker: "ZANO",
+        requires_address: false,
     },
     PayoutEndpoint {
-        id: "k1pool-xelis-ssl",
-        url_template: "https://k1pool.com/api/miner/xel/{addr}",
-        kind: PayoutKind::K1poolMinerJson,
+        id: "pwnda-xelis",
+        url_template: "https://pwnda.org/xelis-api/stats",
+        kind: PayoutKind::PwndaXelisJson,
         ticker: "XEL",
-        requires_address: true,
+        requires_address: false,
+    },
+    // ZANO on third-party pools (2026-09-18, both answered live: HeroMiners
+    // 0.2 ZANO, WoolyPooly `minPay` 0.25).
+    PayoutEndpoint {
+        id: "herominers-zano",
+        url_template: "https://zano.herominers.com/api/stats",
+        kind: PayoutKind::HerominersJson,
+        ticker: "ZANO",
+        requires_address: false,
+    },
+    PayoutEndpoint {
+        id: "woolypooly-zano",
+        url_template: "https://api.woolypooly.com/api/zano-1/stats",
+        kind: PayoutKind::WoolypoolyJson,
+        ticker: "ZANO",
+        requires_address: false,
     },
 ];
 
@@ -249,6 +282,9 @@ const ALLOWED_HOSTS: &[&str] = &[
     "api.nanopool.org",
     // K1Pool account API (Xelis, 2026-09-15).
     "k1pool.com",
+    // Pwnda pools and HeroMiners ZANO (2026-09-18).
+    "pwnda.org",
+    "zano.herominers.com",
 ];
 
 fn is_host_allowed(host: &str) -> bool {
@@ -320,6 +356,7 @@ pub async fn fetch_pool_min_payout(
         PayoutKind::WoolypoolyJson => Some(parse_woolypooly(&body, endpoint.ticker)?),
         PayoutKind::NanopoolUserSettingsJson => parse_nanopool_user_settings(&body, endpoint.ticker)?,
         PayoutKind::K1poolMinerJson => Some(parse_k1pool_payout_threshold(&body, endpoint.ticker)?),
+        PayoutKind::PwndaXelisJson => Some(parse_pwnda_xelis_threshold(&body, endpoint.ticker)?),
     };
 
     Ok(display_opt.map(|display| PoolPayoutInfo {
@@ -342,6 +379,14 @@ fn parse_herominers(v: &serde_json::Value, ticker: &str) -> Result<String, Strin
     // Decimal division: precision is not load-bearing because this
     // string is for display only.
     let amount = (threshold as f64) / (units as f64);
+    Ok(format_amount(amount, ticker))
+}
+
+fn parse_pwnda_xelis_threshold(v: &serde_json::Value, ticker: &str) -> Result<String, String> {
+    let amount = v
+        .get("payment_threshold")
+        .and_then(|x| x.as_f64())
+        .ok_or_else(|| "payment_threshold missing or not a number".to_string())?;
     Ok(format_amount(amount, ticker))
 }
 
@@ -479,18 +524,12 @@ mod tests {
     }
 
     #[test]
-    fn every_xel_k1pool_payout_endpoint_is_allowlisted_and_needs_an_address() {
-        let xel: Vec<_> = ENDPOINTS
-            .iter()
-            .filter(|e| e.id.starts_with("k1pool-xelis"))
-            .collect();
-        assert_eq!(xel.len(), 3);
-        for e in xel {
-            assert!(e.requires_address, "{}", e.id);
-            let url = e.url_template.replace("{addr}", api_address(e.kind, "xel:abc"));
-            assert_eq!(url, "https://k1pool.com/api/miner/xel/abc");
-            assert!(is_host_allowed(host_of(&url).unwrap()), "{}", e.id);
-        }
+    fn k1pool_has_no_live_payout_endpoint() {
+        // Its per-account `payoutThreshold` (3) is not what K1Pool pays at
+        // (0.2 — miningpoolstats + the pool's own payments list, 2026-09-18).
+        // The static `pools.ts` value is used instead, and no address is sent.
+        assert!(ENDPOINTS.iter().all(|e| !e.id.starts_with("k1pool-")));
+        assert_eq!(api_address(PayoutKind::K1poolMinerJson, "xel:abc"), "abc");
     }
 
     #[test]
@@ -636,5 +675,33 @@ mod tests {
         let body = json!({ "status": true });
         let result = parse_nanopool_user_settings(&body, "CFX");
         assert!(result.is_err());
+    }
+}
+
+#[cfg(test)]
+mod pwnda_payout_tests {
+    use super::*;
+
+    /// `config` values read live from pwnda.org on 2026-09-18.
+    #[test]
+    fn pwnda_zeph_and_zano_thresholds_come_from_the_config_block() {
+        let zeph = serde_json::json!({"config":{"minPaymentThreshold":10000000000u64,"coinUnits":1000000000000u64}});
+        let zano = serde_json::json!({"config":{"minPaymentThreshold":200000000000u64,"coinUnits":1000000000000u64}});
+        assert_eq!(parse_herominers(&zeph, "ZEPH").unwrap(), "0.01 ZEPH");
+        assert_eq!(parse_herominers(&zano, "ZANO").unwrap(), "0.2 ZANO");
+    }
+
+    #[test]
+    fn pwnda_xel_threshold_is_the_top_level_field() {
+        let v = serde_json::json!({"payment_threshold":0.05,"pool_fee_percent":1});
+        assert_eq!(parse_pwnda_xelis_threshold(&v, "XEL").unwrap(), "0.05 XEL");
+    }
+
+    #[test]
+    fn new_endpoints_are_on_allowed_hosts() {
+        for id in ["pwnda-zephyr", "pwnda-zano", "pwnda-xelis", "herominers-zano", "woolypooly-zano"] {
+            let e = ENDPOINTS.iter().find(|e| e.id == id).unwrap_or_else(|| panic!("{id}"));
+            assert!(is_host_allowed(host_of(e.url_template).unwrap()), "{id}");
+        }
     }
 }

@@ -1,6 +1,6 @@
 {
   "_comment": "Pinned miner releases per platform. SHA256 hashes lock downloads against silent upstream tampering. Update both 'version' and 'sha256' together \u2014 the runtime downloader refuses to extract on mismatch. xmrig hashes come from the official SHA256SUMS file in the same release; the others are computed locally after download.",
-  "_updated": "2026-08-28",
+  "_updated": "2026-09-18",
   "_note_2026_08_28": "rigel dropped (binary-bundling-plan T2) \u2014 no advertised GPU algo was rigel-exclusive. Bundled+shipped miners are now xmrig/lolMiner/SRBMiner-MULTI only.",
   "miners": {
     "xmrig": {
@@ -14,19 +14,6 @@
         "url": "https://github.com/xmrig/xmrig/releases/download/v6.26.0/xmrig-6.26.0-linux-static-x64.tar.gz",
         "sha256": "fc6f8ae5f64e4f17481f7e3be29a1c56949f216a998414188003eae1db20c9e5",
         "extract": "xmrig-6.26.0/xmrig"
-      }
-    },
-    "lolMiner": {
-      "version": "1.98a",
-      "win32": {
-        "url": "https://github.com/Lolliedieb/lolMiner-releases/releases/download/1.98a/lolMiner_v1.98a_Win64.zip",
-        "sha256": "f2bbda2d2255155d50935967b8c55105b9aeefbd27cda3e8d01beaf535a16762",
-        "extract": "1.98a/lolMiner.exe"
-      },
-      "linux": {
-        "url": "https://github.com/Lolliedieb/lolMiner-releases/releases/download/1.98a/lolMiner_v1.98a_Lin64.tar.gz",
-        "sha256": "0b8078299654a12846e4967f1db3506409cfb8b1031687a910965d1a99c6f270",
-        "extract": "1.98a/lolMiner"
       }
     },
     "SRBMiner-MULTI": {
@@ -44,5 +31,6 @@
         "subdir": "SRBMiner-Multi-3-6-2"
       }
     }
-  }
+  },
+  "_note_2026_09_18": "lolMiner dropped: RVN/CFX/ERG retired from mining; CFX (Octopus) was its only algorithm. Shipped miners are now xmrig and SRBMiner-MULTI only."
 }

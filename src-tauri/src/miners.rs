@@ -630,12 +630,10 @@ fn get_miner_definitions() -> Vec<MinerInfo> {
             executable: format!("xmrig{}", crate::platform::EXE_SUFFIX),
             extract_all: false, // only needs the exe — WinRing0x64.sys is fetched lazily, see ensure_msr_driver
         },
-        MinerInfo {
-            name: "lolMiner".to_string(),
-            repo: "Lolliedieb/lolMiner-releases".to_string(),
-            executable: format!("lolMiner{}", crate::platform::EXE_SUFFIX),
-            extract_all: false, // self-contained exe
-        },
+        // lolMiner was dropped 2026-09-18: its only algorithm was Octopus (CFX),
+        // and RVN/CFX/ERG were retired from mining that day
+        // (`RETIRED_GPU_ALGORITHMS` in the frontend). Its argv builders and
+        // device parser below are kept as archived code; nothing reaches them.
         MinerInfo {
             name: "SRBMiner-MULTI".to_string(),
             repo: "doktor83/SRBMiner-Multi".to_string(),
@@ -648,6 +646,24 @@ fn get_miner_definitions() -> Vec<MinerInfo> {
         // so removing it costs no algo. Re-adding it is a deliberate act, guarded by
         // `get_miner_definitions_is_exactly_the_three` below.
     ]
+}
+
+/// Executables of miners the app no longer ships (lolMiner, dropped
+/// 2026-09-18). Installs from before that date downloaded or extracted it into
+/// the miners folder, and nothing else would ever remove it once it left
+/// `get_miner_definitions` (`delete_miners` only walks the current list).
+const RETIRED_MINER_EXECUTABLES: &[&str] = &["lolMiner.exe", "lolMiner"];
+
+/// Best-effort removal of retired miner executables from the app's own miners
+/// folder. Only these exact file names, only in that folder; a file in use or
+/// already gone is ignored and retried on the next status check.
+fn remove_retired_miners(miners_dir: &std::path::Path) {
+    for name in RETIRED_MINER_EXECUTABLES {
+        let p = miners_dir.join(name);
+        if p.is_file() && std::fs::remove_file(&p).is_ok() {
+            eprintln!("[miners] removed retired miner {}", p.display());
+        }
+    }
 }
 
 fn get_miners_dir(app: &AppHandle) -> Result<PathBuf, String> {
@@ -666,6 +682,7 @@ fn get_miners_dir(app: &AppHandle) -> Result<PathBuf, String> {
 pub async fn check_miners_exist(app: AppHandle) -> Result<Vec<MinerStatus>, String> {
     let miners_dir = get_miners_dir(&app)?;
     let definitions = get_miner_definitions();
+    remove_retired_miners(&miners_dir);
 
     let statuses: Vec<MinerStatus> = definitions
         .iter()
@@ -1815,26 +1832,42 @@ fn sanitize_algo_slug(algo: &str) -> String {
 
 #[cfg(test)]
 mod miner_definition_tests {
-    use super::get_miner_definitions;
+    use super::{get_miner_definitions, remove_retired_miners};
 
-    /// binary-bundling-plan T2: the shipped miner set is exactly xmrig,
-    /// lolMiner, SRBMiner-MULTI. rigel was dropped 2026-08-28 (no advertised GPU
-    /// algo was rigel-exclusive). Re-adding a miner must be deliberate, so this
-    /// pins the set — a silent re-add (or an accidental drop) goes red here.
+    /// binary-bundling-plan T2: the shipped miner set is exactly xmrig and
+    /// SRBMiner-MULTI. rigel was dropped 2026-08-28, lolMiner 2026-09-18 (its
+    /// only coin, CFX, was retired from mining). Re-adding a miner must be
+    /// deliberate, so this pins the set — a silent re-add goes red here.
     #[test]
-    fn get_miner_definitions_is_exactly_the_three() {
+    fn retired_miners_are_removed_and_nothing_else() {
+        let dir = std::env::temp_dir().join(format!("pwnda-retired-miners-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for f in ["lolMiner.exe", "lolMiner", "xmrig.exe", "SRBMiner-MULTI.exe", "keep.txt"] {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+        remove_retired_miners(&dir);
+        assert!(!dir.join("lolMiner.exe").exists());
+        assert!(!dir.join("lolMiner").exists());
+        for f in ["xmrig.exe", "SRBMiner-MULTI.exe", "keep.txt"] {
+            assert!(dir.join(f).exists(), "{f} must survive");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn get_miner_definitions_is_exactly_xmrig_and_srbminer() {
         let names: Vec<String> = get_miner_definitions()
             .into_iter()
             .map(|m| m.name)
             .collect();
         assert_eq!(
             names,
-            vec![
-                "xmrig".to_string(),
-                "lolMiner".to_string(),
-                "SRBMiner-MULTI".to_string(),
-            ],
+            vec!["xmrig".to_string(), "SRBMiner-MULTI".to_string()],
             "shipped miner set changed — update binary-bundling-plan + the bundle producer if intentional"
+        );
+        assert!(
+            !names.iter().any(|n| n == "lolMiner"),
+            "lolMiner was dropped 2026-09-18; do not re-add without restoring a coin that needs it"
         );
         assert!(
             !names.iter().any(|n| n == "rigel"),

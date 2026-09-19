@@ -106,7 +106,10 @@ describe("#1 the mined-asset decision is made once", () => {
     const [hero] = elements(code(SIMPLE), "BalanceHero");
     expect(hero).toBeDefined();
     expect(hero).toMatch(/projection=\{asset\.projection\}/);
-    expect(hero).toMatch(/minedAmount=\{asset\.minedAmount\}/);
+    // 2026-09-18: the hero amount is the decided XMR balance for a routed
+    // coin and the POOL's unpaid balance otherwise — never the raw prop.
+    expect(hero).toMatch(/minedAmount=\{heroAmount\}/);
+    expect(code(SIMPLE)).toMatch(/heroAmount = canProject\s*\?\s*asset\.minedAmount/);
   });
 
   const noRoute = MINING_COINS.filter((c) => capabilityFor(c.chain).kind !== "route");
@@ -468,5 +471,18 @@ describe("#6 / #7 the layout hosts pass the same mining props", () => {
       showMinerSetup: () => calls.push("show"),
     });
     expect(calls).toEqual(["check", "show"]);
+  });
+});
+
+describe("SIMPLE pool picker (2026-09-18)", () => {
+  // Operator: "in simple mode for xmr only ... a drop down to select a pool.
+  // The rest of the assets can keep the pro only drop down for pools."
+  it("is offered for XMR only, and writes the same selection PRO does", () => {
+    const src = code(SIMPLE);
+    expect(src).toMatch(/const xmrPoolPicker = miningCoin === "monero" && availablePools\.length > 1;/);
+    expect(src).toMatch(/\{xmrPoolPicker && \(\s*<div[^>]*>\s*<SelectMenu/);
+    expect(src).toMatch(/onChange=\{\(id\) => id && setSelectedPoolId\(id\)\}/);
+    // Locked while the CPU lane (the only XMR lane) is mining.
+    expect(src).toMatch(/ariaLabel="Pool to mine XMR to"[\s\S]{0,200}disabled=\{isMiningCpu\}/);
   });
 });

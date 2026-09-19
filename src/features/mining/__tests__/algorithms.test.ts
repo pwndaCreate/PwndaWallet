@@ -21,7 +21,9 @@ import {
   CPU_SENDS_WORKER,
   GPU_ALGORITHM_COIN,
   GPU_MINER,
+  RETIRED_GPU_ALGORITHMS,
 } from "../algorithms";
+import type { GpuAlgorithm } from "../../../types/mining";
 import { MINING_COINS, algorithmFor } from "../miningCoins";
 import type { ChainType } from "../../../wallets";
 
@@ -35,6 +37,12 @@ describe("GPU algorithm → coin", () => {
 
   it("every GPU algorithm's coin really mines it on GPU", () => {
     for (const [algo, chain] of Object.entries(GPU_ALGORITHM_COIN)) {
+      // Retired algorithms (2026-09-18) stay in the table as archived code but
+      // must NOT be minable from any rostered coin.
+      if (RETIRED_GPU_ALGORITHMS.has(algo as GpuAlgorithm)) {
+        expect(algorithmFor(chain as ChainType, "gpu")).toBeNull();
+        continue;
+      }
       expect(algorithmFor(chain as ChainType, "gpu")).toBe(algo);
     }
   });

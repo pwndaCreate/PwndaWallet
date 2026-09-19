@@ -10,7 +10,7 @@
  * before. A copy of a table goes stale the day the table changes; a view of it
  * cannot.
  */
-import { ALGORITHM_LABEL, CPU_MINER, GPU_MINER } from "../mining/algorithms";
+import { ALGORITHM_LABEL, CPU_MINER, GPU_MINER, RETIRED_GPU_ALGORITHMS } from "../mining/algorithms";
 import { MINING_COINS } from "../mining/miningCoins";
 import type { CpuAlgorithm, GpuAlgorithm } from "../../types/mining";
 
@@ -67,6 +67,9 @@ export function miningSoftwareLineup(): MinerSoftware[] {
     add(sel.miner, "cpu", algorithm);
   }
   for (const [algorithm, sel] of Object.entries(GPU_MINER) as [GpuAlgorithm, (typeof GPU_MINER)[GpuAlgorithm]][]) {
+    // Retired 2026-09-18 (RVN/CFX/ERG): not mined, so not listed — this is
+    // also what drops lolMiner from the list, its only algorithm was Octopus.
+    if (RETIRED_GPU_ALGORITHMS.has(algorithm)) continue;
     add(sel.miner, "gpu", algorithm);
   }
   return [...byMiner.values()];

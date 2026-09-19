@@ -69,8 +69,10 @@ describe("Pwnda Zephyr pool (mine.pwnda.org:17706)", () => {
     expect(pass).toBe("rig1"); // worker name goes in the password field
   });
 
-  it("has no live-stats adapter yet → PoolStatsPanel hides gracefully (no error)", () => {
-    expect(getStatsAdapter("pwnda-zephyr")).toBeNull();
+  // 2026-09-18: the pool's own API (`pwnda.org/pool-api`, the one the
+  // pwnda.org MY STATS page reads) is wired, so the account shows in the app.
+  it("has a live-stats adapter (pwnda.org/pool-api)", () => {
+    expect(getStatsAdapter("pwnda-zephyr")?.id).toBe("pwnda-zephyr");
   });
 });
 
@@ -116,8 +118,8 @@ describe("Pwnda Zano pool (zano.pwnda.org:17706)", () => {
     expect(pass).toBe("rig1");
   });
 
-  it("has no live-stats adapter yet → PoolStatsPanel hides gracefully (no error)", () => {
-    expect(getStatsAdapter("pwnda-zano")).toBeNull();
+  it("has a live-stats adapter (pwnda.org/zano-api)", () => {
+    expect(getStatsAdapter("pwnda-zano")?.id).toBe("pwnda-zano");
   });
 });
 
@@ -130,12 +132,13 @@ describe("HOUSE_DEFAULT_POOL — a policy override, not a fabricated payout", ()
     }
   });
 
-  it("does not touch minPayout — the ascending-payout sort stays honest", () => {
-    // Pwnda's own entries are still "—" (unknown/no live-stats adapter); the
-    // override wins via getDefaultPoolId, not by editing this field. If this
-    // ever changes to a real number that would be a separate, verifiable claim.
-    expect(getPoolById("pwnda-zephyr")!.minPayout).toBe("—");
-    expect(getPoolById("pwnda-zano")!.minPayout).toBe("—");
+  it("carries the pool's real minimum, not a number chosen to win the sort", () => {
+    // Was "—" for both until 2026-09-18. They are now the pool's own
+    // `config.minPaymentThreshold / coinUnits`, read live that day, and
+    // `pool_payout.rs` refreshes them at runtime. The house pool is first in
+    // the dropdown because `availablePools` pins it, not because of these.
+    expect(getPoolById("pwnda-zephyr")!.minPayout).toBe("0.01 ZEPH");
+    expect(getPoolById("pwnda-zano")!.minPayout).toBe("0.2 ZANO");
   });
 
   it("does not change the default for coins with no house pool (XMR/RVN/CFX/ERG)", () => {

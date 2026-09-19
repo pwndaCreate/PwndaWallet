@@ -25,9 +25,9 @@ describe("MINING_COINS — the collapsed-view order", () => {
     ]);
   });
 
-  // XEL has had a house pool since 2026-09-16 but stays here: the top three
-  // are full, and which coin leaves them is the operator's call.
-  it("XEL sits first behind the fold, not in the top three", () => {
+  // XEL is fourth. Since 2026-09-18 SIMPLE shows four targets collapsed, so
+  // there is no fold left to sit behind; the order still pins it last.
+  it("XEL is fourth", () => {
     expect(MINING_COINS[3].sym).toBe("XEL");
   });
 
@@ -35,8 +35,11 @@ describe("MINING_COINS — the collapsed-view order", () => {
     // Reordering must never silently drop a coin — the whole point of a
     // single shared array (per this file's own header) is that a coin can't
     // go missing from one surface while staying in another.
+    // RVN, CFX and ERG were removed ON PURPOSE on 2026-09-18 (retired from
+    // mining, lolMiner no longer shipped). This pins the new set so the next
+    // drop is deliberate too.
     expect(MINING_COINS.map((c) => c.sym).sort()).toEqual(
-      ["CFX", "ERG", "RVN", "XEL", "XMR", "ZANO", "ZEPH"].sort()
+      ["XEL", "XMR", "ZANO", "ZEPH"].sort()
     );
   });
 
@@ -48,9 +51,6 @@ describe("MINING_COINS — the collapsed-view order", () => {
       monero: ["cpu"],
       zephyr: ["cpu"],
       xelis: ["cpu", "gpu"],
-      ravencoin: ["gpu"],
-      conflux: ["gpu"],
-      ergo: ["gpu"],
       zano: ["gpu"],
     });
   });

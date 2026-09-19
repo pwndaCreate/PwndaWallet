@@ -21,6 +21,10 @@
  * fold. It gained a house pool on 2026-09-16 (`pwnda-xelis`) and was left
  * here: the top three are full, and which coin gives up its slot is the
  * operator's call.
+ *
+ * 2026-09-18: RVN/CFX/ERG retired from mining (lolMiner no longer shipped).
+ * The roster is the four pwnda-pool coins and `TARGETS_COLLAPSED` is 4, so
+ * SIMPLE shows every coin with no expander.
  */
 import type { ChainType } from "../../wallets";
 import type {
@@ -68,9 +72,10 @@ export const MINING_COINS: readonly MiningCoinOption[] = [
   { sym: "ZANO", chain: "zano",      algo: "ProgPowZ",     algorithms: { gpu: "progpowz" } },
   { sym: "ZEPH", chain: "zephyr",    algo: "RandomX",      algorithms: { cpu: "randomx" } },
   { sym: "XEL",  chain: "xelis",     algo: "XelisHash v3", algorithms: { cpu: "xelishashv3", gpu: "xelishashv3" } },
-  { sym: "RVN",  chain: "ravencoin", algo: "KAWPOW",       algorithms: { gpu: "kawpow" } },
-  { sym: "CFX",  chain: "conflux",   algo: "Octopus",      algorithms: { gpu: "octopus" } },
-  { sym: "ERG",  chain: "ergo",      algo: "Autolykos2",   algorithms: { gpu: "autolykos" } },
+  // RVN (KAWPOW), CFX (Octopus, the only lolMiner coin) and ERG (Autolykos2)
+  // were retired from mining 2026-09-18 — see `RETIRED_GPU_ALGORITHMS`. Their
+  // pools, pool-stats readers and earnings tables are kept as archived data;
+  // the wallet still sends and receives all three.
 ];
 
 const LANE_ORDER: readonly MiningHardware[] = ["cpu", "gpu"];

@@ -1843,6 +1843,21 @@ function App() {
   }, [balancesByChain.monero]);
 
   /**
+   * Any coin's wallet balance as a number, for the Mine tab's "in wallet"
+   * line (2026-09-18). Same parsing and the same "no number" cases as
+   * `earnSourceBalance`; `null` for a chain the wallet has not loaded.
+   */
+  const walletBalanceFor = useCallback(
+    (coin: ChainType): number | null => {
+      const raw = balancesByChain[coin];
+      if (!raw || raw === "-" || raw === "—" || raw === "Not initialized") return null;
+      const n = parseFloat(raw.replace(/,/g, ""));
+      return Number.isFinite(n) ? n : null;
+    },
+    [balancesByChain],
+  );
+
+  /**
    * The Mine tab's display coin, and the convert rate it implies.
    *
    * Computed HERE rather than in the mining feature because it needs the
@@ -1990,6 +2005,7 @@ function App() {
         convertSeed={convertSeed}
         onSidecarSwapAdopt={adoptSidecarSwap}
         earnSourceBalance={earnSourceBalance}
+        walletBalanceFor={walletBalanceFor}
         miningProjection={miningProjection}
         mineReachableTickers={mineReachableTickers}
         onOpenSwapForAsset={openSwapForAsset}
@@ -2179,6 +2195,7 @@ function App() {
       convertSeed={convertSeed}
       onSidecarSwapAdopt={adoptSidecarSwap}
       earnSourceBalance={earnSourceBalance}
+      walletBalanceFor={walletBalanceFor}
       miningProjection={miningProjection}
       mineReachableTickers={mineReachableTickers}
       onOpenSwapForAsset={openSwapForAsset}
