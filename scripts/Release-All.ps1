@@ -112,6 +112,14 @@ function Invoke-Native {
 if (-not $SkipRelease -and -not $Version) {
   Die "-Version is required unless -SkipRelease is given"
 }
+# Same rule release-local.ps1 enforces, checked HERE, before the snapshot half.
+# 2026-09-18: `-Version v0.6.4.1` ran the whole ~20 min snapshot build + publish
+# and only then failed in release-local ("Version must look like v1.2.3 or
+# v1.2.3-rc1"). A version the release half will refuse must stop the run first.
+# Four-part versions are not semver, which Tauri, the MSI and the updater need.
+if (-not $SkipRelease -and $Version -notmatch '^v\d+\.\d+\.\d+(-[A-Za-z0-9.-]+)?$') {
+  Die "Version must look like v1.2.3 or v1.2.3-rc1 — got '$Version' (four-part versions are not semver; use e.g. v0.6.5)"
+}
 
 # ─── Shared preflight ────────────────────────────────────────────────────
 Phase "preflight (both halves)"
@@ -139,6 +147,19 @@ if (-not $SkipRelease) {
     Die "Docker is not running, and the Linux half needs it. Start Docker Desktop, or pass -SkipLinux."
   }
   Info "docker       $(if ($dockerUp) { 'running' } else { 'not needed (-SkipLinux)' })"
+
+  # The release half's public replay REFUSES uncommitted changes to published
+  # files (publish-public.ps1 -ReplayPreflight). release-local runs that check
+  # itself, but only after this script's snapshot half — so on 2026-09-18 a run
+  # answered YES to the dirty-tree prompt above, spent ~20 min building and
+  # publishing a snapshot, then aborted on exactly this. Same check, up front.
+  # (Release-All always replays; there is no -NoReplay pass-through.)
+  $pf = & (Join-Path $RepoRoot "scripts/publish-public.ps1") -Replay -ReplayPreflight *>&1
+  if ($LASTEXITCODE -ne 0) {
+    $pf | Select-String "ABORT|^\s{4}\S" | ForEach-Object { Write-Host $_.Line -ForegroundColor Red }
+    Die "commit the files above first -- the public replay publishes COMMITS and will refuse them after the snapshot half has already run."
+  }
+  Info "replay       published files are committed"
 
   # Two different TAURI_SIGNING_PRIVATE_KEY lines in .env.local means the LAST
   # one silently wins, which may not be the key tauri.conf.json pins. The

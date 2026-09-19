@@ -224,7 +224,13 @@ for (const [target, over] of Object.entries(PLATFORM_COIN_BINARIES)) {
     }
   }
 }
-const MINERS = ["xmrig", "lolMiner", "SRBMiner-MULTI"];
+const MINERS = ["xmrig", "SRBMiner-MULTI"];
+// Miners that USED to ship. `fetch-miners` never cleans the staging folder, so
+// a lolMiner fetched before 2026-09-18 would still sit there and — since the
+// payload is "every file in the folder" — be packed into miners.enc. These are
+// excluded by name so a stale checkout cannot put a retired miner back in the
+// installer.
+const RETIRED_MINER_FILES = new Set(["lolMiner", "lolMiner.exe"]);
 
 async function exists(p) {
   try { await stat(p); return true; } catch { return false; }
@@ -574,8 +580,12 @@ async function main() {
     // three exes + SRBMiner's DLLs all live flat here after fetch-miners.
     const all = await readdir(MINERS_SRC);
     const skip = new Set([".gitignore", ".gitkeep"]);
-    const entries = all.filter((f) => !skip.has(f));
-    // sanity: the three executables must be present
+    const entries = all.filter((f) => !skip.has(f) && !RETIRED_MINER_FILES.has(f));
+    const retired = all.filter((f) => RETIRED_MINER_FILES.has(f));
+    if (retired.length) {
+      console.log(`${LOG} miners: skipping retired ${retired.join(", ")} left in ${path.relative(REPO, MINERS_SRC)}`);
+    }
+    // sanity: every shipped miner executable must be present
     for (const m of MINERS) {
       if (!(await exists(path.join(MINERS_SRC, `${m}${EXE}`)))) {
         console.error(`${LOG} miners source is missing ${m}${EXE} in ${MINERS_SRC}`);

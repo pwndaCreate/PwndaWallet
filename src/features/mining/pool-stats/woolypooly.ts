@@ -20,3 +20,9 @@ export const WOOLYPOOLY_RAVENCOIN: PoolStatsAdapter = {
   id: "woolypooly-ravencoin",
   recommendedPollMs: POLL,
 };
+
+/** ZANO pool `zano-1`, added 2026-09-18 (balances in whole ZANO, 12 decimals). */
+export const WOOLYPOOLY_ZANO: PoolStatsAdapter = {
+  id: "woolypooly-zano",
+  recommendedPollMs: POLL,
+};

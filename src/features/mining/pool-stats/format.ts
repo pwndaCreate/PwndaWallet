@@ -11,6 +11,8 @@ import type { ChainType } from "../../../wallets";
 const COIN_DECIMALS: Partial<Record<ChainType, number>> = {
   monero: 12,
   zephyr: 12,
+  // ZANO = 1e12 atomic per coin (pool `coinUnits`, 2026-09-18).
+  zano: 12,
   ravencoin: 8,
   conflux: 18,
   // ERG = 1e9 nanoErg per ERG (Sigmaverse / EIP-26 atomic unit).
@@ -53,6 +55,25 @@ export function formatAtomic(
   // than understating it by a fraction of a satoshi).
   const truncFrac = fracPart.slice(0, displayDecimals).replace(/0+$/, "");
   return truncFrac.length > 0 ? `${intPart}.${truncFrac}` : intPart;
+}
+
+/**
+ * An atomic-unit decimal string as a number of whole coins, or `null` when the
+ * input is missing or the coin's decimals are unknown. For arithmetic (USD
+ * value, payout progress) — display keeps using {@link formatAtomic}, which
+ * never goes through a float.
+ */
+export function atomicToNumber(
+  atomic: string | null | undefined,
+  coin: ChainType,
+): number | null {
+  if (atomic == null || atomic === "") return null;
+  const decimals = COIN_DECIMALS[coin];
+  if (decimals === undefined) return null;
+  const digits = atomic.replace(/\D/g, "");
+  if (digits.length === 0) return null;
+  const n = Number(digits) / 10 ** decimals;
+  return Number.isFinite(n) ? n : null;
 }
 
 /**

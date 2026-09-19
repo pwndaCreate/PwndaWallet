@@ -39,6 +39,7 @@
  */
 import type { ReactNode } from "react";
 import type { MiningProjection } from "../../../types/mining";
+import type { PoolAccountView } from "../poolAccount";
 import { CoinIcon } from "../../../components/CoinIcon";
 import { SelectMenu } from "../../../design/primitives/SelectMenu";
 
@@ -271,6 +272,182 @@ export function DisplayCoinChips({
   );
 }
 
+/**
+ * {@link formatProjected} without trailing zeros: `0.5`, `0.00878`, `0` —
+ * for balances and thresholds, where "0.50000 ERG" and "0.00000000 ERG" read
+ * as precision the number does not have.
+ */
+export function formatAmount(n: number | null, ticker: string): string {
+  const s = formatProjected(n, ticker);
+  return s.includes(".") ? s.replace(/0+$/, "").replace(/\.$/, "") : s;
+}
+
+/**
+ * `$27.85`, `$0.013`, `<$0.01`, or `—`. Mining balances are often fractions of
+ * a cent; `$0.00` reads as "worth nothing", which is the wrong message.
+ */
+export function formatUsd(n: number | null | undefined): string {
+  if (n == null || !Number.isFinite(n)) return "—";
+  if (n === 0) return "$0.00";
+  if (Math.abs(n) >= 1) return `$${formatProjected(n, "USD")}`;
+  if (Math.abs(n) >= 0.01) return `$${n.toFixed(3)}`;
+  return "<$0.01";
+}
+
+/**
+ * The user's account at the selected pool, inside the balance hero: unpaid,
+ * paid, the payout level and a bar toward it. When there is no number, it
+ * shows the reason and the action that fixes it. Shared by SIMPLE (both
+ * layouts) and landscape PRO; `poolAccount.ts` makes the decisions.
+ */
+export function PoolAccountStrip({
+  account,
+  onOptIn,
+  onRefresh,
+  onOpenStats,
+}: {
+  account: PoolAccountView;
+  onOptIn?: () => void;
+  onRefresh?: () => void;
+  onOpenStats?: (url: string) => void;
+}) {
+  const a = account;
+  const amt = (v: number | null) =>
+    v == null ? "—" : `${formatAmount(v, a.ticker)} ${a.ticker}`;
+  const linkBtn = {
+    ...mono,
+    border: "1px solid var(--border)",
+    background: "transparent",
+    color: "var(--text-muted)",
+    padding: "2px 8px",
+    fontSize: 8,
+    letterSpacing: 1,
+    textTransform: "uppercase" as const,
+    cursor: "pointer",
+  };
+  const cells: { label: string; value: string; usd: number | null }[] = [
+    { label: "unpaid", value: amt(a.unpaid), usd: a.unpaidUsd },
+    ...(a.immature != null && a.immature > 0
+      ? [{ label: "confirming", value: amt(a.immature), usd: null }]
+      : []),
+    { label: "paid", value: amt(a.paid), usd: a.paidUsd },
+    {
+      label: a.thresholdSource === "account" ? "your payout at" : "pays at",
+      // "pool" = custom levels exist but the API is silent: the note says so.
+      value: amt(a.threshold),
+      usd: null,
+    },
+  ];
+  return (
+    <div
+      data-testid="pool-account"
+      style={{
+        marginTop: 14,
+        border: "1px solid var(--border-soft)",
+        padding: "10px 12px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 8,
+      }}
+    >
+      <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+        <MicroLabel>at {a.poolName}</MicroLabel>
+        <span style={{ flex: 1 }} />
+        {a.status === "ok" && onRefresh && (
+          <button type="button" style={linkBtn} onClick={onRefresh} title="Read the pool again">
+            refresh
+          </button>
+        )}
+        {a.statsPageUrl && onOpenStats && (
+          <button
+            type="button"
+            style={linkBtn}
+            onClick={() => onOpenStats(a.statsPageUrl as string)}
+            title="Open the pool's own stats page in your browser"
+          >
+            my stats ↗
+          </button>
+        )}
+      </div>
+
+      {a.status === "ok" ? (
+        <>
+          <div style={{ display: "flex", gap: 14, flexWrap: "wrap", fontSize: 10 }}>
+            {cells.map((c) => (
+              <div key={c.label} style={{ flex: 1, minWidth: 90 }}>
+                <MicroLabel>{c.label}</MicroLabel>
+                <div
+                  style={{
+                    marginTop: 3,
+                    color: c.label === "unpaid" ? "var(--accent)" : "var(--text)",
+                    fontVariantNumeric: "tabular-nums",
+                  }}
+                >
+                  {c.value}
+                </div>
+                {c.usd != null && (
+                  <div style={{ fontSize: 8, color: "var(--text-dim)", marginTop: 2 }}>
+                    {formatUsd(c.usd)}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+          {a.progress != null && (
+            <div
+              title={`${Math.round(a.progress * 100)}% of the payout level`}
+              style={{ height: 3, background: "var(--border-soft)", position: "relative" }}
+            >
+              <div
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  bottom: 0,
+                  left: 0,
+                  width: `${a.progress > 0 ? Math.max(2, a.progress * 100) : 0}%`,
+                  background: "var(--accent)",
+                }}
+              />
+            </div>
+          )}
+        </>
+      ) : (
+        <div
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            fontSize: 9,
+            color: a.status === "error" ? "var(--warn)" : "var(--text-dim)",
+            flexWrap: "wrap",
+          }}
+        >
+          <Mark
+            tone={a.status === "error" ? "warn" : "dim"}
+            size={5}
+            pulse={a.status === "loading"}
+          />
+          <span style={{ flex: 1, minWidth: 160 }}>
+            {a.status === "loading" ? `reading your balance at ${a.poolName}…` : a.note}
+          </span>
+          {a.status === "needs-optin" && onOptIn && (
+            <button type="button" style={{ ...linkBtn, color: "var(--accent)" }} onClick={onOptIn}>
+              check balance
+            </button>
+          )}
+          {a.threshold != null && (
+            <span style={{ color: "var(--text-dim)" }}>pays at {amt(a.threshold)}</span>
+          )}
+        </div>
+      )}
+
+      {a.status === "ok" && a.note && (
+        <div style={{ fontSize: 8, color: "var(--text-dim)", lineHeight: 1.5 }}>{a.note}</div>
+      )}
+    </div>
+  );
+}
+
 export function BalanceHero({
   projection,
   minedTicker = MINED_TICKER,
@@ -288,6 +465,13 @@ export function BalanceHero({
   routeSourceNote = null,
   onRetryRoute,
   compact = false,
+  heroLabel = null,
+  walletAmount = null,
+  priceUsd = null,
+  poolAccount = null,
+  onPoolOptIn,
+  onPoolRefresh,
+  onOpenPoolStats,
 }: {
   projection: MiningProjection;
   /**
@@ -332,14 +516,35 @@ export function BalanceHero({
   routeSourceNote?: string | null;
   onRetryRoute?: () => void;
   compact?: boolean;
+  /**
+   * What the big number IS: `wallet` for a routed coin (the convertible
+   * balance), `unpaid at pwnda pool` for the rest. Without it the hero read
+   * as "your mined balance" whatever it held (2026-09-18).
+   */
+  heroLabel?: string | null;
+  /** The mined coin's balance in this wallet, for the "in wallet" line. */
+  walletAmount?: number | null;
+  /** USD per mined coin. Falls back to the projection's XMR price. */
+  priceUsd?: number | null;
+  /** The account at the selected pool; see `poolAccount.ts`. */
+  poolAccount?: PoolAccountView | null;
+  onPoolOptIn?: () => void;
+  onPoolRefresh?: () => void;
+  onOpenPoolStats?: (url: string) => void;
 }) {
   const { targetTicker, ratePerXmr, xmrPriceUsd } = projection;
   const isNative = targetTicker === minedTicker;
   const converted =
     minedAmount != null && ratePerXmr != null ? minedAmount * ratePerXmr : null;
 
-  const usd =
-    minedAmount != null && xmrPriceUsd != null ? minedAmount * xmrPriceUsd : null;
+  const unitUsd = priceUsd ?? xmrPriceUsd;
+  // A projected hero is always the routed coin's WALLET balance, so without
+  // an explicit wallet amount that balance is the native figure to show.
+  walletAmount = walletAmount ?? (!isNative ? minedAmount : null);
+  const walletUsd =
+    walletAmount != null && unitUsd != null ? walletAmount * unitUsd : null;
+  const heroUsd =
+    minedAmount != null && unitUsd != null ? minedAmount * unitUsd : null;
 
   const periodIn = (v: number | undefined) =>
     v != null && ratePerXmr != null ? v * ratePerXmr : null;
@@ -355,7 +560,10 @@ export function BalanceHero({
           flexWrap: "wrap",
         }}
       >
-        <MicroLabel>{capabilityNote ? "balance" : "balance · shown as"}</MicroLabel>
+        <MicroLabel>
+          {heroLabel ?? "balance"}
+          {capabilityNote ? "" : " · shown as"}
+        </MicroLabel>
         {capabilityNote && (
           <span style={{ fontSize: 8, color: "var(--text-dim)", letterSpacing: 0.5 }}>
             {capabilityNote}
@@ -396,7 +604,9 @@ export function BalanceHero({
               progress element rather than "unknown", so the pixel hero uses a
               plain hyphen. Every other surface keeps the em dash. */}
           {(() => {
-            const v = formatProjected(isNative ? minedAmount : converted, targetTicker);
+            const v = isNative
+              ? formatAmount(minedAmount, targetTicker)
+              : formatProjected(converted, targetTicker);
             return v === "—" ? "-" : v;
           })()}
         </span>
@@ -503,13 +713,27 @@ export function BalanceHero({
           flexWrap: "wrap",
         }}
       >
+        {/* The hero's own USD value, then the wallet line. Until 2026-09-18
+            this row read "mined <wallet XMR>": the wallet cannot tell mined
+            coins from received ones, and every other coin printed "—". */}
+        {heroUsd != null && (
+          <>
+            <span style={{ fontVariantNumeric: "tabular-nums" }}>{formatUsd(heroUsd)}</span>
+            <span style={{ color: "rgba(255,255,255,0.15)" }}>|</span>
+          </>
+        )}
         <span style={{ fontVariantNumeric: "tabular-nums" }}>
-          mined {formatProjected(minedAmount, minedTicker)} {minedTicker}
+          in wallet {formatAmount(walletAmount, minedTicker)} {minedTicker}
+          {walletUsd != null ? ` · ${formatUsd(walletUsd)}` : ""}
         </span>
-        <span style={{ color: "rgba(255,255,255,0.15)" }}>|</span>
-        <span style={{ fontVariantNumeric: "tabular-nums" }}>
-          {usd == null ? "—" : `$${formatProjected(usd, "USD")}`}
-        </span>
+        {unitUsd != null && (
+          <>
+            <span style={{ color: "rgba(255,255,255,0.15)" }}>|</span>
+            <span style={{ fontVariantNumeric: "tabular-nums" }}>
+              1 {minedTicker} = {formatUsd(unitUsd)}
+            </span>
+          </>
+        )}
         {dailyUsd != null && (
           <>
             <span style={{ color: "rgba(255,255,255,0.15)" }}>|</span>
@@ -537,6 +761,15 @@ export function BalanceHero({
           </>
         )}
       </div>
+
+      {poolAccount && (
+        <PoolAccountStrip
+          account={poolAccount}
+          onOptIn={onPoolOptIn}
+          onRefresh={onPoolRefresh}
+          onOpenStats={onOpenPoolStats}
+        />
+      )}
 
       <div
         style={{

@@ -20,24 +20,23 @@ const laneText = (miner: string, lane: "CPU" | "GPU") =>
     ?.algorithms.join(" · ") ?? "";
 
 describe("mining software lineup", () => {
-  it("names the three binaries the launcher runs", () => {
-    expect(lineup.map((m) => m.name)).toEqual(["XMRig", "SRBMiner-MULTI", "lolMiner"]);
+  // lolMiner left 2026-09-18 with CFX, its only coin.
+  it("names the two binaries the launcher runs", () => {
+    expect(lineup.map((m) => m.name)).toEqual(["XMRig", "SRBMiner-MULTI"]);
   });
 
   it("lists SRBMiner's CPU lane, which the old copy left out", () => {
     expect(laneText("SRBMiner-MULTI", "CPU")).toContain("XelisHash v3 (XEL)");
   });
 
-  it("lists every SRBMiner GPU algorithm, not just KawPow", () => {
+  it("lists exactly SRBMiner's GPU algorithms still mined — no retired ones", () => {
     const gpu = laneText("SRBMiner-MULTI", "GPU");
-    for (const s of ["KawPow (RVN)", "Autolykos2 (ERG)", "ProgPowZ (ZANO)", "XelisHash v3 (XEL)"]) {
-      expect(gpu).toContain(s);
-    }
+    expect(gpu).toBe("ProgPowZ (ZANO) · XelisHash v3 (XEL)");
+    for (const s of ["KawPow", "Autolykos2", "Octopus"]) expect(gpu).not.toContain(s);
   });
 
-  it("keeps XMRig on RandomX and lolMiner on Octopus", () => {
+  it("keeps XMRig on RandomX", () => {
     expect(laneText("XMRig", "CPU")).toBe("RandomX (XMR, ZEPH)");
-    expect(laneText("lolMiner", "GPU")).toBe("Octopus (CFX)");
   });
 
   it("covers every coin on the Mine tab's roster, on every lane it mines on", () => {

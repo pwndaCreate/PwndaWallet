@@ -20,7 +20,7 @@
  * PwndaLite ships this feature as a standalone product. Absent props are the
  * Lite case and degrade to: native XMR hero, no EARN promo.
  */
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import type { ChainType } from "../../wallets";
 import type { MiningProjection } from "../../types/mining";
 import type { useMiner } from "./useMiner";
@@ -29,10 +29,14 @@ import { coinTileLocked, pickMiningCoin } from "./pickCoin";
 import { useMinedAssetView } from "./minedAssetView";
 import { useMiningEarnings } from "./useMiningEarnings";
 import { laneHasIntensity, startBlocker } from "./miningLane";
+import { GPU_MINER } from "./algorithms";
+import { poolAccountView } from "./poolAccount";
+import { openExternal } from "../../utils/openExternal";
 import { presetForCpuThreads, presetForGpuIntensity } from "./miningTuning";
 import { GpuDevicePicker } from "./components/GpuDevicePicker";
 import { algorithmHashUnit, formatHashrateParts } from "./pool-stats/format";
 import { CoinIcon } from "../../components/CoinIcon";
+import { SelectMenu } from "../../design/primitives/SelectMenu";
 import {
   BalanceHero,
   MicroLabel,
@@ -55,7 +59,10 @@ function fmtUptime(secs: number | null): string {
 }
 
 /** Targets shown before the "N MORE ▾" expander, per the mock. */
-const TARGETS_COLLAPSED = 3;
+// 4 since 2026-09-18: with RVN/CFX/ERG retired the roster IS four coins, and
+// a "1 more ▾" expander hiding the fourth only cost a click. The expander
+// still appears if the roster grows past this again.
+const TARGETS_COLLAPSED = 4;
 
 function Segmented<T extends string>({
   options,
@@ -63,7 +70,8 @@ function Segmented<T extends string>({
   onChange,
   disabled,
 }: {
-  options: readonly { value: T; label: string }[];
+  /** `live` puts a pulsing dot on the option: that lane is mining right now. */
+  options: readonly { value: T; label: string; live?: boolean }[];
   /** `null` highlights nothing (a PRO slider set between presets). */
   value: T | null;
   onChange: (v: T) => void;
@@ -98,6 +106,21 @@ function Segmented<T extends string>({
               opacity: disabled ? 0.5 : 1,
             }}
           >
+            {o.live && (
+              <span
+                aria-label="mining"
+                style={{
+                  display: "inline-block",
+                  width: 5,
+                  height: 5,
+                  borderRadius: "50%",
+                  background: "var(--accent)",
+                  boxShadow: "0 0 6px var(--accent)",
+                  marginRight: 5,
+                  verticalAlign: "middle",
+                }}
+              />
+            )}
             {o.label}
           </button>
         );
@@ -134,6 +157,12 @@ export interface MineSimpleViewProps {
   onSelectDisplayCoin?: (ticker: string) => void;
   /** Mined XMR balance. `null` when the wallet has not reported one. */
   minedAmount?: number | null;
+  /**
+   * The wallet's balance of any coin, for the hero's "in wallet" line.
+   * Absent in PwndaLite (no wallet). Added 2026-09-18: until then only XMR's
+   * balance reached this view, so every other coin printed `—`.
+   */
+  walletBalanceFor?: (coin: ChainType) => number | null;
   /** Navigate to the EARN surface. Absent ⇒ the promo strip does not render. */
   onOpenEarn?: () => void;
   /** A conversion is already in flight, so the promo becomes a status line. */
@@ -154,6 +183,7 @@ export function MineSimpleView({
   projection,
   onSelectDisplayCoin,
   minedAmount = null,
+  walletBalanceFor,
   onOpenEarn,
   conversionRunning = false,
   onRetryRoute,
@@ -179,6 +209,8 @@ export function MineSimpleView({
     stopMining,
     selectedPool,
     selectedPoolId,
+    setSelectedPoolId,
+    availablePools,
     poolPings,
     session,
     displayMinPayout,
@@ -189,6 +221,15 @@ export function MineSimpleView({
     setGpuSelection,
     minerError,
     minerInfo,
+    laneCoins,
+    statsAdapter,
+    statsAddress,
+    poolStats,
+    poolStatsLoading,
+    poolStatsError,
+    statsOptInForCurrent,
+    optInToPoolStats,
+    refreshPoolStats,
   } = miner;
 
   const [showAllTargets, setShowAllTargets] = useState(false);
@@ -233,10 +274,23 @@ export function MineSimpleView({
     payoutAddress: addressFor(miningCoin as ChainType),
   });
 
+  // The collapsed list is the first three PLUS whatever is selected or
+  // running. XEL is fourth in the roster, so a GPU XEL session used to leave
+  // no visible tile lit and read as "the selection is lost" (2026-09-18).
+  const pinned = new Set<ChainType>(
+    [miningCoin as ChainType, laneCoins.cpu, laneCoins.gpu].filter(
+      (c): c is ChainType => c != null,
+    ),
+  );
   const targets = showAllTargets
     ? MINING_COINS
-    : MINING_COINS.slice(0, TARGETS_COLLAPSED);
-  const hiddenTargets = MINING_COINS.length - TARGETS_COLLAPSED;
+    : MINING_COINS.filter((c, i) => i < TARGETS_COLLAPSED || pinned.has(c.chain));
+  const hiddenTargets = MINING_COINS.length - targets.length;
+  /** Lanes mining `chain` right now, e.g. `["gpu"]`. */
+  const lanesMining = (chain: ChainType): ("cpu" | "gpu")[] =>
+    (["cpu", "gpu"] as const).filter((lane) => laneCoins[lane] === chain);
+  const displayedLaneBusy = miningHardware === "gpu" ? isMiningGpu : isMiningCpu;
+  const displayedLaneCoin = laneCoins[miningHardware === "gpu" ? "gpu" : "cpu"];
 
   /**
    * Latency, derived exactly as `MineLandscapeView` does it.
@@ -257,6 +311,50 @@ export function MineSimpleView({
    * only because JSX accepts almost anything in a text slot.
    */
   const payoutLabel = selectedPool ? displayMinPayout(selectedPool) : null;
+  /** SIMPLE's pool dropdown is offered for XMR only (see the pool card). */
+  const xmrPoolPicker = miningCoin === "monero" && availablePools.length > 1;
+
+  // The account at the selected pool, and the wallet's own balance of the
+  // mined coin. XMR keeps the wallet balance as its hero (it is what EARN
+  // converts); every other coin's hero is what the pool owes.
+  const walletAmount =
+    walletBalanceFor?.(miningCoin as ChainType) ??
+    (miningCoin === "monero" ? minedAmount : null);
+  const poolAccount = useMemo(
+    () =>
+      poolAccountView({
+        coin: miningCoin as ChainType,
+        ticker: minedSym,
+        pool: selectedPool,
+        minPayoutLabel: payoutLabel,
+        address: statsAddress,
+        statsAdapter,
+        optedIn: statsOptInForCurrent,
+        stats: poolStats,
+        loading: poolStatsLoading,
+        error: poolStatsError,
+        priceUsd: asset.minedPriceUsd,
+      }),
+    [
+      miningCoin,
+      minedSym,
+      selectedPool,
+      payoutLabel,
+      statsAddress,
+      statsAdapter,
+      statsOptInForCurrent,
+      poolStats,
+      poolStatsLoading,
+      poolStatsError,
+      asset.minedPriceUsd,
+    ],
+  );
+  const heroAmount = canProject
+    ? asset.minedAmount
+    : poolAccount.status === "ok"
+      ? poolAccount.unpaid
+      : null;
+  const heroLabel = canProject ? "wallet" : `unpaid at ${poolAccount.poolName}`;
 
   /**
    * Scaled hashrate, via the same formatter the PRO console uses.
@@ -326,6 +424,25 @@ export function MineSimpleView({
                 {c.algo}
               </span>
             </span>
+            {lanesMining(c.chain).map((lane) => (
+              <span
+                key={lane}
+                title={`Mining ${c.sym} on ${lane.toUpperCase()} now`}
+                style={{
+                  fontSize: 7,
+                  letterSpacing: 1,
+                  color: "var(--accent)",
+                  border: "1px solid rgba(0,255,102,0.35)",
+                  padding: "1px 5px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: 4,
+                }}
+              >
+                <Mark tone="accent" size={4} pulse />
+                {lane.toUpperCase()}
+              </span>
+            ))}
           </button>
         );
       })}
@@ -350,6 +467,15 @@ export function MineSimpleView({
           {showAllTargets ? "▴ fewer" : `${hiddenTargets} more ▾`}
         </button>
       )}
+      {displayedLaneBusy && (
+        <div style={{ fontSize: 8, color: "var(--text-dim)", marginTop: 6, lineHeight: 1.5 }}>
+          {miningHardware.toUpperCase()} is mining
+          {displayedLaneCoin
+            ? ` ${MINING_COINS.find((c) => c.chain === displayedLaneCoin)?.sym ?? ""}`
+            : ""}{" "}
+          · stop it to pick another {miningHardware.toUpperCase()} coin
+        </div>
+      )}
     </div>
   );
 
@@ -365,13 +491,17 @@ export function MineSimpleView({
       >
         <MicroLabel>hardware</MicroLabel>
         <Segmented
+          // A DISPLAY switch — it never starts, stops or changes a lane
+          // (`switchHardware`). It was `disabled={isMining}`, so once it showed
+          // a running lane it locked itself there: switch SIMPLE to GPU while
+          // the GPU mined and there was no way back to CPU (2026-09-18). PRO's
+          // toggles were never locked. The dot says which lane is live.
           options={[
-            { value: "cpu" as const, label: "CPU" },
-            { value: "gpu" as const, label: "GPU" },
+            { value: "cpu" as const, label: "CPU", live: isMiningCpu },
+            { value: "gpu" as const, label: "GPU", live: isMiningGpu },
           ]}
           value={miningHardware === "gpu" ? "gpu" : "cpu"}
           onChange={(v) => switchHardware(v)}
-          disabled={isMining}
         />
       </div>
       <div
@@ -425,7 +555,11 @@ export function MineSimpleView({
           ? "med keeps your pc usable while mining · exact threads in pro"
           : laneHasIntensity("gpu", gpuAlgorithm)
             ? "auto lets the miner tune itself · exact intensity in pro"
-            : "lolMiner has no intensity setting"}
+            : GPU_MINER[gpuAlgorithm].miner !== "SRBMiner-MULTI"
+              ? "lolMiner has no intensity setting"
+              : // Named lolMiner for every lane without an intensity until
+                // 2026-09-18 — including XEL, which SRBMiner mines.
+                "sized to each card's memory by the miner · vram limit in pro"}
       </div>
       {miningHardware === "gpu" && (
         <div style={{ marginTop: 10 }}>
@@ -477,9 +611,35 @@ export function MineSimpleView({
               <span style={{ color: "var(--text-dim)" }}>·</span>
             </>
           )}
-          {selectedPool?.name ?? "—"}
+          {xmrPoolPicker ? null : (selectedPool?.name ?? "—")}
         </span>
       </div>
+      {/* XMR only (operator, 2026-09-18): SIMPLE may pick the pool for
+          Monero; every other coin keeps its house pool here and the choice
+          lives in PRO. Same `setSelectedPoolId` PRO calls, so the two modes
+          share one selection. Locked while the CPU lane mines — the pool is
+          a launch argument. Its own full-width row: the card is too narrow
+          to hold it beside the POOL label. */}
+      {xmrPoolPicker && (
+        <div style={{ marginTop: 8 }}>
+          <SelectMenu
+            ariaLabel="Pool to mine XMR to"
+            value={selectedPoolId ?? ""}
+            disabled={isMiningCpu}
+            style={{ width: "100%" }}
+            onChange={(id) => id && setSelectedPoolId(id)}
+            items={availablePools.map((p) => {
+              const ping = poolPings[p.id];
+              return {
+                value: p.id,
+                label: p.name,
+                hint: `min ${displayMinPayout(p)}${ping?.ok ? ` · ${ping.latencyMs}ms` : ""}`,
+                title: p.endpoint,
+              };
+            })}
+          />
+        </div>
+      )}
       <div
         style={{
           display: "flex",
@@ -515,7 +675,14 @@ export function MineSimpleView({
     <BalanceHero
       projection={asset.projection}
       minedTicker={minedSym}
-      minedAmount={asset.minedAmount}
+      minedAmount={heroAmount}
+      heroLabel={heroLabel}
+      walletAmount={walletAmount}
+      priceUsd={asset.minedPriceUsd}
+      poolAccount={poolAccount}
+      onPoolOptIn={optInToPoolStats}
+      onPoolRefresh={refreshPoolStats}
+      onOpenPoolStats={(url) => void openExternal(url)}
       mining={isMining}
       hashrateLabel={hashLabel}
       perPeriod={perPeriod}

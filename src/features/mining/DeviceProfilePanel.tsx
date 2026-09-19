@@ -65,14 +65,10 @@ export function DeviceProfilePanel({
   // round-trip across all four.
   const xmrStats = useCoinStats("monero");
   const zphStats = useCoinStats("zephyr");
-  const rvnStats = useCoinStats("ravencoin");
-  const cfxStats = useCoinStats("conflux");
   const xelStats = useCoinStats("xelis");
   const liveCoinParams = {
     monero: xmrStats,
     zephyr: zphStats,
-    ravencoin: rvnStats,
-    conflux: cfxStats,
     xelis: xelStats,
   };
   const profile = useDeviceProfile({

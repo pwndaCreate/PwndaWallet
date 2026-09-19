@@ -110,6 +110,8 @@ export type ViewRouterProps = {
   } | null;
   onSidecarSwapAdopt?: (handle: never) => void;
   earnSourceBalance?: number | null;
+  /** Wallet balance of any coin, for the Mine tab's "in wallet" line. */
+  walletBalanceFor?: (coin: ChainType) => number | null;
   /** Convert-route projection for the Mine tab's SIMPLE hero (frame 3a). */
   miningProjection?: MiningProjection | null;
   onSelectMineDisplayCoin?: (ticker: string) => void;
@@ -344,6 +346,7 @@ export function ViewRouter(props: ViewRouterProps) {
   convertSeed,
   onSidecarSwapAdopt,
   earnSourceBalance,
+  walletBalanceFor,
   miningProjection = null,
   onSelectMineDisplayCoin,
   mineReachableTickers,
@@ -617,6 +620,7 @@ export function ViewRouter(props: ViewRouterProps) {
             onSelectDisplayCoin={onSelectMineDisplayCoin}
             reachableTickers={mineReachableTickers}
             minedAmount={earnSourceBalance}
+            walletBalanceFor={walletBalanceFor}
             // Portrait has no EARN tab (frame 1g: the nav is already full),
             // so the promo routes to the Swap tab's CONVERT segment, which
             // is the same pipeline under a different arrangement.

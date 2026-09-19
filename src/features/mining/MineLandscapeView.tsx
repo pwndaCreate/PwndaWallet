@@ -5,7 +5,7 @@ import { CoinIcon } from "../../components/CoinIcon";
 import { Btn } from "../../components/PrimitivesV2";
 import { HashrateAreaChart } from "./HashrateAreaChart";
 import { ST } from "../../components/Primitives";
-import { algorithmHashUnit, formatHashrateParts } from "./pool-stats/format";
+import { algorithmHashUnit, atomicToNumber, formatHashrateParts } from "./pool-stats/format";
 import { PoolStatsPanel, getStatsAdapter } from "./pool-stats";
 import { poolHostPort, decoratePoolLabel } from "./pools";
 import { ProxyModePanel } from "./ProxyModePanel";
@@ -33,6 +33,7 @@ import {
   MicroLabel,
   Panel,
   ViewModeChip,
+  formatAmount,
 } from "./components/mine-simple";
 import { EarnCapabilityBlock } from "./components/EarnCapabilityBlock";
 import { MineRunButton, MinerStatusBanner } from "./components/MineRunControls";
@@ -72,6 +73,8 @@ interface MineLandscapeViewProps {
   onSelectDisplayCoin?: (ticker: string) => void;
   /** Mined XMR balance for the hero. */
   minedAmount?: number | null;
+  /** Any coin's wallet balance, for SIMPLE's "in wallet" line. */
+  walletBalanceFor?: (coin: ChainType) => number | null;
   /** Navigate to EARN. Absent means the cross-promo strip does not render. */
   onOpenEarn?: () => void;
   /** A conversion is already running, so the promo becomes a status line. */
@@ -117,6 +120,7 @@ export function MineLandscapeView({
   projection,
   onSelectDisplayCoin,
   minedAmount = null,
+  walletBalanceFor,
   onOpenEarn,
   conversionRunning = false,
   reachableTickers,
@@ -293,18 +297,12 @@ export function MineLandscapeView({
   // `fetchCoinStats` collapses to one round-trip across all calls.
   const xmrStats = useCoinStats("monero");
   const zphStats = useCoinStats("zephyr");
-  const rvnStats = useCoinStats("ravencoin");
-  const cfxStats = useCoinStats("conflux");
-  const ergStats = useCoinStats("ergo");
   const xelStats = useCoinStats("xelis");
   const profile = useDeviceProfile({
     pricesByTicker: pricesByTicker ?? {},
     liveCoinParams: {
       monero: xmrStats,
       zephyr: zphStats,
-      ravencoin: rvnStats,
-      conflux: cfxStats,
-      ergo: ergStats,
       xelis: xelStats,
     },
   });
@@ -362,6 +360,7 @@ export function MineLandscapeView({
           projection={projection}
           onSelectDisplayCoin={onSelectDisplayCoin}
           minedAmount={minedAmount}
+          walletBalanceFor={walletBalanceFor}
           onOpenEarn={onOpenEarn}
           conversionRunning={conversionRunning}
           onShowPro={() => setMode("pro")}
@@ -407,6 +406,20 @@ export function MineLandscapeView({
       REV {revenueUsd == null ? "—/day" : `≈ ${formatUsdPerDay(revenueUsd)}`}
     </span>
   );
+  // What the selected pool owes, from the same read PoolStatsPanel shows —
+  // visible in the header so it survives scrolling the console (2026-09-18).
+  const poolUnpaid = miner.poolStats
+    ? atomicToNumber(miner.poolStats.pendingBalance, miningCoin)
+    : null;
+  const unpaidChip =
+    poolUnpaid != null ? (
+      <span
+        style={{ ...chipStyle, border: "1px solid var(--border)", background: "transparent" }}
+        title={`Unpaid at ${miner.selectedPool?.name ?? "the pool"}`}
+      >
+        UNPAID {formatAmount(poolUnpaid, asset.minedTicker)} {asset.minedTicker}
+      </span>
+    ) : null;
 
   const proHeader = (
     <ProHeader
@@ -434,6 +447,7 @@ export function MineLandscapeView({
       right={
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
           {valueChip}
+          {unpaidChip}
           <ViewModeChip mode="pro" onToggle={() => setMode("simple")} />
         </span>
       }

@@ -15,18 +15,18 @@
  *     synthesized with one drop-to-zero segment (~45 min mid-window) and
  *     one transient spike to ~9 kH/s near the trailing edge. Pool stats
  *     show one online worker.
- *   - `gpu_mining_active` — active GPU mining session (Ergo / Autolykos2
+ *   - `gpu_mining_active` — active GPU mining session (Zano / ProgPowZ; Ergo / Autolykos2 until 2026-09-18
  *     on SRBMiner, ~115 MH/s). `is_gpu_mining` is true and the
  *     `activeSessions` store is seeded with a GPU descriptor, so loading
  *     the sandbox reproduces "returned to the Mining tab after a
  *     mem_guard reload during GPU mining" — the post-reload rehydration
  *     path in `useMiner` (see [[webview2-memory-management]] Round 13).
  *   - `cpu_gpu_mining_active` — CONCURRENT lanes: Zephyr on CPU (~7.3
- *     kH/s) AND Ergo on GPU (~115 MH/s). Both `is_mining` + `is_gpu_mining`
+ *     kH/s) AND Zano on GPU (~58 MH/s; Ergo until 2026-09-18). Both `is_mining` + `is_gpu_mining`
  *     are true and the `activeSessions` store is seeded with BOTH lane
  *     descriptors. Reproduces the 2026-06-13 per-hardware-coin bug (after a
  *     reload the displayed lane must show its real coin AND toggling to the
- *     hidden lane must restore ITS coin — CPU→Zephyr, GPU→Ergo, not the
+ *     hidden lane must restore ITS coin — CPU→Zephyr, GPU→Zano, not the
  *     monero/kawpow defaults) plus per-lane tile gating + the landscape
  *     hardware toggle (see [[mining-session-rehydration]]).
  *   - `xelis_mining_active` — Xelis on BOTH lanes at once, as two SRBMiner
@@ -691,10 +691,12 @@ function pluginStore(cmd: string, args: any): unknown {
       if (path.endsWith(PREFS_FILE) && key === ACTIVE_SESSIONS_KEY) {
         const gpuDesc = {
           hardware: "gpu",
-          coin: "ergo",
-          gpuAlgorithm: "autolykos",
+          // Was Ergo/Autolykos2 on WoolyPooly until ERG was retired from
+          // mining (2026-09-18); now the default GPU coin.
+          coin: "zano",
+          gpuAlgorithm: "progpowz",
           miner: "SRBMiner-MULTI",
-          poolId: "woolypooly-ergo",
+          poolId: "pwnda-zano",
         };
         const cpuDesc = {
           hardware: "cpu",
@@ -798,7 +800,6 @@ function minerStatuses(): Array<{ name: string; exists: boolean; path: string }>
   return [
     { name: "xmrig", exists: true, path: `${sandboxBase}\\xmrig.exe` },
     { name: "SRBMiner-MULTI", exists: true, path: `${sandboxBase}\\SRBMiner-MULTI.exe` },
-    { name: "lolMiner", exists: true, path: `${sandboxBase}\\lolMiner.exe` },
   ];
 }
 
@@ -910,12 +911,12 @@ function gpuSnapshot() {
     scenario() !== "cpu_gpu_mining_active"
   )
     return null;
-  // Active Ergo / Autolykos2 session ~115 MH/s, ~46 min uptime. GPU
-  // miners don't expose stratum ping, so `ping_ms` is null (the view
-  // falls back to the pre-mine TCP probe latency). Seeded jitter (stable).
-  const jitter = ((hashStr("gpu-jitter") % 200) - 100) * 15_000; // fixed
+  // Active Zano / ProgPowZ session ~58 MH/s (was Ergo ~115 MH/s before
+  // ERG was retired, 2026-09-18), ~46 min uptime. `ping_ms` is null (the
+  // view falls back to the pre-mine TCP probe latency). Seeded jitter.
+  const jitter = ((hashStr("gpu-jitter") % 200) - 100) * 7_500; // fixed
   return {
-    hashrate: 115_000_000 + jitter,
+    hashrate: 58_000_000 + jitter,
     accepted: 142,
     rejected: 1,
     diff_current: 2_400_000,
@@ -995,12 +996,51 @@ function minerStats(poolId?: string) {
       fetchedAt: now,
     };
   }
-  if (!cpuMiningActive()) {
-    // Pool returns "no records for this address" pre-mining. Match
-    // what the adapters return for unknown miners.
-    return null;
-  }
   const now = Math.floor(Date.now() / 1000);
+  if (!cpuMiningActive()) {
+    // An address the pool has no record of. Since 2026-09-18 the
+    // cryptonote parser (`{"error":"Not found"}`) returns an EMPTY ACCOUNT
+    // rather than an error, and this mock returned `null` — a value the
+    // Rust command can never produce, which left the Mine tab's pool block
+    // "reading…" forever.
+    return {
+      pendingBalance: "0",
+      immatureBalance: null,
+      totalPaid: "0",
+      payoutThreshold: null,
+      hashrate: 0,
+      hashrate1h: null,
+      hashrate6h: null,
+      hashrate24h: null,
+      validShares: null,
+      invalidShares: null,
+      staleShares: null,
+      lastShare: null,
+      workersOnline: null,
+      fetchedAt: now,
+    };
+  }
+  if (poolId === "pwnda-zephyr") {
+    // The live pwnda.org `/pool-api/stats_address` account from 2026-09-18,
+    // as `parse_herominers` returns it (atomic 1e12; no threshold in the
+    // per-address reply — that comes from `fetch_pool_min_payout`).
+    return {
+      pendingBalance: "8783940898", // 0.00878 ZEPH
+      immatureBalance: null,
+      totalPaid: "36178000000000", // 36.178 ZEPH
+      payoutThreshold: null,
+      hashrate: 13424,
+      hashrate1h: 13748,
+      hashrate6h: 13571,
+      hashrate24h: 13138,
+      validShares: null,
+      invalidShares: null,
+      staleShares: null,
+      lastShare: now - 30,
+      workersOnline: 1,
+      fetchedAt: now,
+    };
+  }
   // ATOMIC strings (1e12 for XMR/ZEPH), like every Rust parser returns.
   // Corrected 2026-09-16 with the XEL branch above: these were whole-coin
   // strings ("0.00231" …), which `formatAtomic` rendered as "0".
@@ -4360,10 +4400,20 @@ const MOCKS: Record<string, (args: any) => unknown> = {
 
   // Pool min-payout (per-pool registry lookup). Realistic-ish defaults
   // so the SESSION card's "next payout in" affordance computes a number.
+  // The real command returns `{ poolId, display } | null` (null = "use the
+  // static pools.ts value"). This mock returned `{ minPayout, currency }`
+  // until 2026-09-18 — a shape nothing reads, so the live-minimum path was
+  // never exercised in the sandbox. Values are the live ones read that day.
   fetch_pool_min_payout: (args: any) => {
     const id = String(args?.poolId ?? "");
-    const minXmr = id.startsWith("xmr") ? "0.004" : id.startsWith("zph") ? "0.1" : "0.01";
-    return { minPayout: minXmr, currency: id.split("-")[0] ?? "xmr" };
+    const live: Record<string, string> = {
+      "pwnda-zephyr": "0.01 ZEPH",
+      "pwnda-zano": "0.2 ZANO",
+      "pwnda-xelis": "0.05 XEL",
+      "herominers-zano": "0.2 ZANO",
+      "woolypooly-zano": "0.25 ZANO",
+    };
+    return live[id] ? { poolId: id, display: live[id] } : null;
   },
 
   // MSR env cache reader (used by Settings → diagnostics). Returns

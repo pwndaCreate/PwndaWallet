@@ -25,3 +25,9 @@ export const HEROMINERS_RAVENCOIN: PoolStatsAdapter = {
   id: "herominers-ravencoin",
   recommendedPollMs: POLL,
 };
+
+/** ZANO subdomain, added 2026-09-18 (`stats_address` answered live that day). */
+export const HEROMINERS_ZANO: PoolStatsAdapter = {
+  id: "herominers-zano",
+  recommendedPollMs: POLL,
+};

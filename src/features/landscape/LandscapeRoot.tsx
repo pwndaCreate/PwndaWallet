@@ -91,6 +91,8 @@ export function LandscapeRoot(props: {
   } | null;
   onSidecarSwapAdopt?: (handle: never) => void;
   earnSourceBalance?: number | null;
+  /** Wallet balance of any coin, for the Mine tab's "in wallet" line. */
+  walletBalanceFor?: (coin: ChainType) => number | null;
   /**
    * Convert-route projection for the Mine tab's SIMPLE hero.
    *
@@ -351,6 +353,7 @@ export function LandscapeRoot(props: {
     convertSeed,
     onSidecarSwapAdopt,
     earnSourceBalance = null,
+    walletBalanceFor,
     miningProjection = null,
     onSelectMineDisplayCoin,
     mineReachableTickers,
@@ -733,6 +736,7 @@ export function LandscapeRoot(props: {
             onSelectDisplayCoin={onSelectMineDisplayCoin}
             reachableTickers={mineReachableTickers}
             minedAmount={earnSourceBalance}
+            walletBalanceFor={walletBalanceFor}
             // Navigates to the EARN tab, carrying nothing: the pipeline
             // already knows its target, and the Mine tab's display coin is
             // the DEFAULT for that target rather than an override of it.

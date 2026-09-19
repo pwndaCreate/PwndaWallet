@@ -82,6 +82,20 @@ export const GPU_MINER: Record<
   xelishashv3: { miner: "SRBMiner-MULTI", algorithm: "xelishashv3", sendsWorker: true },
 };
 
+/**
+ * GPU algorithms RETIRED from mining on 2026-09-18 (operator: "remove rvn, cfx,
+ * and erg from the mining page ... make sure we aren't bundling the lolminer
+ * anymore"). Their table entries above and below are kept as archived code —
+ * the union still names them, so persisted state or an old test fixture can
+ * never index a table and get `undefined` — but no roster coin mines them, so
+ * no surface can select one. Mining ships xmrig + SRBMiner-MULTI only.
+ */
+export const RETIRED_GPU_ALGORITHMS: ReadonlySet<GpuAlgorithm> = new Set<GpuAlgorithm>([
+  "kawpow",
+  "octopus",
+  "autolykos",
+]);
+
 /** Whether the CPU lane for this algorithm also sends `--worker` (XELIS stratum). */
 export const CPU_SENDS_WORKER: Record<CpuAlgorithm, boolean> = {
   randomx: false,

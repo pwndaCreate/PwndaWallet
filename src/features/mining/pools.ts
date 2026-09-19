@@ -70,6 +70,13 @@ export interface PoolDef {
    * `YOUR_XELIS_ADDRESS.2000000` as the difficulty form (maximum 10,000,000).
    */
   numericWorkerIsDifficulty?: boolean;
+  /**
+   * The pool's own "my stats" page, for the Mine tab's pool-account block.
+   * Opened without the address in the URL: the page asks for it, and an
+   * address in a query string would end up in browser history and server
+   * logs. Added 2026-09-18 (pwnda.org's MY STATS page is `/pool`).
+   */
+  statsPageUrl?: string;
 }
 
 // `PWNDA_POOL` entries (stratum+ssl://*.pwnda.org:20871) were removed
@@ -174,11 +181,13 @@ const ZEPHYR_POOLS: PoolDef[] = [
     // TLS 1.3 handshake with a valid Let's Encrypt cert (CN=pwnda.org) and a
     // `login` for algo rx/0 returns `status:"OK"` plus a real job.
     //
-    // `minPayout: "—"` (unknown) → the ascending-min-payout dropdown
-    // sort (useMiner `availablePools`) lists it LAST among ZEPH pools, and it
-    // is NOT the default (HashVault, lowest payout, keeps that slot). Supply a
-    // real min payout to sort it in, or move this entry first to make it the
-    // house default.
+    // Dropdown position: house pools are pinned first by `availablePools`
+    // (2026-09-18), whatever their payout; `HOUSE_DEFAULT_POOL` makes this
+    // the default.
+    // 2026-09-18: the pool's API is `pwnda.org/pool-api` (upstream
+    // cryptonote-nodejs-pool); `/stats` reports `minPaymentThreshold`
+    // 0.01 ZEPH and `stats_address` a per-address balance, both read by the
+    // Rust fetchers. The static value below is only the fallback.
     id: "pwnda-zephyr",
     name: "Pwnda Pool",
     coin: "zephyr",
@@ -187,7 +196,8 @@ const ZEPHYR_POOLS: PoolDef[] = [
     ssl: true,
     userFormat: "address",
     passFormat: "worker",
-    minPayout: "—",
+    minPayout: "0.01 ZEPH",
+    statsPageUrl: "https://pwnda.org/pool",
   },
 ];
 
@@ -345,7 +355,9 @@ const ERGO_POOLS: PoolDef[] = [
     ssl: false,
     userFormat: "address.worker",
     passFormat: "x",
-    minPayout: "0.1 ERG",
+    // miningpoolstats.stream lists 0.5 (2026-09-18); was 0.1. The live
+    // `/api/stats` value replaces it where ergo.herominers.com is reachable.
+    minPayout: "0.5 ERG",
   },
   {
     id: "woolypooly-ergo",
@@ -356,7 +368,9 @@ const ERGO_POOLS: PoolDef[] = [
     ssl: false,
     userFormat: "address.worker",
     passFormat: "x",
-    minPayout: "0.5 ERG",
+    // Live `/api/ergo-1/stats` `minPay` was 1 on 2026-09-18 (pool audit);
+    // this fallback said 0.5. The runtime value comes from pool_payout.rs.
+    minPayout: "1 ERG",
   },
   {
     // Nanopool EU. Per-account default is **0.1 ERG** floor (lowest
@@ -497,9 +511,10 @@ const ZANO_POOLS: PoolDef[] = [
     // stratum `login` for algo `progpowz` returns a JSON-RPC response (an
     // "Invalid address used for login" error against a placeholder address —
     // i.e. the pool parsed and rejected the login for the right reason, not a
-    // connection or protocol failure). No live-stats adapter, so
-    // `PoolStatsPanel` hides for this pool exactly as it does for
-    // `pwnda-zephyr`; mining + the connectivity probe work normally.
+    // connection or protocol failure).
+    //
+    // 2026-09-18: live stats and payout come from `pwnda.org/zano-api`
+    // (cryptonote-nodejs-pool, `minPaymentThreshold` 0.2 ZANO).
     id: "pwnda-zano",
     name: "Pwnda Pool",
     coin: "zano",
@@ -508,7 +523,8 @@ const ZANO_POOLS: PoolDef[] = [
     ssl: true,
     userFormat: "address",
     passFormat: "worker",
-    minPayout: "—",
+    minPayout: "0.2 ZANO",
+    statsPageUrl: "https://pwnda.org/pool",
   },
 ];
 
@@ -581,7 +597,10 @@ const XELIS_POOLS: PoolDef[] = [
     ssl: false,
     userFormat: "address",
     passFormat: "x",
-    minPayout: "3 XEL",
+    // 0.2 per miningpoolstats.stream and K1Pool's own payments list (0.23-0.78
+    // XEL payouts), 2026-09-18. It was 3 — the account API's `payoutThreshold`,
+    // which is not what the pool pays at.
+    minPayout: "0.2 XEL",
     hardware: ["cpu"],
   },
   {
@@ -593,7 +612,10 @@ const XELIS_POOLS: PoolDef[] = [
     ssl: false,
     userFormat: "address",
     passFormat: "x",
-    minPayout: "3 XEL",
+    // 0.2 per miningpoolstats.stream and K1Pool's own payments list (0.23-0.78
+    // XEL payouts), 2026-09-18. It was 3 — the account API's `payoutThreshold`,
+    // which is not what the pool pays at.
+    minPayout: "0.2 XEL",
     hardware: ["gpu"],
   },
   {
@@ -606,13 +628,16 @@ const XELIS_POOLS: PoolDef[] = [
     ssl: true,
     userFormat: "address",
     passFormat: "x",
-    minPayout: "3 XEL",
+    // 0.2 per miningpoolstats.stream and K1Pool's own payments list (0.23-0.78
+    // XEL payouts), 2026-09-18. It was 3 — the account API's `payoutThreshold`,
+    // which is not what the pool pays at.
+    minPayout: "0.2 XEL",
     hardware: ["gpu"],
   },
   {
-    // 1225 answers BOTH plain stratum and TLS (probed both). `minPayout` is
-    // unknown rather than guessed: xelis.herominers.com is blocked by the dev
-    // box's web filter, so neither its page nor its `/api/stats` could be read.
+    // 1225 answers BOTH plain stratum and TLS (probed both). xelis.herominers.com
+    // is blocked by the dev box's web filter; `minPayout` is from
+    // miningpoolstats.stream (`minpay: 0.1`, 2026-09-18), which could be read.
     id: "herominers-xelis",
     name: "HeroMiners",
     coin: "xelis",
@@ -621,7 +646,7 @@ const XELIS_POOLS: PoolDef[] = [
     ssl: false,
     userFormat: "address",
     passFormat: "x",
-    minPayout: "—",
+    minPayout: "0.1 XEL",
   },
   {
     // PwndaWallet's own XEL pool, added 2026-09-16. Every value is from
@@ -657,6 +682,7 @@ const XELIS_POOLS: PoolDef[] = [
     passFormat: "x",
     minPayout: "0.05 XEL",
     numericWorkerIsDifficulty: true,
+    statsPageUrl: "https://pwnda.org/pool",
   },
 ];
 

@@ -5,9 +5,11 @@ import {
   HEROMINERS_MONERO,
   HEROMINERS_CONFLUX,
   HEROMINERS_RAVENCOIN,
+  HEROMINERS_ZANO,
 } from "./herominers";
 import { NANOPOOL_CONFLUX } from "./nanopool";
-import { WOOLYPOOLY_CONFLUX, WOOLYPOOLY_RAVENCOIN } from "./woolypooly";
+import { WOOLYPOOLY_CONFLUX, WOOLYPOOLY_RAVENCOIN, WOOLYPOOLY_ZANO } from "./woolypooly";
+import { PWNDA_ZEPHYR, PWNDA_ZANO } from "./pwnda";
 import { NTMINERPOOL_ZEPHYR } from "./ntminerpool";
 import {
   HEROMINERS_ERGO,
@@ -27,8 +29,9 @@ export { PoolStatsPanel } from "./PoolStatsPanel";
 
 /**
  * Returns the stats adapter for a given pool ID, or null when:
- *   - the pool has no live-stats integration yet (pwnda-zephyr, pwnda-zano,
- *     Ntminer pre-Phase-2; pwnda-xelis has one since 2026-09-16)
+ *   - the pool has no live-stats integration yet (Kryptex, HeroMiners
+ *     ZEPH/XEL, most Ntminer entries; every pwnda pool has one since
+ *     2026-09-18)
  *   - the pool ID is unknown.
  *
  * The UI hides `PoolStatsPanel` whenever this returns null.
@@ -56,4 +59,8 @@ const ADAPTERS: Record<string, PoolStatsAdapter> = {
   [K1POOL_XELIS_GPU.id]: K1POOL_XELIS_GPU,
   [K1POOL_XELIS_SSL.id]: K1POOL_XELIS_SSL,
   [PWNDA_XELIS.id]: PWNDA_XELIS,
+  [PWNDA_ZEPHYR.id]: PWNDA_ZEPHYR,
+  [PWNDA_ZANO.id]: PWNDA_ZANO,
+  [HEROMINERS_ZANO.id]: HEROMINERS_ZANO,
+  [WOOLYPOOLY_ZANO.id]: WOOLYPOOLY_ZANO,
 };

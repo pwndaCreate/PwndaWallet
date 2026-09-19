@@ -35,9 +35,6 @@ describe("the lane a coin mines on", () => {
     // Four call sites used to hardcode `RVN || CFX || ERG`, so ZANO — added
     // later — fell outside all of them at once.
     expect(coinLanes("zano")).toEqual(["gpu"]);
-    expect(coinLanes("ravencoin")).toEqual(["gpu"]);
-    expect(coinLanes("conflux")).toEqual(["gpu"]);
-    expect(coinLanes("ergo")).toEqual(["gpu"]);
     expect(coinLanes("monero")).toEqual(["cpu"]);
     expect(coinLanes("zephyr")).toEqual(["cpu"]);
     expect(coinLanes("xelis")).toEqual(["cpu", "gpu"]);
@@ -65,9 +62,9 @@ describe("picking a coin", () => {
 
   it("leaves the hardware alone when it is already right", () => {
     const m = miner({ miningHardware: "gpu" });
-    pickMiningCoin("ravencoin", m);
+    pickMiningCoin("zano", m);
     expect(m.setMiningHardware).not.toHaveBeenCalled();
-    expect(m.setMiningCoin).toHaveBeenCalledWith("ravencoin");
+    expect(m.setMiningCoin).toHaveBeenCalledWith("zano");
   });
 
   it("switches back to CPU for a CPU coin", () => {
@@ -87,7 +84,6 @@ describe("per-lane gating", () => {
     const m = miner({ isMiningCpu: true });
     expect(coinTileLocked("monero", m)).toBe(true);
     expect(coinTileLocked("zano", m)).toBe(false);
-    expect(coinTileLocked("ravencoin", m)).toBe(false);
   });
 
   it("a GPU session does not lock CPU coins", () => {
@@ -144,6 +140,6 @@ describe("dual-lane coins (XEL, 2026-09-15)", () => {
     const m = miner({ isMiningCpu: true });
     expect(coinTileLocked("monero", m)).toBe(true);
     expect(coinTileLocked("zephyr", m)).toBe(true);
-    expect(coinTileLocked("ergo", m)).toBe(false);
+    expect(coinTileLocked("zano", m)).toBe(false);
   });
 });

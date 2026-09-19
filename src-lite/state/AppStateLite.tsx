@@ -25,9 +25,7 @@ export const LITE_SUPPORTED_CHAINS: ChainType[] = [
   "zephyr",
   "zano",
   "xelis",
-  "ravencoin",
-  "conflux",
-  "ergo",
+  // RVN / CFX / ERG retired from mining 2026-09-18.
 ];
 
 export type LiteView = "mining" | "settings";

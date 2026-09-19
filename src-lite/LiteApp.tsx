@@ -102,7 +102,7 @@ export function LiteApp() {
     // Every rostered coin. `fetchUsdPrices` drops a ticker it has no price id
     // for (XEL until the wallet layer maps one), so listing it is harmless and
     // the XEL tile starts pricing the moment the id exists.
-    const tickers = ["XMR", "ZEPH", "ZANO", "XEL", "RVN", "CFX", "ERG"];
+    const tickers = ["XMR", "ZEPH", "ZANO", "XEL"];
     const refresh = async () => {
       try {
         const prices = await fetchUsdPrices(tickers);

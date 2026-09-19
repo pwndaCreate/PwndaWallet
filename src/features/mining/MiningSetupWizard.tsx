@@ -67,7 +67,7 @@ export function MiningSetupWizard({
           <p style={{ marginTop: 0 }}>
             Mining is <strong>optional and off by default</strong>. Turn it on
             to put your CPU or GPU to work mining supported coins
-            (<strong>XMR · ZEPH · ZANO · XEL · RVN · CFX · ERG</strong>) straight
+            (<strong>XMR · ZEPH · ZANO · XEL</strong>) straight
             to your own wallet address. Here's what setting it up does:
           </p>
 
@@ -80,7 +80,7 @@ export function MiningSetupWizard({
             <li style={{ marginBottom: 6 }}>
               <strong>Downloads mining software on demand.</strong> Nothing
               ships pre-installed. PwndaWallet fetches the miner it needs
-              (XMRig / lolMiner / SRBMiner) from the official upstream release
+              (XMRig / SRBMiner) from the official upstream release
               into your app-data folder — only when you set up here.
             </li>
             {isWin && (

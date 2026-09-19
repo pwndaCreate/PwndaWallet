@@ -314,8 +314,9 @@ export interface ChainMiningProfile {
 export const CHAIN_MINING_PROFILES: ChainMiningProfile[] = [
   { chain: "monero",    ticker: "XMR",  algo: "randomx", hardware: ["cpu"], miner: "xmrig" },
   { chain: "zephyr",    ticker: "ZEPH", algo: "randomx", hardware: ["cpu"], miner: "xmrig" },
-  { chain: "ravencoin", ticker: "RVN",  algo: "kawpow",  hardware: ["gpu"], miner: "SRBMiner-MULTI" },
-  { chain: "conflux",   ticker: "CFX",  algo: "octopus", hardware: ["gpu"], miner: "lolMiner" },
+  // RVN (kawpow) and CFX (octopus, lolMiner) retired from mining 2026-09-18.
+  // Their benchmark tables stay below as archived data; with no profile, no
+  // device row predicts or calibrates them.
   // Xelis mines on BOTH lanes, each as its own SRBMiner-MULTI process. The
   // benchmark tables key CPU and GPU devices separately, so one profile with
   // both kinds gives each device row its own prediction.

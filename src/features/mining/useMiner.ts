@@ -26,6 +26,7 @@ import {
   getDefaultPoolId,
   getPoolById,
   getPoolsForCoin,
+  HOUSE_DEFAULT_POOL,
   parseMinPayoutValue,
   resolveDefaultPool,
   workerFlagFor,
@@ -48,6 +49,7 @@ import { supportsDefenderExclusion } from "../../platform/os";
 import { useCalibration } from "./hooks/useCalibration";
 import { useMinerSetup } from "./hooks/useMinerSetup";
 import {
+  loadOptIns,
   optInKey,
   saveOptIn,
   usePoolStats,
@@ -227,7 +229,10 @@ export function useMiner(args: {
   const [miningCoin, setMiningCoin] = useState<ChainType>("monero");
   const [miningHardware, setMiningHardware] = useState<MiningHardware>("cpu");
   const [cpuAlgorithm, setCpuAlgorithm] = useState<CpuAlgorithm>("randomx");
-  const [gpuAlgorithm, setGpuAlgorithm] = useState<GpuAlgorithm>("kawpow");
+  // ZANO (ProgPowZ) is the GPU lane's first coin since 2026-09-18 — the
+  // operator's call; it was KawPow/RVN, so toggling to GPU before mining
+  // anything landed on Ravencoin.
+  const [gpuAlgorithm, setGpuAlgorithm] = useState<GpuAlgorithm>("progpowz");
   const [selectedPoolId, setSelectedPoolId] = useState<PoolId | null>(null);
 
   // Which physical GPU(s) to mine on — a niche control, shown only when the
@@ -363,6 +368,18 @@ export function useMiner(args: {
    *  CPU lane is idle. */
   const [runningCpuMiner, setRunningCpuMiner] =
     useState<"xmrig" | "SRBMiner-MULTI" | null>(null);
+  /** The coin each lane is actually mining, set when the lane starts (or is
+   *  rehydrated) and cleared when it stops. `miningCoin` is the DISPLAYED
+   *  lane's selection and cannot say what the hidden lane runs — which is how
+   *  SIMPLE lit the CPU coin while the GPU lane mined XEL (2026-09-18). */
+  const [laneCoins, setLaneCoins] = useState<{ cpu: ChainType | null; gpu: ChainType | null }>(
+    { cpu: null, gpu: null },
+  );
+  const setLaneCoin = useCallback(
+    (lane: MiningHardware, coin: ChainType | null) =>
+      setLaneCoins((prev) => (prev[lane] === coin ? prev : { ...prev, [lane]: coin })),
+    [],
+  );
   /** Pool IDs that are *currently* held open by a running miner process,
    *  one slot per hardware. Captured at `startMining` time so we know
    *  which pool xmrig/SRBMiner is talking to even after the user changes
@@ -560,8 +577,12 @@ export function useMiner(args: {
   //
   // Why this is its own poller (not bundled with `poolStats`): the
   // pool-stats fetch sends the user's wallet address to the pool and is
-  // privacy-gated. Min-payout is pool-wide config — no wallet address
-  // sent, no privacy gate, no opt-in required. We fire it eagerly so
+  // privacy-gated. Min-payout is MOSTLY pool-wide config and fired eagerly —
+  // but Nanopool and K1Pool read it per ACCOUNT, with the address in the
+  // URL. Until 2026-09-18 the address went to those for every pool in the
+  // dropdown, opted-in or not (this comment said "no wallet address sent");
+  // the pool audit caught it. It is now sent only for a pool the user has
+  // opted in to (`loadOptIns`), i.e. mined at or asked to check. We fire it eagerly so
   // users with NTMiner / Nanopool dashboards configured to higher
   // thresholds see the real number rather than the marketing-page
   // default.
@@ -709,13 +730,19 @@ export function useMiner(args: {
   // the same coin so the bare numeric sort is meaningful. Entries with
   // an unknown / placeholder payout (`"—"`) sink to the bottom in their
   // registry order. Stable wrt registry order for ties.
+  //
+  // 2026-09-18: the coin's house pool (`HOUSE_DEFAULT_POOL`, pwnda's) is
+  // pinned FIRST, whatever its payout — it is the default, and a default that
+  // sits third in its own dropdown reads as an accident.
   const availablePools = useMemo(() => {
     const indexed = rawPools.map((pool, idx) => ({
       pool,
       payout: parseMinPayoutValue(pool.minPayout),
       idx,
+      house: HOUSE_DEFAULT_POOL[pool.coin] === pool.id,
     }));
     indexed.sort((a, b) => {
+      if (a.house !== b.house) return a.house ? -1 : 1;
       // Both known → ascending payout
       if (a.payout != null && b.payout != null) {
         if (a.payout !== b.payout) return a.payout - b.payout;
@@ -830,10 +857,15 @@ export function useMiner(args: {
     (async () => {
       const results = await Promise.all(
         availablePools.map(async (p) => {
+          const optedIn = loadOptIns();
+          const address =
+            walletForPayoutFetch && optedIn.has(optInKey(p.id, walletForPayoutFetch))
+              ? walletForPayoutFetch
+              : null;
           try {
             const info = await invoke<{ poolId: string; display: string } | null>(
               "fetch_pool_min_payout",
-              { poolId: p.id, address: walletForPayoutFetch ?? null }
+              { poolId: p.id, address }
             );
             return info && info.display ? ([p.id, info.display] as const) : null;
           } catch {
@@ -874,6 +906,7 @@ export function useMiner(args: {
   // starts a session (the address goes to the pool over stratum then).
   const statsAddress = addressFor(miningCoin);
   const {
+    statsAdapter,
     poolStats,
     poolStatsLoading,
     poolStatsError,
@@ -883,6 +916,19 @@ export function useMiner(args: {
     optInToPoolStats,
     refreshPoolStats,
   } = usePoolStats({ focus, selectedPoolId, statsAddress });
+
+  // A lane that is ALREADY mining at the selected pool has sent it this
+  // address over stratum, so reading the account reveals nothing new — the
+  // same reasoning `startMining` uses to opt in. Without this, a session
+  // restored after an app restart (it keeps running; the opt-in was only
+  // ever set by pressing START) showed "check balance" for the pool it was
+  // mining to (2026-09-18).
+  const displayedLanePoolId = miningHardware === "cpu" ? activeCpuPoolId : activeGpuPoolId;
+  useEffect(() => {
+    if (!statsOptInForCurrent && selectedPoolId && displayedLanePoolId === selectedPoolId) {
+      optInToPoolStats();
+    }
+  }, [statsOptInForCurrent, selectedPoolId, displayedLanePoolId, optInToPoolStats]);
 
   const startMining = useCallback(async () => {
     setMinerError("");
@@ -1065,6 +1111,7 @@ export function useMiner(args: {
         }
         setRunningCpuMiner(cpuMiner.miner);
         setIsMiningCpu(true);
+        setLaneCoin("cpu", miningCoin);
         setActiveCpuPoolId(pool.id);
         // Persist the running-session descriptor so the Mining view can
         // rehydrate (correct hardware lane, coin, algo, miner, pool) if the
@@ -1137,6 +1184,7 @@ export function useMiner(args: {
         });
         setRunningGpuMiner(miner);
         setIsMiningGpu(true);
+        setLaneCoin("gpu", miningCoin);
         setActiveGpuPoolId(pool.id);
         // Persist the running-session descriptor for post-reload
         // rehydration (see the CPU branch + `activeSessionStore.ts`).
@@ -1213,6 +1261,7 @@ export function useMiner(args: {
         if (stopError) throw stopError;
         setIsMiningCpu(false);
         setRunningCpuMiner(null);
+        setLaneCoin("cpu", null);
         setCpuHashrateSamples([]);
         setCpuSession(null);
         setActiveCpuPoolId(null);
@@ -1224,6 +1273,7 @@ export function useMiner(args: {
       } else {
         await invoke("stop_gpu_miner");
         setIsMiningGpu(false);
+        setLaneCoin("gpu", null);
         setGpuHashrateSamples([]);
         setGpuSession(null);
         setRunningGpuMiner(null);
@@ -1251,6 +1301,7 @@ export function useMiner(args: {
     try { await invoke("stop_gpu_miner"); } catch { /* not running */ }
     setIsMiningCpu(false);
     setIsMiningGpu(false);
+    setLaneCoins({ cpu: null, gpu: null });
     setCpuSession(null);
     setGpuSession(null);
     setRunningCpuMiner(null);
@@ -1383,9 +1434,11 @@ export function useMiner(args: {
             invoke("stop_srbminer_cpu").catch(() => {});
             setIsMiningCpu(false);
             setRunningCpuMiner(null);
+            setLaneCoin("cpu", null);
           } else if (kind === "gpu") {
             invoke("stop_gpu_miner").catch(() => {});
             setIsMiningGpu(false);
+            setLaneCoin("gpu", null);
           } else {
             // Unknown kind — defensive: stop both. Shouldn't happen
             // (backend always populates kind from SessionLogger), but
@@ -1399,6 +1452,7 @@ export function useMiner(args: {
             setIsMiningCpu(false);
             setIsMiningGpu(false);
             setRunningCpuMiner(null);
+            setLaneCoins({ cpu: null, gpu: null });
           }
           setMinerError(message);
           return;
@@ -1609,11 +1663,13 @@ export function useMiner(args: {
         // un-mined) pool again.
         if (!cpu) {
           setActiveCpuPoolId(null);
+          setLaneCoin("cpu", null);
           void clearActiveSession("cpu");
         }
         if (!gpu) {
           setRunningGpuMiner(null);
           setActiveGpuPoolId(null);
+          setLaneCoin("gpu", null);
           void clearActiveSession("gpu");
         }
       } catch {
@@ -1691,6 +1747,10 @@ export function useMiner(args: {
         if (gpuMiner && gpuMiner !== "xmrig") setRunningGpuMiner(gpuMiner);
         if (sessions.gpu?.poolId) setActiveGpuPoolId(sessions.gpu.poolId);
         if (sessions.gpu?.gpuAlgorithm) setGpuAlgorithm(sessions.gpu.gpuAlgorithm);
+        const gpuCoin =
+          sessions.gpu?.coin ??
+          (sessions.gpu?.gpuAlgorithm ? GPU_ALGORITHM_COIN[sessions.gpu.gpuAlgorithm] : null);
+        if (gpuCoin) setLaneCoin("gpu", gpuCoin);
       }
       if (cpu) {
         if (sessions.cpu?.poolId) setActiveCpuPoolId(sessions.cpu.poolId);
@@ -1703,6 +1763,7 @@ export function useMiner(args: {
         const cpuCoin = sessions.cpu?.coin;
         if (cpuCoin && coinMinesOn(cpuCoin, "cpu")) {
           lastCpuCoinRef.current = cpuCoin;
+          setLaneCoin("cpu", cpuCoin);
         }
       }
 
@@ -2070,6 +2131,9 @@ export function useMiner(args: {
      *  Surfaces let the view label the lane honestly and gate the xmrig-only
      *  controls (MSR) without re-deriving it from the algorithm. */
     runningCpuMiner,
+    /** The coin each lane is mining right now (`null` = idle, or a session
+     *  restored without its descriptor). */
+    laneCoins,
     isAnyMining,
     miningStarting,
     cpuStarting,
@@ -2134,6 +2198,8 @@ export function useMiner(args: {
     gpuSelection,
     setGpuSelection,
     // Pool stats (Phase 1)
+    statsAdapter,
+    statsAddress,
     poolStats,
     poolStatsLoading,
     poolStatsError,

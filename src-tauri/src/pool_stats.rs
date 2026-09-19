@@ -213,6 +213,36 @@ const POOLS: &[PoolEndpoint] = &[
         url_template: "https://pwnda.org/xelis-api/stats/{addr}",
         kind: ParserKind::PwndaXelisJson,
     },
+    // ── Pwnda ZEPH / ZANO (2026-09-18). Both run upstream
+    // cryptonote-nodejs-pool behind pwnda.org (`/pool-api` = ZEPH,
+    // `/zano-api` = ZANO — the paths the pwnda.org site's own bundle calls).
+    // `stats_address` returns `{stats:{balance, paid, hashrate, …}}` in atomic
+    // units (1e12 for both coins). Verified live against a real ZEPH account:
+    // balance "8783940898", paid "36178000000000", hashrate 13424.
+    PoolEndpoint {
+        id: "pwnda-zephyr",
+        url_template: "https://pwnda.org/pool-api/stats_address?address={addr}&longpoll=false",
+        kind: ParserKind::HerominersJson,
+    },
+    PoolEndpoint {
+        id: "pwnda-zano",
+        url_template: "https://pwnda.org/zano-api/stats_address?address={addr}&longpoll=false",
+        kind: ParserKind::HerominersJson,
+    },
+    // ── ZANO on third-party pools (2026-09-18). Both endpoints answered from
+    // the dev box that day. HeroMiners ZEPH/XEL did not (connection timeout),
+    // so they stay out until a response has been seen.
+    PoolEndpoint {
+        id: "herominers-zano",
+        url_template:
+            "https://zano.herominers.com/api/stats_address?address={addr}&longpoll=false",
+        kind: ParserKind::HerominersJson,
+    },
+    PoolEndpoint {
+        id: "woolypooly-zano",
+        url_template: "https://api.woolypooly.com/api/zano-1/accounts/{addr}",
+        kind: ParserKind::WoolypoolyJson,
+    },
 ];
 
 const ALLOWED_HOSTS: &[&str] = &[
@@ -222,6 +252,8 @@ const ALLOWED_HOSTS: &[&str] = &[
     "ravencoin.herominers.com",
     // Ergo subdomain on the HeroMiners cluster (added 2026-05-15).
     "ergo.herominers.com",
+    // Zano subdomain (2026-09-18).
+    "zano.herominers.com",
     "api.nanopool.org",
     "api.woolypooly.com",
     "ntminerpool.com",
@@ -268,11 +300,8 @@ pub async fn fetch_pool_stats(
         .find(|p| p.id == pool_id)
         .ok_or_else(|| format!("Unknown pool_id: {}", pool_id))?;
 
-    // Most PWNDA pool ids ("pwnda-zephyr", "pwnda-zano") intentionally don't
-    // appear in POOLS — the Mining UI hides the panel for them, but if a
-    // future caller tries one we want a clear error rather than a generic
-    // "Unknown". `pwnda-xelis` is the exception (2026-09-16): its pool
-    // publishes a per-address API.
+    // All three pwnda pools are in POOLS: XEL since 2026-09-16, ZEPH and
+    // ZANO since 2026-09-18 (their cryptonote-nodejs-pool APIs).
 
     let url = pool
         .url_template
@@ -329,6 +358,9 @@ pub async fn fetch_pool_stats(
                 18
             } else if pool.id.contains("ergo") {
                 9
+            } else if pool.id.contains("zano") {
+                // ZANO = 1e12 atomic per coin (pool config `coinUnits`).
+                12
             } else {
                 8
             };
@@ -372,6 +404,26 @@ fn parse_hashvault(body: &str) -> Result<MinerStatsDto, String> {
     })
 }
 
+/// An account the pool has no record of yet: nothing owed, nothing paid.
+fn empty_account() -> MinerStatsDto {
+    MinerStatsDto {
+        pending_balance: "0".into(),
+        immature_balance: None,
+        total_paid: Some("0".into()),
+        payout_threshold: None,
+        hashrate: 0.0,
+        hashrate1h: None,
+        hashrate6h: None,
+        hashrate24h: None,
+        valid_shares: None,
+        invalid_shares: None,
+        stale_shares: None,
+        last_share: None,
+        workers_online: None,
+        fetched_at: 0,
+    }
+}
+
 /// HeroMiners (cryptonote-nodejs-pool fork) schema. The `hashrate` and the
 /// `_1h/_6h/_24h` siblings live at the *top level* of the response, not
 /// under `stats`. Field names for share counters are `shares_good`,
@@ -383,24 +435,54 @@ fn parse_herominers(body: &str) -> Result<MinerStatsDto, String> {
         .map_err(|e| format!("HeroMiners JSON parse: {}", e))?;
 
     if v.get("error").is_some() && v.get("stats").is_none() {
-        return Err(format!(
-            "HeroMiners: {}",
-            v["error"].as_str().unwrap_or("address not found")
-        ));
+        let msg = v["error"].as_str().unwrap_or("address not found");
+        // `{"error":"Not found"}` is what cryptonote-nodejs-pool answers for a
+        // valid address with no shares on record yet (verified on pwnda's
+        // ZEPH pool, 2026-09-18). That is an empty account, not a failure:
+        // the Mine tab shows 0 unpaid instead of an error. Anything else
+        // (`Invalid address`, …) is still an error.
+        if msg.eq_ignore_ascii_case("not found") {
+            return Ok(empty_account());
+        }
+        return Err(format!("HeroMiners: {}", msg));
     }
 
     let stats = &v["stats"];
-    let workers = v["workers"].as_array().map(|a| a.len() as u64);
+    // Only workers hashing now. pwnda's ZEPH pool keeps a stale `undefined`
+    // worker (0 H/s, last share 11 days earlier) in the list, so counting
+    // every entry said 2 online with 1 rig running (pool audit, 2026-09-18).
+    let workers = v["workers"].as_array().map(|a| {
+        a.iter()
+            .filter(|w| parse_hashrate_field(&w["hashrate"]).unwrap_or(0.0) > 0.0)
+            .count() as u64
+    });
+    // The account's share of blocks still confirming: HeroMiners lists them
+    // in `unconfirmed[].reward` (atomic; `reward` is the miner's cut, next to
+    // the block's own `blockReward`). Upstream cryptonote-nodejs-pool has no
+    // such list, so pwnda's pools report no immature tier.
+    let immature = v["unconfirmed"].as_array().filter(|a| !a.is_empty()).map(|a| {
+        a.iter()
+            .filter_map(|b| atomic_string(&b["reward"]).and_then(|r| r.parse::<u128>().ok()))
+            .sum::<u128>()
+            .to_string()
+    });
+    // HeroMiners' fork lifts the hashrate fields to the top level; upstream
+    // cryptonote-nodejs-pool (pwnda's ZEPH/ZANO pools) keeps them in `stats`.
+    let rate = |key: &str| parse_hashrate_field(&v[key]).or_else(|| parse_hashrate_field(&stats[key]));
 
     Ok(MinerStatsDto {
         pending_balance: atomic_string(&stats["balance"]).unwrap_or_else(|| "0".into()),
-        immature_balance: None, // cryptonote-nodejs-pool has no immature tier
+        immature_balance: immature,
         total_paid: atomic_string(&stats["paid"]),
-        payout_threshold: None, // exposed by /api/config; not fetched in Phase 1
-        hashrate: parse_hashrate_field(&v["hashrate"]).unwrap_or(0.0),
-        hashrate1h: parse_hashrate_field(&v["hashrate_1h"]),
-        hashrate6h: parse_hashrate_field(&v["hashrate_6h"]),
-        hashrate24h: parse_hashrate_field(&v["hashrate_24h"]),
+        // The ACCOUNT's own payout level, present only when the miner changed
+        // it on HeroMiners' site (a ZANO account at 2 ZANO against the 0.2
+        // pool minimum, 2026-09-18; `get_miner_payout_level` agreed: level 2).
+        // Absent = the pool-wide `minPaymentThreshold` from `pool_payout.rs`.
+        payout_threshold: atomic_string(&stats["minPayoutLevel"]),
+        hashrate: rate("hashrate").unwrap_or(0.0),
+        hashrate1h: rate("hashrate_1h"),
+        hashrate6h: rate("hashrate_6h"),
+        hashrate24h: rate("hashrate_24h"),
         valid_shares: as_u64(&stats["shares_good"]),
         invalid_shares: as_u64(&stats["shares_invalid"]),
         stale_shares: as_u64(&stats["shares_stale"]),
@@ -1012,3 +1094,78 @@ mod k1pool_tests {
 }
 
 
+
+#[cfg(test)]
+mod cryptonote_pool_tests {
+    use super::*;
+
+    /// pwnda.org `/pool-api/stats_address` for a real ZEPH account,
+    /// 2026-09-18 (trimmed: `payments`/`charts`/`workers` shortened). Upstream
+    /// cryptonote-nodejs-pool keeps the hashrate INSIDE `stats`, where the
+    /// HeroMiners-only parser used to read the top level and got 0.
+    const PWNDA_ZEPH: &str = r#"{"stats":{"hashes":"65087474055","lastShare":"1789704158","balance":"8783940898","paid":"36178000000000","hashrate":13424,"roundScore":10226266026,"roundHashes":10226266026,"hashrate_1h":13748,"hashrate_6h":13571.181818181818,"hashrate_24h":13138.25},"payments":[],"charts":{},"workers":[{"name":"undefined","hashrate":0,"lastShare":1788660039},{"name":"DZP","hashrate":21518,"lastShare":1789704890}]}"#;
+
+    #[test]
+    fn pwnda_zeph_account_parses_balance_paid_and_stats_level_hashrate() {
+        let s = parse_herominers(PWNDA_ZEPH).expect("parses");
+        assert_eq!(s.pending_balance, "8783940898"); // 0.008783940898 ZEPH
+        assert_eq!(s.total_paid.as_deref(), Some("36178000000000")); // 36.178 ZEPH
+        assert_eq!(s.hashrate, 13424.0);
+        assert_eq!(s.hashrate1h, Some(13748.0));
+        assert_eq!(s.hashrate24h, Some(13138.25));
+        assert_eq!(s.last_share, Some(1789704158));
+        // The live list carried a stale `undefined` worker at 0 H/s.
+        assert_eq!(s.workers_online, Some(1));
+    }
+
+    /// The verbatim reply for a valid address with no shares on record.
+    #[test]
+    fn not_found_is_an_empty_account_not_an_error() {
+        let s = parse_herominers(r#"{"error":"Not found"}"#).expect("empty account");
+        assert_eq!(s.pending_balance, "0");
+        assert_eq!(s.total_paid.as_deref(), Some("0"));
+    }
+
+    /// `Invalid address` (HeroMiners ZANO's reply to a malformed address) is
+    /// still a real error.
+    #[test]
+    fn invalid_address_is_still_an_error() {
+        assert!(parse_herominers(r#"{"error":"Invalid address"}"#).is_err());
+    }
+
+    #[test]
+    fn every_pwnda_pool_has_a_stats_endpoint_on_an_allowed_host() {
+        for id in ["pwnda-xelis", "pwnda-zephyr", "pwnda-zano", "herominers-zano", "woolypooly-zano"] {
+            let p = POOLS.iter().find(|p| p.id == id).unwrap_or_else(|| panic!("{id} missing"));
+            let host = parse_https_host(&p.url_template.replace("{addr}", "x")).unwrap();
+            assert!(is_host_allowed(&host), "{id}: {host} not allowlisted");
+        }
+    }
+}
+
+#[cfg(test)]
+mod herominers_account_tests {
+    use super::*;
+
+    /// A live HeroMiners ZANO account, 2026-09-18 (trimmed): a custom payout
+    /// level of 2 ZANO, two confirming blocks, one worker hashing and one idle.
+    const HM_ZANO: &str = r#"{"stats":{"balance":"130612500481","paid":"2713822710000000","minPayoutLevel":"2000000000000","hashrate":"1.2 MH/s","lastShare":"1789704700"},"workers":[{"name":"a","hashrate":1200000},{"name":"b","hashrate":0}],"unconfirmed":[{"height":3865297,"reward":"118858539737","blockReward":"1000000000000"},{"height":3865290,"reward":"122000000000","blockReward":"1000000000000"}]}"#;
+
+    #[test]
+    fn reads_the_accounts_own_payout_level_and_confirming_rewards() {
+        let s = parse_herominers(HM_ZANO).unwrap();
+        assert_eq!(s.payout_threshold.as_deref(), Some("2000000000000")); // 2 ZANO
+        assert_eq!(s.immature_balance.as_deref(), Some("240858539737")); // 0.2408… ZANO
+        assert_eq!(s.pending_balance, "130612500481");
+        assert_eq!(s.workers_online, Some(1));
+    }
+
+    /// No `minPayoutLevel`: the miner never changed it, so the pool minimum
+    /// applies and the parser must not invent one.
+    #[test]
+    fn no_custom_level_means_no_account_threshold() {
+        let s = parse_herominers(r#"{"stats":{"balance":"0","paid":"13676026477597"},"unconfirmed":[]}"#).unwrap();
+        assert_eq!(s.payout_threshold, None);
+        assert_eq!(s.immature_balance, None);
+    }
+}
