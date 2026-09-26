@@ -57,7 +57,7 @@ in Docker, and uploads both as a GitHub Release. The runbook is
 
 ## Pwnda Grove
 
-The peer-to-peer swap route is [BasicSwap](https://github.com/basicswap/basicswap) 0.18.5
+The peer-to-peer swap route is [BasicSwap](https://github.com/basicswap/basicswap)
 plus this project's patch series (`upstream/patches/`), applied over the upstream
 package rather than forked. Each patch is documented in its own header; the series is
 re-verified against the assembled runtime by `scripts/swap/verify-*.py`. Makers use
