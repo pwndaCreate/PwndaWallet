@@ -47,6 +47,12 @@ For the Rust side:
 cd src-tauri && cargo test --lib
 ```
 
+A fresh clone needs two things first. `tauri-build` refuses a `binaries/*` bundle resource that
+matches nothing, and the release pipeline is what fills `src-tauri/binaries/`, so an empty
+placeholder file there is enough for `cargo test`. And two tests read the pinned BasicSwap source,
+which lives in `upstream/basicswap/` (the pin is in `scripts/fetch-swap-runtime.mjs`).
+`.github/workflows/ci.yml` shows both steps.
+
 `npm run tauri dev` starts the app against a local dev swap node. The swap engine
 runtime is assembled under `.swap-sidecar-work/` by `scripts/fetch-swap-runtime.mjs`
 and patched by `scripts/apply-engine-patches.mjs`; see
