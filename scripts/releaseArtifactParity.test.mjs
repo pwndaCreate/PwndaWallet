@@ -34,12 +34,19 @@
  * the same reason.
  */
 import { describe, it, expect } from "vitest";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
 const read = (rel) => readFileSync(resolve(process.cwd(), rel), "utf8");
 
 const SCRIPT = "scripts/release-local.ps1";
+
+// The release pipeline is private by design, so a checkout of the public
+// repository has no release-local.ps1 to read; skip there rather than fail. In
+// the development tree (recognised by the project wiki being present) a missing
+// script still FAILS, which is the whole point of this test.
+const DEV_TREE = existsSync(resolve(process.cwd(), "PwndaWalletVault"));
+const SCRIPT_ABSENT = !existsSync(resolve(process.cwd(), SCRIPT)) && !DEV_TREE;
 
 /**
  * Formats the bundler signs when `createUpdaterArtifacts` is on, written as the
@@ -61,7 +68,7 @@ const SIGNED_FORMATS = [".exe", ".deb", ".rpm", ".AppImage"];
  */
 const bare = (ext) => ext.slice(1);
 
-describe("release artifact staging", () => {
+describe.skipIf(SCRIPT_ABSENT)("release artifact staging", () => {
   it("stages a .sig alongside every signed format", () => {
     const src = read(SCRIPT);
     const block = /\$patterns\s*=\s*@\(([\s\S]*?)\n\)/.exec(src);

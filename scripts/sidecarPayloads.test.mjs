@@ -11,6 +11,7 @@
  */
 import { describe, expect, it, beforeAll, afterAll } from "vitest";
 import { mkdtemp, mkdir, writeFile, rm, readFile } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { createHash, randomBytes } from "node:crypto";
 import { gzipSync } from "node:zlib";
 import os from "node:os";
@@ -22,6 +23,14 @@ import { checkSidecarPayloads } from "./check-sidecar-payloads.mjs";
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, "..");
 const read = (p) => readFile(path.join(REPO, p), "utf8");
+
+// The release pipeline is private by design, so a checkout of the public
+// repository has no release-local.ps1; the one check that reads it is skipped
+// there. In the development tree (the project wiki is present) a missing script
+// still FAILS.
+const RELEASE_SCRIPT_ABSENT =
+  !existsSync(path.join(REPO, "scripts", "release-local.ps1")) &&
+  !existsSync(path.join(REPO, "PwndaWalletVault"));
 
 /** The staged manifest as it stood on 2026-09-13 (Linux, no Xelis). */
 const MANIFEST_2026_09_13 = {
@@ -174,7 +183,7 @@ describe("the gate is wired in", () => {
     expect(pkg.scripts.predev).toBe("node scripts/check-sidecar-payloads.mjs --warn");
   });
 
-  it("leaves the tree Windows-ready after a release's Linux half", async () => {
+  it.skipIf(RELEASE_SCRIPT_ABSENT)("leaves the tree Windows-ready after a release's Linux half", async () => {
     const ps = await read("scripts/release-local.ps1");
     const linux = ps.indexOf("scripts/build-linux-docker.ps1");
     expect(linux).toBeGreaterThan(0);

@@ -23,8 +23,33 @@
 use std::path::Path;
 
 fn main() {
+    check_engine_fixtures();
     check_bundled_sidecars();
     tauri_build::build()
+}
+
+/// Decide whether the desk tests that read the vendored swap engine can be
+/// compiled here, and say so with `cfg(engine_handoff)`.
+///
+/// Those tests `include_str!` files under `pwnda-engine-handoff/` to pin literals
+/// across the Python/Rust boundary. That tree is not part of the public
+/// repository, and a missing `include_str!` target is a compile error, so without
+/// this a public checkout cannot build `cargo test` at all.
+///
+/// In the development tree (recognised by the project wiki being present) a
+/// missing engine is still fatal, which keeps the original guarantee: the build
+/// fails loudly instead of quietly testing nothing.
+fn check_engine_fixtures() {
+    println!("cargo:rustc-check-cfg=cfg(engine_handoff)");
+    if Path::new("../pwnda-engine-handoff/engine/desk_engine.py").exists() {
+        println!("cargo:rustc-cfg=engine_handoff");
+    } else if Path::new("../PwndaWalletVault").exists() {
+        panic!(
+            "pwnda-engine-handoff/engine/desk_engine.py is missing from the development \
+             tree, so the desk tests that pin literals against the engine cannot be built. \
+             It is tracked; restore it rather than skipping the tests."
+        );
+    }
 }
 
 fn check_bundled_sidecars() {
