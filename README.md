@@ -3,10 +3,13 @@
 A desktop multi-chain wallet with built-in mining and peer-to-peer atomic swaps.
 Windows first; Linux bundles are produced by the same release pipeline.
 
-**The first wallet to ship BasicSwap natively.** The peer-to-peer atomic-swap engine
-runs inside the app, bundled in the installer and supervised by the wallet, rather than
-installed beside it. No Docker, no second program, no account: you take an offer from
-the Swap tab and the engine trades from your own wallet's accounts.
+**The BasicSwap engine ships inside the installer, bundled and supervised by the wallet,
+with no second program and no account.** The peer-to-peer atomic-swap engine runs inside
+the app rather than beside it, so there is no Docker and nothing else to install: you take
+an offer from the Swap tab and the engine trades from your own wallet's accounts.
+
+**Status.** In production since 2026: six signed releases (v0.6.0 to v0.6.5) and an in-app
+updater.
 
 - **Wallet.** One seed, many chains (Bitcoin, Litecoin, Bitcoin Cash, Ethereum and
   EVM networks, Solana, Cardano, Monero, Zephyr, Zano and more). Keys never leave the
