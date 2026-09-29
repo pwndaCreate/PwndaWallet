@@ -52,6 +52,15 @@ These tell you *where* signature behaviors should fire — applying them everywh
 - `<Btn>` hover-scramble is intrinsic — every `<Btn>` does it. To disable, set the button disabled.
 - Active-coin / tab swaps are **instant** — no animation, scramble would be too much.
 - CRT scanlines are tunable via the `--scan-opacity` token; the only live slider is the design catalog's TokenInspector (`?design=1` / `npm run dev:catalog`). The in-app Settings → Tweaks panel was removed 2026-04-28 — do not document it as a user control. (Corrected 2026-08-28.)
+- **Every infinite animation is held still while nobody is using the window**
+  (hidden, unfocused, or no input for 60 s) by `holdAmbientAnimationsWhileIdle`
+  in `src/lib/decorativeMotion.ts`, installed in both entry points.
+  - WebView2 composites on the CPU here, so a never-ending animation repaints
+    the window every frame. The status-dot pulse alone cost ~12% of a core in
+    a 1280×720 window, and more on a large display.
+  - A new infinite CSS animation is covered automatically.
+  - A JS-driven one (`requestAnimationFrame`, timers) must follow
+    `useDecorativeMotion()` itself, as `DitherCanvas` does. (2026-09-29)
 - Per-row scramble stagger: `delay = base + idx * 55ms` with `speed` per content kind:
   - Short labels (Coin, Pool, HW tokens): `speed: 22`
   - Numeric values (balances, hashrate): `speed: 20`
