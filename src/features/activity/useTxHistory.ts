@@ -5,8 +5,12 @@
  *   - First-paint hydration from `tauri-plugin-store` (instant render of
  *     the last known list).
  *   - Initial fetch via `adapter.getTransactionHistory(address)`.
- *   - Background poll every `pollMs` (default 60s), paused while the
- *     document is hidden so backgrounded windows don't burn API budget.
+ *   - Background poll every `pollMs` (default 60s) while a history view is
+ *     on screen, every `backgroundPollMs` (default 15 min) otherwise, paused
+ *     while the document is hidden; failing pairs back off; routine polls
+ *     fetch a small page and merge it (RAM plan 3.6, 2026-09-25).
+ *   - Results are applied in one commit per burst and not at all when
+ *     unchanged (RAM plan 3.7).
  *   - Coalesced in-flight requests per chain so re-renders never
  *     double-fetch.
  *
@@ -19,6 +23,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Store } from "@tauri-apps/plugin-store";
 import { getAdapterByChain } from "../../wallets";
 import type { ChainTx, ChainType } from "../../wallets";
+import {
+  isDue,
+  mergeHistoryPage,
+  pollIntervalMs,
+  pollPageOverlaps,
+  sameError,
+  sameHistory,
+} from "./txHistorySchedule";
 
 export interface ChainAddressPair {
   chain: ChainType;
@@ -159,7 +171,17 @@ export function netAcrossAddresses(rows: ChainTx[], ownAddresses: ReadonlySet<st
 
 const STORE_FILE = "tx-cache.json";
 const DEFAULT_POLL_MS = 60_000;
+/** Cadence while no history-showing view is on screen (RAM plan 3.6). */
+const DEFAULT_BACKGROUND_POLL_MS = 15 * 60_000;
 const DEFAULT_LIMIT = 50;
+/** Steady-state page size once a full page is held (RAM plan 3.6). */
+const DEFAULT_POLL_LIMIT = 10;
+/** How often due pairs are checked. Cheap: a loop over timestamps. */
+const SCHEDULER_MS = 5_000;
+/** Results arriving within this window share one commit (RAM plan 3.7)... */
+const FLUSH_DEBOUNCE_MS = 1_000;
+/** ...but no result waits longer than this to reach the screen. */
+const FLUSH_MAX_WAIT_MS = 5_000;
 
 function key(chain: ChainType, address: string) {
   return `${chain}:${address}`;
@@ -178,16 +200,70 @@ interface CacheEntry {
   fetchedAt: number;
 }
 
+export interface UseTxHistoryOpts {
+  /** Poll cadence while `active` (default 60 s). */
+  pollMs?: number;
+  /** Poll cadence while not `active` (default 15 min). */
+  backgroundPollMs?: number;
+  /** A view that shows history is on screen (default true). */
+  active?: boolean;
+  /** Full page size - first fetch per pair, and every explicit refresh (default 50). */
+  limit?: number;
+  /** Page size for routine polls once a full page is held (default 10). */
+  pollLimit?: number;
+}
+
+interface PairState {
+  lastAttemptAt: number;
+  failures: number;
+  /** A full `limit` page has been fetched this session. */
+  fullDone: boolean;
+}
+
+/**
+ * RAM plan 3.6 / 3.7 (2026-09-25). Two changes to how this hook runs, both from
+ * the renderer-memory trace ([[ram-optimization-execution-plan]] § "cause
+ * trace"), which measured this hook re-fetching ~99 pairs x 50 transactions
+ * every 60 s on every view (~660 requests/min idle) and landing each result as
+ * its own `App`-root update - the commit stream React's dev build leaked on:
+ *
+ *  - WHEN: pairs are polled at `pollMs` only while `active` (a history view is
+ *    on screen), at `backgroundPollMs` otherwise; a failing pair backs off
+ *    (`pollIntervalMs`); after one full page a pair is polled with a small page
+ *    that is merged in (`mergeHistoryPage`), with a full re-fetch when the small
+ *    page does not connect (`pollPageOverlaps`).
+ *  - HOW MUCH: results are held and applied together - one commit per burst,
+ *    none for an unchanged result (`sameHistory`, `sameError`) - and the cache
+ *    file is written once per burst, for the pairs that changed. Background
+ *    polls no longer flip `loading`; only a first load or an explicit
+ *    `refresh()` does.
+ */
 export function useTxHistory(
   pairs: ChainAddressPair[],
-  opts: { pollMs?: number; limit?: number } = {}
+  opts: UseTxHistoryOpts = {}
 ): UseTxHistoryResult {
   const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
+  const backgroundPollMs = opts.backgroundPollMs ?? DEFAULT_BACKGROUND_POLL_MS;
+  const active = opts.active ?? true;
   const limit = opts.limit ?? DEFAULT_LIMIT;
+  const pollLimit = Math.min(opts.pollLimit ?? DEFAULT_POLL_LIMIT, limit);
 
   const [txByChain, setTxByChain] = useState<Record<string, ChainTx[]>>({});
   const [loading, setLoading] = useState<Record<string, boolean>>({});
   const [errors, setErrors] = useState<Record<string, string | null>>({});
+
+  // Mirrors of what has been committed, so the fetch path can merge and
+  // compare without depending on (and re-running for) every state change.
+  const heldTx = useRef<Record<string, ChainTx[]>>({});
+  const heldErr = useRef<Record<string, string | null>>({});
+  const pairState = useRef<Map<string, PairState>>(new Map());
+
+  // Results waiting for the next flush.
+  const pendingTx = useRef<Record<string, ChainTx[]>>({});
+  const pendingErr = useRef<Record<string, string | null>>({});
+  const pendingLoadingOff = useRef<Set<string>>(new Set());
+  const flushTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const firstPendingAt = useRef<number>(0);
 
   // Stable signature so effects only re-fire when the *set* of chains changes.
   const sig = useMemo(
@@ -198,45 +274,108 @@ export function useTxHistory(
   // Per-key in-flight gate — coalesces concurrent fetches.
   const inFlight = useRef<Map<string, Promise<void>>>(new Map());
 
+  const flushNow = useCallback(() => {
+    if (flushTimer.current) {
+      clearTimeout(flushTimer.current);
+      flushTimer.current = null;
+    }
+    firstPendingAt.current = 0;
+    const tx = pendingTx.current;
+    const err = pendingErr.current;
+    const off = pendingLoadingOff.current;
+    pendingTx.current = {};
+    pendingErr.current = {};
+    pendingLoadingOff.current = new Set();
+    const txKeys = Object.keys(tx);
+    const errKeys = Object.keys(err);
+    // All three setters run in one synchronous block, so React commits once.
+    if (txKeys.length) {
+      heldTx.current = { ...heldTx.current, ...tx };
+      setTxByChain((m) => ({ ...m, ...tx }));
+    }
+    if (errKeys.length) {
+      heldErr.current = { ...heldErr.current, ...err };
+      setErrors((e) => ({ ...e, ...err }));
+    }
+    if (off.size) {
+      setLoading((l) => {
+        const next = { ...l };
+        for (const k of off) next[k] = false;
+        return next;
+      });
+    }
+    // One cache write per flush, only for the pairs whose history changed.
+    if (txKeys.length) {
+      void (async () => {
+        try {
+          const store = await getStore();
+          const now = Date.now();
+          for (const k of txKeys) {
+            const entry: CacheEntry = { items: tx[k], fetchedAt: now };
+            await store.set(k, entry);
+          }
+          await store.save();
+        } catch {
+          /* cache write failure is non-fatal */
+        }
+      })();
+    }
+  }, []);
+
+  const scheduleFlush = useCallback(() => {
+    const now = Date.now();
+    if (!firstPendingAt.current) firstPendingAt.current = now;
+    if (flushTimer.current) clearTimeout(flushTimer.current);
+    const wait = Math.max(0, Math.min(FLUSH_DEBOUNCE_MS, firstPendingAt.current + FLUSH_MAX_WAIT_MS - now));
+    flushTimer.current = setTimeout(flushNow, wait);
+  }, [flushNow]);
+
   const fetchOne = useCallback(
-    async (chain: ChainType, address: string): Promise<void> => {
+    async (chain: ChainType, address: string, userInitiated = false): Promise<void> => {
       const k = key(chain, address);
       const existing = inFlight.current.get(k);
       if (existing) return existing;
 
+      const st = pairState.current.get(k) ?? { lastAttemptAt: 0, failures: 0, fullDone: false };
+      pairState.current.set(k, st);
+      st.lastAttemptAt = Date.now();
+      const prev = pendingTx.current[k] ?? heldTx.current[k];
+      // Only a first load or a user-asked refresh shows a spinner.
+      const showLoading = userInitiated || !prev;
+
       const promise = (async () => {
-        setLoading((l) => ({ ...l, [k]: true }));
+        if (showLoading) setLoading((l) => ({ ...l, [k]: true }));
         try {
           const adapter = getAdapterByChain(chain);
-          const page = await adapter.getTransactionHistory(address, { limit });
-          setTxByChain((m) => ({ ...m, [k]: page.items }));
-          setErrors((e) => ({ ...e, [k]: null }));
-          // Persist to cache (fire-and-forget; failure here is non-fatal).
-          try {
-            const store = await getStore();
-            const entry: CacheEntry = {
-              items: page.items,
-              cursor: page.cursor,
-              fetchedAt: Date.now(),
-            };
-            await store.set(k, entry);
-            await store.save();
-          } catch {
-            /* cache write failure is non-fatal */
+          const full = userInitiated || !st.fullDone;
+          let items: ChainTx[];
+          if (full) {
+            items = (await adapter.getTransactionHistory(address, { limit })).items;
+          } else {
+            const page = await adapter.getTransactionHistory(address, { limit: pollLimit });
+            items = pollPageOverlaps(prev, page.items, pollLimit)
+              ? mergeHistoryPage(prev, page.items, limit)
+              : (await adapter.getTransactionHistory(address, { limit })).items;
           }
+          st.fullDone = true;
+          st.failures = 0;
+          if (!sameHistory(prev, items)) pendingTx.current[k] = items;
+          if (heldErr.current[k] != null || pendingErr.current[k] != null) pendingErr.current[k] = null;
         } catch (e) {
+          st.failures += 1;
           const msg = e instanceof Error ? e.message : String(e);
-          setErrors((er) => ({ ...er, [k]: msg }));
+          if (!sameError(pendingErr.current[k] ?? heldErr.current[k], msg)) pendingErr.current[k] = msg;
         } finally {
-          setLoading((l) => ({ ...l, [k]: false }));
+          if (showLoading) pendingLoadingOff.current.add(k);
           inFlight.current.delete(k);
+          scheduleFlush();
         }
       })();
 
       inFlight.current.set(k, promise);
       return promise;
     },
-    [limit]
+    [limit, pollLimit, scheduleFlush]
   );
 
   // Hydrate cache once per pair set.
@@ -252,6 +391,7 @@ export function useTxHistory(
           if (cached?.items) next[k] = cached.items;
         }
         if (!cancelled && Object.keys(next).length > 0) {
+          heldTx.current = { ...next, ...heldTx.current };
           setTxByChain((m) => ({ ...next, ...m }));
         }
       } catch {
@@ -263,32 +403,46 @@ export function useTxHistory(
     };
   }, [sig]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Initial fetch + polling for each chain.
+  // Scheduler: every pair is fetched once at start (full page), then whenever
+  // it is due at the current cadence. Re-created when the pair set or the
+  // cadence inputs change; `active` turning on runs a check immediately, so a
+  // stale pair refreshes the moment a history view opens.
   useEffect(() => {
     if (pairs.length === 0) return;
     let cancelled = false;
-
-    // Fire one fetch per chain immediately.
-    for (const p of pairs) void fetchOne(p.chain, p.address);
-
-    const tick = () => {
+    const check = () => {
       if (cancelled) return;
       if (typeof document !== "undefined" && document.visibilityState === "hidden") return;
-      for (const p of pairs) void fetchOne(p.chain, p.address);
+      const now = Date.now();
+      for (const p of pairs) {
+        const st = pairState.current.get(key(p.chain, p.address));
+        const interval = pollIntervalMs({
+          active,
+          failures: st?.failures ?? 0,
+          activeMs: pollMs,
+          backgroundMs: backgroundPollMs,
+        });
+        if (isDue(now, st?.lastAttemptAt ?? 0, interval)) void fetchOne(p.chain, p.address);
+      }
     };
-    const id = window.setInterval(tick, pollMs);
+    check();
+    const id = window.setInterval(check, SCHEDULER_MS);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [sig, pollMs, fetchOne]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [sig, pollMs, backgroundPollMs, active, fetchOne]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Deliver anything still held when the hook goes away.
+  useEffect(() => () => flushNow(), [flushNow]);
 
   const refresh = useCallback(
     async (chain?: ChainType) => {
       const targets = chain ? pairs.filter((p) => p.chain === chain) : pairs;
-      await Promise.all(targets.map((p) => fetchOne(p.chain, p.address)));
+      await Promise.all(targets.map((p) => fetchOne(p.chain, p.address, true)));
+      flushNow();
     },
-    [pairs, fetchOne]
+    [pairs, fetchOne, flushNow]
   );
 
   return { txByChain, loading, errors, refresh };

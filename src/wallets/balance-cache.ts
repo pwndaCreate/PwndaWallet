@@ -130,15 +130,52 @@ export function keepLastGood(
   chain: ChainType,
   addrs?: { recordedAddress?: string; currentAddress?: string },
 ): Partial<Record<ChainType, string>> {
-  const next = { ...prev };
   const recorded = addrs?.recordedAddress;
   const current = addrs?.currentAddress;
   const belongsToAnotherWallet =
     recorded !== undefined && current !== undefined && recorded !== current;
   if (belongsToAnotherWallet || !isNumericBalance(prev[chain])) {
-    next[chain] = "—";
+    return withChainBalance(prev, chain, "—");
   }
-  return next;
+  // Nothing to change: the SAME object, so React does not re-render App for a
+  // chain that failed the same way as last time (RAM plan 3.7).
+  return prev as Partial<Record<ChainType, string>>;
+}
+
+/**
+ * Set one chain's balance string, returning `prev` itself when it already
+ * holds that value (RAM plan 3.7, 2026-09-25).
+ *
+ * The sweep used to write `{ ...prev, [chain]: bal }` for every chain every
+ * 60 s, and a new object is a new state even when every value is the same -
+ * measured on the wallet view as ~40 `App` renders/min, each doubled by the
+ * `balancesByWallet` attribution effect that reacts to it (~88/min total).
+ * React's development build retains native memory per `App` render (see
+ * [[ram-optimization-execution-plan]] § cause trace); production pays the
+ * render. An unchanged balance is not an update.
+ */
+export function withChainBalance(
+  prev: Readonly<Partial<Record<ChainType, string>>>,
+  chain: ChainType,
+  bal: string,
+): Partial<Record<ChainType, string>> {
+  if (prev[chain] === bal) return prev as Partial<Record<ChainType, string>>;
+  return { ...prev, [chain]: bal };
+}
+
+/**
+ * File `balances` under wallet `id` in the per-wallet map ("All Wallets"),
+ * returning `prev` itself when every value is already there (RAM plan 3.7).
+ */
+export function attributeWalletBalances(
+  prev: Readonly<Record<string, Partial<Record<ChainType, string>>>>,
+  id: string,
+  balances: Readonly<Partial<Record<ChainType, string>>>,
+): Record<string, Partial<Record<ChainType, string>>> {
+  const held = prev[id] ?? {};
+  const changed = (Object.keys(balances) as ChainType[]).some((c) => held[c] !== balances[c]);
+  if (!changed) return prev as Record<string, Partial<Record<ChainType, string>>>;
+  return { ...prev, [id]: { ...held, ...balances } };
 }
 
 /**

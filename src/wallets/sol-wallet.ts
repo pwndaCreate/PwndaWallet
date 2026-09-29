@@ -137,6 +137,68 @@ function makeConnection(url: string): Connection {
   return conn;
 }
 
+/** What a Solana history row needs from a parsed transaction. */
+export interface SolTxSummary {
+  /** Lamport delta on the queried account (post - pre). */
+  net: number;
+  /** Lamports, when the transaction reports a fee. */
+  fee?: number;
+}
+
+/**
+ * Reduce a `getParsedTransaction` result to the two numbers a history row
+ * uses. `null` when there is no transaction to read (not yet available, or the
+ * lookup failed) - such a result must never be cached.
+ */
+export function summarizeParsedTx(tx: any, address: string): SolTxSummary | null {
+  if (!tx) return null;
+  const meta = tx.meta;
+  // Net SOL delta on our account = postBalance - preBalance for the
+  // index where account == us. `accountKeys` order matches `balances`.
+  let net = 0;
+  try {
+    const keys = tx.transaction?.message?.accountKeys ?? [];
+    const idx = keys.findIndex((k: any) => k.pubkey?.toBase58?.() === address);
+    if (
+      idx !== -1 &&
+      meta?.preBalances?.[idx] !== undefined &&
+      meta?.postBalances?.[idx] !== undefined
+    ) {
+      net = meta.postBalances[idx] - meta.preBalances[idx];
+    }
+  } catch {
+    /* leave net=0 */
+  }
+  return { net, fee: typeof meta?.fee === "number" ? meta.fee : undefined };
+}
+
+/**
+ * Bounded cache of parsed-transaction summaries for FINALIZED signatures,
+ * keyed by (address, signature) because the net amount depends on which
+ * account is asking. Insertion-ordered; the oldest entry is evicted past
+ * `max`. RAM plan 3.6 - see `getTransactionHistory`.
+ */
+export function createSolParsedCache(max = 2_000) {
+  const map = new Map<string, SolTxSummary>();
+  const k = (address: string, signature: string) => `${address}|${signature}`;
+  return {
+    get(address: string, signature: string): SolTxSummary | undefined {
+      return map.get(k(address, signature));
+    },
+    set(address: string, signature: string, v: SolTxSummary): void {
+      const key = k(address, signature);
+      map.delete(key);
+      map.set(key, v);
+      while (map.size > max) map.delete(map.keys().next().value as string);
+    },
+    get size() {
+      return map.size;
+    },
+  };
+}
+
+const solParsedCache = createSolParsedCache();
+
 /** Sticky-routing cache. The last URL that succeeded is tried first on
  *  the next call, so when one endpoint is reachable + healthy we stop
  *  hammering the others. Reset to `null` whenever the sticky URL fails
@@ -386,36 +448,36 @@ export const solAdapter: ChainAdapter = {
     );
     if (sigs.length === 0) return { items: [] };
 
+    // RAM plan 3.6 (2026-09-25): only ask for the transactions we have not
+    // already parsed. This used to fetch every signature's full parsed
+    // transaction on every call - 1 + 50 RPCs per address per minute from the
+    // 60 s history poll, each rotating up to 11 endpoints on a 429 - and was
+    // the single biggest source of background traffic (~450-530 IPC calls a
+    // minute on an idle Mine view, measured). A FINALIZED transaction cannot
+    // change, so its parsed result is cached per (address, signature).
     const parsed = await Promise.allSettled(
-      sigs.map((s) =>
-        runOnAnyRpc((c) =>
+      sigs.map((s) => {
+        const hit = solParsedCache.get(address, s.signature);
+        if (hit) return Promise.resolve(hit);
+        return runOnAnyRpc((c) =>
           c.getParsedTransaction(s.signature, {
             maxSupportedTransactionVersion: 0,
           })
-        )
-      )
+        ).then((tx) => {
+          const summary = summarizeParsedTx(tx, address);
+          if (summary && s.confirmationStatus === "finalized") {
+            solParsedCache.set(address, s.signature, summary);
+          }
+          return summary;
+        });
+      })
     );
 
     const items: ChainTx[] = sigs.map((s, i) => {
       const r = parsed[i];
-      const tx = r.status === "fulfilled" ? r.value : null;
-      const meta = tx?.meta;
-      // Net SOL delta on our account = postBalance - preBalance for the
-      // index where account == us. `accountKeys` order matches `balances`.
-      let net = 0;
-      try {
-        const keys = tx?.transaction.message.accountKeys ?? [];
-        const idx = keys.findIndex((k: any) => k.pubkey?.toBase58?.() === address);
-        if (
-          idx !== -1 &&
-          meta?.preBalances?.[idx] !== undefined &&
-          meta?.postBalances?.[idx] !== undefined
-        ) {
-          net = meta.postBalances[idx] - meta.preBalances[idx];
-        }
-      } catch {
-        /* leave net=0 */
-      }
+      const summary = r.status === "fulfilled" ? r.value : null;
+      const net = summary?.net ?? 0;
+      const meta = summary ? { fee: summary.fee } : undefined;
       const direction: ChainTx["direction"] = s.err
         ? "failed"
         : net > 0

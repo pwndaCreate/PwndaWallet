@@ -112,6 +112,7 @@ import {
 import { activeSwapToTracked, mergeActiveSwaps } from "./activeSwaps";
 import { AUTO_RETRY_MAX_ATTEMPTS, shouldAutoRetry } from "./autoRetry";
 import { readSwapSidecarOptIn } from "./swapSidecarOptIn";
+import { singleFlight, throttleLeadingTrailing } from "./pollGate";
 import {
   filterOffersForDirection,
   rankOffers,
@@ -1305,6 +1306,13 @@ const POLL_MS = 15_000;
  * or two after this hook first runs.
  */
 const ACTIVE_SYNC_MS = 15_000;
+/**
+ * Minimum spacing between websocket-triggered polls (RAM plan Phase 2.2).
+ * Two seconds: well inside the 15 s interval and a swap leg's 30-90 minutes, so
+ * it costs no responsiveness, yet it caps a frame flood at 0.5 polls/s.
+ */
+const WS_DOORBELL_WINDOW_MS = 2_000;
+
 /** How long "Checking…" stays on the button at minimum. See `pollAll`. */
 export const CHECKING_MIN_VISIBLE_MS = 600;
 
@@ -1541,12 +1549,19 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
 
   const hasLive = useMemo(() => swaps.some(needsRead), [swaps]);
 
+  // RAM plan Phase 2.2 (2026-09-23): the interval, `refresh()` (nonce) and the
+  // websocket doorbell all funnel through ONE single-flight gate, so no two
+  // `pollAll` loops ever overlap and a burst of triggers collapses to one
+  // trailing run. The gate adds no delay — `refresh()` and the first tick still
+  // poll immediately. See `pollGate.ts` for the incident-shaped why.
+  const pollGuarded = useMemo(() => singleFlight(pollAll), [pollAll]);
+
   useEffect(() => {
     if (!enabled || !hasLive) return;
-    void pollAll();
-    const handle = setInterval(() => void pollAll(), POLL_MS);
+    void pollGuarded();
+    const handle = setInterval(() => void pollGuarded(), POLL_MS);
     return () => clearInterval(handle);
-  }, [enabled, hasLive, pollAll, nonce]);
+  }, [enabled, hasLive, pollGuarded, nonce]);
 
   // ── websocket doorbell ────────────────────────────────────────────────
   useEffect(() => {
@@ -1554,6 +1569,10 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
     if (typeof WebSocket === "undefined") return;
     let socket: WebSocket | null = null;
     let closed = false;
+    const doorbell = throttleLeadingTrailing(
+      () => void pollGuarded(),
+      WS_DOORBELL_WINDOW_MS,
+    );
     void (async () => {
       let wsPort: number;
       try {
@@ -1570,12 +1589,20 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
       socket.onopen = () => setTransport("websocket");
       // The frame is not parsed on purpose — see the hook's header. Any frame
       // means "something changed", and the poll is what reads it.
-      socket.onmessage = () => void pollAll();
+      //
+      // But the node rings this for EVERY offer any peer posts and for its
+      // periodic balance events, so on a live order book that is a steady
+      // stream, and — unlike the interval — a hidden window does not slow it
+      // (a frame is an event, not a timer). Leading + trailing throttle: the
+      // first frame still polls at once, a flood collapses to one poll per
+      // window. The 15 s interval remains the floor either way.
+      socket.onmessage = doorbell;
       socket.onerror = () => setTransport("poll");
       socket.onclose = () => setTransport("poll");
     })();
     return () => {
       closed = true;
+      doorbell.cancel();
       setTransport("poll");
       try {
         socket?.close();
@@ -1583,7 +1610,7 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
         /* already gone */
       }
     };
-  }, [enabled, hasLive, pollAll]);
+  }, [enabled, hasLive, pollGuarded]);
 
   const adopt = useCallback((handle: SidecarSwapHandle) => {
     setSwaps((prev) => [

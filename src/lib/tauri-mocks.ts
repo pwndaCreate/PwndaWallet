@@ -3341,12 +3341,11 @@ function sidecarStatus(): unknown {
     engine: mockEngineIdentity(),
     datadir: SIDECAR_DATADIR,
     autostart: st.autostart,
-    // A3 (Option A). `VITE_MOCK_PARTICL_UNPRUNED=1` reaches the "this chain
-    // predates pruning" line in SidecarStatusCard. Added with the flag rather
-    // than hardcoded false for the reason `engine` above was: a branch no
-    // sandbox state can reach is a branch nobody looks at, and this one is
-    // shown to exactly the users who already have a node — never to a fresh
-    // install, which is the state the sandbox otherwise always simulates.
+    // A3 (Option A). `VITE_MOCK_PARTICL_UNPRUNED=1` reports a chain that
+    // predates pruning. Until 2026-09-26 that reached a "this chain predates
+    // pruning" line in SidecarStatusCard; the operator removed the line (the
+    // user cannot act on it), and the flag stays so a sandbox can confirm the
+    // card says NOTHING about it on exactly the installs that have such a chain.
     particlUnpruned: import.meta.env.VITE_MOCK_PARTICL_UNPRUNED === "1",
     // 2026-09-15. The unlock screen's "swaps waiting" note (`LoginView`).
     // `VITE_MOCK_SWAPS_WAITING=<n>` reports n swaps in progress as of 30

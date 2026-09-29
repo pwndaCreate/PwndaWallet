@@ -52,6 +52,17 @@ export const MEMORY_TRACE_INTERVAL_MS = 60_000;
 export const MEMORY_TRACE_MAX_SAMPLES = 1440;
 
 const STORAGE_KEY = "pwnda.memoryTrace.v1";
+/** Release-build opt-in — the SAME key `MemoryTraceCard` reads, so one
+ *  switch arms both the sampler and the card that displays it. */
+const TRACE_ENABLE_KEY = "pwnda-dev-diagnostics";
+
+function readTraceOverride(): boolean {
+  try {
+    return window.localStorage.getItem(TRACE_ENABLE_KEY) === "true";
+  } catch {
+    return false; // private mode / storage disabled
+  }
+}
 
 /** One memory sample. Sizes in MB for human readability. `t` is Unix
  *  ms. `view` is the active app view at sample time — helps correlate
@@ -253,12 +264,24 @@ export function usePeriodicGc(mining: boolean = false): void {
  * inflections with which panel was active.
  */
 export function useMemoryTracker({ view }: { view: string }): void {
+  // DEV-ONLY since 2026-09-22. This is a diagnostic, and in a shipped build it
+  // cost every user a 60 s wake-up that JSON.parse'd + JSON.stringify'd the
+  // whole rolling buffer (up to 1440 samples) through localStorage, for a
+  // sample whose backend sink (`mem_frontend_log`) is itself dev-gated and
+  // discards it. The native half (`mem_watch`/`mem_guard`) has always been
+  // dev-only; this is the frontend half catching up.
+  //
+  // `localStorage["pwnda-dev-diagnostics"] = "true"` re-arms it in a release
+  // build for a support session — the same key `MemoryTraceCard` already uses.
+  const enabled =
+    import.meta.env.DEV || readTraceOverride();
   // Track the latest view in a ref so the polling closure can read it
   // without re-subscribing the interval every time the view changes.
   const viewRef = useRef(view);
   viewRef.current = view;
 
   useEffect(() => {
+    if (!enabled) return;
     const collect = () => {
       const s = readSample(viewRef.current);
       if (!s) return;
@@ -281,7 +304,7 @@ export function useMemoryTracker({ view }: { view: string }): void {
     collect();
     const id = window.setInterval(collect, MEMORY_TRACE_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, []);
+  }, [enabled]);
 }
 
 /**

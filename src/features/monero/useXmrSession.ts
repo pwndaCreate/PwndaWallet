@@ -99,9 +99,25 @@ export function useXmrSession(args: {
   const [downloadProgress, setDownloadProgress] =
     useState<XmrDownloadProgressPayload | null>(null);
 
+  /**
+   * RAM plan 3.1 (2026-09-25): asleep to save memory. `sleep` releases the
+   * wallet-rpc exactly as `lock` does - so a swap engine holding its own lease
+   * keeps the process - but keeps what `retry` needs to reopen the same wallet
+   * file, and leaves the last history/address on screen. `wake` is that
+   * `retry`. App's idle scheduler (`src/lib/sidecarIdle.ts`) decides when.
+   * `start`, `lock` and `forget` all end dormancy.
+   */
+  const [dormant, setDormant] = useState(false);
+  const dormantRef = useRef(false);
+  const markDormant = useCallback((d: boolean) => {
+    dormantRef.current = d;
+    setDormant(d);
+  }, []);
+
   const start = useCallback(
     (seed: string, masterPassword: string, restoreHeight: number = 0, walletFilename?: string) => {
       startArgsRef.current = { restoreHeight, walletFilename };
+      markDormant(false);
       setSyncState("starting");
       setSyncPercent(0);
       setSyncWalletHeight(0);
@@ -118,7 +134,7 @@ export function useXmrSession(args: {
         }
       })();
     },
-    []
+    [markDormant]
   );
 
   /** Reopens the SAME wallet file at the SAME height — see `startArgsRef`.
@@ -187,6 +203,7 @@ export function useXmrSession(args: {
   // `retry` would replay ends with it.
   const resetState = useCallback(() => {
     startArgsRef.current = null;
+    markDormant(false);
     setSyncState("idle");
     setSyncPercent(0);
     setSyncWalletHeight(0);
@@ -197,7 +214,27 @@ export function useXmrSession(args: {
     syncSamplesRef.current = [];
     setSyncBlocksPerSec(null);
     setSyncEtaSeconds(null);
-  }, []);
+  }, [markDormant]);
+
+  /** RAM plan 3.1 - see `dormant`. No-op without a session to reopen. */
+  const sleep = useCallback(async () => {
+    if (!startArgsRef.current || dormantRef.current) return;
+    markDormant(true);
+    try {
+      await closeXmrWallet();
+    } catch (e) {
+      console.warn("[useXmrSession] sleep cleanup failed:", e);
+    }
+    setSyncState("idle");
+    syncSamplesRef.current = [];
+    setSyncBlocksPerSec(null);
+    setSyncEtaSeconds(null);
+  }, [markDormant]);
+
+  const wake = useCallback(() => {
+    if (!dormantRef.current) return;
+    retry(); // `start` clears dormancy
+  }, [retry]);
 
   /**
    * Lock: close the wallet and release this caller's claim on the
@@ -498,6 +535,9 @@ export function useXmrSession(args: {
     resetState,
     lock,
     forget,
+    dormant,
+    sleep,
+    wake,
     setSyncState,
     setSyncError,
   };

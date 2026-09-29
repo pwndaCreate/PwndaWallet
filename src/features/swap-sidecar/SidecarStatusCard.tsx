@@ -113,50 +113,16 @@ interface SidecarStatus {
    * ~2.9 GB where a new setup uses ~1.3 GB. Optional because a status from an
    * older backend does not carry it, and `undefined` must read as "no claim"
    * rather than as `false` — the drift this type's own note warns about.
+   *
+   * **Not shown to the user since 2026-09-26 (operator):** the card used to
+   * explain it (`ParticlFootprintNote`), and the operator removed that — it is
+   * disk layout the user cannot act on and should not have to worry about.
+   * Kept on the type because the backend still reports it and diagnostics may.
    */
   particlUnpruned?: boolean;
 }
 
 const POLL_MS = 5000;
-
-/**
- * A3 (Option A): this node's Particl chain predates pruning.
- *
- * New setups run Particl at `prune=550` (~1.3 GB). A chain synced before that
- * keeps ~2.9 GB, and particl-core cannot drop `txindex`/`spentindex` from a
- * chain that already has them — so this is a fact about the datadir, not a
- * setting this card could flip. Reclaiming the space needs a fresh sync.
- *
- * Rendered rather than left silent because the setup wizard now quotes "about
- * 1.5 GB" for the whole node: an existing install showing three times that,
- * with nothing to explain the gap, reads as a wrong number rather than as an
- * older layout. Deliberately NOT a warning colour and NOT an action — nothing
- * is broken, and every swap behaves identically either way.
- *
- * A separate pure component so the branch is unit-testable. The card itself
- * holds `useState`/`useEffect` and cannot be invoked directly in a test, and
- * the opted-in card is unreachable in the browser-only sandbox (the wizard's
- * Tauri event listener has no mock — see `SidecarSetupWizard.tsx:86`), so
- * without this split the copy would ship on nothing but a type-check.
- */
-export function ParticlFootprintNote({ unpruned }: { unpruned: boolean }) {
-  if (!unpruned) return null;
-  return (
-    <div
-      style={{
-        marginTop: 12,
-        fontFamily: "var(--font-mono)",
-        fontSize: 10.5,
-        lineHeight: 1.6,
-        color: "var(--text-muted)",
-      }}
-    >
-      This node's Particl chain predates pruning and keeps about 2.9 GB. New
-      setups use about 1.3 GB. Reclaiming the difference needs a fresh Particl
-      sync, so nothing changes on its own.
-    </div>
-  );
-}
 
 
 /**
@@ -856,8 +822,6 @@ export function SidecarStatusCard({
           />
         </div>
       )}
-
-      <ParticlFootprintNote unpruned={status?.particlUnpruned === true} />
 
       <label
         style={{

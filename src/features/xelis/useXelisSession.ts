@@ -171,10 +171,26 @@ export function useXelisSession(args: {
     setTxLoading(false);
   }, []);
 
+  /**
+   * RAM plan 3.1 (2026-09-25): asleep to save memory. `sleep` releases the
+   * wallet-rpc exactly as `lock` does - so a swap engine holding its own lease
+   * keeps the process - but keeps what `retry` needs to reopen the same wallet
+   * file, and leaves the last history/address on screen. `wake` is that
+   * `retry`. App's idle scheduler (`src/lib/sidecarIdle.ts`) decides when.
+   * `start`, `lock` and `forget` all end dormancy.
+   */
+  const [dormant, setDormant] = useState(false);
+  const dormantRef = useRef(false);
+  const markDormant = useCallback((d: boolean) => {
+    dormantRef.current = d;
+    setDormant(d);
+  }, []);
+
   const start = useCallback(
     (seed: string, masterPassword: string, walletFile?: string) => {
       const gen = ++generationRef.current;
       walletFileRef.current = walletFile;
+      markDormant(false);
       clearSessionData();
       setSyncState("starting");
       void (async () => {
@@ -193,7 +209,7 @@ export function useXelisSession(args: {
         }
       })();
     },
-    [clearSessionData, readStatus]
+    [clearSessionData, readStatus, markDormant]
   );
 
   const retry = useCallback(() => {
@@ -236,9 +252,10 @@ export function useXelisSession(args: {
     } catch (e) {
       console.warn("[useXelisSession] close failed:", errorText(e));
     }
+    markDormant(false);
     clearSessionData();
     setSyncState("idle");
-  }, [clearSessionData]);
+  }, [clearSessionData, markDormant]);
 
   /** Lock (`lockXelisWallet`). Xelis has no swap engine to keep the wallet for. */
   const lock = useCallback(async () => {
@@ -249,9 +266,29 @@ export function useXelisSession(args: {
     } catch (e) {
       console.warn("[useXelisSession] lock failed:", errorText(e));
     }
+    markDormant(false);
     clearSessionData();
     setSyncState("idle");
-  }, [clearSessionData]);
+  }, [clearSessionData, markDormant]);
+
+  /** RAM plan 3.1 - see `dormant`. Stopped like `lock`; the wallet file and
+   *  the last balance/history stay, and in-flight reads are dropped. */
+  const sleep = useCallback(async () => {
+    if (dormantRef.current) return;
+    markDormant(true);
+    generationRef.current++;
+    try {
+      await lockXelisWallet();
+    } catch (e) {
+      console.warn("[useXelisSession] sleep failed:", errorText(e));
+    }
+    setSyncState("idle");
+  }, [markDormant]);
+
+  const wake = useCallback(() => {
+    if (!dormantRef.current) return;
+    retry(); // `start` clears dormancy
+  }, [retry]);
 
   const refreshTxHistory = useCallback(
     () => readHistory(generationRef.current),
@@ -352,6 +389,9 @@ export function useXelisSession(args: {
     retry,
     forget,
     lock,
+    dormant,
+    sleep,
+    wake,
     downloadBinary,
     checkBinaryStatus,
     refreshTxHistory,

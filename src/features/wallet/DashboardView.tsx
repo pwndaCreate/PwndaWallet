@@ -74,6 +74,7 @@ import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import type { ZanoAssetBalance, ZanoTransferEntry } from "../../wallets/zano-rpc";
 import type { ChainTx } from "../../wallets/types";
 import { UtxoAccountCard } from "./UtxoAccountCard";
+import { usePausedChains } from "../../lib/sidecarIdle";
 
 /**
  * Chains that mount a richer derivation switcher below `DerivationInfoCard`.
@@ -1148,6 +1149,8 @@ function AssetsList({
    *  firing in lockstep every mount; see the parent's `dexSwapRows`. */
   swapRows: Record<string, SidecarBalanceRow>;
 }) {
+  // RAM plan 3.1: chains whose wallet sidecar is asleep show " · paused".
+  const pausedChains = usePausedChains();
   // T3.4 — collapsed by default; localStorage-persisted.
   const [showAll, setShowAll] = useState<boolean>(() => {
     try {
@@ -1285,6 +1288,7 @@ function AssetsList({
             onSelect={() => onSelect(r.chain)}
             balanceRaw={r.bal}
             usd={r.usd}
+            pausedSince={pausedChains.get(r.chain)}
             // Swap-node holding, when there is one: below the wallet amount,
             // never merged into the wallet's own figures.
             swapBalanceRaw={swapRows[r.ticker.toUpperCase()]?.balance}

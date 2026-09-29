@@ -146,7 +146,10 @@ describe("retry reopens the same file at the same height", () => {
     const hook = code(path);
     const start = blockBetween(hook, "const start = useCallback(", "const retry = useCallback(");
     const retry = blockBetween(hook, "const retry = useCallback(", "const checkBinaryStatus");
-    const reset = blockBetween(hook, "const resetState = useCallback(", "}, []);");
+    // Ends at the callback's dependency list, whatever is in it: `resetState`
+    // closed with `}, []);` until RAM plan 3.1 (2026-09-25) gave it
+    // `[markDormant]`, and the old marker then matched nothing at all.
+    const reset = blockBetween(hook, "const resetState = useCallback(", "}, [");
 
     it(`${label}: positive control`, () => {
       expect(start).not.toBe("");

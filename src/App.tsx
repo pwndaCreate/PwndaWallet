@@ -35,9 +35,22 @@ import {
   orderChains,
   readBalanceCache,
   runLimited,
+  attributeWalletBalances,
+  withChainBalance,
   withTimeout,
   writeBalanceCache,
 } from "./wallets/balance-cache";
+import {
+  IDLE_CHAINS,
+  IDLE_TICK_MS,
+  SWAP_CAPABLE,
+  decideIdle,
+  holdsBalance,
+  initialIdleState,
+  setPausedChains,
+  type IdleChain,
+  type IdleChainState,
+} from "./lib/sidecarIdle";
 
 /* ═══════════════════════════════════════════════════════════
    DESIGN SYSTEM — primitives imported from src/components/.
@@ -84,6 +97,7 @@ import { useVault } from "./features/vault/useVault";
 import { useAppState } from "./state/AppStateContext";
 import { useLayout } from "./features/landscape/useLayout";
 import { toMiningFocus } from "./features/mining/featureFocus";
+import type { FeatureFocus } from "./state/featureFocus";
 import { LandscapeRoot } from "./features/landscape/LandscapeRoot";
 import { useConvertPipeline } from "./features/swap/useConvertPipeline";
 import { deriveWalletAddresses, addressForAssetId } from "./features/swap/asset-address-resolver";
@@ -133,6 +147,17 @@ import {
  * generic `useTxHistory` poll (2026-09-16). See `polledTxPairs` in `App`.
  */
 const SESSION_FED_HISTORY: ReadonlySet<ChainType> = new Set<ChainType>(["zano", "xelis"]);
+
+/**
+ * Focuses whose screen shows transaction history, so `useTxHistory` polls at
+ * its fast cadence only there (RAM plan 3.6). Landscape's wallet, swap, earn
+ * and activity tabs all derive to `"dashboard"` (`deriveFeatureFocus`).
+ */
+const HISTORY_VIEWS: ReadonlySet<FeatureFocus> = new Set<FeatureFocus>([
+  "dashboard",
+  "activity",
+  "wallet-details",
+]);
 
 function App() {
   const {
@@ -410,6 +435,36 @@ function App() {
   useEffect(() => {
     if (swapAutoSetup.unparkNotice) setSuccess(swapAutoSetup.unparkNotice);
   }, [swapAutoSetup.unparkNotice, setSuccess]);
+  // RAM plan Phase 1.4 (2026-09-22): `mem_guard.rs`'s circuit-breaker sets
+  // `pwnda.memGuardReloadAt` in `sessionStorage` right before it reloads the
+  // webview to reclaim renderer memory — a background event that, until
+  // now, nothing ever told the user about. Landing back on the home/login
+  // screen with zero explanation is indistinguishable from "did I get
+  // logged out? did something crash?" — the same "silent" failure shape
+  // this project's bug-documentation protocol flags by name. Read once on
+  // mount, only within a short window of the reload (an old breadcrumb from
+  // a much earlier session is not "just now" and would be a confusing
+  // non-sequitur), then clear it so it can't repeat on the NEXT unrelated
+  // reload. `mem_guard.rs`'s own reload only fires while the vault is
+  // LOCKED (see `window.__pwndaVaultUnlocked`, synced in
+  // `AppStateContext.tsx`), so "please unlock again" is always the correct
+  // ask here — never "your unlocked session was interrupted".
+  useEffect(() => {
+    try {
+      const raw = window.sessionStorage.getItem("pwnda.memGuardReloadAt");
+      if (!raw) return;
+      window.sessionStorage.removeItem("pwnda.memGuardReloadAt");
+      const at = Number(raw);
+      if (Number.isFinite(at) && Date.now() - at < 30_000) {
+        setSuccess(
+          "The wallet's UI refreshed automatically to free up memory. Please unlock again."
+        );
+      }
+    } catch {
+      // sessionStorage unavailable (e.g. a locked-down webview) — nothing to show.
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
   // Mining opt-in gate (pure-wallet cutover). A fresh/dormant full wallet
   // fires ZERO mining invokes: when not opted-in we force the mining hook's
   // focus to "other" (idles every focus-gated poller) AND pass
@@ -548,7 +603,18 @@ function App() {
     loading: polledTxLoading,
     errors: polledTxErrors,
     refresh: refreshPolledTxHistory,
-  } = useTxHistory(polledTxPairs, { pollMs: 60_000, limit: 50 });
+  } = useTxHistory(polledTxPairs, {
+    pollMs: 60_000,
+    limit: 50,
+    // RAM plan 3.6 (2026-09-25): 60 s only while a view that shows history is
+    // on screen - the wallet dashboard (portrait + every landscape tab that
+    // maps to it), Activity, wallet details. Elsewhere (Mine, Settings, the
+    // node managers) the hook drops to its 15 min background cadence; the
+    // tx-cache hydrate keeps the lists instant, and a stale pair refreshes the
+    // moment one of these views opens. This poll was ~660 requests/min on an
+    // idle Mine tab and the commit stream behind the dev-build renderer leak.
+    active: HISTORY_VIEWS.has(featureFocus),
+  });
   const ownedChains = useMemo(
     () => txPairs.map((p) => p.chain),
     [txPairs]
@@ -590,11 +656,17 @@ function App() {
         ? walletEntries.find((e) => e.kind === "bip39")?.id
         : activeWalletId;
     if (!targetId) return;
-    setBalancesByWallet((prev) => ({
-      ...prev,
-      [targetId]: { ...prev[targetId], ...balancesByChain },
-    }));
+    // Same object back when nothing moved (RAM plan 3.7) - this effect used to
+    // add an App render to every balance write, changed or not.
+    setBalancesByWallet((prev) => attributeWalletBalances(prev, targetId, balancesByChain));
   }, [balancesByChain, activeWalletId, walletEntries]);
+
+  // RAM plan 3.1 (2026-09-25): the idle scheduler's per-chain state and each
+  // chain's live "synced" flag, declared here because the balance sweep below
+  // reads them (a sleeping chain keeps its last balance). The scheduler itself
+  // sits after the session hooks.
+  const idleStateRef = useRef(new Map<IdleChain, IdleChainState>());
+  const idleSyncedRef = useRef<Partial<Record<IdleChain, boolean>>>({});
 
   // Check for saved wallet on mount
   // DEV-ONLY: the bypass only fires when BOTH flags are set:
@@ -803,7 +875,7 @@ function App() {
       if (reqId !== balanceReqRef.current) return;
       setBalance(bal);
       setNetworkInfo(info);
-      setBalancesByChain((prev) => ({ ...prev, [reqChain]: bal }));
+      setBalancesByChain((prev) => withChainBalance(prev, reqChain, bal));
       balanceAddrRef.current[reqChain] = reqAddress;
       void writeBalanceCache(reqChain, reqAddress, bal);
 
@@ -892,11 +964,23 @@ function App() {
           const myReqId =
             (chainReqRef.current[chain] = (chainReqRef.current[chain] ?? 0) + 1);
           const reqAddress = w.address;
+          // RAM plan 3.1: a sleeping chain (or one mid periodic wake) keeps its
+          // last real balance - its adapter would answer "Syncing…" and that
+          // would be written over the number and into the cache.
+          if (
+            (IDLE_CHAINS as readonly ChainType[]).includes(chain) &&
+            holdsBalance(
+              idleStateRef.current.get(chain as IdleChain),
+              idleSyncedRef.current[chain as IdleChain] === true,
+            )
+          ) {
+            return;
+          }
           try {
             const a = getAdapter(chain);
             if (chain === "monero" && !xmrSeedLoaded) {
               if (myReqId === chainReqRef.current[chain]) {
-                setBalancesByChain((prev) => ({ ...prev, [chain]: "—" }));
+                setBalancesByChain((prev) => withChainBalance(prev, chain, "—"));
               }
               return;
             }
@@ -933,7 +1017,7 @@ function App() {
               `${chain} balance`,
             );
             if (myReqId !== chainReqRef.current[chain]) return;
-            setBalancesByChain((prev) => ({ ...prev, [chain]: bal }));
+            setBalancesByChain((prev) => withChainBalance(prev, chain, bal));
             balanceAddrRef.current[chain] = reqAddress;
             void writeBalanceCache(chain, reqAddress, bal);
           } catch (e) {
@@ -1154,6 +1238,9 @@ function App() {
     refreshReceiveAddress: refreshXmrReceive,
     lock: lockXmrSession,
     forget: forgetXmrSession,
+    dormant: xmrDormant,
+    sleep: sleepXmrSession,
+    wake: wakeXmrSession,
   } = useXmrSession({
     activeChain,
     focus: featureFocus,
@@ -1184,6 +1271,9 @@ function App() {
     addDefender: handleZphAddDefenderExclusion,
     forget: forgetZphSession,
     lock: lockZphSession,
+    dormant: zphDormant,
+    sleep: sleepZphSession,
+    wake: wakeZphSession,
   } = useZphSession({
     activeChain,
     focus: featureFocus,
@@ -1207,6 +1297,9 @@ function App() {
     retry: retryZanoSync,
     forget: forgetZanoSession,
     lock: lockZanoSession,
+    dormant: zanoDormant,
+    sleep: sleepZanoSession,
+    wake: wakeZanoSession,
     downloadBinary: handleZanoDownloadBinary,
     refreshAssetBalances: refreshZanoAssetBalances,
     refreshTxHistory: refreshZanoTxHistory,
@@ -1330,6 +1423,14 @@ function App() {
       void refreshAllBalances();
     }
   }, [xelisSession.syncState, refreshAllBalances]);
+  // Zano likewise (RAM plan 3.1): without it an hourly wake of a sleeping Zano
+  // wallet would sync and go back to sleep with the dashboard never re-reading
+  // its balance.
+  useEffect(() => {
+    if (zanoSyncState === "ready") {
+      void refreshAllBalances();
+    }
+  }, [zanoSyncState, refreshAllBalances]);
 
   // Grove-shared coins (BTC / LTC / BCH) send like any other UTXO chain: the
   // wallet's own account-wide signer builds, signs and broadcasts, whether or
@@ -1434,6 +1535,105 @@ function App() {
     sendOverride: sessionSignedSendOverride,
     sendGuard: sharedCoinSendGuard,
   });
+
+  // RAM plan 3.1 (2026-09-25) — idle-stop + periodic wake for the chain
+  // sidecars (the operator's choice over a strict lazy start). Policy, rules
+  // and why: `src/lib/sidecarIdle.ts`; this block only supplies the inputs and
+  // performs the actions through each session hook's `sleep` / `wake`.
+  const idleSessions: Record<
+    IdleChain,
+    { seeded: boolean; synced: boolean; dormant: boolean; sleep: () => Promise<void>; wake: () => void }
+  > = {
+    monero: { seeded: !!xmrSeedLoaded, synced: xmrSyncState === "synced", dormant: xmrDormant, sleep: sleepXmrSession, wake: wakeXmrSession },
+    zephyr: { seeded: !!zphSeedLoaded, synced: zphSyncState === "synced", dormant: zphDormant, sleep: sleepZphSession, wake: wakeZphSession },
+    zano: { seeded: !!zanoSeedLoaded, synced: zanoSyncState === "ready", dormant: zanoDormant, sleep: sleepZanoSession, wake: wakeZanoSession },
+    xelis: { seeded: !!xelisSeedLoaded, synced: xelisSession.syncState === "synced", dormant: xelisSession.dormant, sleep: xelisSession.sleep, wake: xelisSession.wake },
+  };
+  // In use: the chain's own details — Send and Receive live there — i.e. it
+  // is the active chain on the wallet surface or the details view, or the
+  // Send modal is open for it; and EVERY chain while the Activity feed or the
+  // Swap tab is open, since both read these wallets directly.
+  const idleUseAll =
+    layout === "landscape"
+      ? landscapeTab === "activity" || landscapeTab === "swap"
+      : view === "activity" || view === "swap";
+  const idleOnActive = walletSurfaceVisible || view === "wallet-details" || showSendModal;
+  const idleInUse = (c: IdleChain) => idleUseAll || (idleOnActive && activeChain === c);
+  const idleLiveRef = useRef({ idleSessions, idleInUse });
+  useEffect(() => {
+    idleLiveRef.current = { idleSessions, idleInUse };
+    for (const c of IDLE_CHAINS) idleSyncedRef.current[c] = idleSessions[c].synced;
+  });
+  const idleTickRef = useRef<() => Promise<void>>(async () => {});
+  useEffect(() => {
+    if (!sessionPassword) {
+      idleStateRef.current.clear();
+      setPausedChains(new Map());
+      return;
+    }
+    let busy = false;
+    const tick = async () => {
+      if (busy) return;
+      busy = true;
+      try {
+        const now = Date.now();
+        const { idleSessions: sessions, idleInUse: inUse } = idleLiveRef.current;
+        // The swap node's hold, judged conservatively: only a node KNOWN not
+        // to be running releases XMR / ZEPH / ZANO. A running node may hold
+        // any of them (lease, claim, host wallet), and an unreadable status is
+        // not a "no" — so both keep the wallet awake.
+        let nodeRunning: boolean | null = null;
+        if (IDLE_CHAINS.some((c) => SWAP_CAPABLE.has(c) && sessions[c].seeded)) {
+          try {
+            nodeRunning = (await swapSidecarStatus()).running;
+          } catch {
+            nodeRunning = null;
+          }
+        }
+        for (const c of IDLE_CHAINS) {
+          const sess = sessions[c];
+          if (!sess.seeded) {
+            idleStateRef.current.delete(c);
+            continue;
+          }
+          let st = idleStateRef.current.get(c) ?? initialIdleState(now);
+          // The hook is the truth about dormancy: a Retry, a wallet switch or
+          // a Lock ends it without asking this scheduler.
+          if (st.dormantSince !== null && !sess.dormant) st = initialIdleState(now);
+          const swapHold = SWAP_CAPABLE.has(c) && nodeRunning !== false;
+          const { action, next } = decideIdle(now, st, { synced: sess.synced, inUse: inUse(c), swapHold });
+          idleStateRef.current.set(c, next);
+          if (action === "sleep") {
+            console.info(
+              `[sidecarIdle] ${c}: synced and unused for ${Math.round((now - next.lastUsedAt) / 60_000)} min — releasing its wallet sidecar`,
+            );
+            await sess.sleep();
+          } else if (action === "wake") {
+            console.info(`[sidecarIdle] ${c}: waking (${next.wake?.reason})`);
+            sess.wake();
+          }
+        }
+        const pausedNow = new Map<ChainType, number>();
+        for (const [c, st] of idleStateRef.current) {
+          if (st.dormantSince !== null) pausedNow.set(c, st.dormantSince);
+        }
+        setPausedChains(pausedNow);
+      } finally {
+        busy = false;
+      }
+    };
+    idleTickRef.current = tick;
+    const id = window.setInterval(() => void tick(), IDLE_TICK_MS);
+    return () => {
+      window.clearInterval(id);
+      idleTickRef.current = async () => {};
+    };
+  }, [sessionPassword]);
+  // Use wakes a chain at once, not on the next tick.
+  const idleUseKey = IDLE_CHAINS.filter(idleInUse).join(",");
+  useEffect(() => {
+    if (idleUseKey) void idleTickRef.current();
+  }, [idleUseKey]);
 
   // Vault orchestration — owns pending seeds, the six auth-flow handlers
   // (create / import / setPassword / unlock / removeWallet / logout), and

@@ -9,7 +9,16 @@ import React from "react";
 import ReactDOM from "react-dom/client";
 import App from "./App";
 import { AppStateProvider } from "./state/AppStateContext";
+import { installDevPerfTrackGuard, reactPerfTracksWanted } from "./lib/devPerfTrackGuard";
 import "./styles.css";
+
+// Dev-only, before the first render: React 19.2's development build records a
+// props diff per component render into the Performance timeline and nothing
+// ever clears it — 13 GB of renderer memory over a mining night (2026-09-27).
+// See `lib/devPerfTrackGuard.ts`. Dead-code-eliminated in production builds.
+if (import.meta.env.DEV && !reactPerfTracksWanted()) {
+  installDevPerfTrackGuard();
+}
 
 if (import.meta.env.VITE_DEV_INSTANCE === "sandbox") {
   // eslint-disable-next-line no-console

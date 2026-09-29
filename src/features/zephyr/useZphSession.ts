@@ -102,9 +102,25 @@ export function useZphSession(args: {
     }
   }, []);
 
+  /**
+   * RAM plan 3.1 (2026-09-25): asleep to save memory. `sleep` releases the
+   * wallet-rpc exactly as `lock` does - so a swap engine holding its own lease
+   * keeps the process - but keeps what `retry` needs to reopen the same wallet
+   * file, and leaves the last history/address on screen. `wake` is that
+   * `retry`. App's idle scheduler (`src/lib/sidecarIdle.ts`) decides when.
+   * `start`, `lock` and `forget` all end dormancy.
+   */
+  const [dormant, setDormant] = useState(false);
+  const dormantRef = useRef(false);
+  const markDormant = useCallback((d: boolean) => {
+    dormantRef.current = d;
+    setDormant(d);
+  }, []);
+
   const start = useCallback(
     (seed: string, masterPassword: string, restoreHeight: number = 0, walletFilename?: string) => {
       startArgsRef.current = { restoreHeight, walletFilename };
+      markDormant(false);
       setSyncState("starting");
       setSyncPercent(0);
       setSyncWalletHeight(0);
@@ -121,7 +137,7 @@ export function useZphSession(args: {
         }
       })();
     },
-    []
+    [markDormant]
   );
 
   /** Reopens the SAME wallet file at the SAME height — see `startArgsRef`.
@@ -178,6 +194,7 @@ export function useZphSession(args: {
   // `retry` would replay ends with it.
   const resetState = useCallback(() => {
     startArgsRef.current = null;
+    markDormant(false);
     setSyncState("idle");
     setSyncPercent(0);
     setSyncWalletHeight(0);
@@ -186,7 +203,7 @@ export function useZphSession(args: {
     syncSamplesRef.current = [];
     setSyncBlocksPerSec(null);
     setSyncEtaSeconds(null);
-  }, []);
+  }, [markDormant]);
 
   const forget = useCallback(async () => {
     try {
@@ -208,6 +225,27 @@ export function useZphSession(args: {
     }
     resetState();
   }, [resetState]);
+
+  /** RAM plan 3.1 - see `dormant`. Released like `lock`; asset balances and
+   *  what `retry` needs are kept. */
+  const sleep = useCallback(async () => {
+    if (!startArgsRef.current || dormantRef.current) return;
+    markDormant(true);
+    try {
+      await lockZphWallet();
+    } catch (e) {
+      console.warn("[useZphSession] sleep cleanup failed:", e);
+    }
+    setSyncState("idle");
+    syncSamplesRef.current = [];
+    setSyncBlocksPerSec(null);
+    setSyncEtaSeconds(null);
+  }, [markDormant]);
+
+  const wake = useCallback(() => {
+    if (!dormantRef.current) return;
+    retry(); // `start` clears dormancy
+  }, [retry]);
 
   useEffect(() => {
     if (syncPollRef.current) {
@@ -434,6 +472,9 @@ export function useZphSession(args: {
     resetState,
     forget,
     lock,
+    dormant,
+    sleep,
+    wake,
     setSyncState,
     setSyncError,
   };

@@ -2,6 +2,7 @@ import {
   createContext,
   useCallback,
   useContext,
+  useEffect,
   useMemo,
   useState,
   type ReactNode,
@@ -59,6 +60,27 @@ export function AppStateProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
   const [sessionPassword, setSessionPassword] = useState<string | null>(null);
+
+  // RAM plan Phase 1.4 (2026-09-22): `mem_guard.rs`'s webview-memory
+  // circuit-breaker needs to know whether the vault is currently unlocked
+  // BEFORE it reloads the window (reloading an unlocked session silently
+  // logs the user out — the F2 bug this exists to fix). The Rust backend
+  // has no visibility into frontend vault state at all, so rather than
+  // plumb a new Tauri command + AppState field for one boolean, this
+  // mirrors `sessionPassword` onto a plain `window` global that the
+  // backend's injected reload script reads synchronously (see
+  // `mem_guard.rs::run`'s eval string). `sessionPassword !== null` IS this
+  // app's definition of "unlocked" — same source of truth, no new state.
+  useEffect(() => {
+    try {
+      (window as unknown as { __pwndaVaultUnlocked?: boolean }).__pwndaVaultUnlocked =
+        sessionPassword !== null;
+    } catch {
+      // non-browser environment / frozen window — the backend's reload
+      // check treats a missing flag as "safe to reload" (fail toward the
+      // breaker's original behavior, never toward silently disabling it).
+    }
+  }, [sessionPassword]);
 
   const setErrorCb = useCallback((v: string) => setError(v), []);
   const setSuccessCb = useCallback((v: string) => setSuccess(v), []);

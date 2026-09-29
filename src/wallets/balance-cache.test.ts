@@ -1,10 +1,12 @@
 import { describe, it, expect } from "vitest";
 import {
+  attributeWalletBalances,
   hydrateBalances,
   isNumericBalance,
   keepLastGood,
   orderChains,
   runLimited,
+  withChainBalance,
   withTimeout,
 } from "./balance-cache";
 import type { ChainType, WalletInfo } from "./index";
@@ -87,9 +89,39 @@ describe("keepLastGood — a failed refresh never blanks a real number", () => {
     expect(keepLastGood({}, "litecoin")).toEqual({ litecoin: "—" });
     expect(keepLastGood({ litecoin: "Syncing…" }, "litecoin")).toEqual({ litecoin: "—" });
   });
-  it("returns a new object", () => {
-    const prev = { litecoin: "1" };
-    expect(keepLastGood(prev, "litecoin")).not.toBe(prev);
+  // Corrected 2026-09-25 (RAM plan 3.7): this used to pin "returns a new
+  // object" even when nothing changed. The property worth pinning is that
+  // `prev` is never mutated; a fresh object for an unchanged value is a state
+  // change React has to render - once per failing chain per sweep.
+  it("never mutates prev, and returns prev itself when nothing changes", () => {
+    const kept = { litecoin: "1" };
+    expect(keepLastGood(kept, "litecoin")).toBe(kept);
+    const blanked = { litecoin: "Syncing…" };
+    const out = keepLastGood(blanked, "litecoin");
+    expect(out).not.toBe(blanked);
+    expect(blanked).toEqual({ litecoin: "Syncing…" });
+    const dashed = { litecoin: "—" };
+    expect(keepLastGood(dashed, "litecoin")).toBe(dashed);
+  });
+});
+
+describe("withChainBalance / attributeWalletBalances — an unchanged balance is not an update", () => {
+  // RAM plan 3.7 (2026-09-25): the sweep and the per-wallet attribution
+  // effect produced ~88 App renders/min on the wallet view with no change.
+  it("returns prev itself for the same value, a copy for a new one", () => {
+    const prev = { bitcoin: "0.5" };
+    expect(withChainBalance(prev, "bitcoin", "0.5")).toBe(prev);
+    const next = withChainBalance(prev, "bitcoin", "0.6");
+    expect(next).toEqual({ bitcoin: "0.6" });
+    expect(prev).toEqual({ bitcoin: "0.5" });
+  });
+  it("attribution is a no-op when the wallet already holds every value", () => {
+    const prev = { main: { bitcoin: "0.5", ethereum: "1" }, other: { solana: "2" } };
+    expect(attributeWalletBalances(prev, "main", { bitcoin: "0.5" })).toBe(prev);
+    const next = attributeWalletBalances(prev, "main", { bitcoin: "0.7" });
+    expect(next.main).toEqual({ bitcoin: "0.7", ethereum: "1" });
+    expect(next.other).toBe(prev.other);
+    expect(attributeWalletBalances({}, "new", { bitcoin: "1" })).toEqual({ new: { bitcoin: "1" } });
   });
 });
 

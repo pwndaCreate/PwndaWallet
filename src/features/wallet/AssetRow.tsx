@@ -43,6 +43,7 @@ export function AssetRow({
   swapBalanceRaw,
   delta24hPct = null,
   compact = false,
+  pausedSince,
 }: {
   name: string;
   ticker: string;
@@ -62,9 +63,13 @@ export function AssetRow({
   /** Portrait's 24h price change; null while history is loading. */
   delta24hPct?: number | null;
   compact?: boolean;
+  /** RAM plan 3.1: when this chain's wallet sidecar was put to sleep. The
+   *  balance shown is the last real one, from before that. */
+  pausedSince?: number;
 }) {
   const balanceText = formatAssetBalance(balanceRaw);
   const usdText = formatAssetUsd(usd);
+  const paused = pausedSince !== undefined ? <PausedTag since={pausedSince} /> : null;
 
   if (!compact) {
     return (
@@ -102,6 +107,7 @@ export function AssetRow({
           <div style={ellipsis({ fontSize: 11, fontWeight: 600, letterSpacing: 0.4 })}>{name}</div>
           <div style={ellipsis({ fontSize: 8, color: "var(--text-dim)", marginTop: 1 })}>
             {address !== undefined ? `${ticker} · ${truncAddr(address)}` : ticker}
+            {paused}
           </div>
           <SwapBalanceSubline raw={swapBalanceRaw} ticker={ticker} />
         </div>
@@ -156,6 +162,7 @@ export function AssetRow({
         </span>
         <span className="tnum" style={{ fontSize: 10.5, color: "var(--text-dim)", letterSpacing: 0.2 }}>
           {balanceText} {ticker}
+          {paused}
         </span>
         <SwapBalanceSubline raw={swapBalanceRaw} ticker={ticker} size={9.5} />
       </div>
@@ -285,6 +292,25 @@ export function ImportableAssetRow({
       {label}
       {cta}
     </button>
+  );
+}
+
+/**
+ * " · paused" after a chain whose wallet sidecar the idle scheduler put to
+ * sleep (RAM plan 3.1). Says what the number is - the last real balance - and
+ * what brings it back, on hover; the row itself stays fully clickable, and a
+ * click on it is exactly what wakes the wallet.
+ */
+function PausedTag({ since }: { since: number }) {
+  const at = new Date(since).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return (
+    <span
+      data-paused-since={since}
+      title={`Wallet paused at ${at} to save memory — the balance is from then. Selecting this asset starts it again; it also re-checks on its own every hour.`}
+      style={{ color: "var(--text-dim)", opacity: 0.8 }}
+    >
+      {" · paused"}
+    </span>
   );
 }
 

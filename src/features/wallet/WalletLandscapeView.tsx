@@ -1,4 +1,5 @@
 import { useUtxoReceiveAddress } from "../../lib/utxoAccountRegistry";
+import { usePausedChains } from "../../lib/sidecarIdle";
 import { HederaSetupPanel } from "./HederaSetupPanel";
 import { isHederaAccountMissing } from "../../wallets/hbar-wallet";
 import {
@@ -255,6 +256,8 @@ export function WalletLandscapeView({
   /** Copy-to-clipboard helper used by the legacy panels. */
   onCopy?: (text: string) => void;
 }) {
+  // RAM plan 3.1: chains whose wallet sidecar is asleep show " · paused".
+  const pausedChains = usePausedChains();
   const [copiedAddr, setCopiedAddr] = useState(false);
   // When a Zephyr ecosystem asset (ZSD/ZRS/ZYS) row is selected, the center
   // focal panel shows IT instead of ZEPH — same address + Send/Receive/Swap,
@@ -1038,6 +1041,7 @@ export function WalletLandscapeView({
                   balanceRaw={balancesByChain[chain]}
                   usd={item.usd}
                   address={w.address}
+                  pausedSince={pausedChains.get(chain)}
                   swapBalanceRaw={swapRows[a.ticker.toUpperCase()]?.balance}
                 />
               );

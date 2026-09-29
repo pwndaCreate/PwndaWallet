@@ -106,6 +106,21 @@ export function useZanoSession(args: {
     }
   }, []);
 
+  /**
+   * RAM plan 3.1 (2026-09-25): asleep to save memory. `sleep` releases the
+   * wallet-rpc exactly as `lock` does - so a swap engine holding its own lease
+   * keeps the process - but keeps what `retry` needs to reopen the same wallet
+   * file, and leaves the last history/address on screen. `wake` is that
+   * `retry`. App's idle scheduler (`src/lib/sidecarIdle.ts`) decides when.
+   * `start`, `lock` and `forget` all end dormancy.
+   */
+  const [dormant, setDormant] = useState(false);
+  const dormantRef = useRef(false);
+  const markDormant = useCallback((d: boolean) => {
+    dormantRef.current = d;
+    setDormant(d);
+  }, []);
+
   const start = useCallback(
     (
       seed: string,
@@ -116,6 +131,7 @@ export function useZanoSession(args: {
       walletFile?: string,
     ) => {
       walletFileRef.current = walletFile;
+      markDormant(false);
       setSyncState("starting");
       setSyncError("");
       (async () => {
@@ -132,7 +148,7 @@ export function useZanoSession(args: {
         }
       })();
     },
-    [refreshBalance, refreshAssetBalances, refreshTxHistory]
+    [refreshBalance, refreshAssetBalances, refreshTxHistory, markDormant]
   );
 
   /** Reopens the SAME wallet file `start` was given — see `walletFileRef`. */
@@ -176,11 +192,12 @@ export function useZanoSession(args: {
   // remembered wallet file ends with it: the next `start` brings its own.
   const resetState = useCallback(() => {
     walletFileRef.current = undefined;
+    markDormant(false);
     setSyncState("idle");
     setSyncError("");
     setAssetBalances(null);
     setTxHistory([]);
-  }, []);
+  }, [markDormant]);
 
   const forget = useCallback(async () => {
     try {
@@ -202,6 +219,24 @@ export function useZanoSession(args: {
     }
     resetState();
   }, [resetState]);
+
+  /** RAM plan 3.1 - see `dormant`. Released like `lock` (a swap node using
+   *  the wallet keeps it); the wallet file, assets and history are kept. */
+  const sleep = useCallback(async () => {
+    if (dormantRef.current) return;
+    markDormant(true);
+    try {
+      await lockZanoWallet();
+    } catch (e) {
+      console.warn("[useZanoSession] sleep cleanup failed:", e);
+    }
+    setSyncState("idle");
+  }, [markDormant]);
+
+  const wake = useCallback(() => {
+    if (!dormantRef.current) return;
+    retry(); // `start` clears dormancy
+  }, [retry]);
 
   // `start()` is CALLER-triggered, matching `useZphSession`'s convention —
   // not an internal auto-effect. Real trigger points (mirroring ZEPH's
@@ -285,6 +320,9 @@ export function useZanoSession(args: {
     retry,
     forget,
     lock,
+    dormant,
+    sleep,
+    wake,
     downloadBinary,
     checkBinaryStatus,
     refreshAssetBalances,

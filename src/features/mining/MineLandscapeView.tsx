@@ -4,6 +4,7 @@ import { ALL_CHAINS, getCoinMeta } from "../../wallets/coin-metadata";
 import { CoinIcon } from "../../components/CoinIcon";
 import { Btn } from "../../components/PrimitivesV2";
 import { HashrateAreaChart } from "./HashrateAreaChart";
+import { CHART_REPAINT_THROTTLE_MS, useThrottledRef } from "./useThrottledRef";
 import { ST } from "../../components/Primitives";
 import { algorithmHashUnit, atomicToNumber, formatHashrateParts } from "./pool-stats/format";
 import { PoolStatsPanel, getStatsAdapter } from "./pool-stats";
@@ -213,6 +214,12 @@ export function MineLandscapeView({
       peak: p,
     };
   }, [hashrateSamples, isMining]);
+  // RAM plan Phase 2M.2 (2026-09-23): the chart's DATA reference refreshes at
+  // most every CHART_REPAINT_THROTTLE_MS, exactly as in the portrait view. The
+  // Round 9 mining-leak fix lived only in `MiningView`, so this view repainted
+  // the chart every 2 s. The stats above keep reading the raw samples and stay
+  // live; a 1 HR window moves ~0.1 px/s, so the slower repaint is invisible.
+  const chartSamples = useThrottledRef(hashrateSamples, CHART_REPAINT_THROTTLE_MS);
   const heroParts = formatHashrateParts(current || null, baseUnit);
 
   // Earnings — the one shared path (`useMiningEarnings`): live network
@@ -506,7 +513,7 @@ export function MineLandscapeView({
             </div>
             <div style={{ marginTop: 10 }}>
               <HashrateAreaChart
-                data={hashrateSamples}
+                data={chartSamples}
                 windowMs={60 * 60_000}
                 expectedIntervalMs={2_000}
                 baseUnit={baseUnit}

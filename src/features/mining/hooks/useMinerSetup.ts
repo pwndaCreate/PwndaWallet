@@ -104,5 +104,7 @@ export function useMinerSetup(args: {
     // Setters needed by the orchestrator's `miner-download-progress` listener.
     setDownloadingMiners,
     setDownloadProgress,
+    // `startMining` records a confirmed exclusion without re-checking (2026-09-25).
+    setDefenderExcluded,
   };
 }

@@ -1,58 +1,39 @@
 /**
- * A3 (Option A): the "this chain predates pruning" line on the swap-node card.
+ * The swap-node card does NOT talk about the Particl chain's disk layout.
  *
- * Exists because the branch cannot be reached any other way before it ships.
- * `SidecarStatusCard` holds `useState`/`useEffect`, so it cannot be invoked
- * directly the way `DexParticlCard` is in `syncState.test.ts`; and the
- * opted-in card is unreachable in the browser-only sandbox, where the setup
- * wizard's Tauri event listener has no mock and throws
- * `Cannot read properties of undefined (reading 'unregisterListener')`
- * (`SidecarSetupWizard.tsx:86`) before the flow can complete. Verified by hand
- * on 2026-09-09; the wizard's own footprint copy WAS confirmed live in that
- * pass ("about 1.5 GB downloaded and stored"), which is what makes the missing
- * half worth pinning here.
+ * History: A3 (Option A, 2026-09-09) added `ParticlFootprintNote` — "This
+ * node's Particl chain predates pruning and keeps about 2.9 GB. New setups use
+ * about 1.3 GB. Reclaiming the difference needs a fresh Particl sync, so
+ * nothing changes on its own." — on installs whose chain was synced with
+ * txindex/spentindex. On 2026-09-26 the operator removed it: it described
+ * something the user cannot act on (particl-core cannot drop the indexes in
+ * place, and nothing re-syncs on its own) and read as a problem to worry
+ * about. The backend still reports `particlUnpruned`; only the copy is gone.
+ *
+ * Source-reading on purpose: the card holds `useState`/`useEffect` and is
+ * unreachable in the browser-only sandbox (see the smoke-test notes in
+ * CLAUDE.md), so the render path cannot be driven here.
  */
 import { describe, it, expect } from "vitest";
-import { ParticlFootprintNote } from "../SidecarStatusCard";
+import { readFileSync } from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 
-/** Flatten a returned element tree into its text, the way syncState.test does. */
-function textOf(node: unknown): string {
-  if (node == null || node === false) return "";
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  if (Array.isArray(node)) return node.map(textOf).join("");
-  const el = node as { props?: { children?: unknown } };
-  return el.props ? textOf(el.props.children) : "";
-}
+const CARD = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "SidecarStatusCard.tsx"),
+  "utf8",
+);
+/** The card's code with comments stripped, so the history note above the type does not count. */
+const code = CARD.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/.*$/gm, "");
 
-describe("ParticlFootprintNote", () => {
-  it("says nothing on a pruned or fresh node", () => {
-    // The common case by far, and the one where a stray line would be noise on
-    // every healthy install.
-    expect(ParticlFootprintNote({ unpruned: false })).toBeNull();
+describe("swap-node card — Particl footprint copy (removed 2026-09-26)", () => {
+  it("renders no footprint note", () => {
+    expect(code).not.toMatch(/ParticlFootprintNote/);
   });
 
-  it("explains the footprint on a chain that predates pruning", () => {
-    const out = ParticlFootprintNote({ unpruned: true });
-    expect(out).not.toBeNull();
-    const text = textOf(out);
-    // Both numbers, because the point is the COMPARISON: the wizard quotes
-    // ~1.5 GB for the node and this install shows ~2.9 GB, and the line exists
-    // to reconcile those two facts rather than to report one of them.
-    expect(text).toMatch(/2\.9 GB/);
-    expect(text).toMatch(/1\.3 GB/);
-    // And it must say the remedy is a fresh sync, not imply the card can fix
-    // it: particl-core cannot drop the indexes from an existing chain, so an
-    // actionable-sounding sentence here would be a promise nothing can keep.
-    expect(text).toMatch(/fresh Particl sync/);
-  });
-
-  it("is not phrased as a fault", () => {
-    // Nothing is broken and no swap behaves differently; alarm words here
-    // would send users hunting for a problem that does not exist. This mirrors
-    // the reasoning behind DexParticlCard's amber-not-red `not-started` dot.
-    const text = textOf(ParticlFootprintNote({ unpruned: true })).toLowerCase();
-    for (const alarm of ["error", "warning", "failed", "problem", "broken"]) {
-      expect(text).not.toContain(alarm);
+  it("carries none of the removed copy", () => {
+    for (const phrase of ["predates pruning", "fresh Particl sync", "2.9 GB", "Reclaiming the difference"]) {
+      expect(code).not.toContain(phrase);
     }
   });
 });

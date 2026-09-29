@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "../../lib/tauri";
+import { appendCapped, createLaneSink, type LaneSink } from "./laneSink";
 import { listen } from "@tauri-apps/api/event";
 import type { ChainType } from "../../wallets";
 import {
@@ -46,6 +47,7 @@ import {
 } from "./activeSessionStore";
 import { useProxyPool } from "./useProxyPool";
 import { supportsDefenderExclusion } from "../../platform/os";
+import { shouldAutoScanEnv, shouldPromptDefender } from "./envScanGate";
 import { useCalibration } from "./hooks/useCalibration";
 import { useMinerSetup } from "./hooks/useMinerSetup";
 import {
@@ -185,6 +187,16 @@ function toSession(
 // React's `slice(-1800)` keeps the array bounded and re-renders are
 // throttled by the 2-second poll cadence, so cost is negligible.
 const MAX_HASHRATE_SAMPLES = 1800;
+
+/**
+ * How long a parked hashrate sample may wait before it is committed to React
+ * state while the Mine view is NOT on screen (RAM plan Phase 2M.3). The poll
+ * itself still runs every 2 s and every sample keeps its real timestamp; only
+ * the commit is batched. 15 s: long enough to cut ~30 app-root renders a minute
+ * per lane to ~4, short enough that the auto-calibration effect and the
+ * Tier-2 catch-up (which read the buffer) are never more than one window behind.
+ */
+const OFFSCREEN_FLUSH_MS = 15_000;
 
 /**
  * Owns all mining state + lifecycle: miner binary presence, Defender
@@ -462,7 +474,11 @@ export function useMiner(args: {
     addDefenderExclusions,
     setDownloadingMiners,
     setDownloadProgress,
+    setDefenderExcluded,
   } = useMinerSetup({ setMinerError });
+  /** The user declined the Defender UAC prompt this session: do not ask on
+   *  every start (2026-09-25 — see `shouldPromptDefender`). */
+  const defenderDeclinedRef = useRef(false);
   /**
    * Non-error informational notice shown in the mining view (different
    * styling from `minerError`). Used by the SOCKS5 auto-rotation flow:
@@ -1061,9 +1077,23 @@ export function useMiner(args: {
       // rather than blocking the primary action on a second UAC prompt the
       // user might decline — the existing "stopped unexpectedly" death-watch
       // error below still fires if Defender blocks it regardless.
-      if (supportsDefenderExclusion() && defenderExcluded !== true) {
+      //
+      // 2026-09-25: this used to prompt on EVERY start. A non-elevated process
+      // cannot read Defender's exclusion lists on current Windows, so the
+      // check answered `false` even with the exclusion in place. The check now
+      // trusts a confirmation the elevated script writes, the answer below is
+      // remembered, and a decline is not re-asked until the next launch.
+      if (
+        shouldPromptDefender({
+          supported: supportsDefenderExclusion(),
+          excluded: defenderExcluded,
+          declinedThisSession: defenderDeclinedRef.current,
+        })
+      ) {
         try {
-          await invoke<boolean>("add_defender_exclusions");
+          const confirmed = await invoke<boolean>("add_defender_exclusions");
+          if (confirmed) setDefenderExcluded(true);
+          else defenderDeclinedRef.current = true;
         } catch {
           /* best-effort — see comment above */
         }
@@ -1431,12 +1461,22 @@ export function useMiner(args: {
             invoke("stop_xmrig", {
               reason: "stopped: miner process died",
             }).catch(() => {});
-            invoke("stop_srbminer_cpu").catch(() => {});
+            // `stop_srbminer_cpu` gained the same `reason` param as
+            // `stop_xmrig` (RAM plan Phase 0.3, 2026-09-22) — the death
+            // watch already logged the real exit code via `mining-events`,
+            // and passing this text tells the backend NOT to log a second,
+            // code-less duplicate for the frontend's own cleanup call. See
+            // `classify_stop_reason` in miners.rs.
+            invoke("stop_srbminer_cpu", {
+              reason: "stopped: miner process died",
+            }).catch(() => {});
             setIsMiningCpu(false);
             setRunningCpuMiner(null);
             setLaneCoin("cpu", null);
           } else if (kind === "gpu") {
-            invoke("stop_gpu_miner").catch(() => {});
+            invoke("stop_gpu_miner", {
+              reason: "stopped: miner process died",
+            }).catch(() => {});
             setIsMiningGpu(false);
             setLaneCoin("gpu", null);
           } else {
@@ -1447,8 +1487,12 @@ export function useMiner(args: {
             invoke("stop_xmrig", {
               reason: "stopped: miner process died (unknown kind)",
             }).catch(() => {});
-            invoke("stop_srbminer_cpu").catch(() => {});
-            invoke("stop_gpu_miner").catch(() => {});
+            invoke("stop_srbminer_cpu", {
+              reason: "stopped: miner process died (unknown kind)",
+            }).catch(() => {});
+            invoke("stop_gpu_miner", {
+              reason: "stopped: miner process died (unknown kind)",
+            }).catch(() => {});
             setIsMiningCpu(false);
             setIsMiningGpu(false);
             setRunningCpuMiner(null);
@@ -1621,6 +1665,11 @@ export function useMiner(args: {
     }
   }, [rescanEnv]);
 
+  // Miner binaries + Defender status: once per entry into a mining view.
+  // Until 2026-09-25 this shared an effect with the env scan below, so every
+  // scan-state change re-ran it — and a scan that always failed made that a
+  // loop: a Defender check (a PowerShell) every ~2.5 s while the Mine tab was
+  // open. See `envScanGate.ts`.
   useEffect(() => {
     if (focus === "mining" || focus === "miner-setup") {
       checkMinerStatus();
@@ -1628,12 +1677,26 @@ export function useMiner(args: {
         .then((count) => setCpuThreadCount(count))
         .catch(() => setCpuThreadCount(0));
     }
-    // Sprint 2 Phase 3 — fire env scan on Mining tab entry only (not Miner Setup).
-    // Cached for the session; re-scans on Hard Reset or app restart.
-    if (focus === "mining" && !hashrateFixPlan && !scanningEnv) {
+  }, [focus, checkMinerStatus]);
+
+  // Sprint 2 Phase 3 — fire env scan on Mining tab entry only (not Miner Setup).
+  // Cached for the session; re-scans on Hard Reset or app restart. Started
+  // automatically at most ONCE per session: a failure is not retried in a
+  // loop (Hard Reset and the panel's rescan still ask explicitly).
+  const envScanAttemptedRef = useRef(false);
+  useEffect(() => {
+    if (
+      shouldAutoScanEnv({
+        focus,
+        hasPlan: !!hashrateFixPlan,
+        scanning: scanningEnv,
+        attempted: envScanAttemptedRef.current,
+      })
+    ) {
+      envScanAttemptedRef.current = true;
       void rescanEnv(false);
     }
-  }, [focus, checkMinerStatus, hashrateFixPlan, scanningEnv, rescanEnv]);
+  }, [focus, hashrateFixPlan, scanningEnv, rescanEnv]);
 
   // Poll BOTH `is_mining` and `is_gpu_mining` every 5s while the Mining
   // view is open. Independent state means the user sees either or both
@@ -1971,6 +2034,23 @@ export function useMiner(args: {
   // continuous line. The IPC cost (one snapshot every 2 s) is
   // negligible. See `wiki/concepts/hashrate-history.md` § "Tier-2
   // depends on the unconditional poll".
+  // RAM plan Phase 2M.3 (2026-09-23): the pollers below commit through a lane
+  // sink that batches while the Mine view is off screen. `focusRef` lets the
+  // long-lived poll closures see the CURRENT focus without re-creating the
+  // interval on every tab switch; the sink refs let a focus change flush the
+  // parked backlog the instant the Mine view appears, so it never mounts
+  // showing a stale tail.
+  const focusRef = useRef(focus);
+  const cpuSinkRef = useRef<LaneSink<MinerSession> | null>(null);
+  const gpuSinkRef = useRef<LaneSink<MinerSession> | null>(null);
+  useEffect(() => {
+    focusRef.current = focus;
+    if (focus === "mining") {
+      cpuSinkRef.current?.flush();
+      gpuSinkRef.current?.flush();
+    }
+  }, [focus]);
+
   useEffect(() => {
     if (!isMiningCpu) return;
     // WHICH CPU backend to poll. xmrig and SRBMiner's CPU lane are different
@@ -2003,17 +2083,24 @@ export function useMiner(args: {
         if (!snap) return;
         const raw = snap.hashrate ?? 0;
         const value = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 0;
-        setCpuHashrateSamples((prev) => {
-          const next = [...prev, { t: Date.now(), value }];
-          if (next.length > MAX_HASHRATE_SAMPLES)
-            return next.slice(-MAX_HASHRATE_SAMPLES);
-          return next;
-        });
-        setCpuSession(toSession(snap, snap.ping_ms));
+        // RAM plan Phase 2M.3: same sample, same timestamp - but committed to
+        // React state through the lane sink (see laneSink.ts). Mine view on
+        // screen: immediately, as before. Otherwise batched, so the app root is
+        // not re-rendered every 2 s for data nothing is showing.
+        cpuSink.push({ t: Date.now(), value }, toSession(snap, snap.ping_ms));
       } catch {
         /* ignore */
       }
     };
+    const cpuSink: LaneSink<MinerSession> = createLaneSink<MinerSession>({
+      isLive: () => focusRef.current === "mining",
+      apply: (batch, session) => {
+        setCpuHashrateSamples((prev) => appendCapped(prev, batch, MAX_HASHRATE_SAMPLES));
+        setCpuSession(session);
+      },
+      flushMs: OFFSCREEN_FLUSH_MS,
+    });
+    cpuSinkRef.current = cpuSink;
     const id = setInterval(pollOnce, 2000);
     const onVisible = () => {
       if (typeof document !== "undefined" && document.visibilityState === "visible") {
@@ -2025,6 +2112,9 @@ export function useMiner(args: {
     }
     return () => {
       clearInterval(id);
+      // The lane stopped: drop anything parked so a restart starts clean.
+      cpuSink.dispose();
+      if (cpuSinkRef.current === cpuSink) cpuSinkRef.current = null;
       if (typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", onVisible);
       }
@@ -2052,12 +2142,6 @@ export function useMiner(args: {
         if (!snap) return;
         const raw = snap.hashrate ?? 0;
         const value = Number.isFinite(raw) && raw > 0 ? Math.round(raw) : 0;
-        setGpuHashrateSamples((prev) => {
-          const next = [...prev, { t: Date.now(), value }];
-          if (next.length > MAX_HASHRATE_SAMPLES)
-            return next.slice(-MAX_HASHRATE_SAMPLES);
-          return next;
-        });
         // SRBMiner DOES report stratum latency (`pool.latency`), so prefer
         // the miner's own live number; lolMiner has none, and any miner's
         // first polls arrive before it connects, so fall back to whatever the
@@ -2066,11 +2150,24 @@ export function useMiner(args: {
           activeGpuPoolId && poolPings[activeGpuPoolId]?.ok
             ? poolPings[activeGpuPoolId]?.latencyMs ?? null
             : null;
-        setGpuSession(toSession(snap, snap.ping_ms ?? fallbackPing));
+        // Committed through the lane sink - see the CPU poller and laneSink.ts.
+        gpuSink.push(
+          { t: Date.now(), value },
+          toSession(snap, snap.ping_ms ?? fallbackPing),
+        );
       } catch {
         /* ignore */
       }
     };
+    const gpuSink: LaneSink<MinerSession> = createLaneSink<MinerSession>({
+      isLive: () => focusRef.current === "mining",
+      apply: (batch, session) => {
+        setGpuHashrateSamples((prev) => appendCapped(prev, batch, MAX_HASHRATE_SAMPLES));
+        setGpuSession(session);
+      },
+      flushMs: OFFSCREEN_FLUSH_MS,
+    });
+    gpuSinkRef.current = gpuSink;
     const id = setInterval(pollOnce, 2000);
     const onVisible = () => {
       if (typeof document !== "undefined" && document.visibilityState === "visible") {
@@ -2082,6 +2179,8 @@ export function useMiner(args: {
     }
     return () => {
       clearInterval(id);
+      gpuSink.dispose();
+      if (gpuSinkRef.current === gpuSink) gpuSinkRef.current = null;
       if (typeof document !== "undefined") {
         document.removeEventListener("visibilitychange", onVisible);
       }

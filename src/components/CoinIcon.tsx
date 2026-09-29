@@ -1,5 +1,5 @@
-import { useId } from "react";
-import type { CSSProperties, ReactElement } from "react";
+import { memo, useId } from "react";
+import type { CSSProperties } from "react";
 
 const RING_12 = [
   "....####....",
@@ -15,6 +15,53 @@ const RING_12 = [
   "..##....##..",
   "....####....",
 ];
+
+/**
+ * Every lit cell of a pixel grid as ONE SVG path: a 1.02-unit square per
+ * cell, `offset` cells in from the origin. The 1.02 (not 1) overlaps
+ * neighbours by 0.02 so `crispEdges` never leaves a hairline seam — the same
+ * cell geometry the per-cell `<rect>`s this replaced drew.
+ *
+ * RAM plan Phase 2.3 (2026-09-22). The icon used to emit one `<rect>` per lit
+ * cell — 40 for the ring alone, plus up to 40 more for a pixel glyph — so a
+ * coin mark was 41–82 SVG nodes and the dashboard, which mounts a mark per
+ * chain in several lists, carried a median 1,887 SVG nodes (worst case
+ * 14,083). One path per layer is 1–2 nodes.
+ *
+ * **The same CELLS, not the same PIXELS** (measured, not assumed — see
+ * CoinIcon.nodes.test.ts and the wiki correction): when a cell is a
+ * non-integer number of device pixels (22 px / 12 = 1.83), each `<rect>` snapped
+ * to the pixel grid on its own and overlapped its neighbours, leaving uneven
+ * stroke widths and visible cell seams inside the glyph. A single union fill
+ * has no seams and uniform strokes. At sizes where a cell is a whole number of
+ * pixels the two converge. So this is a small visual cleanup of a shared
+ * primitive, not a bit-for-bit refactor.
+ */
+function cellsPath(rows: readonly string[], size: number, offset: number): string {
+  let d = "";
+  for (let y = 0; y < size; y++) {
+    const row = rows[y] || "";
+    for (let x = 0; x < size; x++) {
+      if (row[x] === "#") d += `M${x + offset} ${y + offset}h1.02v1.02h-1.02z`;
+    }
+  }
+  return d;
+}
+
+/** The ring is the same for every coin — built once, at module load. */
+const RING_PATH = cellsPath(RING_12, 12, 0);
+
+/** Pixel-glyph paths, built on first use. Keyed by the glyph's own grid array
+ *  (a module constant), so a glyph is converted once per app run. */
+const GLYPH_PATHS = new WeakMap<readonly string[], string>();
+function glyphPath(grid: readonly string[]): string {
+  let d = GLYPH_PATHS.get(grid);
+  if (d === undefined) {
+    d = cellsPath(grid, 8, 2);
+    GLYPH_PATHS.set(grid, d);
+  }
+  return d;
+}
 
 /**
  * A small corner badge, drawn over a masked-out notch in the bottom-right
@@ -411,7 +458,7 @@ export function resolveCoinGlyph(sym: string): CoinGlyph | undefined {
  * 2026-09-15) on the v2 dashboard, account card, and activity rows so
  * every chain shares the same visual silhouette.
  */
-export function CoinIcon({
+function CoinIconImpl({
   sym,
   size = 22,
   color = "var(--white)",
@@ -443,46 +490,6 @@ export function CoinIcon({
   const maskId = `coin-badge-${useId().replace(/:/g, "")}`;
   const badge = glyph?.badge;
 
-  const ringRects: ReactElement[] = [];
-  for (let y = 0; y < 12; y++) {
-    const row = RING_12[y] || "";
-    for (let x = 0; x < 12; x++) {
-      if (row[x] === "#") {
-        ringRects.push(
-          <rect
-            key={`r${x},${y}`}
-            x={x}
-            y={y}
-            width={1.02}
-            height={1.02}
-            fill={dim}
-          />
-        );
-      }
-    }
-  }
-
-  const innerRects: ReactElement[] = [];
-  if (glyph?.kind === "p") {
-    for (let y = 0; y < 8; y++) {
-      const row = glyph.g[y] || "";
-      for (let x = 0; x < 8; x++) {
-        if (row[x] === "#") {
-          innerRects.push(
-            <rect
-              key={`i${x},${y}`}
-              x={x + 2}
-              y={y + 2}
-              width={1.02}
-              height={1.02}
-              fill={innerColor}
-            />
-          );
-        }
-      }
-    }
-  }
-
   return (
     <svg
       viewBox="0 0 12 12"
@@ -512,8 +519,8 @@ export function CoinIcon({
         </mask>
       )}
       <g mask={badge ? `url(#${maskId})` : undefined}>
-      {ringRects}
-      {glyph?.kind === "p" && innerRects}
+      <path d={RING_PATH} fill={dim} />
+      {glyph?.kind === "p" && <path d={glyphPath(glyph.g)} fill={innerColor} />}
       {glyph?.kind === "g" && (
         <text
           x="6"
@@ -562,3 +569,11 @@ export function CoinIcon({
     </svg>
   );
 }
+
+/**
+ * Memoised (RAM plan Phase 2.3): the dashboard re-renders on every price /
+ * balance tick and each pass used to rebuild every mark's element tree from
+ * scratch. Props are primitives except `style`, which callers mostly omit, so
+ * the shallow compare holds and an unchanged mark is skipped outright.
+ */
+export const CoinIcon = memo(CoinIconImpl);
