@@ -254,6 +254,19 @@ async function* walkFiles(root) {
 async function main() {
   console.log(`[fetch-miners] target=${TARGET}, staging=${path.relative(REPO_ROOT, STAGING_DIR)}`);
   const manifest = JSON.parse(await readFile(MANIFEST_PATH, "utf8"));
+  // Stage from EMPTY. The bundler packs every file in this folder, so a file
+  // left by a miner that has since left the manifest would ship in the
+  // installer. Clearing here keeps the manifest the only list of miners —
+  // nothing downstream needs to know which miners used to exist. Archives
+  // are cached in TMP_DIR, so this costs a re-extract, not a re-download.
+  await mkdir(STAGING_DIR, { recursive: true });
+  let cleared = 0;
+  for (const entry of await readdir(STAGING_DIR)) {
+    if (entry === ".gitignore" || entry === ".gitkeep") continue;
+    await rm(path.join(STAGING_DIR, entry), { recursive: true, force: true });
+    cleared++;
+  }
+  if (cleared) console.log(`[fetch-miners] cleared ${cleared} staged files`);
   for (const [name, spec] of Object.entries(manifest.miners)) {
     try {
       await processOne(name, spec);

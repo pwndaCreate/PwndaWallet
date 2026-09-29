@@ -5,7 +5,7 @@
 // The CONSUMER side is src-tauri/src/bundle.rs.
 //
 // Ships the AV-sensitive binaries INSIDE the installer, dormant until opt-in:
-//   * miners  (xmrig, lolMiner, SRBMiner-MULTI)  -> extracted into <app-data>/miners
+//   * miners  (xmrig, SRBMiner-MULTI)  -> extracted into <app-data>/miners
 //   * grove   (Python/BasicSwap runtime + the coin daemons in BUNDLED_COINS,
 //              minus a target's DECLARED gaps in NOT_BUNDLED_FOR) -> extracted
 //              into <app-data>/swap-sidecar/ (i.e. runtime/ + bin/<coin>/)
@@ -225,12 +225,6 @@ for (const [target, over] of Object.entries(PLATFORM_COIN_BINARIES)) {
   }
 }
 const MINERS = ["xmrig", "SRBMiner-MULTI"];
-// Miners that USED to ship. `fetch-miners` never cleans the staging folder, so
-// a lolMiner fetched before 2026-09-18 would still sit there and — since the
-// payload is "every file in the folder" — be packed into miners.enc. These are
-// excluded by name so a stale checkout cannot put a retired miner back in the
-// installer.
-const RETIRED_MINER_FILES = new Set(["lolMiner", "lolMiner.exe"]);
 
 async function exists(p) {
   try { await stat(p); return true; } catch { return false; }
@@ -580,11 +574,9 @@ async function main() {
     // three exes + SRBMiner's DLLs all live flat here after fetch-miners.
     const all = await readdir(MINERS_SRC);
     const skip = new Set([".gitignore", ".gitkeep"]);
-    const entries = all.filter((f) => !skip.has(f) && !RETIRED_MINER_FILES.has(f));
-    const retired = all.filter((f) => RETIRED_MINER_FILES.has(f));
-    if (retired.length) {
-      console.log(`${LOG} miners: skipping retired ${retired.join(", ")} left in ${path.relative(REPO, MINERS_SRC)}`);
-    }
+    // The folder holds exactly the manifest's miners: `fetch-miners` stages
+    // from empty (2026-09-22), so nothing here filters by miner name.
+    const entries = all.filter((f) => !skip.has(f));
     // sanity: every shipped miner executable must be present
     for (const m of MINERS) {
       if (!(await exists(path.join(MINERS_SRC, `${m}${EXE}`)))) {
