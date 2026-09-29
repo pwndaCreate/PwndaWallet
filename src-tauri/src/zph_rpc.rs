@@ -636,6 +636,14 @@ pub async fn zph_start_rpc(
         .arg("--log-level")
         .arg("0")
         .arg("--non-interactive")
+        // Cap the log. Monero-family wallet-rpc rotates at
+        // `--max-log-file-size` and keeps `--max-log-files` of them; without
+        // both it grows without bound (33 MB monero + 15 MB zephyr observed
+        // on the dev box, 2026-09-22). 4 MB x 2 keeps a useful tail.
+        .arg("--max-log-file-size")
+        .arg("4194304")
+        .arg("--max-log-files")
+        .arg("2")
         .arg("--log-file")
         .arg(&log_file);
 
@@ -649,7 +657,8 @@ pub async fn zph_start_rpc(
     }
 
     // Parallel block parsing. Physical cores only — SMT hurts view-key scan.
-    let concurrency = (num_cpus::get_physical() as u32).clamp(2, 16);
+    // Ceiling and why: `wallet_rpc_common::WALLET_RPC_MAX_CONCURRENCY`.
+    let concurrency = crate::wallet_rpc_common::wallet_rpc_concurrency(num_cpus::get_physical());
     cmd.arg("--max-concurrency").arg(concurrency.to_string());
 
     if is_local {
@@ -1041,7 +1050,7 @@ pub async fn zph_swap_wallet_start(
     let wallet_dir = get_swap_wallet_dir(app)?;
     let log_file = get_swap_log_file(app)?;
     let creds = (random_hex(16), random_hex(16));
-    let concurrency = (num_cpus::get_physical() as u32).clamp(2, 16);
+    let concurrency = crate::wallet_rpc_common::wallet_rpc_concurrency(num_cpus::get_physical());
     let args = zph_swap_spawn_args(port, &creds, &wallet_dir, daemon_address, &log_file, concurrency);
 
     let mut cmd = tokio::process::Command::new(&binary);
@@ -1307,7 +1316,8 @@ pub struct ZphDownloadProgress {
 fn hidden_powershell_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("powershell");
     crate::platform::apply_hidden_spawn(&mut cmd);
-    cmd.args(["-ExecutionPolicy", "Bypass"]);
+    // -NoProfile (2026-09-25): see `miners::hidden_powershell_command`.
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass"]);
     cmd
 }
 
@@ -1615,7 +1625,7 @@ pub async fn zph_add_defender_exclusion(app: AppHandle) -> Result<bool, String> 
             .map_err(|e| format!("Failed to write defender script: {}", e))?;
 
         let elevate_cmd_str = format!(
-            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-ExecutionPolicy Bypass -File \"{}\"'",
+            "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{}\"'",
             script_path.to_string_lossy()
         );
         let mut elevate_cmd = hidden_powershell_command();

@@ -514,8 +514,8 @@ const COIN_CORES = [
     // kind to cross-check against: all 69 assets across all 15 releases
     // (v0.1.0 -> v2.3.0) were checked and none carry a sha/sum/hash/sig/.asc/
     // gpg/pgp file, the release body has no inline hash, and no sigs repo
-    // exists in the ZephyrProtocol org (per the reference
-    // notes, re-verified
+    // exists in the ZephyrProtocol org (REU26
+    // ResearchWiki/synthesis/zeph-basicswap-pr-paths.md, re-verified
     // 2026-07-01). So `signer`/`assertFile` below are null — there is
     // nothing to name — and this pin is OUR sha256 of THEIR bytes, exactly
     // like the python-build-standalone pin above, not a cross-check against

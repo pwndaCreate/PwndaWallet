@@ -114,7 +114,7 @@ export const DEFAULT_COIN_DECIMALS = 8;
  * display name or the ticker. Matches upstream's `chainparams`
  * `decimal_places`; ZEPH follows Monero at 12. ZANO is also 12 — verified
  * against both `chainparams.py`'s `Coins.ZANO` entry (`decimal_places: 12`,
- * the reference port) and the live wallet's own `asset_info.decimal_point` (see [[Zano]]
+ * REU26) and the live wallet's own `asset_info.decimal_point` (see [[Zano]]
  * in the vault) — not a guess extrapolated from the CryptoNote family.
  */
 export const COIN_DECIMALS: Readonly<Record<string, number>> = {

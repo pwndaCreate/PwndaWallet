@@ -12,12 +12,12 @@ beside PWNDA-PATCH-8's own `mainwalletrpc*` hunk, and a ZANO-specific
 `getTotalBalance` branch), and `bin/prepare.py` (`coin_prepare_modules` and
 `known_coins`).
 
-Three real defects were fixed here beyond a literal port of the reference port's own
-registration: the reference port's allow-list hunk leaves `walletrpcpassword` mandatory,
+Three real defects were fixed here beyond a literal port of REU26's own
+registration: REU26's allow-list hunk leaves `walletrpcpassword` mandatory,
 which breaks Grove's JWT-only ZANO; `external_main_wallet` reached no
 allow-list at all, so PWNDA-PATCH-15's flag could only ever read False; and
 `getTotalBalance` called `get_balance` where Zano's method is `getbalance`
-(the reference port's own documented rung 5-6 bug, silently swallowed by an except-fallback).
+(REU26's own documented rung 5-6 bug, silently swallowed by an except-fallback).
 
 RECONSTRUCTED 2026-09-03: this file was lost from `upstream/patches/` by an
 orchestrating-session mistake (moved aside during an abandoned experiment, then
@@ -56,7 +56,7 @@ index b4b01846..919d4a69 100644
 +            # is inert for every other coin. Without this entry the flag can never
 +            # be anything but zano.py's own default False, no matter what Grove's
 +            # supervisor writes into basicswap.json, and initialiseWallet would run
-+            # the reference port's original engine-owned-wallet path against a wallet-rpc Grove
++            # REU26's original engine-owned-wallet path against a wallet-rpc Grove
 +            # never intends the engine to provision.
 +            "external_main_wallet",
          ):
@@ -78,7 +78,7 @@ index b4b01846..919d4a69 100644
 +                    # touched. self.coin_clients[coin] is built from a fixed
 +                    # allowlist (this whole function), so without this copy the
 +                    # setting is silently dropped and the interface falls back
-+                    # to no scratch wallet at all -- matches the reference port's proven fix
++                    # to no scratch wallet at all -- matches REU26's proven fix
 +                    # (basicswap.py:965-977, RUNG 5-6 review).
 +                    if "scratchwalletrpcport" in chain_client_settings:
 +                        self.coin_clients[coin]["scratchwalletrpcport"] = (
@@ -102,15 +102,15 @@ index b4b01846..919d4a69 100644
 +                        self.coin_clients[coin]["scratchwalletrpcjwt"] = (
 +                            chain_client_settings["scratchwalletrpcjwt"]
 +                        )
-+                    # [Grove divergence from the reference port -- see B-X2's log.md entry]
-+                    # The reference port's own equivalent hunk (basicswap.py:978-984) left the
++                    # [Grove divergence from REU26 -- see B-X2's log.md entry]
++                    # REU26's own equivalent hunk (basicswap.py:978-984) left the
 +                    # walletrpcpassword requirement below unconditional for ZANO
 +                    # too; its deployment satisfied it by always writing SOME
 +                    # walletrpcpassword value even under --unsecure-no-auth (the
 +                    # value was present but never checked by the daemon). Grove's
 +                    # ZANO deployment never writes walletrpcuser/walletrpcpassword
 +                    # at all -- JWT (copied above) is the real, checked
-+                    # credential. Carrying the reference port's hunk verbatim would make this
++                    # credential. Carrying REU26's hunk verbatim would make this
 +                    # function raise ValueError("Missing XMR wallet rpc
 +                    # credentials.") for every Grove ZANO node before it ever
 +                    # reached the wallet-rpc layer, so ZANO skips the XMR/WOW-
@@ -127,7 +127,7 @@ index b4b01846..919d4a69 100644
 +            # PWNDA-PATCH-16: registers PWNDA-PATCH-15's ZanoInterface (see
 +            # interface/zano/zano.py). Same signature every other xmr-family
 +            # interface receives here (coin_settings, chain, swap_client) --
-+            # matches the reference port's proven createInterface branch (basicswap.py:1234-1237
++            # matches REU26's proven createInterface branch (basicswap.py:1234-1237
 +            # in the flat fork) re-pathed onto this tree's per-coin-folder layout.
 +            from .interface.zano.zano import ZanoInterface
 +
@@ -141,7 +141,7 @@ index b4b01846..919d4a69 100644
                      Coins.ZEPH: threadPollXMRChainState,
 +                    Coins.ZANO: threadPollXMRChainState,  # PWNDA-PATCH-16: same
 +                    # daemon-shaped (getinfo-style) chain-state poll as XMR/WOW --
-+                    # matches the reference port's proven thread_func entry (basicswap.py:1393).
++                    # matches REU26's proven thread_func entry (basicswap.py:1393).
                  }.get(
                      c, threadPollChainState
                  )  # default case
@@ -151,14 +151,14 @@ index b4b01846..919d4a69 100644
              if hasattr(ci, "rpc_wallet"):
 -                if coin_type in self.xmr_based_coins:
 +                if coin_type == Coins.ZANO:
-+                    # PWNDA-PATCH-16 [REFERENCE-PORT RUNG 5-6 bug, ported]: ZANO's wallet-rpc
++                    # PWNDA-PATCH-16 [REU26 RUNG 5-6 bug, ported]: ZANO's wallet-rpc
 +                    # method is `getbalance` (one word), not Monero's `get_balance`
 +                    # -- ZANO joined self.xmr_based_coins above it, and without this
 +                    # branch every getTotalBalance(ZANO) call raises "Method not
 +                    # found" here and silently falls back to
 +                    # ci.getSpendableBalance() at the bottom of this function (the
 +                    # broad except at the end), which is a functioning but
-+                    # needlessly-degraded path. See the reference port's identical fix,
++                    # needlessly-degraded path. See REU26's identical fix,
 +                    # basicswap.py:7522-7526 in the flat fork. ZEPH does not need
 +                    # this branch -- ZEPHInterface inherits XMRInterface's standard
 +                    # get_balance wallet-rpc shape (PWNDA-PATCH-13).
@@ -233,9 +233,9 @@ index e2916900..67b70210 100644
      # its side of a swap at all, same as XMR/WOW).
      Coins.ZEPH,
 +    # PWNDA-PATCH-16: adaptor-sig-only, same family as XMR/WOW -- see
-+    # the reference port's Zano feasibility note (linear ephemeral secret,
++    # ResearchWiki/synthesis/zano-xmr-swap-feasibility.md (linear ephemeral secret,
 +    # ed25519). Omitting it here would route ZANO swaps through the scripted/HTLC
-+    # path this coin has no scripting to support -- the reference port's flat fork carries the
++    # path this coin has no scripting to support -- REU26's flat fork carries the
 +    # identical membership (basicswap.py:559-567, self.scriptless_coins).
 +    Coins.ZANO,
  )

@@ -147,6 +147,13 @@ pub fn run() {
             // release / non-Windows. See mem_watch.rs.
             mem_watch::start(app.handle().clone());
 
+            // RAM plan Phase 1.3 (2026-09-22): one-time sweep of stale
+            // dev-fee-*/leaderboard-*.jsonl files left over from the
+            // subsystem removed 2026-07-06. Cheap (a handful of files at
+            // most) and runs unconditionally — dev and release alike, since
+            // an install that predates the cutover can be either.
+            miners::cleanup_retired_mining_logs(app.handle());
+
             // WebView2 memory-pressure: drop the renderer to Low memory while
             // the window is unfocused, restore Normal on focus (MS-recommended
             // mitigation for the renderer memory leak; #3678 + WebView2 perf
@@ -738,8 +745,58 @@ pub fn run() {
                     // The SRBMiner CPU lane (XelisHash v3) is an unelevated
                     // child we own; stop it by its own handle like the GPU
                     // lane, so an app exit never leaves it hashing.
-                    let _ = miners::stop_srbminer_cpu(app_handle.clone()).await;
-                    let _ = miners::stop_gpu_miner(app_handle).await;
+                    let _ = miners::stop_srbminer_cpu(
+                        app_handle.clone(),
+                        Some("stopped: app exiting".to_string()),
+                    )
+                    .await;
+                    let _ = miners::stop_gpu_miner(
+                        app_handle.clone(),
+                        Some("stopped: app exiting".to_string()),
+                    )
+                    .await;
+
+                    // RAM plan Phase 1.2 (2026-09-22): the wallet-rpc
+                    // sidecars had NO exit-time stop at all — every session
+                    // leaked them, measured at 7 orphans / 245 MB with the
+                    // app fully closed (wallet-ram-and-process-review.md
+                    // F-series). Each call below releases the SAME lease/claim
+                    // the base wallet's OWN panels release on their normal
+                    // stop paths, so this changes nothing about WHEN a
+                    // process is allowed to die — it just makes sure exit
+                    // actually asks.
+                    //
+                    // XMR/ZPH: releasing only the `Session` lease is
+                    // deliberate, not an oversight — if `SwapEngine` still
+                    // holds its own lease (a swap genuinely in flight), the
+                    // process correctly stays up for `on_exit_requested`'s
+                    // own swap-engine shutdown ladder (kicked off above) to
+                    // use, and the existing orphan-now/reconcile-next
+                    // pidfile cleanup on next launch is the crash net for
+                    // that rare case — see `xmr_stop_rpc`/`zph_stop_rpc`'s
+                    // own lease-gating, which this does not bypass.
+                    #[cfg(feature = "full")]
+                    {
+                        let _ =
+                            xmr_rpc::xmr_stop_rpc(app_handle.clone(), xmr_rpc::XmrLease::Session)
+                                .await;
+                        let _ = zph_rpc::zph_stop_rpc(
+                            app_handle.clone(),
+                            Some(zph_rpc::ZphLease::Session),
+                        )
+                        .await;
+                        // Zano's claim model is NOT a lease set like XMR/ZPH:
+                        // `stop_keeps_main` only keeps Main alive for a
+                        // `lock=true` caller (the app's own Lock button) while
+                        // the swap node holds a claim. `lock=false` — what any
+                        // OTHER caller including this one passes — already
+                        // always stops Main regardless of the claim, so this
+                        // exit call needs no special bypass; it is exactly
+                        // what a normal non-Lock stop already does.
+                        let _ = zano_rpc::zano_stop_rpc(app_handle.clone(), Some(false)).await;
+                        // Xelis has no lease/claim gating at all — always stops.
+                        let _ = xelis_rpc::xelis_stop_rpc(app_handle).await;
+                    }
                 });
             }
         });

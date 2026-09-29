@@ -35,6 +35,16 @@
 //! and it will NOT be a hand-rolled native process walk. Set
 //! `PWNDA_MEM_GUARD=0` to disable, `PWNDA_MEM_GUARD_MB=<n>` to tune.
 //!
+//! **What it measures (RAM plan 3.4, 2026-09-25).** Until 3.4 the breaker read
+//! the summed WORKING SET of the WebView2 processes. `MemoryUsageLevel::Low`
+//! trims that working set every time the window loses focus, so a leaking
+//! renderer read a few hundred MB while its COMMIT - what the pagefile backs,
+//! and what grew the operator's pagefile on 2026-09-24 - sat at 7.4 GB. The
+//! breaker could not fire on the leak it exists for. It now reads the commit
+//! of the largest single renderer (`mem_watch::latest_renderer_commit_mb`),
+//! and falls back to the old working-set reading, with the old threshold, only
+//! when the sampler could not type a renderer. See [`pick_reading`].
+//!
 //! Windows-only; a no-op elsewhere (WebView2 is the Windows backend and this
 //! leak does not exist on the WebKitGTK / macOS backends).
 
@@ -49,17 +59,69 @@ use std::time::{Duration, Instant};
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Reload when the webview renderer's summed RSS exceeds this many MB. The
-/// canvas build idles around 200–400 MB. Lowered 3072 -> 2048 on 2026-06-02
-/// after the rebuilt-binary session (`mem-native-20260603T024702Z`) showed a
-/// residual *focused-climb* during active mining that peaked ~1,877 MB and
-/// was still rising when the window blurred. A 2 GB cap resets that climb via
-/// reload before it grows further, while still sitting well clear of the
-/// idle baseline (so it won't fire during normal blurred/idle operation).
-/// The host has tens of GB free at 2 GB, so the reload is calm. Until the
-/// residual is fixed at the source (see the mem-frontend trace), this keeps
-/// the focused peak bounded. Override with `PWNDA_MEM_GUARD_MB`.
-#[cfg(target_os = "windows")]
-const DEFAULT_THRESHOLD_MB: u64 = 2048;
+/// canvas build idles around 200–400 MB. Was 2048 from 2026-06-02 (after a
+/// residual *focused-climb* during active mining peaked ~1,877 MB); raised to
+/// 4096 as part of the RAM plan Phase 1.4 fix (2026-09-22) alongside gating
+/// the reload on lock state (see `run`'s vault-unlock check below) — with
+/// that gate in place an unlocked long session no longer gets silently
+/// reloaded at all, so the raise is about the LOCKED case: a locked/idle
+/// window sitting at the host/home screen has no in-progress state to lose,
+/// so there is less reason to reclaim its memory aggressively, and a higher
+/// threshold means fewer reload cycles for a window that was already safe to
+/// reload at 2048. The host has tens of GB free at 4 GB, so the reload is
+/// still calm. Override with `PWNDA_MEM_GUARD_MB`.
+///
+/// Since RAM plan 3.4 this is only the FALLBACK threshold - used when the
+/// sample has no typed renderer and the guard reads working set as before.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const DEFAULT_WS_THRESHOLD_MB: u64 = 4096;
+
+/// Reload when the largest renderer's COMMIT exceeds this many MB (RAM plan
+/// 3.4, 2026-09-25). A fresh renderer commits ~100 MB (105 MB measured on the
+/// dev host); the pre-3.6 dev build grew it ~150 MB/h and reached 7.4 GB, the
+/// production build ~13 MB/h. 3 GB is ~30x a fresh renderer - far past
+/// anything a healthy session reaches, well before the pagefile pressure of
+/// 2026-06-02. What a healthy renderer commits after DAYS is not yet measured
+/// (Phase 4); if the breaker ever fires on a session that was not leaking,
+/// raise this rather than trusting the number. `PWNDA_MEM_GUARD_MB` overrides
+/// both thresholds.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+const DEFAULT_COMMIT_THRESHOLD_MB: u64 = 3072;
+
+/// One breaker reading: the value, the threshold it is judged against, and
+/// the name of what was measured (for the log line).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) struct Reading {
+    pub mb: u64,
+    pub threshold_mb: u64,
+    pub metric: &'static str,
+}
+
+impl Reading {
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    pub fn over(&self) -> bool {
+        self.mb >= self.threshold_mb
+    }
+}
+
+/// Which measurement the breaker judges this tick (RAM plan 3.4). Renderer
+/// commit when the sampler typed a renderer, else the WebView2 working set
+/// against its own (higher) threshold, else nothing. Never mixes one metric's
+/// value with the other's threshold. Pure, so the choice is tested on every
+/// platform even though the breaker only runs on Windows.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn pick_reading(
+    renderer_commit_mb: Option<u64>,
+    webview_ws_mb: Option<u64>,
+    commit_threshold_mb: u64,
+    ws_threshold_mb: u64,
+) -> Option<Reading> {
+    if let Some(mb) = renderer_commit_mb {
+        return Some(Reading { mb, threshold_mb: commit_threshold_mb, metric: "renderer commit" });
+    }
+    webview_ws_mb.map(|mb| Reading { mb, threshold_mb: ws_threshold_mb, metric: "webview working set" })
+}
 
 /// Windows this guard must NOT reload — surfaces the wallet does not own.
 ///
@@ -88,13 +150,16 @@ pub fn attach(app: &tauri::AppHandle) {
         eprintln!("[mem-guard] disabled via PWNDA_MEM_GUARD");
         return;
     }
-    let threshold_mb = std::env::var("PWNDA_MEM_GUARD_MB")
+    // One override for both metrics: whichever the guard ends up reading,
+    // the operator asked for this number.
+    let override_mb = std::env::var("PWNDA_MEM_GUARD_MB")
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
-        .filter(|n| *n >= 256) // refuse an absurdly low threshold that would thrash-reload
-        .unwrap_or(DEFAULT_THRESHOLD_MB);
+        .filter(|n| *n >= 256); // refuse an absurdly low threshold that would thrash-reload
+    let commit_threshold_mb = override_mb.unwrap_or(DEFAULT_COMMIT_THRESHOLD_MB);
+    let ws_threshold_mb = override_mb.unwrap_or(DEFAULT_WS_THRESHOLD_MB);
     let app = app.clone();
-    tauri::async_runtime::spawn(async move { run(app, threshold_mb).await });
+    tauri::async_runtime::spawn(async move { run(app, commit_threshold_mb, ws_threshold_mb).await });
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -104,12 +169,14 @@ pub fn attach(_app: &tauri::AppHandle) {
 }
 
 #[cfg(target_os = "windows")]
-async fn run(app: tauri::AppHandle, threshold_mb: u64) {
+async fn run(app: tauri::AppHandle, commit_threshold_mb: u64, ws_threshold_mb: u64) {
     use tauri::Manager;
 
     eprintln!(
-        "[mem-guard] webview RSS circuit-breaker armed: threshold {} MB, poll {}s",
-        threshold_mb,
+        "[mem-guard] webview memory circuit-breaker armed: renderer commit >= {} MB \
+         (working set >= {} MB if no renderer is typed), poll {}s",
+        commit_threshold_mb,
+        ws_threshold_mb,
         POLL_INTERVAL.as_secs()
     );
 
@@ -118,11 +185,16 @@ async fn run(app: tauri::AppHandle, threshold_mb: u64) {
     loop {
         ticker.tick().await;
 
-        let rss_mb = match webview_rss_mb() {
-            Some(mb) => mb,
+        let reading = match pick_reading(
+            crate::mem_watch::latest_renderer_commit_mb(),
+            webview_rss_mb(),
+            commit_threshold_mb,
+            ws_threshold_mb,
+        ) {
+            Some(r) => r,
             None => continue, // measurement hiccup — skip this tick, never fatal
         };
-        if rss_mb < threshold_mb {
+        if !reading.over() {
             continue;
         }
 
@@ -131,16 +203,16 @@ async fn run(app: tauri::AppHandle, threshold_mb: u64) {
         if let Some(t) = last_reload {
             if t.elapsed() < MIN_RELOAD_INTERVAL {
                 eprintln!(
-                    "[mem-guard] webview RSS {} MB still >= {} MB but within reload cooldown — holding",
-                    rss_mb, threshold_mb
+                    "[mem-guard] {} {} MB still >= {} MB but within reload cooldown — holding",
+                    reading.metric, reading.mb, reading.threshold_mb
                 );
                 continue;
             }
         }
 
-        // Reload the wallet's OWN webview windows. Mining keeps running
-        // (backend-owned); this only resets the UI renderer and frees its
-        // leaked memory.
+        // Request a reload of the wallet's OWN webview windows. Mining keeps
+        // running (backend-owned); a reload only resets the UI renderer and
+        // frees its leaked memory.
         //
         // # Why this is not "every window" (2026-08-21)
         //
@@ -149,7 +221,7 @@ async fn run(app: tauri::AppHandle, threshold_mb: u64) {
         // DOM loses nothing.* That is true of surfaces this project wrote. It
         // is FALSE of [`SKIP_RELOAD_LABELS`] below, which renders upstream's
         // BasicSwap UI — a reload there discards whatever the user had typed,
-        // and the realistic moment for a 2 GB RSS threshold to trip is a long
+        // and the realistic moment for a high RSS threshold to trip is a long
         // session, which is exactly when a half-filled bid form is on screen.
         // Losing a bid form is a bad outcome; losing an in-flight swap is not
         // possible (the engine owns that), but the form is not recoverable.
@@ -157,7 +229,25 @@ async fn run(app: tauri::AppHandle, threshold_mb: u64) {
         // Enumerated by label rather than by "is it the main window" so a
         // future second wallet-owned window keeps the leak protection by
         // default, and only surfaces we do NOT own are opted out.
-        let mut reloaded = false;
+        //
+        // # Vault-lock gate (RAM plan Phase 1.4, 2026-09-22 — F2 fix)
+        //
+        // Before this, EVERY reload wiped the in-memory vault session
+        // unconditionally — `location.reload()` is a full page navigation,
+        // so an actively unlocked session got silently logged out by a
+        // background memory sweep with zero warning. Rust has no visibility
+        // into frontend vault state (it lives entirely in React state, never
+        // sent over IPC), so rather than build a new command + AppState
+        // field for one boolean, the injected script reads
+        // `window.__pwndaVaultUnlocked` — a plain global the frontend
+        // mirrors from `sessionPassword` (`AppStateContext.tsx`) — and skips
+        // the reload while it is explicitly `true`. Anything else (`false`,
+        // `undefined`, or the check itself throwing) is treated as safe to
+        // reload: this is the hard safety net the module's own doc comment
+        // describes, and it must fail TOWARD its original unconditional
+        // behavior, never toward silently becoming a permanent no-op because
+        // a future page forgot to set the flag.
+        let mut requested = 0usize;
         for (label, win) in app.webview_windows() {
             if SKIP_RELOAD_LABELS.contains(&label.as_str()) {
                 eprintln!(
@@ -166,17 +256,31 @@ async fn run(app: tauri::AppHandle, threshold_mb: u64) {
                 );
                 continue;
             }
-            // Leave a breadcrumb the reloaded UI can read (to show a notice
-            // or restore view); harmless if ignored.
+            // Leave a breadcrumb the reloaded UI can read (App.tsx reads +
+            // clears `pwnda.memGuardReloadAt` on mount to explain the reload
+            // instead of landing on login with zero context) — set only
+            // when the reload actually proceeds, so a deferred (vault
+            // unlocked) tick never produces a misleading breadcrumb.
             let _ = win.eval(
-                "try{sessionStorage.setItem('pwnda.memGuardReloadAt',String(Date.now()))}catch(e){}window.location.reload()",
+                "try{\
+                   if(window.__pwndaVaultUnlocked===true){\
+                     /* vault unlocked — deferred, not reloaded */\
+                   }else{\
+                     sessionStorage.setItem('pwnda.memGuardReloadAt',String(Date.now()));\
+                     window.location.reload();\
+                   }\
+                 }catch(e){window.location.reload();}",
             );
-            reloaded = true;
+            requested += 1;
         }
-        if reloaded {
+        // We cannot get a return value back from `eval` here (fire-and-
+        // forget, same as the breadcrumb write always was), so "requested"
+        // vs "actually reloaded" can't be distinguished from the Rust side —
+        // logged as a request only.
+        if requested > 0 {
             eprintln!(
-                "[mem-guard] webview RSS {} MB >= {} MB threshold -> reloaded webview to reclaim renderer memory (mining unaffected)",
-                rss_mb, threshold_mb
+                "[mem-guard] {} {} MB >= {} MB threshold -> requested a reload on {} window(s) to reclaim renderer memory (skipped for any window whose vault is unlocked; mining unaffected either way)",
+                reading.metric, reading.mb, reading.threshold_mb, requested
             );
             last_reload = Some(Instant::now());
         }
@@ -199,4 +303,51 @@ async fn run(app: tauri::AppHandle, threshold_mb: u64) {
 #[cfg(target_os = "windows")]
 fn webview_rss_mb() -> Option<u64> {
     crate::mem_watch::latest_webview_mb()
+}
+
+/// RAM plan 3.4 (2026-09-25): which measurement the breaker judges.
+#[cfg(test)]
+mod pick_reading_tests {
+    use super::{pick_reading, DEFAULT_COMMIT_THRESHOLD_MB, DEFAULT_WS_THRESHOLD_MB};
+
+    const C: u64 = DEFAULT_COMMIT_THRESHOLD_MB;
+    const W: u64 = DEFAULT_WS_THRESHOLD_MB;
+
+    #[test]
+    fn renderer_commit_wins_when_present() {
+        // The 2026-09-24 shape: working set trimmed to a few hundred MB,
+        // commit in the GB. The old guard read the first number and slept.
+        let r = pick_reading(Some(7_400), Some(550), C, W).unwrap();
+        assert_eq!(r.metric, "renderer commit");
+        assert_eq!(r.mb, 7_400);
+        assert!(r.over(), "the leak the breaker exists for must trip it");
+    }
+
+    #[test]
+    fn falls_back_to_working_set_with_its_own_threshold() {
+        let r = pick_reading(None, Some(3_500), C, W).unwrap();
+        assert_eq!(r.metric, "webview working set");
+        assert_eq!(r.threshold_mb, W);
+        assert!(
+            !r.over(),
+            "3.5 GB of working set is under the 4 GB WS threshold - judging it \
+             against the 3 GB COMMIT threshold would reload a healthy window"
+        );
+    }
+
+    #[test]
+    fn nothing_measured_is_no_reading_not_a_zero() {
+        assert_eq!(pick_reading(None, None, C, W), None);
+    }
+
+    #[test]
+    fn a_healthy_renderer_is_under() {
+        assert!(!pick_reading(Some(105), Some(160), C, W).unwrap().over());
+    }
+
+    #[test]
+    fn the_threshold_is_inclusive() {
+        assert!(pick_reading(Some(C), None, C, W).unwrap().over());
+        assert!(!pick_reading(Some(C - 1), None, C, W).unwrap().over());
+    }
 }

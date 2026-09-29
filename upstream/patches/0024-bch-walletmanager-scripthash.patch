@@ -43,8 +43,8 @@ every other caller. A comment describing a trap does not disarm it.
       _computeScripthash came to disagree with _deriveAddress; leaving the
       duplicate in place would have re-armed it.
 
-Found by porting the reference port's own BCH scripthash harness
-into scripts/swap/. That harness compares
+Found by porting the REU26 research repo's own BCH scripthash harness
+(zephyr-testnet/bch-electrum-evidence) into scripts/swap/. That harness compares
 FOUR independent scripthash implementations over 16 derived addresses; against
 the Grove it reported _computeScripthash returning "" for all 16 while the other
 three agreed exactly. The Grove's own offline suite could not have found it: it

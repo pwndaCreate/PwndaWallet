@@ -87,7 +87,7 @@ index ac81ad8..d0f8dec 100644
 --- a/basicswap/interface/zano/zano.py
 +++ b/basicswap/interface/zano/zano.py
 @@ -815,6 +815,85 @@ class ZanoInterface(CoinInterface):
-         DEFAULT_ZANO_FEE_ATOMIC = 10000000000  # 0.01 ZANO, matches reference-port rung1/2's observed fee
+         DEFAULT_ZANO_FEE_ATOMIC = 10000000000  # 0.01 ZANO, matches REU26 rung1/2's observed fee
          return float(self.format_amount(DEFAULT_ZANO_FEE_ATOMIC)), "zano_default_fee"
  
 +    def validateFeeRate(

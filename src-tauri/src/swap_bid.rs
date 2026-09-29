@@ -1697,7 +1697,10 @@ mod unpark_tests {
     /// Structural: the wallet-key push is what the janitor reads as an unlock.
     #[test]
     fn the_wallet_key_push_is_the_unlock_signal() {
-        let src = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let src = include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let f = &src[src
             .find("pub async fn swap_sidecar_set_wallet_key(")
             .expect("key push moved")..];

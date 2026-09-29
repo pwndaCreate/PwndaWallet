@@ -217,7 +217,7 @@ pub(crate) async fn accept_and_persist(
     // `clientChainAPubkey` is `,omitempty` on the wire and the desk never reads
     // it: `Coordinator.Accept()` mints only the DESK's own material and returns
     // M1; the client's chain-A pubkey is consumed solely at `SubmitKeys`/M2,
-    // which requires `State==ACCEPTED`. That matches section 8.1 of the swap protocol, where M2
+    // which requires `State==ACCEPTED`. That matches REU26 8.1, where M2
     // `SwapAccept` is what carries the client's key material (confirmed by the
     // desk in `DESK-ANSWER-v6.md`).
     //

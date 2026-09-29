@@ -10,10 +10,6 @@
 /src-tauri/resources/miners-linux
 /src/mining
 
-# Reference source fetched at the pinned commit by the CI workflow
-/upstream/basicswap
-/upstream/coincurve
-
 # Local environment
 .env
 .env.local

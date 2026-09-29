@@ -1,0 +1,107 @@
+- generic [ref=e3]:
+  - link "Skip to wallet content" [ref=e4] [cursor=pointer]:
+    - /url: "#pwnda-main-content"
+  - generic [ref=e6]:
+    - generic:
+      - generic: PWNDA
+      - generic: wallet · v2.0.1
+    - generic: idle
+    - generic [ref=e7]:
+      - button "Minimize" [ref=e8] [cursor=pointer]
+      - button "Close" [ref=e11] [cursor=pointer]
+  - generic [ref=e15]:
+    - banner [ref=e16]:
+      - heading "PWNDA WALLET" [level=1] [ref=e792]
+      - button "► Lock" [ref=e20] [cursor=pointer]
+    - generic [ref=e881]:
+      - generic [ref=e882]:
+        - generic [ref=e883]: swap · cross-chain
+        - generic [ref=e884]: Exchange assets
+      - generic [ref=e885]:
+        - generic [ref=e886]:
+          - tab "Auto Best" [ref=e887] [cursor=pointer]
+          - tab "SwapKit" [ref=e888] [cursor=pointer]
+          - tab "NEAR" [selected] [ref=e889] [cursor=pointer]
+          - tab "Desk" [ref=e890] [cursor=pointer]
+          - tab "Zephyr ↺" [ref=e891] [cursor=pointer]
+        - button "history" [ref=e892] [cursor=pointer]
+      - generic [ref=e893]:
+        - status [ref=e894]:
+          - generic [ref=e895]: ℹ
+          - generic [ref=e896]: Routing through NEAR Intents (cross-chain bridge). Quotes are live; nothing moves until you confirm a swap.
+        - generic [ref=e897]:
+          - generic [ref=e898]: "ⓘMin: 0.99 ETH (~$3445.80) for ETH → BTC"
+          - generic [ref=e899]: (receives ~$3475.00 of BTC; send more to receive more)
+        - generic [ref=e900]:
+          - generic [ref=e901]:
+            - generic [ref=e902]: you send
+            - generic [ref=e903]: "bal: 0 ETH"
+          - generic [ref=e904]:
+            - textbox "0.00" [ref=e905]
+            - button "ETH ▾" [ref=e907] [cursor=pointer]
+          - generic [ref=e985]:
+            - generic [ref=e986]: network
+            - generic [ref=e987]: on Ethereum
+          - generic [ref=e988]:
+            - button "25%" [ref=e989] [cursor=pointer]
+            - button "50%" [ref=e990] [cursor=pointer]
+            - button "75%" [ref=e991] [cursor=pointer]
+            - button "MAX" [ref=e992] [cursor=pointer]
+        - button "⇅" [ref=e994] [cursor=pointer]
+        - generic [ref=e995]:
+          - generic [ref=e996]: you receive
+          - generic [ref=e997]:
+            - generic [ref=e998]: "0.00"
+            - button "BTC ▾" [ref=e1001] [cursor=pointer]
+          - generic [ref=e1046]:
+            - generic [ref=e1047]: network
+            - generic [ref=e1048]: on Bitcoin
+        - generic [ref=e1049]: Enter an amount to see the quote, fee, and minimum received.
+        - button "Enter amount" [disabled] [ref=e1052]
+      - generic [ref=e1054]: popular pairs
+      - generic [ref=e1058]:
+        - button "→ ETH/BTC 0.03651" [ref=e1059] [cursor=pointer]:
+          - generic [ref=e1060]:
+            - generic [ref=e1136]: →
+            - img [ref=e1137]
+          - generic [ref=e1179]:
+            - generic [ref=e1180]: ETH/BTC
+            - generic [ref=e1181]: "0.03651"
+        - button "→ BTC/ETH 27.3923" [ref=e1182] [cursor=pointer]:
+          - generic [ref=e1183]:
+            - img [ref=e1184]
+            - generic [ref=e1226]: →
+          - generic [ref=e1302]:
+            - generic [ref=e1303]: BTC/ETH
+            - generic [ref=e1304]: "27.3923"
+        - button "→ ETH/XMR 21.4932" [ref=e1305] [cursor=pointer]:
+          - generic [ref=e1306]:
+            - generic [ref=e1382]: →
+            - img [ref=e1383]
+          - generic [ref=e1425]:
+            - generic [ref=e1426]: ETH/XMR
+            - generic [ref=e1427]: "21.4932"
+        - button "→ XMR/ZEPH 107.0623" [ref=e1428] [cursor=pointer]:
+          - generic [ref=e1429]:
+            - img [ref=e1430]
+            - generic [ref=e1472]: →
+            - img [ref=e1473]
+          - generic [ref=e1515]:
+            - generic [ref=e1516]: XMR/ZEPH
+            - generic [ref=e1517]: "107.0623"
+  - generic [ref=e776]:
+    - button "◈ Wallet" [ref=e777] [cursor=pointer]:
+      - generic [ref=e778]: ◈
+      - generic [ref=e779]: Wallet
+    - button "⇄ Swap" [active] [ref=e780] [cursor=pointer]:
+      - generic [ref=e781]: ⇄
+      - generic [ref=e782]: Swap
+    - button "⛏ Mine" [ref=e783] [cursor=pointer]:
+      - generic [ref=e784]: ⛏
+      - generic [ref=e785]: Mine
+    - button "≡ Activity" [ref=e786] [cursor=pointer]:
+      - generic [ref=e787]: ≡
+      - generic [ref=e788]: Activity
+    - button "⚙ Settings" [ref=e789] [cursor=pointer]:
+      - generic [ref=e790]: ⚙
+      - generic [ref=e791]: Settings

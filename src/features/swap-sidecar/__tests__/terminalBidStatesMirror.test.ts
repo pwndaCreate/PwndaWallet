@@ -28,12 +28,6 @@ import {
 
 const JSON_PATH = path.join("scripts", "swap", "terminal-bid-states.json");
 
-// The operator swap tooling (scripts/swap/) is private, so a checkout of the
-// public repository has no mirror to compare against; skip there rather than
-// fail. In the development tree (the project wiki is present) a missing mirror
-// still FAILS.
-const MIRROR_ABSENT = !fs.existsSync(JSON_PATH) && !fs.existsSync("PwndaWalletVault");
-
 function fromDisk(): string[] {
   const raw = JSON.parse(fs.readFileSync(JSON_PATH, "utf8")) as {
     terminal: string[];
@@ -47,7 +41,7 @@ function fromSource(): string[] {
   );
 }
 
-describe.skipIf(MIRROR_ABSENT)("terminal-bid-states.json", () => {
+describe("terminal-bid-states.json", () => {
   it("matches bidStates.ts exactly", () => {
     // Sorted, because the JSON is generated in declaration order and neither
     // side should care about that.

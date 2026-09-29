@@ -133,6 +133,16 @@ impl MinerLane {
             MinerLane::Gpu => "gpu",
         }
     }
+
+    /// The executable this lane runs, for `mining-events.jsonl` (Phase 0.3).
+    /// GPU is always SRBMiner-MULTI now — lolMiner was retired (see
+    /// `RETIRED_MINER_EXECUTABLES`).
+    fn miner_binary(self) -> &'static str {
+        match self {
+            MinerLane::Cpu => "xmrig",
+            MinerLane::CpuSrb | MinerLane::Gpu => "SRBMiner-MULTI",
+        }
+    }
 }
 
 /// Result of one liveness poll.
@@ -143,7 +153,520 @@ enum LaneState {
     /// ran: the user stopped on purpose. Exit quietly, emit nothing.
     UserStopped,
     /// The tracked process exited while we still believed it was mining.
+    /// Carries `ExitStatus::code()` when the OS gave us one, for
+    /// `mining-events.jsonl` (Phase 0.3) — this is the ONE place in the
+    /// death-watch/stop-command family that reads a real exit status, so it
+    /// is the sole writer of `reason: "died"` events.
+    Died(Option<i32>),
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Mining-events log (RAM plan Phase 0.3, 2026-09-22)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Five in-app miner stops were unexplained going into the RAM review
+// (wallet-ram-and-process-review.md) because nothing recorded WHY a lane
+// went quiet — `MINER_PROCESS_DIED` fires but the exit code was never
+// captured, and a user-initiated stop left no trace at all. This closes
+// that gap with one JSONL line per stop, in three coarse buckets.
+
+/// Why a miner lane stopped, for `mining-events.jsonl`. Coarse by design —
+/// the frontend's own free-text `reason` strings (SOCKS5 rotation copy,
+/// etc.) are preserved verbatim in `detail` so nothing is lost, but the
+/// top-level field stays a fixed, greppable vocabulary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StopReason {
+    /// The user clicked Stop (directly, or via the "turn mining off"
+    /// opt-out / a lane switch) — no `reason` string was supplied.
+    User,
+    /// A backend policy stopped the lane without the user asking (SOCKS5
+    /// proxy exhaustion / auto-rotation today). Free text lands in `detail`.
+    Disable,
+    /// The process exited on its own. Logged ONLY from
+    /// `spawn_miner_death_watch`'s `Died` branch — see `LaneState::Died`.
     Died,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            StopReason::User => "user",
+            StopReason::Disable => "disable",
+            StopReason::Died => "died",
+        }
+    }
+}
+
+/// Classify a stop command's free-text `reason` param into the coarse
+/// `StopReason` vocabulary. `None` back means "don't log" — used so the
+/// frontend's post-death cleanup calls (`stop_xmrig`/`stop_srbminer_cpu`
+/// with a "…miner process died…" reason, fired after `MINER_PROCESS_DIED`)
+/// don't duplicate the line the death watch already wrote with the real
+/// exit code.
+pub(crate) fn classify_stop_reason(reason: &Option<String>) -> Option<StopReason> {
+    match reason {
+        None => Some(StopReason::User),
+        Some(r) if r.to_ascii_lowercase().contains("died") => None,
+        Some(_) => Some(StopReason::Disable),
+    }
+}
+
+/// Append one line to `mining-events.jsonl`, next to `mem-native-*.jsonl` /
+/// `mem-frontend-*.jsonl` so a session's process-memory trace and its
+/// mining-lane history can be read together. Same dev-only gate as those
+/// two (`cfg!(debug_assertions)` or `PWNDA_MEM_WATCH=1`) — best-effort,
+/// never fails the caller.
+fn log_mining_event(
+    app: &AppHandle,
+    lane: MinerLane,
+    miner: &str,
+    reason: StopReason,
+    detail: Option<&str>,
+    exit_code: Option<i32>,
+) {
+    let enabled = cfg!(debug_assertions)
+        || matches!(
+            std::env::var("PWNDA_MEM_WATCH").as_deref(),
+            Ok("1") | Ok("true") | Ok("on")
+        );
+    if !enabled {
+        return;
+    }
+    use std::io::Write;
+    use tauri::Manager;
+    let Ok(dir) = app.path().app_log_dir() else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    // One file per process run, not per mining session — stop/death events
+    // are comparatively rare, so this doesn't need `mem_watch`'s per-session
+    // rotation.
+    static PATH: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    let path = PATH.get_or_init(|| {
+        let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        Some(dir.join(format!("mining-events-{}.jsonl", stamp)))
+    });
+    let Some(path) = path.as_ref() else {
+        return;
+    };
+    let line = serde_json::json!({
+        "t": chrono::Utc::now().timestamp_millis(),
+        "lane": lane.as_str(),
+        "miner": miner,
+        "reason": reason.as_str(),
+        "detail": detail,
+        "exitCode": exit_code,
+    });
+    if let Ok(text) = serde_json::to_string(&line) {
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(text.as_bytes());
+            let _ = f.write_all(b"\n");
+        }
+    }
+}
+
+/// RAM plan Phase 2M.4 (2026-09-23): xmrig liveness from the process handle.
+///
+/// The precedence logic is pure and tested directly. The Windows handle probe
+/// is tested against REAL processes - including a handle opened WITHOUT the
+/// SYNCHRONIZE right, which is the one case this whole design hinges on and the
+/// one a UAC-elevated launch cannot be driven to produce from a test.
+#[cfg(test)]
+mod xmrig_liveness_tests {
+    use super::{combine_liveness, HandleStatus, WatcherStatus, XmrigLiveness};
+
+    #[test]
+    fn no_tracked_pid_is_not_running_whatever_else_says() {
+        assert_eq!(
+            combine_liveness(false, Some(HandleStatus::Running), Some(WatcherStatus::Running), true),
+            XmrigLiveness::NotRunning
+        );
+    }
+
+    #[test]
+    fn a_waitable_handle_is_definitive_and_carries_the_real_exit_code() {
+        assert_eq!(
+            combine_liveness(true, Some(HandleStatus::Exited(Some(7))), None, false),
+            XmrigLiveness::Exited(Some(7))
+        );
+        assert_eq!(
+            combine_liveness(true, Some(HandleStatus::Running), None, false),
+            XmrigLiveness::Alive
+        );
+    }
+
+    #[test]
+    fn the_handle_overrides_a_watcher_that_died_early() {
+        // The false-death case: PowerShell was killed while xmrig lives. The
+        // old code reported a miner death; a waitable handle says otherwise.
+        assert_eq!(
+            combine_liveness(
+                true,
+                Some(HandleStatus::Running),
+                Some(WatcherStatus::Exited(Some(0))),
+                false
+            ),
+            XmrigLiveness::Alive
+        );
+    }
+
+    #[test]
+    fn an_unwaitable_handle_defers_to_the_watcher() {
+        assert_eq!(
+            combine_liveness(true, Some(HandleStatus::Unknown), Some(WatcherStatus::Running), false),
+            XmrigLiveness::Alive
+        );
+        assert_eq!(
+            combine_liveness(true, None, Some(WatcherStatus::Exited(None)), false),
+            XmrigLiveness::Exited(None)
+        );
+    }
+
+    #[test]
+    fn the_watchers_exit_code_is_used_only_where_the_watcher_is_the_miner() {
+        // Windows: the watcher is PowerShell, its status is meaningless.
+        assert_eq!(
+            combine_liveness(true, None, Some(WatcherStatus::Exited(Some(0))), false),
+            XmrigLiveness::Exited(None)
+        );
+        // Linux: the "watcher" slot holds xmrig itself.
+        assert_eq!(
+            combine_liveness(true, None, Some(WatcherStatus::Exited(Some(139))), true),
+            XmrigLiveness::Exited(Some(139))
+        );
+    }
+
+    #[test]
+    fn nothing_to_ask_is_unknown_never_a_guessed_death() {
+        assert_eq!(combine_liveness(true, None, None, false), XmrigLiveness::Unknown);
+        assert_eq!(
+            combine_liveness(true, Some(HandleStatus::Unknown), None, false),
+            XmrigLiveness::Unknown
+        );
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod handle_status_tests {
+    use super::{handle_status, HandleStatus};
+    use std::os::windows::io::AsRawHandle;
+    use std::process::{Command, Stdio};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE};
+
+    fn raw(child: &std::process::Child) -> HANDLE {
+        HANDLE(child.as_raw_handle())
+    }
+
+    /// Poll until `f` returns true or `secs` elapse.
+    fn wait_until(secs: u64, mut f: impl FnMut() -> bool) -> bool {
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+        while std::time::Instant::now() < end {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        false
+    }
+
+    #[test]
+    fn a_live_process_reads_running_and_never_blocks() {
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        let t = std::time::Instant::now();
+        let st = handle_status(raw(&child));
+        assert_eq!(st, HandleStatus::Running);
+        assert!(t.elapsed() < std::time::Duration::from_millis(500), "must be non-blocking");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn a_killed_process_reads_exited_with_its_own_code() {
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        assert_eq!(handle_status(raw(&child)), HandleStatus::Running);
+        child.kill().expect("kill");
+        assert!(
+            wait_until(5, || matches!(handle_status(raw(&child)), HandleStatus::Exited(_))),
+            "the handle never reported the exit"
+        );
+        // `Child::kill` terminates with exit code 1.
+        assert_eq!(handle_status(raw(&child)), HandleStatus::Exited(Some(1)));
+        let _ = child.wait();
+    }
+
+    /// The point of using the handle: the exit code is the PROCESS's, where the
+    /// PowerShell watcher reported 0 no matter what happened to its target.
+    #[test]
+    fn the_exit_code_is_the_processs_not_zero() {
+        let child = Command::new("cmd")
+            .args(["/C", "exit 7"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn cmd");
+        assert!(
+            wait_until(5, || matches!(handle_status(raw(&child)), HandleStatus::Exited(_))),
+            "never exited"
+        );
+        assert_eq!(handle_status(raw(&child)), HandleStatus::Exited(Some(7)));
+        let mut child = child;
+        let _ = child.wait();
+    }
+
+    /// THE case the launch probe exists for: a handle without SYNCHRONIZE.
+    /// `WaitForSingleObject` on it fails (access denied), which must read as
+    /// `Unknown` - so the launch path does NOT treat it as waitable and spawns
+    /// the PowerShell watcher - and must never read as "exited".
+    #[test]
+    fn a_handle_without_synchronize_is_unknown_not_dead() {
+        let mut child = Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn ping");
+        // PROCESS_TERMINATE only: the same right the app's own retained
+        // handle is documented to carry - and deliberately no SYNCHRONIZE.
+        let h = unsafe { OpenProcess(PROCESS_TERMINATE, false, child.id()) }
+            .expect("OpenProcess(PROCESS_TERMINATE)");
+        let st = handle_status(h);
+        let _ = unsafe { CloseHandle(h) };
+        assert_eq!(
+            st,
+            HandleStatus::Unknown,
+            "an unwaitable handle must not be mistaken for Running or Exited"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(test)]
+mod mining_events_tests {
+    use super::*;
+
+    #[test]
+    fn no_reason_classifies_as_user() {
+        assert_eq!(classify_stop_reason(&None), Some(StopReason::User));
+    }
+
+    #[test]
+    fn a_died_reason_is_not_logged_here() {
+        // The death watch already wrote this event with a real exit code;
+        // the frontend's post-death cleanup call must not duplicate it.
+        assert_eq!(
+            classify_stop_reason(&Some("stopped: miner process died".to_string())),
+            None
+        );
+        assert_eq!(
+            classify_stop_reason(&Some("stopped: miner process died (unknown kind)".to_string())),
+            None,
+            "case-insensitive substring match, not an exact string"
+        );
+        assert_eq!(
+            classify_stop_reason(&Some("STOPPED: MINER PROCESS DIED".to_string())),
+            None,
+            "classification is case-insensitive"
+        );
+    }
+
+    #[test]
+    fn any_other_free_text_classifies_as_disable() {
+        for text in [
+            "stopped: SOCKS5 proxies exhausted (auto-rotation gave up)",
+            "stopped: rotating SOCKS5 proxy (upstream circuit breaker)",
+            "anything else the frontend might one day send",
+        ] {
+            assert_eq!(
+                classify_stop_reason(&Some(text.to_string())),
+                Some(StopReason::Disable),
+                "text: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_lane_reports_the_binary_it_actually_runs() {
+        assert_eq!(MinerLane::Cpu.miner_binary(), "xmrig");
+        assert_eq!(MinerLane::CpuSrb.miner_binary(), "SRBMiner-MULTI");
+        assert_eq!(
+            MinerLane::Gpu.miner_binary(),
+            "SRBMiner-MULTI",
+            "lolMiner is retired — GPU is always SRBMiner now"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// xmrig liveness (RAM plan Phase 2M.4, 2026-09-23)
+// ─────────────────────────────────────────────────────────────────────
+//
+// Before this, "is the elevated xmrig still alive?" had two answers, both
+// wasteful, and one of them wrong:
+//
+//   * `is_mining` spawned `tasklist` on EVERY call - the frontend polls it
+//     every 5 s, ~720 process spawns an hour, and matched the pid with a
+//     substring test (`stdout.contains(&pid.to_string())`).
+//   * on Windows a hidden `powershell -Command "Wait-Process -Id <pid>"` sat
+//     alive for the WHOLE session purely as an exit-watcher. Measured
+//     2026-09-23: **87 MB working set / 70 MB private / 28 threads** -
+//     more than an entire `xelis_wallet`. And its exit status is `0`
+//     whatever happened to xmrig, so the `exitCode` the death watch wrote to
+//     `mining-events.jsonl` (Phase 0.3) was PowerShell's, not xmrig's.
+//
+// The retained `ElevatedHandle` already answers the question with no process
+// at all: `WaitForSingleObject(handle, 0)` is a non-blocking exit test and
+// `GetExitCodeProcess` reads the real code. `shell_execute_elevated` already
+// waits on this same kind of handle for its one-shot commands.
+//
+// What cannot be assumed is that a handle returned by `runas` from a
+// medium-integrity process carries the SYNCHRONIZE right. So the launch path
+// PROBES it (`handle_status` == `Running`) and only skips the PowerShell
+// watcher when the probe passes; otherwise it spawns the watcher exactly as
+// before. The fallback is therefore not hypothetical - it is what happens the
+// moment the probe fails, and `handle_without_synchronize_is_unknown` below
+// forces that case against a real process.
+
+/// What one non-blocking look at a process HANDLE said.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HandleStatus {
+    /// Waitable and the process is still running.
+    Running,
+    /// Waitable and the process has exited; the exit code if it could be read.
+    Exited(Option<i32>),
+    /// The handle could not be waited on (no SYNCHRONIZE right, or invalid).
+    /// NOT evidence that the process died.
+    Unknown,
+}
+
+/// What `Child::try_wait` said, reduced to what the precedence logic needs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WatcherStatus {
+    Running,
+    Exited(Option<i32>),
+}
+
+/// The xmrig lane's answer to "is it alive?".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum XmrigLiveness {
+    /// No pid is tracked - never started, or `stop_xmrig` ran.
+    NotRunning,
+    Alive,
+    Exited(Option<i32>),
+    /// A pid is tracked but neither a usable handle nor a watcher exists.
+    Unknown,
+}
+
+/// Precedence between the sources. Pure so it can be tested without a Tauri
+/// app or a real process.
+///
+/// 1. **Handle first.** When it is waitable it is definitive, and it is the
+///    only source of xmrig's REAL exit code on Windows.
+/// 2. **Watcher second.** Its exit means xmrig exited. Its exit STATUS is
+///    xmrig's only where the watcher IS the miner (Linux); on Windows it is the
+///    PowerShell watcher's own and is discarded (`watcher_code_is_real`).
+/// 3. Otherwise **unknown** - never guessed into a death.
+///
+/// Handle-over-watcher also closes a false-death case: a watcher that died
+/// early (killed PowerShell) while xmrig lives used to be reported as a miner
+/// death; a waitable handle that says `Running` now overrides it.
+pub(crate) fn combine_liveness(
+    pid_tracked: bool,
+    handle: Option<HandleStatus>,
+    watcher: Option<WatcherStatus>,
+    watcher_code_is_real: bool,
+) -> XmrigLiveness {
+    if !pid_tracked {
+        return XmrigLiveness::NotRunning;
+    }
+    match handle {
+        Some(HandleStatus::Running) => return XmrigLiveness::Alive,
+        Some(HandleStatus::Exited(code)) => return XmrigLiveness::Exited(code),
+        Some(HandleStatus::Unknown) | None => {}
+    }
+    match watcher {
+        Some(WatcherStatus::Running) => XmrigLiveness::Alive,
+        Some(WatcherStatus::Exited(code)) => {
+            XmrigLiveness::Exited(if watcher_code_is_real { code } else { None })
+        }
+        None => XmrigLiveness::Unknown,
+    }
+}
+
+/// One non-blocking look at a Windows process HANDLE.
+///
+/// `WaitForSingleObject(h, 0)`: `WAIT_OBJECT_0` = exited, `WAIT_TIMEOUT` =
+/// running, anything else (`WAIT_FAILED` - typically ACCESS_DENIED because the
+/// handle lacks SYNCHRONIZE) = we cannot tell. Never blocks.
+///
+/// # Safety contract
+///
+/// `handle` must be a valid process handle that stays open for the duration of
+/// the call. Every caller holds the mutex that owns the handle
+/// (`MinerHandle`); `stop_xmrig` removes the handle from that slot BEFORE it
+/// closes it, so a handle reachable through the slot is never closed.
+#[cfg(target_os = "windows")]
+pub(crate) fn handle_status(handle: windows::Win32::Foundation::HANDLE) -> HandleStatus {
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+
+    let wait = unsafe { WaitForSingleObject(handle, 0) };
+    if wait == WAIT_TIMEOUT {
+        return HandleStatus::Running;
+    }
+    if wait == WAIT_OBJECT_0 {
+        let mut code: u32 = 0;
+        let read = unsafe { GetExitCodeProcess(handle, &mut code) }.is_ok();
+        // 259 == STILL_ACTIVE: the process object was signalled but the code
+        // is not final - report no code rather than a wrong one.
+        let code = if read && code != 259 { Some(code as i32) } else { None };
+        return HandleStatus::Exited(code);
+    }
+    HandleStatus::Unknown
+}
+
+/// The xmrig lane's liveness, from the tracked pid, the retained handle and the
+/// watcher child. Synchronous: every guard is taken and dropped in here.
+pub(crate) fn xmrig_liveness(app: &AppHandle) -> XmrigLiveness {
+    let pid_tracked = match app.state::<MinerPid>().0.lock() {
+        Ok(g) => g.is_some(),
+        Err(_) => return XmrigLiveness::Unknown,
+    };
+    if !pid_tracked {
+        return XmrigLiveness::NotRunning;
+    }
+
+    #[cfg(target_os = "windows")]
+    let handle = match app.state::<MinerHandle>().0.lock() {
+        Ok(g) => g.as_ref().map(|h| handle_status(h.as_handle())),
+        Err(_) => None,
+    };
+    #[cfg(not(target_os = "windows"))]
+    let handle: Option<HandleStatus> = None;
+
+    let watcher = match app.state::<MinerProcess>().0.lock() {
+        Ok(mut g) => g.as_mut().map(|child| match child.try_wait() {
+            Ok(None) => WatcherStatus::Running,
+            Ok(Some(status)) => WatcherStatus::Exited(status.code()),
+            // A wait error is not evidence of life; treat as exited, as the
+            // old `match try_wait { Err(_) => *process = None }` paths did.
+            Err(_) => WatcherStatus::Exited(None),
+        }),
+        Err(_) => None,
+    };
+
+    // On Linux the "watcher" slot IS xmrig (`start_xmrig` stores the Child
+    // itself), so its exit status is xmrig's. On Windows it is PowerShell's.
+    combine_liveness(true, handle, watcher, cfg!(not(target_os = "windows")))
 }
 
 /// Poll cadence for the death watch. 3 s sits inside the frontend's own 5 s
@@ -167,19 +690,18 @@ fn poll_lane(app: &AppHandle, lane: MinerLane) -> LaneState {
             if pid_empty {
                 return LaneState::UserStopped;
             }
-            // `MinerProcess` holds the hidden `Wait-Process -Id <xmrig pid>`
-            // child, so ITS exit is exactly "the elevated xmrig exited".
-            let proc_state = app.state::<MinerProcess>();
-            let mut guard = match proc_state.0.lock() {
-                Ok(g) => g,
-                Err(_) => return LaneState::Running,
-            };
-            match guard.as_mut() {
-                None => LaneState::UserStopped,
-                Some(child) => match child.try_wait() {
-                    Ok(Some(_)) => LaneState::Died,
-                    _ => LaneState::Running,
-                },
+            // RAM plan Phase 2M.4 (2026-09-23): liveness now comes from
+            // `xmrig_liveness` — the retained process handle first, the
+            // hidden `Wait-Process` watcher only when the handle cannot be
+            // waited on. See that function for why, and for the exit code.
+            match xmrig_liveness(app) {
+                XmrigLiveness::NotRunning => LaneState::UserStopped,
+                XmrigLiveness::Alive => LaneState::Running,
+                XmrigLiveness::Exited(code) => LaneState::Died(code),
+                // A pid is recorded but there is nothing to ask — the same
+                // "no watcher" case this arm has always treated as a quiet
+                // stop rather than inventing a death.
+                XmrigLiveness::Unknown => LaneState::UserStopped,
             }
         }
         MinerLane::CpuSrb => {
@@ -192,9 +714,9 @@ fn poll_lane(app: &AppHandle, lane: MinerLane) -> LaneState {
                 Err(_) => return LaneState::Running,
             };
             match guard.as_mut() {
-                None => LaneState::UserStopped,
+                None => adopted_lane_state(RecordLane::CpuSrb),
                 Some(child) => match child.try_wait() {
-                    Ok(Some(_)) => LaneState::Died,
+                    Ok(Some(status)) => LaneState::Died(status.code()),
                     _ => LaneState::Running,
                 },
             }
@@ -208,9 +730,9 @@ fn poll_lane(app: &AppHandle, lane: MinerLane) -> LaneState {
                 Err(_) => return LaneState::Running,
             };
             match guard.as_mut() {
-                None => LaneState::UserStopped,
+                None => adopted_lane_state(RecordLane::Gpu),
                 Some(child) => match child.try_wait() {
-                    Ok(Some(_)) => LaneState::Died,
+                    Ok(Some(status)) => LaneState::Died(status.code()),
                     _ => LaneState::Running,
                 },
             }
@@ -239,7 +761,15 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
             match poll_lane(&app, lane) {
                 LaneState::Running => continue,
                 LaneState::UserStopped => return,
-                LaneState::Died => {
+                LaneState::Died(exit_code) => {
+                    log_mining_event(
+                        &app,
+                        lane,
+                        lane.miner_binary(),
+                        StopReason::Died,
+                        None,
+                        exit_code,
+                    );
                     // Clear the lane's "are we mining" slots so `is_mining` /
                     // `is_gpu_mining` immediately report the truth even if no
                     // frontend is listening (e.g. the webview reloaded). The
@@ -262,6 +792,7 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
                             if let Ok(mut g) = pid_lock {
                                 *g = None;
                             }
+                            delete_launch_record(&app, RecordLane::CpuXmrig);
                         }
                         MinerLane::CpuSrb => {
                             let srb_state = app.state::<SrbCpuMinerProcess>();
@@ -269,6 +800,7 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
                             if let Ok(mut g) = srb_lock {
                                 *g = None;
                             }
+                            release_adopted(&app, RecordLane::CpuSrb);
                         }
                         MinerLane::Gpu => {
                             let gpu_state = app.state::<GpuMinerProcess>();
@@ -276,6 +808,7 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
                             if let Ok(mut g) = gpu_lock {
                                 *g = None;
                             }
+                            release_adopted(&app, RecordLane::Gpu);
                         }
                     }
                     crate::emit_meter::bump("mining-error");
@@ -297,6 +830,407 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
             }
         }
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Orphan adoption (2026-09-25)
+// ─────────────────────────────────────────────────────────────────────
+//
+// `start_gpu_miner` / `start_srbminer_cpu` spawn with `kill_on_drop(false)`
+// and xmrig runs elevated, so every miner outlives an app that is killed or
+// crashes before `RunEvent::ExitRequested` can stop it. The next session
+// started with empty slots: it reported the lane idle, could not stop the
+// miner, and could start a second one beside it. Observed 2026-09-25: a Zano
+// GPU SRBMiner kept hashing for an hour after its app exited at ~19:37, while
+// the relaunched app showed only the Xelis CPU session the operator had just
+// started. The operator chose to ADOPT such a miner rather than kill it.
+//
+// Each lane writes a launch record (pid, OS creation time, exe path, API port)
+// when it launches a miner and deletes it when the miner stops or dies. The
+// first status/start/stop call of a session re-opens a recorded process that
+// is still running AND still the same process — same exe path and same
+// creation time, so a reused PID is never adopted — and puts it back in its
+// lane: `is_*_mining` reports it, the stats poll finds its API port, the death
+// watch covers it, and `stop_*` ends it. Windows only: records are written
+// only where `process_identity` exists. See
+// `wiki/concepts/mining-process-management.md` § Orphan adoption.
+
+/// Which lane a launch record belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RecordLane {
+    Gpu,
+    CpuSrb,
+    CpuXmrig,
+}
+
+impl RecordLane {
+    fn file_name(self) -> &'static str {
+        match self {
+            RecordLane::Gpu => "gpu.json",
+            RecordLane::CpuSrb => "cpu-srbminer.json",
+            RecordLane::CpuXmrig => "cpu-xmrig.json",
+        }
+    }
+}
+
+/// What a lane launched, as the OS reported it at launch.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MinerLaunchRecord {
+    pub pid: u32,
+    /// Process creation time: FILETIME ticks from `GetProcessTimes`.
+    pub created: u64,
+    /// Full image path from `QueryFullProcessImageNameW`.
+    pub exe: String,
+    pub api_port: u16,
+}
+
+/// Is the live process the one the record describes? Both the image path and
+/// the creation time must match: Windows reuses PIDs, and a creation time of 0
+/// means "unknown", which never matches. Pure, so it is tested directly.
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+pub(crate) fn launch_record_matches(rec: &MinerLaunchRecord, live_exe: &str, live_created: u64) -> bool {
+    let norm = |s: &str| s.trim().replace('/', "\\").to_lowercase();
+    rec.created != 0 && rec.created == live_created && norm(&rec.exe) == norm(live_exe)
+}
+
+fn launch_record_path(app: &AppHandle, lane: RecordLane) -> Option<PathBuf> {
+    app.path()
+        .app_data_dir()
+        .ok()
+        .map(|d| d.join("miner-launches").join(lane.file_name()))
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn write_launch_record(app: &AppHandle, lane: RecordLane, rec: &MinerLaunchRecord) {
+    let Some(path) = launch_record_path(app, lane) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(json) = serde_json::to_string(rec) {
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("[miners] could not write the {:?} launch record: {}", lane, e);
+        }
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn read_launch_record(app: &AppHandle, lane: RecordLane) -> Option<MinerLaunchRecord> {
+    let path = launch_record_path(app, lane)?;
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+pub(crate) fn delete_launch_record(app: &AppHandle, lane: RecordLane) {
+    if let Some(path) = launch_record_path(app, lane) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Image path and creation time of an open process handle (the handle needs
+/// PROCESS_QUERY_LIMITED_INFORMATION, which even an elevated process grants a
+/// medium-integrity caller).
+#[cfg(target_os = "windows")]
+pub(crate) fn process_identity(handle: windows::Win32::Foundation::HANDLE) -> Option<(String, u64)> {
+    use windows::Win32::Foundation::FILETIME;
+    use windows::Win32::System::Threading::{GetProcessTimes, QueryFullProcessImageNameW, PROCESS_NAME_WIN32};
+    let mut buf = [0u16; 1024];
+    let mut len = buf.len() as u32;
+    unsafe {
+        QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, windows::core::PWSTR(buf.as_mut_ptr()), &mut len)
+    }
+    .ok()?;
+    let exe = String::from_utf16_lossy(&buf[..len as usize]);
+    let (mut created, mut exited, mut kernel, mut user) =
+        (FILETIME::default(), FILETIME::default(), FILETIME::default(), FILETIME::default());
+    unsafe { GetProcessTimes(handle, &mut created, &mut exited, &mut kernel, &mut user) }.ok()?;
+    Some((exe, ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64))
+}
+
+/// The launch record for a process this session just started, by PID.
+#[cfg(target_os = "windows")]
+pub(crate) fn launch_record_for_pid(pid: u32, api_port: u16) -> Option<MinerLaunchRecord> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid) }.ok()?;
+    let identity = process_identity(handle);
+    let _ = unsafe { CloseHandle(handle) };
+    let (exe, created) = identity?;
+    Some(MinerLaunchRecord { pid, created, exe, api_port })
+}
+
+/// Record the child a GPU / SRBMiner-CPU start just stored in its slot.
+#[cfg(target_os = "windows")]
+fn record_child_launch(app: &AppHandle, lane: RecordLane) {
+    let (pid, port) = match lane {
+        RecordLane::Gpu => {
+            let s = app.state::<GpuMinerProcess>();
+            let g = s.0.lock();
+            let pid = g.ok().and_then(|g| g.as_ref().and_then(|c| c.id()));
+            (pid, GPU_API_PORT.load(Ordering::Relaxed))
+        }
+        RecordLane::CpuSrb => {
+            let s = app.state::<SrbCpuMinerProcess>();
+            let g = s.0.lock();
+            let pid = g.ok().and_then(|g| g.as_ref().and_then(|c| c.id()));
+            (pid, SRB_CPU_API_PORT.load(Ordering::Relaxed))
+        }
+        RecordLane::CpuXmrig => return,
+    };
+    match pid.and_then(|pid| launch_record_for_pid(pid, port)) {
+        Some(rec) => write_launch_record(app, lane, &rec),
+        None => eprintln!("[miners] no launch record for the {:?} miner: its identity could not be read", lane),
+    }
+}
+
+/// Re-open a recorded process if — and only if — it is still running and is
+/// still the process the record describes. Asks for terminate rights first (an
+/// unelevated SRBMiner grants them); an elevated xmrig refuses them to a
+/// medium-integrity app, so it is re-opened for watching only. Returns the
+/// handle and whether it can terminate.
+#[cfg(target_os = "windows")]
+pub(crate) fn reopen_recorded_process(
+    rec: &MinerLaunchRecord,
+) -> Result<(windows::Win32::Foundation::HANDLE, bool), &'static str> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::{
+        OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    let watch = PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE;
+    let (handle, can_terminate) = match unsafe { OpenProcess(watch | PROCESS_TERMINATE, false, rec.pid) } {
+        Ok(h) => (h, true),
+        Err(_) => match unsafe { OpenProcess(watch, false, rec.pid) } {
+            Ok(h) => (h, false),
+            Err(_) => return Err("no such process"),
+        },
+    };
+    let same = process_identity(handle)
+        .map(|(exe, created)| launch_record_matches(rec, &exe, created))
+        .unwrap_or(false);
+    if !same {
+        let _ = unsafe { CloseHandle(handle) };
+        return Err("a different process now has this PID");
+    }
+    if handle_status(handle) != HandleStatus::Running {
+        let _ = unsafe { CloseHandle(handle) };
+        return Err("exited");
+    }
+    Ok((handle, can_terminate))
+}
+
+/// A GPU or SRBMiner-CPU miner re-opened from a previous session's launch
+/// record. (An adopted xmrig goes back into `MinerPid` + `MinerHandle`, which
+/// already run from a handle.)
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct AdoptedProc {
+    pid: u32,
+    handle: ElevatedHandle,
+}
+
+static ADOPTED_GPU: Mutex<Option<AdoptedProc>> = Mutex::new(None);
+static ADOPTED_SRB_CPU: Mutex<Option<AdoptedProc>> = Mutex::new(None);
+/// Held for the whole adoption pass, so the rehydrate's three parallel
+/// `is_*_mining` calls all answer AFTER it — none of them reports a lane idle
+/// (and so clears its session descriptor) before the lane is adopted.
+static ADOPTION_RAN: Mutex<bool> = Mutex::new(false);
+
+fn adopted_slot(lane: RecordLane) -> Option<&'static Mutex<Option<AdoptedProc>>> {
+    match lane {
+        RecordLane::Gpu => Some(&ADOPTED_GPU),
+        RecordLane::CpuSrb => Some(&ADOPTED_SRB_CPU),
+        RecordLane::CpuXmrig => None,
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn close_adopted(p: AdoptedProc) {
+    let _ = unsafe { windows::Win32::Foundation::CloseHandle(p.handle.as_handle()) };
+}
+#[cfg(not(target_os = "windows"))]
+fn close_adopted(_p: AdoptedProc) {}
+
+/// Drop the adopted process on `lane` (if any) and its launch record. For a
+/// lane whose miner has exited or been stopped.
+fn release_adopted(app: &AppHandle, lane: RecordLane) {
+    let taken = adopted_slot(lane).and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
+    if let Some(p) = taken {
+        close_adopted(p);
+    }
+    delete_launch_record(app, lane);
+}
+
+/// Liveness of the adopted process on `lane`, `None` when nothing is adopted.
+/// An exited one is released here.
+fn adopted_status(app: &AppHandle, lane: RecordLane) -> Option<HandleStatus> {
+    let status = {
+        let guard = adopted_slot(lane)?.lock().ok()?;
+        #[cfg(target_os = "windows")]
+        let status = handle_status(guard.as_ref()?.handle.as_handle());
+        #[cfg(not(target_os = "windows"))]
+        let status = {
+            guard.as_ref()?;
+            HandleStatus::Unknown
+        };
+        status
+    }; // guard dropped before `release_adopted` re-locks the slot
+    if let HandleStatus::Exited(_) = status {
+        release_adopted(app, lane);
+    }
+    Some(status)
+}
+
+/// `true` while an adopted process on `lane` is (or may be) running.
+fn adopted_running(app: &AppHandle, lane: RecordLane) -> bool {
+    matches!(
+        adopted_status(app, lane),
+        Some(HandleStatus::Running) | Some(HandleStatus::Unknown)
+    )
+}
+
+/// The death watch's view of the adopted process on a lane whose own `Child`
+/// slot is empty: nothing adopted = an intentional stop, as for the slot.
+fn adopted_lane_state(lane: RecordLane) -> LaneState {
+    let Some(slot) = adopted_slot(lane) else { return LaneState::UserStopped };
+    let guard = match slot.lock() {
+        Ok(g) => g,
+        Err(_) => return LaneState::Running,
+    };
+    #[cfg(target_os = "windows")]
+    let state = match guard.as_ref() {
+        None => LaneState::UserStopped,
+        Some(p) => match handle_status(p.handle.as_handle()) {
+            HandleStatus::Exited(code) => LaneState::Died(code),
+            HandleStatus::Running | HandleStatus::Unknown => LaneState::Running,
+        },
+    };
+    #[cfg(not(target_os = "windows"))]
+    let state = if guard.is_some() { LaneState::Running } else { LaneState::UserStopped };
+    state
+}
+
+/// Stop the adopted process on `lane`, if any. Returns whether one existed.
+/// The slot is emptied FIRST, so the death watch reads the exit as a stop.
+async fn terminate_adopted(app: &AppHandle, lane: RecordLane) -> bool {
+    let taken = adopted_slot(lane).and_then(|s| s.lock().ok().and_then(|mut g| g.take()));
+    let Some(p) = taken else { return false };
+    #[cfg(target_os = "windows")]
+    {
+        let ok = unsafe { windows::Win32::System::Threading::TerminateProcess(p.handle.as_handle(), 1) }.is_ok();
+        if !ok {
+            // Re-opened without PROCESS_TERMINATE. The handle is still open,
+            // so the PID cannot have been reused: a PID kill hits this process.
+            let _ = crate::platform::kill_pid_force(p.pid).await;
+        }
+        eprintln!(
+            "[miners] stopped the adopted {:?} miner (pid {}) via {}",
+            lane,
+            p.pid,
+            if ok { "its handle" } else { "a PID kill" }
+        );
+    }
+    close_adopted(p);
+    delete_launch_record(app, lane);
+    true
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn lane_has_own_process(app: &AppHandle, lane: RecordLane) -> bool {
+    match lane {
+        RecordLane::Gpu => {
+            let s = app.state::<GpuMinerProcess>();
+            let g = s.0.lock();
+            let has = g.map(|g| g.is_some()).unwrap_or(true);
+            has
+        }
+        RecordLane::CpuSrb => {
+            let s = app.state::<SrbCpuMinerProcess>();
+            let g = s.0.lock();
+            let has = g.map(|g| g.is_some()).unwrap_or(true);
+            has
+        }
+        RecordLane::CpuXmrig => {
+            let s = app.state::<MinerPid>();
+            let g = s.0.lock();
+            let has = g.map(|g| g.is_some()).unwrap_or(true);
+            has
+        }
+    }
+}
+
+/// Adopt whatever a previous session left running. Runs once per app
+/// process, from the first status, start or stop call; concurrent callers
+/// wait on `ADOPTION_RAN` until it is done.
+pub(crate) fn ensure_orphans_adopted(app: &AppHandle) {
+    let mut ran = ADOPTION_RAN.lock().unwrap_or_else(|p| p.into_inner());
+    if *ran {
+        return;
+    }
+    *ran = true;
+    #[cfg(target_os = "windows")]
+    for lane in [RecordLane::Gpu, RecordLane::CpuSrb, RecordLane::CpuXmrig] {
+        adopt_lane(app, lane);
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = app;
+}
+
+#[cfg(target_os = "windows")]
+fn adopt_lane(app: &AppHandle, lane: RecordLane) {
+    let Some(rec) = read_launch_record(app, lane) else { return };
+    if lane_has_own_process(app, lane) {
+        return;
+    }
+    let (handle, can_terminate) = match reopen_recorded_process(&rec) {
+        Ok(v) => v,
+        Err(why) => {
+            eprintln!("[miners] {:?} launch record (pid {}) not adopted: {}", lane, rec.pid, why);
+            delete_launch_record(app, lane);
+            return;
+        }
+    };
+    let handle = ElevatedHandle::from_raw(handle);
+    match lane {
+        RecordLane::Gpu => {
+            if let Ok(mut g) = ADOPTED_GPU.lock() {
+                *g = Some(AdoptedProc { pid: rec.pid, handle });
+            }
+            GPU_API_PORT.store(rec.api_port, Ordering::Relaxed);
+            spawn_miner_death_watch(app.clone(), MinerLane::Gpu);
+        }
+        RecordLane::CpuSrb => {
+            if let Ok(mut g) = ADOPTED_SRB_CPU.lock() {
+                *g = Some(AdoptedProc { pid: rec.pid, handle });
+            }
+            SRB_CPU_API_PORT.store(rec.api_port, Ordering::Relaxed);
+            spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb);
+        }
+        RecordLane::CpuXmrig => {
+            {
+                let s = app.state::<MinerHandle>();
+                let g = s.0.lock();
+                if let Ok(mut g) = g {
+                    *g = Some(handle);
+                }
+            }
+            {
+                let s = app.state::<MinerPid>();
+                let g = s.0.lock();
+                if let Ok(mut g) = g {
+                    *g = Some(rec.pid);
+                }
+            }
+            XMRIG_API_PORT.store(rec.api_port, Ordering::Relaxed);
+            spawn_miner_death_watch(app.clone(), MinerLane::Cpu);
+        }
+    }
+    eprintln!(
+        "[miners] adopted the {:?} miner (pid {}, api port {}) a previous session left running{}",
+        lane,
+        rec.pid,
+        rec.api_port,
+        if can_terminate { "" } else { " (elevated: stopping it will ask for UAC)" }
+    );
 }
 
 /// Whether to launch miner processes with a visible console window.
@@ -666,6 +1600,47 @@ fn remove_retired_miners(miners_dir: &std::path::Path) {
     }
 }
 
+/// One-time sweep of dev-fee/leaderboard diagnostic files left behind by a
+/// subsystem whose writers were removed 2026-07-06 (pure-wallet cutover) —
+/// `dev-fee-*.jsonl` and `leaderboard-*.jsonl` in the app's log dir. Nothing
+/// ever deleted what they'd already written before this; measured 140 MB of
+/// stale files on the operator's own install (RAM plan Phase 1.3,
+/// 2026-09-22). Runs once per launch from `lib.rs`'s setup hook. Same
+/// "only these exact prefixes, best-effort" shape as
+/// [`remove_retired_miners`] — a file in use or already gone is ignored.
+pub fn cleanup_retired_mining_logs(app: &AppHandle) {
+    let Ok(dir) = app.path().app_log_dir() else {
+        return;
+    };
+    let removed = remove_retired_mining_log_files(&dir);
+    if removed > 0 {
+        eprintln!("[miners] removed {} retired dev-fee/leaderboard log file(s)", removed);
+    }
+}
+
+/// The pure sweep behind [`cleanup_retired_mining_logs`], split out (like
+/// [`remove_retired_miners`] is from its own `AppHandle`-resolving caller)
+/// so it's testable against a plain temp directory. Returns the count
+/// removed. Best-effort: a file in use or already gone is simply not
+/// counted, never an error.
+fn remove_retired_mining_log_files(dir: &std::path::Path) -> u32 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut removed = 0u32;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if (name.starts_with("dev-fee-") || name.starts_with("leaderboard-"))
+            && name.ends_with(".jsonl")
+            && std::fs::remove_file(entry.path()).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 fn get_miners_dir(app: &AppHandle) -> Result<PathBuf, String> {
     let resource_dir = app
         .path()
@@ -740,7 +1715,11 @@ if ($pref.ExclusionProcess) {{
     }}
 }}
 
-if ($pathMatch -or $procMatch) {{ Write-Output 'true' }} else {{ Write-Output 'false' }}
+# A non-elevated process on current Windows is shown only a placeholder
+# ('N/A: Must be an administrator to view exclusions') - say so rather than
+# answering 'false' about lists it cannot see.
+$hidden = @($pref.ExclusionPath) + @($pref.ExclusionProcess) | Where-Object {{ "$_" -like 'N/A*' }}
+if ($pathMatch -or $procMatch) {{ Write-Output 'true' }} elseif ($hidden) {{ Write-Output 'unknown' }} else {{ Write-Output 'false' }}
 "#,
         miners_path = miners_path,
         exe_checks = exe_names.iter().map(|e| format!(
@@ -757,8 +1736,68 @@ if ($pathMatch -or $procMatch) {{ Write-Output 'true' }} else {{ Write-Output 'f
         .map_err(|e| format!("Failed to check Defender exclusions: {}", e))?;
 
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    // Accept 'true' anywhere in stdout (PowerShell may include whitespace/newlines)
-    Ok(stdout.to_lowercase().contains("true"))
+    let confirmation_path = defender_confirmation_path(&app)?;
+    let confirmation = std::fs::read_to_string(&confirmation_path).ok();
+    let verdict = defender_verdict(&stdout, confirmation.as_deref(), &miners_path);
+    if verdict == DefenderVerdict::VisiblyAbsent {
+        // The lists are readable and the exclusion is not in them: any
+        // confirmation on disk is stale.
+        let _ = std::fs::remove_file(&confirmation_path);
+    }
+    Ok(verdict.is_excluded())
+}
+
+/// Where the ELEVATED exclusion script records that it saw the miners
+/// directory in Defender's ExclusionPath (2026-09-25). A non-elevated process
+/// cannot read the exclusion lists on current Windows — `Get-MpPreference`
+/// shows `N/A: Must be an administrator to view exclusions` and the registry
+/// keys are ACL'd — so without this the app could never see an exclusion it
+/// had added, and asked for UAC on every mining start. Outside the miners
+/// dir on purpose: a reinstall deletes that dir, and must not take the
+/// confirmation's meaning with it silently (see `download_miners`).
+fn defender_confirmation_path(app: &AppHandle) -> Result<PathBuf, String> {
+    Ok(app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("defender-exclusion-confirmed.txt"))
+}
+
+/// What the Defender check could establish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DefenderVerdict {
+    /// The lists were readable and contain the miners dir or a miner exe.
+    VisiblyPresent,
+    /// The lists were readable and do not.
+    VisiblyAbsent,
+    /// Hidden from this process, but the elevated script confirmed it.
+    Confirmed,
+    /// Hidden, and nothing on disk says it was ever confirmed.
+    Unknown,
+}
+
+impl DefenderVerdict {
+    fn is_excluded(self) -> bool {
+        matches!(self, DefenderVerdict::VisiblyPresent | DefenderVerdict::Confirmed)
+    }
+}
+
+/// Pure decision behind `check_defender_exclusions`, so every branch is tested
+/// without Defender. `script_out` is the check script's stdout (`true`,
+/// `false` or `unknown`); `confirmation` is the elevated script's record.
+fn defender_verdict(script_out: &str, confirmation: Option<&str>, miners_path: &str) -> DefenderVerdict {
+    let out = script_out.trim().to_ascii_lowercase();
+    if out.contains("true") {
+        return DefenderVerdict::VisiblyPresent;
+    }
+    if out.contains("unknown") {
+        let norm = |s: &str| s.trim().trim_start_matches('\u{feff}').trim_end_matches(['\\', '/']).to_lowercase();
+        return match confirmation {
+            Some(c) if norm(c) == norm(miners_path) => DefenderVerdict::Confirmed,
+            _ => DefenderVerdict::Unknown,
+        };
+    }
+    DefenderVerdict::VisiblyAbsent
 }
 
 /// Add Windows Defender exclusions for the miners directory (requires admin elevation)
@@ -803,6 +1842,24 @@ pub async fn add_defender_exclusions(app: AppHandle) -> Result<bool, String> {
             p.to_string_lossy()
         ));
     }
+    // 2026-09-25: verify INSIDE the elevated session — the only place the
+    // exclusion lists are readable — and record it for the non-elevated check.
+    let confirmation_path = defender_confirmation_path(&app)?;
+    let _ = std::fs::remove_file(&confirmation_path);
+    let esc = |s: &str| s.replace('\'', "''");
+    script_lines.push(format!(
+        "$want = '{}'.ToLower().TrimEnd('\\')",
+        esc(&miners_path)
+    ));
+    script_lines.push(
+        "$have = @((Get-MpPreference).ExclusionPath) | ForEach-Object { \"$_\".ToLower().TrimEnd('\\') }"
+            .to_string(),
+    );
+    script_lines.push(format!(
+        "if ($have -contains $want) {{ [IO.File]::WriteAllText('{}', '{}') }}",
+        esc(&confirmation_path.to_string_lossy()),
+        esc(&miners_path)
+    ));
     let script_content = script_lines.join("\n");
 
     // Write script to a temp file to avoid quoting/escaping issues
@@ -812,7 +1869,7 @@ pub async fn add_defender_exclusions(app: AppHandle) -> Result<bool, String> {
 
     // Run the script elevated via UAC (hidden helper window)
     let elevate_cmd_str = format!(
-        "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-ExecutionPolicy Bypass -File \"{}\"'",
+        "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{}\"'",
         script_path.to_string_lossy()
     );
     let mut elevate_cmd = hidden_powershell_command();
@@ -825,22 +1882,11 @@ pub async fn add_defender_exclusions(app: AppHandle) -> Result<bool, String> {
     // Clean up temp script
     let _ = std::fs::remove_file(&script_path);
 
-    // Verify by actually checking if the exclusion was added (hidden)
-    let mut verify_cmd = hidden_powershell_command();
-    verify_cmd.args([
-        "-Command",
-        &format!(
-            "(Get-MpPreference).ExclusionPath -contains '{}'",
-            miners_path
-        ),
-    ]);
-    let verify = verify_cmd
-        .output()
-        .await
-        .map_err(|e| format!("Failed to verify Defender exclusions: {}", e))?;
-
-    let stdout = String::from_utf8_lossy(&verify.stdout).trim().to_string();
-    Ok(stdout.eq_ignore_ascii_case("true"))
+    // Verify through the same check the rest of the app uses: it reads the
+    // lists where it can, and otherwise the confirmation the elevated script
+    // just wrote (none if the user declined UAC). The old verify here read
+    // `Get-MpPreference` unelevated, so it returned false even on success.
+    check_defender_exclusions(app).await
 }
 
 /// Download all miner executables from GitHub releases
@@ -867,6 +1913,12 @@ pub async fn download_miners(app: AppHandle) -> Result<(), String> {
     // from re-prompting on every re-download.
     #[cfg(target_os = "windows")]
     {
+        // Miners are (re)downloaded when a binary is missing — possibly
+        // because Defender removed it. An old confirmation proves nothing
+        // then, so drop it and let the check (and, if needed, UAC) decide.
+        if let Ok(p) = defender_confirmation_path(&app) {
+            let _ = std::fs::remove_file(p);
+        }
         let already = check_defender_exclusions(app.clone())
             .await
             .unwrap_or(false);
@@ -1534,7 +2586,11 @@ pub async fn delete_miners(app: AppHandle) -> Result<(), String> {
 fn hidden_powershell_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("powershell");
     crate::platform::apply_hidden_spawn(&mut cmd);
-    cmd.args(["-ExecutionPolicy", "Bypass"]);
+    // -NoProfile (2026-09-25): without it every hidden PowerShell loaded the
+    // user's profile first — on the operator's machine a conda hook that
+    // spawned conda.exe + a python per call and took 3.7 s instead of 0.26 s.
+    // None of these scripts needs anything a profile sets up.
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass"]);
     cmd
 }
 
@@ -1576,13 +2632,39 @@ fn miner_command(program: &str, show_window: bool) -> tokio::process::Command {
     {
         if show_window {
             cmd.creation_flags(CREATE_NEW_CONSOLE);
+            // Stdio stays default (inherit): CREATE_NEW_CONSOLE gives the
+            // child a fresh console, and leaving stdout/stderr unset is
+            // what lets the miner's own output land there — that's the
+            // entire point of the "show miner window" toggle.
         } else {
             cmd.creation_flags(CREATE_NO_WINDOW);
+            // RAM plan Phase 0.3 (2026-09-22): explicit `Stdio::null()`
+            // instead of the implicit inherit this fell through to before.
+            // Verified before changing it: this is NOT the piped-and-never-
+            // drained bug the plan first described (that shape exists only
+            // in the two one-shot BENCHMARK spawns —
+            // `run_xmrig_benchmark`/the GPU benchmark fn — which correctly
+            // pipe + read_to_end to parse a result and are unaffected by
+            // this function). In a shipped release the parent is a
+            // console-less GUI-subsystem process, so inherit already meant
+            // "nowhere useful"; this makes that intentional instead of
+            // incidental, and stops a `cargo tauri dev` session (which DOES
+            // have a console) from spending the length of a mining session
+            // piping xmrig/SRBMiner's own chatty stdout into the dev
+            // terminal. The miners already write their own `--log-file`
+            // when `miner_logging_active()` wants one, so nothing is lost.
+            cmd.stdout(std::process::Stdio::null());
+            cmd.stderr(std::process::Stdio::null());
         }
     }
     #[cfg(not(target_os = "windows"))]
     {
         let _ = show_window;
+        // Linux has no CREATE_NEW_CONSOLE equivalent (see the doc comment
+        // above) — always null the miner's stdio so a `cargo tauri dev`
+        // session on Linux gets the same dev-terminal quiet as Windows.
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
     }
     cmd
 }
@@ -1873,6 +2955,62 @@ mod miner_definition_tests {
             !names.iter().any(|n| n == "rigel"),
             "rigel was dropped (T2); do not re-add without updating the manifest, wix, and the plan"
         );
+    }
+}
+
+/// RAM plan Phase 1.3 (2026-09-22): the dev-fee/leaderboard log sweep, same
+/// "narrow prefix + suffix match, best-effort" shape as
+/// `miner_definition_tests` pins for `remove_retired_miners` above.
+#[cfg(test)]
+mod retired_log_cleanup_tests {
+    use super::remove_retired_mining_log_files;
+
+    #[test]
+    fn removes_only_dev_fee_and_leaderboard_jsonl_files() {
+        let dir = std::env::temp_dir().join(format!("pwnda-retired-logs-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let stale = [
+            "dev-fee-20260513T073000Z-cpu.jsonl",
+            "leaderboard-20260601T000000Z.jsonl",
+        ];
+        let keep = [
+            // Wrong extension — must survive even with the right prefix.
+            "dev-fee-notes.txt",
+            // A name that merely CONTAINS the prefix midway, not starting
+            // with it — must survive.
+            "old-dev-fee-archive.jsonl",
+            // An unrelated active trace file that happens to share the dir.
+            "mem-native-20260922T000000Z.jsonl",
+            "mining-events-20260922T000000Z.jsonl",
+        ];
+        for f in stale.iter().chain(keep.iter()) {
+            std::fs::write(dir.join(f), b"x").unwrap();
+        }
+
+        let removed = remove_retired_mining_log_files(&dir);
+
+        assert_eq!(removed, stale.len() as u32);
+        for f in stale {
+            assert!(!dir.join(f).exists(), "{f} must be removed");
+        }
+        for f in keep {
+            assert!(dir.join(f).exists(), "{f} must survive");
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_missing_directory_is_a_quiet_zero_not_an_error() {
+        let dir = std::env::temp_dir().join(format!("pwnda-retired-logs-missing-{}", std::process::id()));
+        assert_eq!(remove_retired_mining_log_files(&dir), 0);
+    }
+
+    #[test]
+    fn an_empty_directory_removes_nothing() {
+        let dir = std::env::temp_dir().join(format!("pwnda-retired-logs-empty-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert_eq!(remove_retired_mining_log_files(&dir), 0);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
 
@@ -2200,6 +3338,9 @@ pub async fn start_xmrig(
     proxy: Option<String>,
     chain_ticker: Option<String>,
 ) -> Result<(), String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
     // RAII "already starting" sentinel. Caught the duplicate-session
     // race observed in `dev-fee-20260513T073*-cpu.jsonl`: three Start
     // clicks during the UAC prompt all passed the existing
@@ -2243,20 +3384,23 @@ pub async fn start_xmrig(
     // through this check; this still catches the case where a prior
     // session is alive and the user hits Start again after it.
     {
-        let state = app.state::<MinerProcess>();
-        let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
-        if let Some(ref mut child) = *process {
-            match child.try_wait() {
-                Ok(Some(_)) => {
-                    *process = None;
-                }
-                Ok(None) => {
-                    return Err("Miner is already running. Stop it first.".to_string());
-                }
-                Err(_) => {
-                    *process = None;
-                }
+        // RAM plan Phase 2M.4: asks `xmrig_liveness` rather than the watcher
+        // slot alone. When the retained handle is waitable there is NO
+        // watcher, so `MinerProcess` is empty for a perfectly live session and
+        // the old check would have let a second Start through.
+        match xmrig_liveness(&app) {
+            XmrigLiveness::Alive => {
+                return Err("Miner is already running. Stop it first.".to_string());
             }
+            XmrigLiveness::Exited(_) | XmrigLiveness::Unknown => {
+                // A stale record of a session that is over. Clear the
+                // watcher slot, as this guard always has; the pid slot is
+                // overwritten by the launch below.
+                let state = app.state::<MinerProcess>();
+                let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
+                *process = None;
+            }
+            XmrigLiveness::NotRunning => {}
         }
     } // MutexGuard dropped here
 
@@ -2265,6 +3409,9 @@ pub async fn start_xmrig(
     // XelisHash session would run two CPU miners that each think they own
     // every core, and the frontend (which tracks one CPU session) would show
     // one of them. The mirror of this check lives in `start_srbminer_cpu`.
+    if adopted_running(&app, RecordLane::CpuSrb) {
+        return Err("The CPU is already mining with SRBMiner. Stop that session first.".to_string());
+    }
     {
         let state = app.state::<SrbCpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
@@ -2500,12 +3647,57 @@ pub async fn start_xmrig(
     .map_err(|e| format!("Task join error: {}", e))??;
     let pid = launch.pid;
 
+    // RAM plan Phase 2M.4 (2026-09-23): PROBE the handle before it is stored.
+    // `Running` means it can be waited on without blocking, so the handle
+    // itself is the exit-watcher and the persistent PowerShell watcher below
+    // (87 MB working set, measured) is not needed. Anything else - no
+    // SYNCHRONIZE right, an already-exited process - keeps the watcher exactly
+    // as before. See `xmrig_liveness`.
+    #[cfg(target_os = "windows")]
+    let handle_is_waitable = launch
+        .handle
+        .as_ref()
+        .map(|h| handle_status(h.as_handle()) == HandleStatus::Running)
+        .unwrap_or(false);
+    // `handle_status` / `ElevatedHandle::as_handle` are Windows-only; on other
+    // targets this launch path is unreachable (the Linux branch above returns
+    // first) but must still compile.
+    #[cfg(not(target_os = "windows"))]
+    let handle_is_waitable = false;
+    eprintln!(
+        "[miners] xmrig exit-watch: {}",
+        if handle_is_waitable {
+            "process handle (no PowerShell watcher)"
+        } else {
+            "PowerShell Wait-Process watcher (handle not waitable)"
+        }
+    );
+
     // Retain the elevated process handle so `stop_xmrig` can call
     // `TerminateProcess(handle)` from medium IL. Without this the
     // `taskkill /F /PID` fallback can't kill the high-IL xmrig and the
     // process keeps mining after the user clicks Stop. The handle has
     // full PROCESS_TERMINATE access from creation time, so termination
     // is possible without UAC.
+    // Orphan adoption: record what was launched, so a session killed before
+    // it can stop xmrig hands it to the next one. Read through the launch
+    // handle when it allows it, else by PID (QUERY_LIMITED is granted across
+    // integrity levels).
+    #[cfg(target_os = "windows")]
+    {
+        let api_port = XMRIG_API_PORT.load(Ordering::Relaxed);
+        let rec = launch
+            .handle
+            .as_ref()
+            .and_then(|h| process_identity(h.as_handle()))
+            .map(|(exe, created)| MinerLaunchRecord { pid, created, exe, api_port })
+            .or_else(|| launch_record_for_pid(pid, api_port));
+        match rec {
+            Some(rec) => write_launch_record(&app, RecordLane::CpuXmrig, &rec),
+            None => eprintln!("[miners] no launch record for xmrig pid {}: its identity could not be read", pid),
+        }
+    }
+
     if let Some(handle) = launch.handle {
         let handle_state = app.state::<MinerHandle>();
         let mut slot = handle_state
@@ -2515,22 +3707,29 @@ pub async fn start_xmrig(
         *slot = Some(handle);
     }
 
-    // Spawn a hidden watcher process that waits for xmrig to exit
-    let mut watcher_cmd = hidden_powershell_command();
-    watcher_cmd.args([
-        "-Command",
-        &format!("Wait-Process -Id {} -ErrorAction SilentlyContinue", pid),
-    ]);
-    let watcher = watcher_cmd
-        .kill_on_drop(true)
-        .spawn()
-        .map_err(|e| format!("Failed to create process watcher: {}", e))?;
+    // Spawn a hidden watcher process that waits for xmrig to exit - ONLY when
+    // the retained handle cannot do that job itself (see the probe above).
+    let watcher = if handle_is_waitable {
+        None
+    } else {
+        let mut watcher_cmd = hidden_powershell_command();
+        watcher_cmd.args([
+            "-Command",
+            &format!("Wait-Process -Id {} -ErrorAction SilentlyContinue", pid),
+        ]);
+        Some(
+            watcher_cmd
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| format!("Failed to create process watcher: {}", e))?,
+        )
+    };
 
     // Store the watcher and PID — separate lock scopes, no .await while holding
     {
         let state = app.state::<MinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
-        *process = Some(watcher);
+        *process = watcher;
     }
     {
         let pid_state = app.state::<MinerPid>();
@@ -2563,6 +3762,9 @@ fn default_xmrig_tls() -> bool { true }
 /// and omits it for a genuine Stop-button click (→ "user stopped CPU mining").
 #[tauri::command]
 pub async fn stop_xmrig(app: AppHandle, reason: Option<String>) -> Result<(), String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
     // Get the elevated xmrig PID + retained process handle.
     let pid = {
         let pid_state = app.state::<MinerPid>();
@@ -2587,14 +3789,15 @@ pub async fn stop_xmrig(app: AppHandle, reason: Option<String>) -> Result<(), St
     // after the user clicked Stop.
     #[allow(unused_mut)]
     let mut terminated_via_handle = false;
+    // The handle stays OPEN until every fallback below has run (2026-09-25):
+    // while it is open the PID cannot be reused, so each PID-based kill is
+    // guaranteed to hit xmrig and not whatever inherited its number.
     #[cfg(target_os = "windows")]
-    if let Some(eh) = retained_handle {
-        use windows::Win32::Foundation::CloseHandle;
+    let open_handle = retained_handle;
+    #[cfg(target_os = "windows")]
+    if let Some(eh) = open_handle.as_ref() {
         use windows::Win32::System::Threading::TerminateProcess;
-        let handle = eh.as_handle();
-        let ok = unsafe { TerminateProcess(handle, 1) }.is_ok();
-        let _ = unsafe { CloseHandle(handle) };
-        terminated_via_handle = ok;
+        terminated_via_handle = unsafe { TerminateProcess(eh.as_handle(), 1) }.is_ok();
     }
 
     // Defensive fallback: if the handle path failed or wasn't available
@@ -2630,6 +3833,50 @@ pub async fn stop_xmrig(app: AppHandle, reason: Option<String>) -> Result<(), St
         }
     }
 
+    // An xmrig ADOPTED from a previous session (see "Orphan adoption") is held
+    // through a handle re-opened at medium integrity, and Windows does not
+    // grant PROCESS_TERMINATE on an elevated process to that — so the handle
+    // kill, `taskkill` and `Stop-Process` above all fail against it. Only an
+    // elevated kill ends it, and that asks for UAC. Decided through the
+    // still-open handle, after a grace period for a kill that did land, so it
+    // runs only when xmrig really survived everything else.
+    #[cfg(target_os = "windows")]
+    if !terminated_via_handle {
+        if let (Some(pid), Some(eh)) = (pid, open_handle.as_ref()) {
+            let mut alive = handle_status(eh.as_handle()) == HandleStatus::Running;
+            for _ in 0..10 {
+                if !alive {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                alive = handle_status(eh.as_handle()) == HandleStatus::Running;
+            }
+            if alive {
+                let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+                let taskkill = format!("{}\\System32\\taskkill.exe", system_root);
+                let args = format!("/F /PID {}", pid);
+                let outcome = tokio::task::spawn_blocking(move || {
+                    shell_execute_elevated(&taskkill, &args, "", true, false)
+                })
+                .await;
+                eprintln!(
+                    "[miners] elevated taskkill of the adopted xmrig (pid {}): {}",
+                    pid,
+                    match outcome {
+                        Ok(Ok(_)) => "ok".to_string(),
+                        Ok(Err(e)) => e,
+                        Err(e) => e.to_string(),
+                    }
+                );
+            }
+        }
+    }
+    #[cfg(target_os = "windows")]
+    if let Some(eh) = open_handle {
+        let _ = unsafe { windows::Win32::Foundation::CloseHandle(eh.as_handle()) };
+    }
+    delete_launch_record(&app, RecordLane::CpuXmrig);
+
     // Also kill the watcher process
     let mut watcher = {
         let state = app.state::<MinerProcess>();
@@ -2643,10 +3890,26 @@ pub async fn stop_xmrig(app: AppHandle, reason: Option<String>) -> Result<(), St
 
     // The dev-fee proxy + per-session logger were removed 2026-07-06
     // (pure-wallet cutover). xmrig now connects direct to the user's
-    // pool, so there is no proxy to tear down here. `reason` is retained
-    // in the command signature for frontend compatibility (callers still
-    // pass a teardown reason) but is no longer logged.
-    let _ = reason;
+    // pool, so there is no proxy to tear down here.
+    //
+    // RAM plan Phase 0.3 (2026-09-22): `reason` used to be discarded here
+    // (`let _ = reason;`) — this was the missing half of "why did mining
+    // stop", the other half being the death watch's own silence on exit
+    // codes (fixed alongside this). `classify_stop_reason` returns `None`
+    // for a "…miner process died…" reason: that call is the frontend's
+    // post-death cleanup after `MINER_PROCESS_DIED`, and the death watch
+    // already logged that exit with its real exit code — logging again
+    // here would duplicate the same event under a worse (code-less) record.
+    if let Some(sr) = classify_stop_reason(&reason) {
+        log_mining_event(
+            &app,
+            MinerLane::Cpu,
+            MinerLane::Cpu.miner_binary(),
+            sr,
+            reason.as_deref(),
+            None,
+        );
+    }
 
     Ok(())
 }
@@ -3927,6 +5190,9 @@ pub async fn start_gpu_miner(
     // itself to the card. See `srb_vram_limit_arg`.
     gpu_vram_limit_mb: Option<u32>,
 ) -> Result<(), String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
     // RAII "already starting" sentinel — same pattern as `start_xmrig`.
     // Prevents duplicate concurrent sessions if the user click-spams
     // Start during the build_and_spawn_gpu_miner async window.
@@ -3962,7 +5228,10 @@ pub async fn start_gpu_miner(
         return Err("PROXY_NOT_SUPPORTED_FOR_LOLMINER".to_string());
     }
 
-    // Check if already running
+    // Check if already running — an adopted miner holds the lane too.
+    if adopted_running(&app, RecordLane::Gpu) {
+        return Err("GPU miner is already running. Stop it first.".to_string());
+    }
     {
         let state = app.state::<GpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
@@ -5030,6 +6299,10 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     // OOM, killed by AV) and surface it to the UI. Started after the health
     // check so an init crash keeps reporting through the clearer `Err` above
     // rather than as a generic "miner died" event.
+    // Orphan adoption: record what was launched, so a session killed before
+    // it can stop this miner hands it to the next one.
+    #[cfg(target_os = "windows")]
+    record_child_launch(app, RecordLane::Gpu);
     spawn_miner_death_watch(app.clone(), MinerLane::Gpu);
 
     Ok(())
@@ -5037,7 +6310,10 @@ pub(crate) async fn build_and_spawn_gpu_miner(
 
 /// Stop the running GPU miner (SRBMiner or lolMiner)
 #[tauri::command]
-pub async fn stop_gpu_miner(app: AppHandle) -> Result<(), String> {
+pub async fn stop_gpu_miner(app: AppHandle, reason: Option<String>) -> Result<(), String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
     // The GPU time-slice scheduler, dev-fee proxy, and per-session logger
     // were all removed 2026-07-06 (pure-wallet cutover), so there is
     // nothing to cancel ahead of the kill — just terminate the process.
@@ -5047,8 +6323,30 @@ pub async fn stop_gpu_miner(app: AppHandle) -> Result<(), String> {
         process.take()
     }; // lock dropped here
 
+    let adopted = terminate_adopted(&app, RecordLane::Gpu).await;
+    let was_running = child.is_some() || adopted;
     if let Some(ref mut c) = child {
         let _ = c.kill().await;
+    }
+    delete_launch_record(&app, RecordLane::Gpu);
+
+    // RAM plan Phase 0.3 (2026-09-22): `reason` added to match `stop_xmrig`'s
+    // existing shape (the frontend already sends "…miner process died…" text
+    // after `MINER_PROCESS_DIED`; there was just nowhere for it to go).
+    // Only log when a process actually existed — an idle-lane stop call
+    // (the "Turn off mining" opt-out best-effort-calls every lane) has
+    // nothing to report.
+    if was_running {
+        if let Some(sr) = classify_stop_reason(&reason) {
+            log_mining_event(
+                &app,
+                MinerLane::Gpu,
+                MinerLane::Gpu.miner_binary(),
+                sr,
+                reason.as_deref(),
+                None,
+            );
+        }
     }
 
     Ok(())
@@ -5057,6 +6355,12 @@ pub async fn stop_gpu_miner(app: AppHandle) -> Result<(), String> {
 /// Check if a GPU miner is currently running
 #[tauri::command]
 pub async fn is_gpu_mining(app: AppHandle) -> Result<bool, String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
+    if adopted_running(&app, RecordLane::Gpu) {
+        return Ok(true);
+    }
     let state = app.state::<GpuMinerProcess>();
     let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
@@ -5064,11 +6368,13 @@ pub async fn is_gpu_mining(app: AppHandle) -> Result<bool, String> {
         match child.try_wait() {
             Ok(Some(_)) => {
                 *process = None;
+                delete_launch_record(&app, RecordLane::Gpu);
                 Ok(false)
             }
             Ok(None) => Ok(true),
             Err(_) => {
                 *process = None;
+                delete_launch_record(&app, RecordLane::Gpu);
                 Ok(false)
             }
         }
@@ -5364,6 +6670,9 @@ pub async fn start_srbminer_cpu(
     // which is also what "all threads" sends.
     threads: Option<usize>,
 ) -> Result<(), String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
     // Shares the CPU lane's "already starting" sentinel with `start_xmrig`,
     // so click-spam cannot start two CPU sessions of either kind.
     let starting_state = app.state::<MinerStarting>();
@@ -5394,7 +6703,10 @@ pub async fn start_srbminer_cpu(
         }
     }
 
-    // …and refuse if this lane is already running.
+    // …and refuse if this lane is already running (adopted or our own).
+    if adopted_running(&app, RecordLane::CpuSrb) {
+        return Err("The CPU miner is already running. Stop it first.".to_string());
+    }
     {
         let state = app.state::<SrbCpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
@@ -5481,6 +6793,8 @@ pub async fn start_srbminer_cpu(
         }
     }
 
+    #[cfg(target_os = "windows")]
+    record_child_launch(&app, RecordLane::CpuSrb);
     spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb);
     Ok(())
 }
@@ -5489,15 +6803,36 @@ pub async fn start_srbminer_cpu(
 /// death watch reads the empty slot as an intentional stop) and kills that
 /// handle — never an image-name kill, which would also stop a GPU session.
 #[tauri::command]
-pub async fn stop_srbminer_cpu(app: AppHandle) -> Result<(), String> {
+pub async fn stop_srbminer_cpu(app: AppHandle, reason: Option<String>) -> Result<(), String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
     let mut child = {
         let state = app.state::<SrbCpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
         process.take()
     }; // lock dropped here
 
+    let adopted = terminate_adopted(&app, RecordLane::CpuSrb).await;
+    let was_running = child.is_some() || adopted;
     if let Some(ref mut c) = child {
         let _ = c.kill().await;
+    }
+    delete_launch_record(&app, RecordLane::CpuSrb);
+
+    // RAM plan Phase 0.3 (2026-09-22) — see `stop_gpu_miner`'s identical
+    // comment for why `reason` exists and why it's gated on `was_running`.
+    if was_running {
+        if let Some(sr) = classify_stop_reason(&reason) {
+            log_mining_event(
+                &app,
+                MinerLane::CpuSrb,
+                MinerLane::CpuSrb.miner_binary(),
+                sr,
+                reason.as_deref(),
+                None,
+            );
+        }
     }
 
     Ok(())
@@ -5506,6 +6841,12 @@ pub async fn stop_srbminer_cpu(app: AppHandle) -> Result<(), String> {
 /// Whether the SRBMiner CPU lane is running.
 #[tauri::command]
 pub async fn is_srbminer_cpu_mining(app: AppHandle) -> Result<bool, String> {
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
+    if adopted_running(&app, RecordLane::CpuSrb) {
+        return Ok(true);
+    }
     let state = app.state::<SrbCpuMinerProcess>();
     let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
 
@@ -5513,11 +6854,13 @@ pub async fn is_srbminer_cpu_mining(app: AppHandle) -> Result<bool, String> {
         match child.try_wait() {
             Ok(Some(_)) => {
                 *process = None;
+                delete_launch_record(&app, RecordLane::CpuSrb);
                 Ok(false)
             }
             Ok(None) => Ok(true),
             Err(_) => {
                 *process = None;
+                delete_launch_record(&app, RecordLane::CpuSrb);
                 Ok(false)
             }
         }
@@ -5772,7 +7115,17 @@ mod srbminer_cpu_tests {
 /// Check if xmrig is currently running by checking if the elevated PID still exists
 #[tauri::command]
 pub async fn is_mining(app: AppHandle) -> Result<bool, String> {
-    // Read the PID from state — drop the lock before any .await
+    // Put back anything a killed previous session left running first, so
+    // this lane's answer covers it. See "Orphan adoption".
+    ensure_orphans_adopted(&app);
+    // RAM plan Phase 2M.4 (2026-09-23): answered from state, with no process
+    // spawn. This used to run `tasklist` on every call - the frontend polls it
+    // every 5 s, ~720 spawns an hour - and `tasklist` does not exist on Linux,
+    // where a live session made this command return an error.
+    //
+    // `Unknown` (a pid is recorded but there is no handle and no watcher to ask)
+    // falls through to the old `tasklist` check on Windows, so the case this
+    // function used to cover is still covered; only the common path changed.
     let pid = {
         let pid_state = app.state::<MinerPid>();
         let pid_lock = pid_state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
@@ -5780,19 +7133,15 @@ pub async fn is_mining(app: AppHandle) -> Result<bool, String> {
     }; // MutexGuard dropped here
 
     if let Some(pid) = pid {
-        // Check if the process with this PID is still running (hidden tasklist)
-        let mut cmd = hidden_command("tasklist");
-        cmd.args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"]);
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to check mining status: {}", e))?;
-
-        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-        let running = stdout.contains(&pid.to_string());
+        let running = match xmrig_liveness(&app) {
+            XmrigLiveness::Alive => true,
+            XmrigLiveness::NotRunning | XmrigLiveness::Exited(_) => false,
+            XmrigLiveness::Unknown => tasklist_pid_running(pid).await?,
+        };
 
         if !running {
             // Clean up: process ended — re-acquire locks in separate scopes
+            delete_launch_record(&app, RecordLane::CpuXmrig);
             {
                 let pid_state = app.state::<MinerPid>();
                 let mut pid_lock =
@@ -5814,6 +7163,20 @@ pub async fn is_mining(app: AppHandle) -> Result<bool, String> {
     } else {
         Ok(false)
     }
+}
+
+/// The old liveness check, kept ONLY as the fallback for
+/// `XmrigLiveness::Unknown` (a pid is tracked but no handle and no watcher
+/// exist to ask). Spawns `tasklist`, so it must stay off the hot path.
+async fn tasklist_pid_running(pid: u32) -> Result<bool, String> {
+    let mut cmd = hidden_command("tasklist");
+    cmd.args(["/FI", &format!("PID eq {}", pid), "/NH", "/FO", "CSV"]);
+    let output = cmd
+        .output()
+        .await
+        .map_err(|e| format!("Failed to check mining status: {}", e))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    Ok(stdout.contains(&pid.to_string()))
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -5839,6 +7202,8 @@ pub struct HashrateFixPlan {
     /// Secure Boot is OFF (informational only).
     pub secure_boot_off: bool,
     /// SeLockMemoryPrivilege is granted to the current user — `--huge-pages-jit` will work.
+    /// Accepts the list shape older scans emitted (see [`bool_or_nonempty_list`]).
+    #[serde(deserialize_with = "bool_or_nonempty_list")]
     pub se_lock_memory_granted: bool,
     /// If WinRing0_1_2_0 is registered with a non-PwndaWallet ImagePath, this contains it.
     /// Hard Reset clears it via `sc stop` + `sc delete` (one UAC consent).
@@ -5854,6 +7219,31 @@ pub struct HashrateFixPlan {
     pub logical_core_count: u32,
     /// Unix timestamp of when this scan was performed.
     pub scanned_at: u64,
+}
+
+/// `seLockMemoryGranted` as the env scan actually produced it until
+/// 2026-09-25: `$priv -match '...'` on the ARRAY of `whoami /priv` lines
+/// yields the matching lines, so the field was `[]` or `["SeLockMemory..."]`,
+/// never a boolean. `serde` rejected the whole plan (`invalid type: sequence,
+/// expected a boolean`), nothing was cached, and the Mining view retried the
+/// scan every ~2.5 s — firing a Defender check each time. The script is fixed;
+/// this keeps a plan from any older script (or an unexpected shape) parseable:
+/// a boolean as-is, a list or string as "non-empty", null as false.
+fn bool_or_nonempty_list<'de, D>(de: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match serde_json::Value::deserialize(de)? {
+        serde_json::Value::Bool(b) => b,
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::String(s) => !s.trim().is_empty(),
+        serde_json::Value::Null => false,
+        other => {
+            return Err(serde::de::Error::custom(format!(
+                "seLockMemoryGranted: expected a boolean, got {other}"
+            )))
+        }
+    })
 }
 
 /// Cached MSR environment, refreshed on demand.
@@ -5909,7 +7299,9 @@ try {
 
 try {
     $priv = whoami /priv 2>$null
-    $result.seLockMemoryGranted = ($priv -match 'SeLockMemoryPrivilege')
+    # [bool](... | Select-String): `$priv -match` on an ARRAY returns the matching
+    # lines, not a boolean — an empty [] here made every scan unparseable (2026-09-25).
+    $result.seLockMemoryGranted = [bool]($priv | Select-String -SimpleMatch 'SeLockMemoryPrivilege')
 } catch {}
 
 try {
@@ -5969,7 +7361,7 @@ $result | ConvertTo-Json -Compress -Depth 5
 /// Run the env scan PowerShell script and return the deserialized plan.
 async fn run_env_scan() -> Result<HashrateFixPlan, String> {
     let mut cmd = hidden_powershell_command();
-    cmd.args(["-NoProfile", "-Command", ENV_SCAN_SCRIPT]);
+    cmd.args(["-Command", ENV_SCAN_SCRIPT]);
     let output = cmd
         .output()
         .await
@@ -6567,5 +7959,243 @@ Device 1:
         let bench = &src[src.find("pub async fn run_gpu_miner_benchmark(").unwrap()..];
         let bench = &bench[..bench.find("\"--benchmark\"").unwrap()];
         assert!(bench.contains("resolve_miner_gpu_ids("));
+    }
+}
+
+/// 2026-09-25: the Mining view's Defender-check storm and the UAC prompt on
+/// every mining start. See PwndaWalletVault/log.md 2026-09-25.
+#[cfg(test)]
+mod defender_and_env_scan_tests {
+    use super::*;
+
+    /// Verbatim from the operator's machine (the frontend's
+    /// "MSR env scan failed" warning): `seLockMemoryGranted` was a list.
+    const OPERATOR_SCAN: &str = r#"{"blocklistOff":true,"sacOff":true,"hvciOff":false,"secureBootOff":true,"seLockMemoryGranted":[],"winring0Collision":"\\??\\G:\\Mining\\WinRing0x64.sys","collisionApps":["ArmouryCrate.Service","LightingService"],"numaNodeCount":1,"smtEnabled":true,"physicalCoreCount":24,"logicalCoreCount":32,"scannedAt":1790365741}"#;
+
+    #[test]
+    fn the_operators_scan_now_parses() {
+        let plan: HashrateFixPlan = serde_json::from_str(OPERATOR_SCAN).expect("was: invalid type: sequence");
+        assert!(!plan.se_lock_memory_granted, "an empty match list means not granted");
+        assert_eq!(plan.physical_core_count, 24);
+        assert_eq!(plan.collision_apps.len(), 2);
+    }
+
+    #[test]
+    fn se_lock_memory_accepts_every_shape_a_scan_has_produced() {
+        let with = |v: &str| {
+            let json = OPERATOR_SCAN.replace(r#""seLockMemoryGranted":[]"#, &format!(r#""seLockMemoryGranted":{v}"#));
+            serde_json::from_str::<HashrateFixPlan>(&json).map(|p| p.se_lock_memory_granted)
+        };
+        assert_eq!(with("true").unwrap(), true);
+        assert_eq!(with("false").unwrap(), false);
+        assert_eq!(with(r#"["SeLockMemoryPrivilege  Lock pages in memory  Disabled"]"#).unwrap(), true);
+        assert_eq!(with("null").unwrap(), false);
+        assert!(with("7").is_err(), "a number is not a guess we make");
+    }
+
+    #[test]
+    fn the_env_scan_script_no_longer_matches_on_an_array() {
+        assert!(!ENV_SCAN_SCRIPT.contains("($priv -match"), "`-match` on the whoami ARRAY returns lines, not a bool");
+        assert!(ENV_SCAN_SCRIPT.contains("[bool]($priv | Select-String"));
+    }
+
+    const MINERS: &str = r"C:\Users\u\AppData\Roaming\com.pwnda.wallet\miners";
+
+    #[test]
+    fn visible_lists_are_believed_either_way() {
+        assert_eq!(defender_verdict("true\r\n", None, MINERS), DefenderVerdict::VisiblyPresent);
+        assert_eq!(defender_verdict("false", Some(MINERS), MINERS), DefenderVerdict::VisiblyAbsent);
+        assert!(!DefenderVerdict::VisiblyAbsent.is_excluded(), "a readable 'no' beats an old confirmation");
+    }
+
+    #[test]
+    fn hidden_lists_fall_back_to_the_elevated_confirmation() {
+        assert_eq!(defender_verdict("unknown", Some(MINERS), MINERS), DefenderVerdict::Confirmed);
+        // case, a trailing separator and a UTF-8 BOM do not matter
+        let loose = format!("\u{feff}{}\\", MINERS.to_uppercase());
+        assert_eq!(defender_verdict("unknown", Some(&loose), MINERS), DefenderVerdict::Confirmed);
+        assert!(DefenderVerdict::Confirmed.is_excluded());
+    }
+
+    #[test]
+    fn hidden_lists_without_a_matching_confirmation_are_not_excluded() {
+        assert_eq!(defender_verdict("unknown", None, MINERS), DefenderVerdict::Unknown);
+        assert_eq!(defender_verdict("unknown", Some(r"D:\elsewhere"), MINERS), DefenderVerdict::Unknown);
+        assert!(!DefenderVerdict::Unknown.is_excluded(), "so the first mining start still asks once");
+    }
+
+    #[test]
+    fn every_hidden_powershell_skips_the_user_profile() {
+        for (file, src) in [
+            ("miners.rs", include_str!("miners.rs")),
+            ("xmr_rpc.rs", include_str!("xmr_rpc.rs")),
+            ("zph_rpc.rs", include_str!("zph_rpc.rs")),
+        ] {
+            let src = src.replace("\r\n", "\n");
+            let at = src.find("fn hidden_powershell_command()").unwrap_or_else(|| panic!("{file}: helper moved"));
+            let helper = &src[at..at + src[at..].find("\n}\n").expect("helper end")];
+            assert!(helper.contains("\"-NoProfile\""), "{file}: a profile made each call 3.7 s + conda");
+            // Split so this test's own source never contains the pattern whole.
+            let old_elevated = concat!("-ArgumentList '", "-ExecutionPolicy Bypass -File");
+            assert!(
+                !src.contains(old_elevated),
+                "{file}: the elevated inner PowerShell must skip the profile too"
+            );
+        }
+    }
+}
+
+/// 2026-09-25: a Zano GPU miner kept running for an hour after its app exited,
+/// invisible to the next session. See "Orphan adoption" above and
+/// PwndaWalletVault/log.md 2026-09-25.
+#[cfg(test)]
+mod orphan_adoption_tests {
+    use super::*;
+
+    fn rec() -> MinerLaunchRecord {
+        MinerLaunchRecord {
+            pid: 36524,
+            created: 134_032_345_930_000_000,
+            exe: r"C:\Users\user\AppData\Roaming\com.pwnda.wallet\miners\SRBMiner-MULTI.exe".into(),
+            api_port: 21558,
+        }
+    }
+
+    #[test]
+    fn the_same_process_matches_whatever_the_path_case_or_slashes() {
+        let r = rec();
+        assert!(launch_record_matches(&r, &r.exe, r.created));
+        assert!(launch_record_matches(
+            &r,
+            "c:/users/user/appdata/roaming/com.pwnda.wallet/miners/srbminer-multi.exe",
+            r.created
+        ));
+    }
+
+    /// Windows reuses PIDs. A process that merely has the recorded PID is not
+    /// the miner, and adopting it would let Stop kill an unrelated program.
+    #[test]
+    fn a_reused_pid_never_matches() {
+        let r = rec();
+        assert!(!launch_record_matches(&r, &r.exe, r.created + 1));
+        assert!(!launch_record_matches(&r, r"C:\Windows\System32\notepad.exe", r.created));
+    }
+
+    #[test]
+    fn an_unknown_creation_time_never_matches() {
+        let r = MinerLaunchRecord { created: 0, ..rec() };
+        assert!(!launch_record_matches(&r, &r.exe, 0));
+    }
+
+    #[test]
+    fn the_record_round_trips_in_camel_case() {
+        let json = serde_json::to_string(&rec()).unwrap();
+        assert!(json.contains("\"apiPort\":21558"), "{json}");
+        assert_eq!(serde_json::from_str::<MinerLaunchRecord>(&json).unwrap(), rec());
+    }
+
+    #[test]
+    fn each_lane_keeps_its_own_record() {
+        let names = [RecordLane::Gpu, RecordLane::CpuSrb, RecordLane::CpuXmrig].map(|l| l.file_name());
+        assert_ne!(names[0], names[1]);
+        assert_ne!(names[1], names[2]);
+        assert_ne!(names[0], names[2]);
+    }
+
+    /// The body of `fn <name>(` up to the next top-level item.
+    fn body<'a>(src: &'a str, signature: &str) -> &'a str {
+        let from = src.find(signature).unwrap_or_else(|| panic!("{signature} not found"));
+        let rest = &src[from..];
+        let end = rest[1..].find("\n#[tauri::command]").map(|i| i + 1).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    /// Adoption must run before a lane answers or acts, or the rehydrate reads
+    /// the lane idle and clears its session descriptor (and a start runs a
+    /// second miner beside the orphan).
+    #[test]
+    fn every_lane_command_adopts_before_it_answers() {
+        let src = include_str!("miners.rs").replace("\r\n", "\n");
+        for sig in [
+            "pub async fn is_mining(",
+            "pub async fn is_gpu_mining(",
+            "pub async fn is_srbminer_cpu_mining(",
+            "pub async fn start_xmrig(",
+            "pub async fn start_gpu_miner(",
+            "pub async fn start_srbminer_cpu(",
+            "pub async fn stop_xmrig(",
+            "pub async fn stop_gpu_miner(",
+            "pub async fn stop_srbminer_cpu(",
+        ] {
+            let b = body(&src, sig);
+            let adopt = b.find("ensure_orphans_adopted(&app)").unwrap_or_else(|| panic!("{sig} never adopts"));
+            let first_lock = b.find(".lock()").unwrap_or(usize::MAX);
+            let first_liveness = b.find("xmrig_liveness(").unwrap_or(usize::MAX);
+            assert!(adopt < first_lock && adopt < first_liveness, "{sig} checks its lane before adopting");
+        }
+    }
+
+    /// A record outliving its miner is harmless (the identity check refuses
+    /// it), but a miner without a record is exactly the orphan this exists
+    /// for — so every launch writes one.
+    #[test]
+    fn every_launch_writes_a_record_and_every_stop_deletes_it() {
+        let src = include_str!("miners.rs").replace("\r\n", "\n");
+        assert!(body(&src, "pub async fn start_xmrig(").contains("write_launch_record(&app, RecordLane::CpuXmrig"));
+        assert!(body(&src, "pub(crate) async fn build_and_spawn_gpu_miner(").contains("record_child_launch(app, RecordLane::Gpu)"));
+        assert!(body(&src, "pub async fn start_srbminer_cpu(").contains("record_child_launch(&app, RecordLane::CpuSrb)"));
+        assert!(body(&src, "pub async fn stop_xmrig(").contains("delete_launch_record(&app, RecordLane::CpuXmrig)"));
+        assert!(body(&src, "pub async fn stop_gpu_miner(").contains("terminate_adopted(&app, RecordLane::Gpu)"));
+        assert!(body(&src, "pub async fn stop_srbminer_cpu(").contains("terminate_adopted(&app, RecordLane::CpuSrb)"));
+    }
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod orphan_adoption_windows_tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    fn ping() -> std::process::Child {
+        Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(Stdio::null())
+            .spawn()
+            .expect("spawn ping")
+    }
+
+    #[test]
+    fn a_live_recorded_process_is_reopened_and_stoppable_through_the_adopted_handle() {
+        let mut child = ping();
+        let rec = launch_record_for_pid(child.id(), 1).expect("identity of a live child");
+        assert!(rec.exe.to_lowercase().ends_with("\\ping.exe"), "{}", rec.exe);
+        assert_ne!(rec.created, 0);
+        assert_eq!(launch_record_for_pid(child.id(), 1).as_ref(), Some(&rec), "identity must be stable");
+
+        let (h, can_terminate) = reopen_recorded_process(&rec).expect("re-open the recorded process");
+        assert!(can_terminate, "an unelevated child grants PROCESS_TERMINATE");
+        assert_eq!(handle_status(h), HandleStatus::Running);
+        unsafe { TerminateProcess(h, 1) }.expect("terminate through the re-opened handle");
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while handle_status(h) == HandleStatus::Running && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert_eq!(handle_status(h), HandleStatus::Exited(Some(1)));
+        let _ = unsafe { CloseHandle(h) };
+        let _ = child.wait();
+        assert!(reopen_recorded_process(&rec).is_err(), "a gone process must not be adopted");
+    }
+
+    #[test]
+    fn a_process_that_only_shares_the_pid_is_refused() {
+        let mut child = ping();
+        let rec = launch_record_for_pid(child.id(), 1).expect("identity of a live child");
+        let restarted = MinerLaunchRecord { created: rec.created - 1, ..rec.clone() };
+        assert_eq!(reopen_recorded_process(&restarted).unwrap_err(), "a different process now has this PID");
+        let other_binary = MinerLaunchRecord { exe: r"C:\Windows\System32\cmd.exe".into(), ..rec.clone() };
+        assert_eq!(reopen_recorded_process(&other_binary).unwrap_err(), "a different process now has this PID");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

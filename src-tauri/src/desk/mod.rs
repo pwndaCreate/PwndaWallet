@@ -61,9 +61,7 @@ pub mod reclaim;
 // Test-only on purpose, like `conformance` and `rung2b`: it exists to run inside
 // `cargo test --lib desk::` — the suite's step 1 — because an integration test in
 // `tests/` is invisible to that gate (the reason it was moved in from there).
-// It reads fixtures from the vendored engine, which a public checkout does not
-// carry; `build.rs` sets `engine_handoff` only where they exist.
-#[cfg(all(test, engine_handoff))]
+#[cfg(test)]
 pub mod real_witness;
 pub mod refund;
 #[cfg(test)]

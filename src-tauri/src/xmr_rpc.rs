@@ -182,6 +182,7 @@ struct JsonRpcError {
 /// is a few hundred bytes. 5 MB is a comfortable threshold.
 const REAL_BINARY_MIN_SIZE: u64 = 5 * 1024 * 1024;
 
+
 /// Check whether a file exists and is large enough to plausibly be the
 /// real monero-wallet-rpc.exe (not the repo placeholder).
 fn is_real_binary(p: &PathBuf) -> bool {
@@ -1103,6 +1104,14 @@ pub async fn xmr_start_rpc(
         .arg("--log-level")
         .arg("0")
         .arg("--non-interactive")
+        // Cap the log. Monero-family wallet-rpc rotates at
+        // `--max-log-file-size` and keeps `--max-log-files` of them; without
+        // both it grows without bound (33 MB monero + 15 MB zephyr observed
+        // on the dev box, 2026-09-22). 4 MB x 2 keeps a useful tail.
+        .arg("--max-log-file-size")
+        .arg("4194304")
+        .arg("--max-log-files")
+        .arg("2")
         .arg("--log-file")
         .arg(&log_file);
 
@@ -1129,10 +1138,10 @@ pub async fn xmr_start_rpc(
     //
     // We pick **physical** cores, not logical — hyperthreading hurts
     // here because two SMT threads on the same core contend for the same
-    // L1/L2 and the view-key scan is latency-bound on cache. Capped at
-    // 16 so a 32-core Threadripper doesn't starve the rest of the app.
-    // Floor of 2 so single-core boxes still get some parallelism.
-    let concurrency = (num_cpus::get_physical() as u32).clamp(2, 16);
+    // L1/L2 and the view-key scan is latency-bound on cache. Floor of 2 so
+    // single-core boxes still get some parallelism; the ceiling (16, and why
+    // not lower) is `wallet_rpc_common::WALLET_RPC_MAX_CONCURRENCY`.
+    let concurrency = crate::wallet_rpc_common::wallet_rpc_concurrency(num_cpus::get_physical());
     cmd.arg("--max-concurrency").arg(concurrency.to_string());
 
     if is_local {
@@ -1545,7 +1554,8 @@ fn parse_hash_for_file<'a>(hashes_txt: &'a str, filename: &str) -> Option<&'a st
 fn hidden_powershell_command() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new("powershell");
     crate::platform::apply_hidden_spawn(&mut cmd);
-    cmd.args(["-ExecutionPolicy", "Bypass"]);
+    // -NoProfile (2026-09-25): see `miners::hidden_powershell_command`.
+    cmd.args(["-NoProfile", "-ExecutionPolicy", "Bypass"]);
     cmd
 }
 
@@ -2115,7 +2125,7 @@ pub async fn xmr_add_defender_exclusion(app: AppHandle) -> Result<bool, String> 
         .map_err(|e| format!("Failed to write defender script: {}", e))?;
 
     let elevate_cmd_str = format!(
-        "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-ExecutionPolicy Bypass -File \"{}\"'",
+        "Start-Process powershell -Verb RunAs -Wait -WindowStyle Hidden -ArgumentList '-NoProfile -ExecutionPolicy Bypass -File \"{}\"'",
         script_path.to_string_lossy()
     );
     let mut elevate_cmd = hidden_powershell_command();

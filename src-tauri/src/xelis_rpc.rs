@@ -740,43 +740,135 @@ static CONSOLE_CTRL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// AttachConsole returned 0, the process logged `CTRL+C received, exiting...`
 /// and exited **0 in 0.52 s**.
 ///
-/// `SetConsoleCtrlHandler(NULL, TRUE)` is what stops the event killing US as
-/// well — the child's console becomes ours for the duration, and the event goes
-/// to every process attached to it. It is restored before returning; leaving it
-/// set would make the whole app ignore Ctrl+C.
+/// **The event reaches THIS process too** — the child's console is ours for
+/// the duration, and `GenerateConsoleCtrlEvent(_, 0)` goes to every process
+/// attached to it — and it arrives *asynchronously*, on a thread Windows
+/// injects after the call has returned. Until 2026-09-26 this function ignored
+/// it with `SetConsoleCtrlHandler(NULL, TRUE)` and restored the default right
+/// after the call; when our copy landed after the restore, the default handler
+/// killed the app with `0xc000013a` (STATUS_CONTROL_C_EXIT). The idle
+/// scheduler stops Xelis 15 minutes after it syncs, so the operator's app died
+/// there (log.md 2026-09-26), leaving its miners orphaned. Reproduced 3/3 by
+/// `ctrl_c_self_kill_tests`.
+///
+/// Now a real handler ([`absorb_own_ctrl_c`]) swallows our own copy, and this
+/// function does not detach until the handler has seen it. The handler is
+/// added **after** `AttachConsole`, every time: attaching re-initialises this
+/// process's handler list to the default handler alone (measured 2026-09-26 —
+/// a handler added before the attach was never called and the sender died,
+/// 0 of 3 console setups; added after, 150/150 rounds delivered, each echo
+/// absorbed once, sender alive — ReactOS's `AttachConsole` does the same
+/// reset). Holding the ignore flag longer instead would also work, but that
+/// flag is inherited by any process spawned meanwhile, which would then never
+/// take a Ctrl+C again.
 ///
 /// Declared with a raw `extern "system"` block rather than pulling a new
 /// `windows` crate feature into `Cargo.toml`, matching the precedent in
 /// `data_paths.rs::system_ram_mb`.
 #[cfg(target_os = "windows")]
-fn graceful_ctrl_c(pid: u32) -> bool {
-    const CTRL_C_EVENT: u32 = 0;
+const CTRL_C_EVENT: u32 = 0;
 
-    extern "system" {
-        fn AttachConsole(dwProcessId: u32) -> i32;
-        fn FreeConsole() -> i32;
-        fn SetConsoleCtrlHandler(handler: *const core::ffi::c_void, add: i32) -> i32;
-        fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+#[cfg(target_os = "windows")]
+extern "system" {
+    fn AttachConsole(dwProcessId: u32) -> i32;
+    fn FreeConsole() -> i32;
+    fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) -> i32;
+}
+
+/// While true, a Ctrl+C reaching this process is our own send echoing back.
+#[cfg(target_os = "windows")]
+static CTRL_C_ABSORBING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Set by the handler when it has swallowed that echo.
+#[cfg(target_os = "windows")]
+static CTRL_C_ABSORBED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Clear an "ignore Ctrl+C" flag this process may have inherited (a parent
+/// started with `CREATE_NEW_PROCESS_GROUP`, or a Git Bash / MSYS shell, hands
+/// it down). Children inherit it in turn, and a wallet spawned with it set
+/// never receives [`graceful_ctrl_c`]'s event — every stop would fall back to
+/// a kill without the sled flush. Called before spawning the wallet.
+#[cfg(target_os = "windows")]
+pub(crate) fn let_children_receive_ctrl_c() {
+    // Safe: a null handler and a plain integer.
+    unsafe {
+        SetConsoleCtrlHandler(None, 0);
     }
+}
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn let_children_receive_ctrl_c() {}
+
+/// Swallows our own Ctrl+C echo; passes everything else on (returns 0), so a
+/// real Ctrl+C in a dev terminal still ends the app.
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn absorb_own_ctrl_c(ctrl_type: u32) -> i32 {
+    use std::sync::atomic::Ordering::SeqCst;
+    if ctrl_type == CTRL_C_EVENT && CTRL_C_ABSORBING.load(SeqCst) {
+        CTRL_C_ABSORBED.store(true, SeqCst);
+        return 1;
+    }
+    0
+}
+
+/// How long to wait for our own copy of the event. It lands in milliseconds;
+/// this is the bound for a stalled console host, not an expected delay.
+#[cfg(target_os = "windows")]
+const CTRL_C_ECHO_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[cfg(target_os = "windows")]
+fn graceful_ctrl_c(pid: u32) -> bool {
+    use std::sync::atomic::Ordering::SeqCst;
+    const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
 
     let _guard = match CONSOLE_CTRL_LOCK.lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
 
-    // Safe: all four take plain integers / a null pointer and touch no memory
-    // we own. The sequence is the one verified against the real binary.
+    // Safe: the calls take plain integers / a `'static` fn pointer and touch
+    // no memory we own.
     unsafe {
         // Detach from any console we already hold; AttachConsole fails if one
-        // is attached. A GUI app normally has none, so this usually no-ops.
-        FreeConsole();
+        // is attached. A release (GUI) build has none; a `tauri dev` build has
+        // the terminal's, which is given back below.
+        let had_console = FreeConsole() != 0;
         if AttachConsole(pid) == 0 {
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
             return false;
         }
-        SetConsoleCtrlHandler(std::ptr::null(), 1);
+        // AFTER the attach — it reset the handler list (see the doc above).
+        SetConsoleCtrlHandler(Some(absorb_own_ctrl_c), 1);
+
+        CTRL_C_ABSORBED.store(false, SeqCst);
+        CTRL_C_ABSORBING.store(true, SeqCst);
         let sent = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0;
-        SetConsoleCtrlHandler(std::ptr::null(), 0);
+        if sent {
+            let deadline = std::time::Instant::now() + CTRL_C_ECHO_WAIT;
+            while !CTRL_C_ABSORBED.load(SeqCst) && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+        }
         FreeConsole();
+        if !sent || CTRL_C_ABSORBED.load(SeqCst) {
+            CTRL_C_ABSORBING.store(false, SeqCst);
+            SetConsoleCtrlHandler(Some(absorb_own_ctrl_c), 0);
+            // Re-attaching resets the handler list again, so it is safe only
+            // now that our copy has been absorbed.
+            if had_console {
+                AttachConsole(ATTACH_PARENT_PROCESS);
+            }
+        } else {
+            // Not seen. Either this process ignores Ctrl+C (an inherited flag;
+            // nothing then reaches the handler, and nothing is in flight) or
+            // our copy is late. Keep absorbing, and stay detached — a re-attach
+            // would reset the handler list under a copy still in flight.
+            eprintln!(
+                "[xelis-rpc] our own Ctrl+C was not seen within {:?}; staying detached and absorbing",
+                CTRL_C_ECHO_WAIT
+            );
+        }
         sent
     }
 }
@@ -955,6 +1047,9 @@ fn spawn_wallet(
         .stdout(std::process::Stdio::from(log))
         .stderr(std::process::Stdio::from(log_err));
 
+    // So the wallet can take `graceful_ctrl_c`'s event however the app itself
+    // was launched (the flag is inherited at spawn).
+    let_children_receive_ctrl_c();
     cmd.spawn().map_err(|e| {
         if matches!(e.raw_os_error(), Some(126) | Some(-1073741515)) {
             "Xelis wallet could not start: the Microsoft Visual C++ Redistributable \
@@ -2175,5 +2270,94 @@ mod spawn_tests {
             "the command line must be exactly `--config-file <path>` — anything else risks \
              putting a secret in the process list"
         );
+    }
+}
+
+/// 2026-09-25: the operator's app died with `0xc000013a` (STATUS_CONTROL_C_EXIT)
+/// the moment the idle scheduler stopped the Xelis wallet — Xelis logged
+/// `CTRL+C received, exiting...` at 22:47:39.088 and the app never sampled
+/// again. `graceful_ctrl_c` attaches THIS process to the wallet's console, so
+/// the Ctrl+C it generates is delivered to this process too, asynchronously.
+/// See PwndaWalletVault/log.md 2026-09-26.
+///
+/// A self-kill cannot be observed from inside the process that dies, so the
+/// real test runs in a CHILD copy of this test binary and the parent reads its
+/// exit code.
+#[cfg(all(test, target_os = "windows"))]
+mod ctrl_c_self_kill_tests {
+    use super::graceful_ctrl_c;
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+
+    const CHILD_ENV: &str = "PWNDA_CTRL_C_SELF_KILL_CHILD";
+    const ROUNDS: usize = 60;
+    /// `0xc000013a` as the i32 `ExitStatus::code()` reports.
+    const STATUS_CONTROL_C_EXIT: i32 = 0xC000013Au32 as i32;
+
+    /// Only does anything inside the child the test below spawns: sends a
+    /// Ctrl+C to a console-less child `ROUNDS` times, exactly as the Xelis stop
+    /// does, and says so if this process is still alive afterwards.
+    #[test]
+    fn child_sends_ctrl_c_repeatedly() {
+        let Ok(progress) = std::env::var(CHILD_ENV) else {
+            return;
+        };
+        // As `spawn_wallet` does. A test binary started from Git Bash inherits
+        // "ignore Ctrl+C", and a target spawned with it never reacts.
+        super::let_children_receive_ctrl_c();
+        for round in 0..ROUNDS {
+            let mut target = Command::new("ping")
+                .args(["-n", "30", "127.0.0.1"])
+                .creation_flags(crate::wallet_rpc_common::CREATE_NO_WINDOW)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn ping");
+            std::thread::sleep(std::time::Duration::from_millis(150));
+            assert!(graceful_ctrl_c(target.id()), "round {round}: the Ctrl+C was not sent");
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while target.try_wait().ok().flatten().is_none() && std::time::Instant::now() < end {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            if target.try_wait().ok().flatten().is_none() {
+                let _ = target.kill();
+                panic!("round {round}: the target ignored the Ctrl+C");
+            }
+            let _ = std::fs::write(&progress, format!("{}", round + 1));
+        }
+    }
+
+    #[test]
+    fn sending_ctrl_c_to_a_child_never_kills_the_sender() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let progress = std::env::temp_dir().join(format!("pwnda-ctrl-c-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&progress);
+        // `status()`, not `output()`: a ping orphaned by a dead child would
+        // hold an inherited stdout pipe open for its full 30 s.
+        let status = Command::new(exe)
+            .args([
+                "xelis_rpc::ctrl_c_self_kill_tests::child_sends_ctrl_c_repeatedly",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, &progress)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("run the child test");
+        let rounds: usize = std::fs::read_to_string(&progress)
+            .ok()
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0);
+        let _ = std::fs::remove_file(&progress);
+        assert_ne!(
+            status.code(),
+            Some(STATUS_CONTROL_C_EXIT),
+            "the sender was killed by its own Ctrl+C (0xc000013a) after {rounds} of {ROUNDS} rounds"
+        );
+        assert!(status.success(), "child exit {:?} after {rounds} of {ROUNDS} rounds", status.code());
+        assert_eq!(rounds, ROUNDS);
     }
 }

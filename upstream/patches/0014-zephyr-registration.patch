@@ -17,8 +17,8 @@ Modelled directly on the existing Coins.WOW registration at every site below
 -- WOW is the nearest sibling (also a Monero-fork xmr_based_coins member on
 this per-coin-folder layout) and every hunk here is "add ZEPH next to WOW",
 never a new pattern. Authoritative shape confirmed against
-the reference port's re-plan notes ("Phase 2 -
-central registrations") (read-only reference, not part of this
+ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md ("Phase 2 -
+central registrations") in G:\REU26 (read-only reference, not part of this
 tree), which re-ported this exact registration onto this exact per-coin-
 folder layout and validated it live (`basicswap-prepare --withcoins=zephyr
 --preparebinonly` ran the new core.py end to end; `test_other` green; CI-

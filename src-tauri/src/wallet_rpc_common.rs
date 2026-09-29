@@ -38,6 +38,28 @@ pub fn random_hex(n: usize) -> String {
     (0..n).map(|_| format!("{:02x}", rng.gen::<u8>())).collect()
 }
 
+/// Most block-parse threads a CryptoNote wallet-rpc (monero / zephyr) is
+/// started with. `--max-concurrency` sizes wallet2's compute thread pool.
+///
+/// **16, and deliberately not lower (RAM plan 3.3 → Phase 4, 2026-09-25).**
+/// 3.3 cut this to 4 on the estimate that each idle pool thread costs memory
+/// (10-40 MB per wallet). Phase 4 measured it with the app's own
+/// `monero-wallet-rpc` v0.18.5.1, a fresh wallet synced to tip against a
+/// public node: 16 → 24 threads, **30.3 MB committed / 35.4 MB working
+/// set**; 4 → 12 threads, **31.5 MB / 34.7 MB**. The pool is real, its idle
+/// threads are not — Windows commits only the stack pages a thread touches.
+/// A lower ceiling saved nothing and only slowed rescans, so it was put back.
+/// Kept as one shared constant so the question is answered in one place.
+pub const WALLET_RPC_MAX_CONCURRENCY: u32 = 16;
+
+/// `--max-concurrency` for a CryptoNote wallet-rpc on a host with `physical`
+/// cores: at least 2, at most [`WALLET_RPC_MAX_CONCURRENCY`]. Used by every
+/// CryptoNote spawn: `xmr_rpc` and `zph_rpc` (user wallet and the
+/// engine-owned swap wallet).
+pub fn wallet_rpc_concurrency(physical: usize) -> u32 {
+    (physical.min(u32::MAX as usize) as u32).clamp(2, WALLET_RPC_MAX_CONCURRENCY)
+}
+
 /// MD5 hex digest of the given bytes. Used for HTTP Digest auth (RFC 7616).
 pub fn md5_hex(data: &[u8]) -> String {
     let mut h = Md5::new();
@@ -571,6 +593,18 @@ pub async fn probe_node(url: String, timeout_ms: u64) -> NodeProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// RAM plan 3.3 capped this at 4; Phase 4's measurement found the idle
+    /// pool costs no memory, so it is back at 16 (see the constant).
+    #[test]
+    fn wallet_rpc_concurrency_follows_physical_cores_between_two_and_sixteen() {
+        assert_eq!(WALLET_RPC_MAX_CONCURRENCY, 16);
+        assert_eq!(wallet_rpc_concurrency(24), 16, "the dev host");
+        assert_eq!(wallet_rpc_concurrency(8), 8);
+        assert_eq!(wallet_rpc_concurrency(3), 3);
+        assert_eq!(wallet_rpc_concurrency(1), 2, "a single core still gets two");
+        assert_eq!(wallet_rpc_concurrency(0), 2, "num_cpus reporting 0 must not pass 0");
+    }
 
     /// `sidecar_naming` is the whole point of the zano generalization — pin the
     /// mapping so a future edit cannot silently make zano look for the wrong

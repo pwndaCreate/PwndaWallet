@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # =============================================================================
 # PwndaWallet client - provision the CLIENT's testnet swap credentials by REUSING
-# the reference port's already-funded, already-tested testnet accounts (no new funding, no new
-# accounts). Operator-run, on-box (the machine that has BOTH the reference checkout and this repo),
+# REU26's already-funded, already-tested testnet accounts (no new funding, no new
+# accounts). Operator-run, on-box (the machine that has BOTH REU26 and this repo),
 # idempotent. No secret is printed to the terminal.
 #
 # WHAT IT STAGES into pwnda-testnet-credentials/ (committed to THIS private repo -
-# testnet/stagenet only, no real value; the same decision the reference port made):
-#   - blockfrost-project-id.preprod : the reference port's preprod BlockFrost project id
+# testnet/stagenet only, no real value; the same decision REU26 made):
+#   - blockfrost-project-id.preprod : REU26's preprod BlockFrost project id
 #       (read-only Cardano preprod; rung 2b + rung 3). SAME id the desk uses - fine,
 #       protocol params are network-deterministic, so sharing one id across two
 #       machines still proves the independent-views property (see README).
-#   - xmr-stagenet/swap-wallet.keys : the reference port second-pair 'bob' Monero stagenet wallet
+#   - xmr-stagenet/swap-wallet.keys : REU26 second-pair 'bob' Monero stagenet wallet
 #       (addr 55e3ZVrF... , ~2.72 sXMR, EMPTY password). The CLIENT's OWN XMR wallet,
 #       DISTINCT from the desk's maker reserve. Used when the client locks XMR
 #       (SELL_FOLLOWER).
-#   - ada-funding.preprod.skey      : the reference port main funding key (addr_test1vrkl2h... ,
-#       ~9,979 preprod tADA). The ONLY spendable preprod ADA the reference port committed, so it is
+#   - ada-funding.preprod.skey      : REU26 main funding key (addr_test1vrkl2h... ,
+#       ~9,979 preprod tADA). The ONLY spendable preprod ADA REU26 committed, so it is
 #       the SAME account the desk funds from. Used when the client leads ADA
 #       (BUY_FOLLOWER). Run the two swap directions SEQUENTIALLY so desk + client never
 #       spend the same account's UTxOs at once (see README). SELL_FOLLOWER needs no
@@ -25,22 +25,22 @@
 #       client's ada-xmr sidecar.
 #   - README.md                     : addresses, balances, passwords, and wiring.
 #
-# The reference checkout is READ-ONLY - this only COPIES from it.
+# REU26 is READ-ONLY - this only COPIES from it.
 #
-# USAGE:  bash scripts/provision-client-testnet-accounts.sh
-#         REFERENCE_ROOT=/path bash ...   (default /home/user/reference-port)
+# USAGE:  bash scripts/provision-client-testnet-from-reu26.sh
+#         REU26_ROOT=/path bash ...   (default /home/user/REU26)
 # THEN:   git add pwnda-testnet-credentials && git commit && git push
 # =============================================================================
 set -euo pipefail
 
-REFERENCE_ROOT="${REFERENCE_ROOT:-/home/user/reference-port}"
+REU26_ROOT="${REU26_ROOT:-/home/user/REU26}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CRED="$REPO_ROOT/pwnda-testnet-credentials"
 XMR="$CRED/xmr-stagenet"
 
-H="$REFERENCE_ROOT/work/forks/ada-xmr-swap"
-KM="$REFERENCE_ROOT/zephyr-testnet/testnet-key-material"
+H="$REU26_ROOT/work/forks/ada-xmr-swap"
+KM="$REU26_ROOT/zephyr-testnet/testnet-key-material"
 BF_ID="$H/.blockfrost-project-id.preprod"
 ADA_SKEY="$H/.preview-alice.skey"
 XMR_BOB="$KM/ada-xmr-stagenet-wallets/bob.keys"
@@ -49,7 +49,7 @@ XMR_BOB_ADDR="$KM/ada-xmr-stagenet-wallets/bob.address.txt"
 ok(){ echo "  [OK]  $1"; }
 die(){ echo "  [FAIL] $1" >&2; exit 1; }
 
-[ -d "$REFERENCE_ROOT" ] || die "reference checkout not found at $REFERENCE_ROOT (set REFERENCE_ROOT=...)"
+[ -d "$REU26_ROOT" ] || die "REU26 not found at $REU26_ROOT (set REU26_ROOT=...)"
 [ -s "$BF_ID" ]    || die "BlockFrost preprod id missing: $BF_ID"
 [ -s "$ADA_SKEY" ] || die "ADA funding key missing: $ADA_SKEY"
 [ -s "$XMR_BOB" ]  || die "client XMR wallet missing: $XMR_BOB"
@@ -81,11 +81,11 @@ chmod 0600 "$CRED/client-testnet.env.sh"
 ok "wrote client-testnet.env.sh"
 
 cat > "$CRED/README.md" <<'RM'
-# Client testnet credentials (reused from the reference port, testnet-only)
+# Client testnet credentials (reused from REU26, testnet-only)
 
-These are TESTNET/STAGENET accounts with NO real-world value, reused from the reference port's already-funded,
+These are TESTNET/STAGENET accounts with NO real-world value, reused from REU26's already-funded,
 already-tested swap accounts so the client side needs no new funding or setup. This repo is private, so
-committing them is safe - the same decision the reference port made. All Monero wallets use an EMPTY password.
+committing them is safe - the same decision REU26 made. All Monero wallets use an EMPTY password.
 
 | File | What it is | Account / balance (2026-07-21) |
 |---|---|---|
@@ -107,7 +107,7 @@ committing them is safe - the same decision the reference port made. All Monero 
 1. The BlockFrost id is the SAME one the desk uses. That is fine: a project id is only an auth token; the
    protocol params come from the Cardano network (a per-epoch consensus constant), so two machines
    fetching with the same id still fetch independently and agree. (A separate free id is optional polish.)
-2. The ADA funding key is the SAME account the desk funds from - the only spendable preprod ADA the reference port
+2. The ADA funding key is the SAME account the desk funds from - the only spendable preprod ADA REU26
    committed. It only matters for BUY_FOLLOWER (when the client leads ADA); SELL_FOLLOWER needs no client
    ADA. Run the two directions SEQUENTIALLY (SELL_FOLLOWER, then BUY_FOLLOWER) so the desk and client never
    spend the same account's UTxOs concurrently. For a first bidirectional rung-3 test that is natural.
@@ -118,6 +118,6 @@ echo
 ok "Client testnet credentials staged in pwnda-testnet-credentials/ (0700). To share to the client machine:"
 cat <<EOF
       git add pwnda-testnet-credentials
-      git commit -m "testnet: reuse the reference port preprod/stagenet credentials for the client swap side"
+      git commit -m "testnet: reuse REU26 preprod/stagenet credentials for the client swap side"
       git push origin feat/swap-desk-client
 EOF

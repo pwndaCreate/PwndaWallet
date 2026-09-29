@@ -367,7 +367,7 @@ index ae67105..f17e65d 100644
 +        # (1) It is inapplicable by design. PATCH-7's require_segwit_inputs
 +        #     guard exists because BTC/LTC pre-sign the chain-A lock's
 +        #     refund against the lock tx's PREDICTED (pre-signing) txid --
-+        #     Route A in the reference notes on chain-A lock mechanisms -- so a
++        #     Route A in ResearchWiki's chain-a-lock-mechanisms.md -- so a
 +        #     malleable (non-segwit) input can move that txid out from
 +        #     under the refund. BCH is Route B: its swaplock.cash covenant
 +        #     is spent by a FRESH transaction against the lock's CONFIRMED

@@ -163,7 +163,7 @@ index 9acf42c..ac81ad8 100644
 +                    )
                  return
  
-             # ---- The reference port's original behaviour, UNCHANGED, for any non-Grove deployment. ----
+             # ---- REU26's original behaviour, UNCHANGED, for any non-Grove deployment. ----
 @@ -593,6 +623,38 @@ class ZanoInterface(CoinInterface):
                  "the payout address is then taken from the live wallet."
              )
@@ -176,7 +176,7 @@ index 9acf42c..ac81ad8 100644
 +        # (None) -- fails closed, exactly as PWNDA-PATCH-8's xmr.py guard does for
 +        # XMRInterface. No-op when _external_main_wallet is False: only a
 +        # host-managed main wallet can be switched out from under this connection
-+        # by a party other than this swap engine; a reference-port-shape deployment (main
++        # by a party other than this swap engine; a REU26-shape deployment (main
 +        # wallet seed-derived, engine-exclusive) has no such actor.
 +        #
 +        # Call this immediately before EVERY self.rpc_wallet("transfer", ...) (or

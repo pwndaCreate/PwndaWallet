@@ -702,16 +702,12 @@ mod tests {
     ///
     /// `include_str!` on purpose, exactly as the ready-ack fixtures do: the
     /// vendored engine is tracked, so if it is ever missing the build fails
-    /// loudly rather than silently testing a stale copy of the string. (`build.rs`
-    /// sets `engine_handoff` where the engine exists and fails the development
-    /// tree if it does not; a public checkout carries no engine, so this test is
-    /// not compiled there.)
+    /// loudly rather than silently testing a stale copy of the string.
     ///
     /// If this goes red, DO NOT edit the literal here to match. Check whether the
     /// engine's rewording also broke the desk's Go matcher — the two must move
     /// together or one side starts classifying a swipe as retryable again, which
     /// is C38.
-    #[cfg(engine_handoff)]
     #[test]
     fn our_swipe_marker_is_still_the_engines_c39() {
         const ENGINE_SRC: &str =

@@ -21,36 +21,36 @@ array; transfer/transfer_split's required source_asset/destination_asset),
 handled by wrapping self.rpc_wallet so every inherited XMRInterface method
 keeps working unmodified.
 
-Ported from a proven, tested source rather than written from scratch: the reference port's
-Zephyr coin-add (an unmerged proposal to github.com/basicswap/basicswap)
-already re-ported this same interface onto
+Ported from a proven, tested source rather than written from scratch: REU26's
+Zephyr coin-add (github.com/basicswap/basicswap PR #531, branch
+add-zephyr-coin, head fa148d0) already re-ported this same interface onto
 this exact per-coin-folder layout and validated it end to end --
 `basicswap-prepare --withcoins=zephyr --preparebinonly` downloading,
 hash-verifying and extracting real zephyrd/zephyr-wallet-rpc binaries, 13/13
 changed files compiling, CI-pinned lint clean, `test_other` green. See
-its re-plan notes (the
+ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md (the
 authoritative shape for these four files) and
-its interface/zephyr.py (the proven
-106-line interface body, pre-#532) (read-only reference, not part
+work/forks/basicswap-zephyr/basicswap/interface/zephyr.py (the proven
+106-line interface body, pre-#532) in G:\REU26 (read-only reference, not part
 of this tree).
 
 zephyr.py's coin_type/ticker_str/COIN/exp/__init__/_wrap_rpc_wallet are
 ported verbatim from that source (import lines re-pathed only). Two things
 diverge from it, both documented inline where they occur, both because this
-patch targets a newer XMRInterface than the reference port's source did:
+patch targets a newer XMRInterface than REU26's source did:
 
-  - depth_spendable() returns 3, not the reference port's 10 (itself copied from Monero).
-    The reference port's own comment on this method warns against exactly what its chosen
+  - depth_spendable() returns 3, not REU26's 10 (itself copied from Monero).
+    REU26's own comment on this method warns against exactly what its chosen
     value does ("do not blindly inherit Monero's value - retune it for THIS
     fork's block time"); 3 is this project's own retuning, reasoned inline.
   - the wallet-open retry logic is ported onto `_openWallet`, not the public
-    `openWallet` that the reference port overrode. The XMRInterface in this tree already splits
+    `openWallet` REU26 overrode. The XMRInterface in this tree already splits
     openWallet (an address-cache fast path) from _openWallet (the actual
     open/retry call) -- WOWInterface, already in this tree, follows the same
-    split for the same reason. Overriding the public method the way the reference port
+    split for the same reason. Overriding the public method the way REU26
     did would silently drop the cache fast path for every ZEPH wallet open.
 
-core.py (a new file relative to the reference port's own source, which predates #532's
+core.py (a new file relative to REU26's own source, which predates #532's
 introduction of per-coin core.py/CoinPrepareModule at all -- built following
 the replan's Phase 1 step 4, the authoritative shape for this file) is a
 ZEPHPrepare(XMRPrepare) supplying getConfigSegment/downloadCore/
@@ -61,13 +61,13 @@ binary provisioning is Phase A unit A2's own hash-pinned fetch, and
 basicswap-prepare is always invoked --nocores for zephyr -- but every
 registered coin in this tree fulfils the CoinPrepareModule contract for real
 (WOW and XMR both carry working versions here), so these are real,
-reference-port-modelled implementations rather than raise-on-call placeholders.
+REU26-modelled implementations rather than raise-on-call placeholders.
 getConfigSegment hardcodes manage_daemon/manage_wallet_daemon to False (every
 other xmr-family coin here routes them through ctx.should_manage_daemon(...))
 because nothing in Grove's deployment ever manages a local ZEPH daemon;
 blocks_confirmed is 3, matching XMRPrepare's own default. extractCore is a
 real zipfile-based override, not the inherited tar-on-non-Windows default --
-the reference port's replan flags this explicitly: Zephyr ships a .zip on every platform,
+REU26's replan flags this explicitly: Zephyr ships a .zip on every platform,
 unlike monero/wownero's tar.bz2 on linux, and the inherited
 extractCoreByBasename only takes the zip branch when the arch string itself
 says win32/win64.
@@ -115,19 +115,19 @@ new file mode 100644
 +# Modelled on basicswap/interface/wow/chainparams.py (also a Monero fork on
 +# this layout).
 +#
-+# Reference-port provenance: its interface/zephyr/
-+# chainparams.py, per
-+# its re-plan notes, Phase 1
-+# step 2. Those notes record a real bug in the OLDER flat fork (single
++# REU26 provenance: work/forks/basicswap-zephyr/basicswap/interface/zephyr/
++# chainparams.py (PR #531, branch add-zephyr-coin, head fa148d0), per
++# ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md Phase 1
++# step 2. That page records a real bug in the OLDER flat fork (single
 +# central chainparams.py, pre-#532): the current xmr.py.__init__ reads
 +# subaddress_prefix UNCONDITIONALLY
 +# (chainparams_network()["subaddress_prefix"], no .get()/default) -- a
 +# params dict carrying only address_prefix raises KeyError the moment a
 +# ZEPHInterface is constructed. Both prefixes are supplied below; mainnet
 +# and testnet values cross-checked independently against
-+# a Go address encoder (a second, unrelated
-+# Zephyr-aware codebase hardcoding the same four constants) and
-+# the older flat chainparams.py entry
++# work/forks/atomic-swap-evm/crypto/monero/address.go (a second, unrelated
++# Zephyr-aware codebase in REU26 hardcoding the same four constants) and
++# work/forks/basicswap-zephyr/basicswap/chainparams.py's old flat entry
 +# (address_prefix values only, pre-#532).
 +
 +ZEPH_COIN = 10**12
@@ -193,8 +193,8 @@ new file mode 100644
 +# on top -- everything a swap needs (key-share split, DLEq, address
 +# encoding, lock-tx publishing) is inherited unchanged from XMRInterface,
 +# exactly like WOWInterface. The two Zephyr-specific adaptations both live
-+# in the *wallet-RPC* layer, not the swap protocol -- see the reference port's
-+# RPC-diff notes:
++# in the *wallet-RPC* layer, not the swap protocol -- see REU26's
++# zephyr-testnet/RQ2-RPC-DIFF.md:
 +#   - get_balance returns {"balances": [{"asset_type": "ZPH", balance, ...},
 +#     ...]}, not Monero's flat {balance, unlocked_balance}. Flattened onto
 +#     the top-level keys XMRInterface's inherited methods actually read.
@@ -204,14 +204,14 @@ new file mode 100644
 +# Both are handled by wrapping self.rpc_wallet in __init__, so every
 +# inherited XMRInterface method keeps working unmodified.
 +#
-+# Reference-port provenance: its interface/
++# REU26 provenance: work/forks/basicswap-zephyr/basicswap/interface/
 +# zephyr.py (the 106-line interface, proven through the 8-test ZEPH swap
-+# matrix), re-pathed onto
-+# dev's post-#532 per-coin-folder layout per its
-+# re-plan notes, Phase 1 step 3. coin_type,
++# matrix -- G:\REU26\zephyr-testnet\test-evidence-zeph*), re-pathed onto
++# dev's post-#532 per-coin-folder layout per ResearchWiki/synthesis/
++# zeph-coin-add-dev-restructure-replan.md Phase 1 step 3. coin_type,
 +# ticker_str, COIN, exp, __init__, _wrap_rpc_wallet are ported verbatim
 +# (import lines re-pathed only, per the replan). depth_spendable() and the
-+# openWallet override both diverge from the reference port -- see the comments at each.
++# openWallet override both diverge from REU26 -- see the comments at each.
 +
 +from basicswap.chainparams import Coins
 +from basicswap.interface.zephyr.chainparams import ZEPH_COIN
@@ -238,7 +238,7 @@ new file mode 100644
 +
 +    @staticmethod
 +    def depth_spendable() -> int:
-+        # PWNDA-PATCH-13 divergence from the reference port: the reference port's zephyr.py returns 10
++        # PWNDA-PATCH-13 divergence from REU26: REU26's zephyr.py returns 10
 +        # here, matched to Monero's own value with the stated reasoning
 +        # "same wall-clock maturity as Monero's 2-minute blocks". That
 +        # reasoning is sound for a coin whose OWN wallet balance the engine
@@ -252,7 +252,7 @@ new file mode 100644
 +        # balance arithmetic treats a received output as spendable" -- the
 +        # same question WOW answers with 4 despite Monero itself answering
 +        # 10, i.e. this value is meant to be retuned per fork, not
-+        # inherited. The reference port's own comment on this exact method warns against
++        # inherited. REU26's own comment on this exact method warns against
 +        # exactly what its own chosen value does: "do not blindly inherit
 +        # Monero's value - retune it for THIS fork's block time." Zephyr's
 +        # 2-minute blocks and materially smaller hashrate than Monero argue
@@ -270,7 +270,7 @@ new file mode 100644
 +
 +    @staticmethod
 +    def _wrap_rpc_wallet(inner):
-+        # Ported verbatim from the reference port's zephyr.py (_wrap_rpc_wallet) -- the
++        # Ported verbatim from REU26's zephyr.py (_wrap_rpc_wallet) -- the
 +        # ZPH-asset-field injection and get_balance flattening described in
 +        # the module docstring above.
 +        def rpc_wallet(method, params=None, **kwargs):
@@ -303,7 +303,7 @@ new file mode 100644
 +
 +        return rpc_wallet
 +
-+    # PWNDA-PATCH-13 divergence from the reference port: the reference port's zephyr.py overrides the
++    # PWNDA-PATCH-13 divergence from REU26: REU26's zephyr.py overrides the
 +    # PUBLIC `openWallet(self, filename)`. On the current dev base this
 +    # patch series targets (upstream/basicswap/basicswap/interface/xmr/
 +    # xmr.py), XMRInterface.openWallet is no longer the whole story: it
@@ -313,11 +313,11 @@ new file mode 100644
 +    # `_openWallet`. WOWInterface already follows this exact split --
 +    # wow.py overrides `_openWallet`, not `openWallet` (its own comment:
 +    # "below only needed until wow is rebased ..."). Overriding the public
-+    # method the way the reference port did would silently drop that address-cache fast
++    # method the way REU26 did would silently drop that address-cache fast
 +    # path for every ZEPH wallet open (every call would re-hit RPC even
 +    # when the cached address already matches). So this override targets
 +    # `_openWallet` instead, through the same extension point WOW uses,
-+    # keeping the reference port's proven retry body unchanged: open; on "no connection
++    # keeping REU26's proven retry body unchanged: open; on "no connection
 +    # to daemon" allow startup against a busy daemon; on any other failure,
 +    # store+close then reopen once.
 +    def _openWallet(self, filename):
@@ -362,20 +362,20 @@ new file mode 100644
 +# fulfils (WOW and XMR both carry working versions in this same tree), and
 +# leaving ZEPH's unimplemented would make it the one coin that silently
 +# breaks if --nocores were ever omitted by mistake, instead of behaving the
-+# way the framework expects every coin to. They are modelled on the reference port's
++# way the framework expects every coin to. They are modelled on REU26's
 +# proven design, cited per-method below.
 +#
-+# Reference-port provenance (primary, authoritative for THIS file's shape):
-+# its re-plan notes, Phase 1
++# REU26 provenance (primary, authoritative for THIS file's shape):
++# ResearchWiki/synthesis/zeph-coin-add-dev-restructure-replan.md Phase 1
 +# step 4. Note this deliberately does NOT match the OLDER flat-fork
-+# prepare.py block, which pointed downloadCore at a
-+# mirror-hosted binary ("Path B": a re-hosted copy of the zephyr-cli-linux zip on
-+# a project-run mirror repository).
-+# The replan's per-coin-folder design
++# prepare.py block (zephyr-testnet/patches/
++# basicswap-prepare-zephyr-coin-add.patch), which pointed downloadCore at a
++# REU26-hosted MIRROR binary ("Path B": zephyr-cli-linux-v{V}-reu26.zip on
++# Notsosmartt-cmd/zephyr-basicswap). The replan's per-coin-folder design
 +# instead downloads Zephyr's own OFFICIAL release ("Path A":
-+# ZephyrProtocol/zephyr) and only borrows the mirror-hosted SHA256SUMS for
++# ZephyrProtocol/zephyr) and only borrows the REU26-hosted SHA256SUMS for
 +# the hash, since Zephyr's official release publishes no hash file of its
-+# own at all -- the reference port's release survey documents
++# own at all -- ResearchWiki/synthesis/zeph-basicswap-pr-paths.md documents
 +# that gap exhaustively (all 69 assets across all 15 releases checked).
 +# Followed here as the replan specifies.
 +
@@ -413,7 +413,7 @@ new file mode 100644
 +        datadir = os.getenv("ZEPH_DATA_DIR", os.path.join(ctx.data_dir, self.name))
 +        config = {
 +            "connection_type": "rpc",
-+            # PWNDA-PATCH-13 divergence from the reference port: the reference port's own core.py (and
++            # PWNDA-PATCH-13 divergence from REU26: REU26's own core.py (and
 +            # every stock xmr-family coin in this tree --
 +            # WOWPrepare.getConfigSegment, XMRPrepare.getConfigSegment)
 +            # routes these two flags through ctx.should_manage_daemon(...),
@@ -459,8 +459,8 @@ new file mode 100644
 +        extra_opts: dict,
 +    ) -> tuple:
 +        # Zephyr's official release asset naming (verified against the real
-+        # release page, linux asset -- the reference port's survey,
-+        # item A4). win/osx cases mirror that same
++        # release page, linux asset -- ResearchWiki/synthesis/
++        # zeph-basicswap-pr-paths.md A4). win/osx cases mirror that same
 +        # "zephyr-cli-<os>-v<version>.zip" convention rather than a second
 +        # independently-verified asset; Grove is Windows-only in practice
 +        # and never exercises this method at all (see the module
@@ -482,12 +482,12 @@ new file mode 100644
 +
 +        # Zephyr's own release has no hash file at all (see the module
 +        # docstring), so the hash BasicSwap's always-runs verifyCoreHash
-+        # step verifies against is a community-hosted mirror of it,
++        # step verifies against is REU26's community-hosted mirror of it,
 +        # per the replan's Phase 1 step 4 -- not a Zephyr-published
 +        # artifact.
 +        assert_filename = f"zephyr-{self.version}-SHA256SUMS"
 +        assert_url = (
-+            f"https://raw.githubusercontent.com/pwndaCreate/"
++            f"https://raw.githubusercontent.com/Notsosmartt-cmd/"
 +            f"zephyr-basicswap/main/{self.version}/SHA256SUMS"
 +        )
 +        assert_path = os.path.join(bin_dir, assert_filename)

@@ -33,7 +33,7 @@
 //! `upstream/patches/0015-zano-coin-module.patch`'s `ZanoInterface.__init__`
 //! reads both as `rpc_wallet` (main, `walletrpcport`/`walletrpcjwt`) and
 //! `rpc_wallet_scratch` (`scratchwalletrpcport`/`scratchwalletrpcjwt`) — see
-//! that patch's own "SECOND wallet-rpc" comment for the full reference-port-derived
+//! that patch's own "SECOND wallet-rpc" comment for the full REU26-derived
 //! rationale, and `swap_sidecar.rs`'s `apply_host_zano_wallet_to_config` /
 //! `maybe_activate_zano_host_wallet` for where these two ports+secrets are
 //! written into `basicswap.json` and how "Main confirmed before Scratch is
@@ -225,6 +225,20 @@ impl Default for ZanoRpcInner {
 }
 
 pub struct ZanoRpcChild(pub Mutex<ZanoRpcInner>);
+
+/// The daemon Main was last started against (2026-09-26).
+///
+/// The swap node's Scratch wallet and its engine chainclient follow it
+/// (`swap_sidecar::pick_zano_engine_daemon`), so a node the user adds in the
+/// Zano panel reaches swaps too. Before this both were pinned to
+/// `swap_sidecar::ZANO_BOOTSTRAP_DAEMON` — the network's single public node,
+/// down for 12+ hours on 2026-09-25/26 — whatever node Main used.
+static MAIN_DAEMON_ADDRESS: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The daemon address Main was last started with, if it has been started.
+pub fn main_daemon_address() -> Option<String> {
+    MAIN_DAEMON_ADDRESS.lock().ok().and_then(|g| g.clone())
+}
 
 impl Default for ZanoRpcChild {
     fn default() -> Self {
@@ -858,6 +872,12 @@ pub async fn zano_start_rpc(
 
     let binary = resolve_rpc_binary(&app)?;
     let log_file = get_log_file(&app)?;
+    // RAM plan Phase 1.3 (2026-09-22): `simplewallet.exe` has no log-size
+    // cap of its own (`--help` lists only `--log-file`/`--log-level`), so
+    // `zano-rpc.log` grew unbounded for the life of an install. Rotate
+    // HERE, before spawn, rather than while the process holds the file
+    // open — see `rotate_log_if_large`'s doc comment for why.
+    crate::swap_sidecar::rotate_log_if_large(&log_file, crate::swap_sidecar::APP_LOG_ROTATE_MAX_BYTES);
     // Under the swap node's claim, keep the secret its config already holds.
     let jwt_secret = engine_claim_secret().unwrap_or_else(|| random_hex(32));
 
@@ -880,6 +900,9 @@ pub async fn zano_start_rpc(
         .arg(&log_file)
         .arg("--log-level")
         .arg("0");
+    if let Ok(mut g) = MAIN_DAEMON_ADDRESS.lock() {
+        *g = Some(daemon_address.clone());
+    }
 
     // NOTE: `--do-pos-mining` is deliberately absent and must stay absent.
     // Staking is an explicit non-goal; its ABSENCE is the kill switch, because
@@ -1772,6 +1795,9 @@ pub async fn zano_scratch_start(
     let (wallet_file, wallet_password) = ensure_scratch_wallet_file(app, &binary).await?;
 
     let log_file = get_scratch_log_file(app)?;
+    // RAM plan Phase 1.3 (2026-09-22) — see the identical rotation call in
+    // `zano_start_rpc` (Main) for why this has to happen pre-spawn.
+    crate::swap_sidecar::rotate_log_if_large(&log_file, crate::swap_sidecar::APP_LOG_ROTATE_MAX_BYTES);
     let jwt_secret = random_hex(32);
 
     let mut cmd = tokio::process::Command::new(&binary);
@@ -2056,7 +2082,10 @@ mod tests {
     /// releases it where the node stops and at the top of every start.
     #[test]
     fn the_supervisor_claims_and_releases_main() {
-        let src = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let src = include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let act = &src[src
             .find("async fn maybe_activate_zano_host_wallet(")
             .expect("activation moved")..];

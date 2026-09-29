@@ -95,7 +95,7 @@ lookahead pool of 20 that put real change at internal index 20, one past BIP-44'
 limit, so a stock restore of the same seed reports zero over on-chain funds.
 
 **13–17 are the CryptoNote-follower patches (ZEPH, ZANO): embedder policy** — upstream
-declined ZEPH on chain health and ZANO needs a Zano-side wallet change first; neither
+declined ZEPH on chain health (#531) and ZANO needs a Zano-side wallet change first; neither
 is a PR candidate. **18 is a PR candidate** (BCH electrum-mode support); **19 is embedder
 policy** (Grove's account-key wallet sharing). See
 [[grove-expansion-master-plan]] for the design these seven implement, and each patch's own
@@ -120,9 +120,9 @@ gitignored workspace.
 | 10 | `0010-redeem-duplicate-broadcast-tolerance.patch` | an already-mined coin-A redeem is recorded as success instead of parking the bid in `BID_ERROR` | `PWNDA-PATCH-10` | **candidate — upstream bug, not policy** |
 | 11 | `0011-recover-stalled-bid-endpoint.patch` | a gated `pwndarecover` that re-queues the engine's own next step for a bid stuck in `BID_ERROR` | `PWNDA-PATCH-11` | no — embedder policy |
 | 12 | `0012-import-account-address-endpoint.patch` | `pwndaimportaddress` — teach the engine about an address of its own account that its bookkeeping missed | `PWNDA-PATCH-12` | no — host-repair surface |
-| 13 | `0013-zephyr-coin-module.patch` | new `interface/zephyr/` coin module (`chainparams`/`core`/`zephyr`, modelled on `wow`/`xmr`, re-ported from the reference port's proven interface) — new files only, no shared-file edits | `PWNDA-PATCH-13` | no — upstream declined the coin (chain-health grounds) |
+| 13 | `0013-zephyr-coin-module.patch` | new `interface/zephyr/` coin module (`chainparams`/`core`/`zephyr`, modelled on `wow`/`xmr`, re-ported from REU26's proven #531 interface) — new files only, no shared-file edits | `PWNDA-PATCH-13` | no — upstream declined the coin (chain-health grounds, #531) |
 | 14 | `0014-zephyr-registration.patch` | registers `Coins.ZEPH` (id 19) into `chainparams.py`, `basicswap.py` (factory + poll thread), `bin/prepare.py`, `bin/run.py`, `ui/page_settings.py` | `PWNDA-PATCH-14` | no — embedder policy |
-| 15 | `0015-zano-coin-module.patch` | new `interface/zano/` coin module (`ZanoInterface`, a JWT wallet-rpc client, `_external_main_wallet`), re-ported from the reference port's 1,340-line interface — new files only | `PWNDA-PATCH-15` | no — Zano-side wallet change (`generate_from_keys`) needed first |
+| 15 | `0015-zano-coin-module.patch` | new `interface/zano/` coin module (`ZanoInterface`, a JWT wallet-rpc client, `_external_main_wallet`), re-ported from REU26's 1,340-line interface — new files only | `PWNDA-PATCH-15` | no — Zano-side wallet change (`generate_from_keys`) needed first |
 | 16 | `0016-zano-registration.patch` | registers `Coins.ZANO` (id 16, upstream's own reserved-but-commented slot) into `chainparams.py`, `basicswap.py` (factory, poll thread, scratch/JWT allowlist copies, `getTotalBalance`'s `getbalance` branch), `bin/prepare.py` — serialised by B-INT against the tree with 14 already applied (both patches edit the same `Coins` enum / `scriptless_coins` / `xmr_based_coins` region; merged, not chosen between) | `PWNDA-PATCH-16` | no — embedder policy |
 | 17 | `0017-cn-follower-host-wallet-guards.patch` | wrong-wallet assertion for `ZanoInterface.publishBLockTx`, PATCH-8-shaped (ZEPH needs none — `ZEPHInterface` inherits `XMRInterface`, already covered by patch 8) | `PWNDA-PATCH-17` | no — embedder policy |
 | 18 | `0018-bch-electrum-core.patch` | BCH light/electrum mode: `bch.py` overrides (FORKID signer, `fundSCLockTx`, `getDestForAddress`, and the eight electrum branches the feasibility query named), `wallet_manager.py` cashaddr `_deriveAddress` branch, `electrumx.py` server list + `scripthash_from_address` fix, `bin/prepare.py` `--bch-mode` wiring | `PWNDA-PATCH-18` | **candidate — upstream feature, not policy** (§ 6, staged for export) |
@@ -360,7 +360,7 @@ patch header records this so the limitation cannot be rediscovered as a bug.
 
 Built the same day as 6, in response to the operator asking for the legacy-wallet work to
 be independently checked for safety against the atomic-swap protocol literature (a
-separate research notebook, not part of this repository). The audit's central
+separate research vault at `G:\REU26`, not part of this repository). The audit's central
 finding: BasicSwap pre-signs the chain-A lock's refund transaction against the **lock
 tx's own predicted, pre-broadcast txid** —
 

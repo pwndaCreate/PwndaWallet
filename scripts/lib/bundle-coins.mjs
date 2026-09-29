@@ -62,7 +62,7 @@ export const COIN_BINARIES = {
  * to `COIN_BINARIES` unchanged.
  *
  * zano on linux (2026-09-11): the Linux arm of the same patched build is STATIC
- * (`-D STATIC=TRUE` in scripts/swap/zano-build/build-zano-linux.sh, the reference port's
+ * (`-D STATIC=TRUE` in scripts/swap/zano-build/build-zano-linux.sh, REU26's
  * proven recipe), so there is no OpenSSL runtime to ship beside it. The two
  * DLLs in the Windows list exist because THAT build is STATIC=FALSE. Demanding
  * them on Linux fails the build on a file that is not supposed to exist;

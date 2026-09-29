@@ -669,7 +669,7 @@ const XELIS_POOLS: PoolDef[] = [
     // Live evidence is the pool's own account API, not a probe from the dev
     // box. It charted the operator's address at 2.0–7.3 kH/s from 23:44 to
     // 01:00 UTC (2026-09-16/17), then 0. By 01:30 UTC every *.pwnda.org
-    // stratum host was a CNAME to a tunnel hostname that returned
+    // stratum host was a CNAME to `pwnda.a.pinggy.link`, which returned
     // NXDOMAIN, so no raw stratum probe or app session could be run. The
     // stats API (pwnda.org/xelis-api) still answered.
     id: "pwnda-xelis",

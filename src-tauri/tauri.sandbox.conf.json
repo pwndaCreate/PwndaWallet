@@ -10,7 +10,7 @@
     "windows": [
       {
         "title": "PWNDA Wallet — Dev Iteration Sandbox",
-        "label": "claude",
+        "label": "main",
         "additionalBrowserArgs": "--js-flags=--expose-gc --disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection --disable-gpu --disable-gpu-compositing"
       }
     ]

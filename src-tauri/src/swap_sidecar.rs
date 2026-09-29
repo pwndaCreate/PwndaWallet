@@ -6309,6 +6309,115 @@ pub(crate) fn strip_bom(bytes: &[u8]) -> Result<&str, String> {
 /// Idempotent: a conf that already sets `listen=` is left untouched. Monero is
 /// not btc-family — a *local* monerod would need its own p2p-bind handling, but
 /// the production config runs XMR on a remote node, so no local monerod exists.
+/// Trailing marker appended to a `dbcache=` line THIS function writes, so a
+/// LATER run — after `daemon_dbcache_mb`'s formula changes, as it did
+/// 2026-09-22 (4096 MB ceiling → 512 MB) — can tell "a value we chose, safe
+/// to correct" from "a value the user chose, or that predates this marker
+/// and is therefore not provably ours". Only the former is ever rewritten.
+/// *(Corrected 2026-09-25: one exception below — [`migrate_legacy_dbcache`]
+/// rewrites an unmarked value that is exactly the pre-marker formula's output
+/// on this machine, because every install provisioned before 2026-09-22 was
+/// stuck on it, the operator's included.)*
+/// A bare `dbcache=<N>` with no marker is left alone FOREVER — that is the
+/// SAME "never second-guess an existing value" contract this file already
+/// tested (`harden_daemon_confs_sets_a_real_dbcache`'s user-override case),
+/// now correctly scoped to "provably not ours" instead of "any value at
+/// all". An install from before this marker existed keeps whatever this
+/// code wrote under the OLD formula until something else regenerates its
+/// conf (a fresh prepare) — retroactively guessing which un-marked values
+/// were ours and which were a real user edit is not attempted, because
+/// guessing wrong there means silently discarding someone's own setting.
+const DBCACHE_MARKER: &str = "# pwnda:auto";
+
+fn is_marked_dbcache_line(line: &str) -> bool {
+    match line.trim_start().strip_prefix("dbcache=") {
+        Some(rest) => rest.trim_end().ends_with(DBCACHE_MARKER),
+        None => false,
+    }
+}
+
+/// The value of a conf's MARKED `dbcache=` line, or `None` if it has no
+/// dbcache line, or an unmarked one (see `DBCACHE_MARKER`).
+fn marked_dbcache_value(text: &str) -> Option<u64> {
+    let line = text.lines().find(|l| is_marked_dbcache_line(l))?;
+    let rest = line.trim_start().strip_prefix("dbcache=")?;
+    rest.trim_end()
+        .trim_end_matches(DBCACHE_MARKER)
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// Replace an existing MARKED `dbcache=` line's value in place; every other
+/// line, including its position, is untouched. Caller must have already
+/// confirmed a marked line exists (via `marked_dbcache_value`).
+fn rewrite_marked_dbcache_line(text: &str, new_value: u64) -> String {
+    let rewritten: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if is_marked_dbcache_line(l) {
+                format!("dbcache={} {}", new_value, DBCACHE_MARKER)
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let mut joined = rewritten.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    joined
+}
+
+/// The formula `harden_daemon_confs` wrote, WITHOUT a marker, from 2026-08-20
+/// (`c2e3b4a`) until RAM plan Phase 1.1 (2026-09-22). Nothing wrote `dbcache`
+/// before it (`git log -S dbcache`), so this is the only unmarked value that
+/// can be ours.
+fn legacy_dbcache_mb(total_ram_mb: u64) -> u64 {
+    (total_ram_mb / 8).clamp(512, 4096)
+}
+
+/// RAM plan Phase 4 (operator decision, 2026-09-25): rewrite a PRE-MARKER
+/// auto-write to the current value, with the marker. Returns the new text, or
+/// `None` to leave the conf alone.
+///
+/// Why: Phase 1.1 left every unmarked value alone, and every install
+/// provisioned before it carries exactly such a line. The operator's own swap
+/// node started 2026-09-24 with `Config file arg: dbcache="4096"` and ran
+/// `particld` at 1,437 MB — the cap never reached it. The marker rule is kept
+/// for everything it can protect: only a value that is BOTH the conf's only
+/// `dbcache=` line, a bare integer (no comment, no quotes), AND exactly what
+/// the old formula gives on this machine is taken as ours. A user's own
+/// number is left alone unless it happens to equal that value to the MB; with
+/// the RAM unreadable nothing is migrated.
+fn migrate_legacy_dbcache(text: &str, total_ram_mb: Option<u64>, new_value: u64) -> Option<String> {
+    let total = total_ram_mb?;
+    let mut dbcache_lines = text.lines().filter(|l| l.trim_start().starts_with("dbcache="));
+    let line = dbcache_lines.next()?;
+    if dbcache_lines.next().is_some() || is_marked_dbcache_line(line) {
+        return None;
+    }
+    let value: u64 = line.trim().strip_prefix("dbcache=")?.parse().ok()?;
+    if value != legacy_dbcache_mb(total) || value == new_value {
+        return None;
+    }
+    let rewritten: Vec<String> = text
+        .lines()
+        .map(|l| {
+            if l == line {
+                format!("dbcache={} {}", new_value, DBCACHE_MARKER)
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    let mut joined = rewritten.join("\n");
+    if text.ends_with('\n') {
+        joined.push('\n');
+    }
+    Some(joined)
+}
+
 fn harden_daemon_confs(datadir: &Path) -> Result<(), String> {
     const BTC_FAMILY: &[&str] = &[
         "particl",
@@ -6326,32 +6435,48 @@ fn harden_daemon_confs(datadir: &Path) -> Result<(), String> {
         if !conf.is_file() {
             continue;
         }
-        let text = std::fs::read_to_string(&conf)
+        let mut text = std::fs::read_to_string(&conf)
             .map_err(|e| format!("read {}.conf: {}", coin, e))?;
+        let mut changed = false;
 
-        // Each setting is prepended only if the conf does not already carry it,
-        // so a user hand-edit is never clobbered and a re-run is a no-op. Both
-        // are cheap line scans, so the file is written at most once.
+        // dbcache is the IBD accelerator. Sizing it from real RAM keeps a
+        // small machine safe while letting a large one actually use its
+        // memory. dbcache is a CEILING, not a reservation — Core releases it
+        // after IBD — so it is safe to leave set permanently. (2026-09-25:
+        // "releases it" was not observed — particld on dbcache=4096 held
+        // 1,437 MB at tip for 19.7 h — which is why the ceiling matters.) See
+        // `daemon_dbcache_mb` for why the ceiling/floor changed 2026-09-22
+        // and why this only ever rewrites a value it can PROVE it wrote.
+        if let Some(existing) = marked_dbcache_value(&text) {
+            if existing != dbcache {
+                text = rewrite_marked_dbcache_line(&text, dbcache);
+                changed = true;
+            }
+        } else if let Some(migrated) = migrate_legacy_dbcache(&text, system_ram_mb(), dbcache) {
+            // A pre-marker auto-write, provably ours — see the function.
+            text = migrated;
+            changed = true;
+        }
+
+        // Each setting is prepended only if the conf does not already carry
+        // it, so a user hand-edit (or a pre-marker auto-write) is never
+        // clobbered and a re-run is a no-op.
         let mut prefix = String::new();
         if !conf_has_key(&text, "listen") {
             prefix.push_str("listen=0\n");
         }
-        // dbcache is the IBD accelerator. The 450 MB default forces the
-        // chainstate to flush to LevelDB constantly, which on a machine with
-        // RAM to spare is pure disk thrash (measured: particld ~0% CPU, disk
-        // queue ~3 during sync). Sizing it from real RAM keeps a 4 GB machine
-        // safe while letting a 64 GB one actually use its memory. dbcache is a
-        // CEILING, not a reservation — Core releases it after IBD — so it is
-        // safe to leave set permanently and needs no post-sync cleanup.
         if !conf_has_key(&text, "dbcache") {
-            prefix.push_str(&format!("dbcache={}\n", dbcache));
+            prefix.push_str(&format!("dbcache={} {}\n", dbcache, DBCACHE_MARKER));
+        }
+        if !prefix.is_empty() {
+            text = format!("{}{}", prefix, text);
+            changed = true;
         }
 
-        if prefix.is_empty() {
+        if !changed {
             continue;
         }
-        let out = format!("{}{}", prefix, text);
-        std::fs::write(&conf, out.as_bytes())
+        std::fs::write(&conf, text.as_bytes())
             .map_err(|e| format!("write {}.conf: {}", coin, e))?;
     }
     Ok(())
@@ -6514,22 +6639,39 @@ fn apply_particl_prune_policy(datadir: &Path) -> Result<bool, String> {
 
 /// dbcache size in MB, sized from system RAM.
 ///
-/// `total_mb / 8`, clamped to `[512, 4096]`:
+/// `total_mb / 32`, clamped to `[64, 512]`:
 ///
-/// * the floor keeps it at least as large as Core's 450 MB default even on a
-///   tiny box, so this can never make sync SLOWER;
-/// * the `/8` leaves the other seven-eighths of RAM for the OS, the webview,
-///   any sibling daemons, and the user's own machine — three full nodes each
-///   taking this is still a fraction of a modest install;
-/// * the ceiling is 4 GB because Particl's UTXO set is far smaller than
-///   Bitcoin's, so the resident-working-set benefit saturates well below it —
-///   past ~4 GB you are reserving RAM the IBD cannot use.
+/// * the ceiling dropped from a former 4 GB (RAM plan Phase 1.1,
+///   2026-09-22) — `daemon_dbcache_mb` is written for **particld**, the one
+///   BTC-family daemon that is mandatory and always running (the standing
+///   constraint is "swap node stays on"; every other coin defaults to
+///   [`CoinMode::Lean`], which runs no local daemon at all and never reads
+///   this value). Particl's UTXO set is small enough that the
+///   resident-working-set benefit was already documented as saturating
+///   "well below" the old 4 GB ceiling — so most of that ceiling was pure
+///   headroom nothing used, at the cost of `dbcache` being a real RSS
+///   contributor on a 64 GB dev box (4 GB reserved per BTC-family daemon
+///   that happens to run Full).
+/// * `/32` (down from `/8`) leaves proportionally more RAM for everything
+///   else — the OS, the webview, sibling daemons — matching the tighter
+///   overall RAM budget in [[ram-budget-1gb-plan]].
+/// * the floor is 64 MB, not Core's 450 MB default: this formula
+///   deliberately goes BELOW Core's own default on a modest machine,
+///   trading some IBD speed for RAM. **Disclosed tradeoff, not built
+///   around:** the plan's own risk note ("keep a high value while syncing,
+///   drop it at tip") describes an adaptive scheme this function does NOT
+///   implement — that needs restart-on-tip-reached machinery, which is
+///   Phase-3-structural-sized work, not a Phase-1 safe win, and would mean
+///   THIS code restarting the swap node on its own initiative, which the
+///   standing constraint reserves for the operator. The risk is real only
+///   for a coin a user has explicitly opted into `Full` mode; particld
+///   itself (see above) is not meaningfully affected.
 ///
-/// A machine whose RAM cannot be read falls back to 1024 MB: still more than
-/// double the default, and safe anywhere that can run the node at all.
+/// A machine whose RAM cannot be read falls back to 2048 MB pre-clamp
+/// (→ 64 MB post-clamp): still safe anywhere that can run the node at all.
 pub fn daemon_dbcache_mb() -> u64 {
-    let total = system_ram_mb().unwrap_or(8 * 1024);
-    (total / 8).clamp(512, 4096)
+    let total = system_ram_mb().unwrap_or(2 * 1024);
+    (total / 32).clamp(64, 512)
 }
 
 /// Total physical RAM in MB, or `None` if it cannot be determined.
@@ -6992,6 +7134,68 @@ pub fn apply_host_xmr_wallet_to_config(
     }
     for (k, val) in want {
         monero.insert(k.to_string(), val);
+    }
+    let out =
+        serde_json::to_string_pretty(&v).map_err(|e| format!("serialize basicswap.json: {}", e))?;
+    std::fs::write(&path, out.as_bytes()).map_err(|e| format!("write basicswap.json: {}", e))?;
+    Ok(true)
+}
+
+/// CryptoNote chainclients whose `trusted_daemon` upstream actually reads
+/// (`basicswap.py::is_trusted_daemon`). ZANO/ZEPH are this project's own
+/// interfaces and carry no such key.
+const TRUSTED_DAEMON_COINS: &[&str] = &["monero", "wownero"];
+
+/// Rewrite a hardcoded `trusted_daemon: true` to upstream's own documented
+/// `"auto"`.
+///
+/// # Why
+///
+/// `prepare.py:1612` writes `chainclients.monero.trusted_daemon =
+/// extra_opts.get("trust_remote_node", True)` — **True when the flag is
+/// absent**, contradicting its own help text ("defaults to auto: true when
+/// daemon rpchost value is a private ip address else false"). This app made it
+/// worse by passing `--trustremotenode` precisely when the node was remote.
+/// Result, found in the live dev config 2026-09-22: `trusted_daemon: true`
+/// against the PUBLIC node `node.monerodevs.org`.
+///
+/// A trusted daemon is granted `rescan_spent` / `import_key_images` semantics
+/// and is believed about fee estimates and spent-ness — appropriate for a node
+/// you run, not for a stranger's.
+///
+/// `"auto"` is resolved per call by `is_private_ip_address(node_host)`
+/// (`basicswap.py:1005-1010`), so a local node stays trusted and a public one
+/// stops being. Only `true` is rewritten: an explicit `false` is someone's
+/// deliberate choice, and a missing key is upstream's business.
+///
+/// Returns whether the file was changed.
+pub fn normalize_trusted_daemon(datadir: &Path) -> Result<bool, String> {
+    let path = datadir.join("basicswap.json");
+    if !path.exists() {
+        return Ok(false); // pre-prepare install: nothing to normalize yet
+    }
+    let raw = std::fs::read(&path).map_err(|e| format!("read basicswap.json: {}", e))?;
+    let text = strip_bom(&raw)?;
+    let mut v: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| format!("parse basicswap.json: {}", e))?;
+    let Some(clients) = v.get_mut("chainclients").and_then(|c| c.as_object_mut()) else {
+        return Ok(false);
+    };
+    let mut changed = false;
+    for coin in TRUSTED_DAEMON_COINS {
+        let Some(obj) = clients.get_mut(*coin).and_then(|m| m.as_object_mut()) else {
+            continue;
+        };
+        if obj.get("trusted_daemon") == Some(&serde_json::Value::Bool(true)) {
+            obj.insert(
+                "trusted_daemon".to_string(),
+                serde_json::Value::String("auto".to_string()),
+            );
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(false);
     }
     let out =
         serde_json::to_string_pretty(&v).map_err(|e| format!("serialize basicswap.json: {}", e))?;
@@ -7575,7 +7779,7 @@ pub fn apply_host_zano_wallet_to_config(
         ),
         // `ZanoInterface.initialiseWallet` (PWNDA-PATCH-15 (a)) treats this
         // as the deliberate-Grove-divergence flag: True -> a logged no-op
-        // instead of the reference port's engine-owned-wallet provisioning path. Written
+        // instead of REU26's engine-owned-wallet provisioning path. Written
         // explicitly here (not left to `getConfigSegment`'s own default)
         // for the same reason `apply_host_xmr_wallet_to_config` writes
         // `wallet_name` explicitly rather than trusting prepare's default:
@@ -7605,6 +7809,29 @@ pub fn apply_host_zano_wallet_to_config(
 /// address for the life of one swap) and Main's own daemon preference is
 /// entirely separate, set by the user's own Zano panel.
 const ZANO_BOOTSTRAP_DAEMON: &str = "http://37.27.100.59:10500";
+
+/// The Zano daemon the swap node uses — Scratch's `--daemon-address` and the
+/// engine chainclient's `rpchost`/`rpcport`: the one the user's own Zano
+/// wallet (Main) was started with, else [`ZANO_BOOTSTRAP_DAEMON`].
+///
+/// Until 2026-09-26 both were the bootstrap node, whatever Main used — so a
+/// node the user added in the Zano panel reached their wallet and never their
+/// swaps. That node is the Zano network's only public one, and it was down
+/// for 12+ hours on 2026-09-25/26 (log.md 2026-09-26): the Scratch wallet
+/// could not sync, and adding a working node could not have helped.
+///
+/// Pure over its input so the rule is testable; a value without a usable
+/// `host:port` falls back, because the chainclient needs both halves.
+pub fn pick_zano_engine_daemon(main: Option<&str>) -> String {
+    match main.map(str::trim) {
+        Some(m) if split_daemon_url(m).is_some() => m.to_string(),
+        _ => ZANO_BOOTSTRAP_DAEMON.to_string(),
+    }
+}
+
+fn zano_engine_daemon() -> String {
+    pick_zano_engine_daemon(crate::zano_rpc::main_daemon_address().as_deref())
+}
 /// How long a start waits for the app's Zano Main wallet before parking ZANO.
 ///
 /// Measured 14 s on 2026-09-04 and up to 41 s since, so the bound stays where
@@ -7882,7 +8109,9 @@ async fn maybe_activate_zano_host_wallet(app: &AppHandle) -> Option<ZanoHostWall
 
     // Only now — Main confirmed — start the Scratch instance the engine
     // fully owns.
-    let scratch = match crate::zano_rpc::zano_scratch_start(app, ZANO_BOOTSTRAP_DAEMON).await {
+    let zano_daemon = zano_engine_daemon();
+    supervisor_log(app, &format!("C-RX: the swap node's Zano daemon is {}", zano_daemon));
+    let scratch = match crate::zano_rpc::zano_scratch_start(app, &zano_daemon).await {
         Ok(s) => s,
         Err(e) => {
             set_park_reason(
@@ -7966,7 +8195,12 @@ pub fn build_config(
         html_base_port: DEFAULT_HTML_PORT,
         ws_base_port: DEFAULT_WS_PORT,
         port_offset,
-        trust_remote_node: xmr_rpc_host.is_some(),
+        // 2026-09-22: was `xmr_rpc_host.is_some()` — i.e. it asked prepare to
+        // mark the daemon TRUSTED exactly when it was a REMOTE (often public)
+        // node, which is backwards. `--trustremotenode` is now never passed;
+        // `normalize_trusted_daemon` below writes upstream's own documented
+        // `"auto"` instead, so trust follows the node's address.
+        trust_remote_node: false,
         xmr_rpc_host,
         xmr_rpc_port,
         xmr_host_wallet,
@@ -8815,6 +9049,18 @@ fn apply_local_config_policy(cfg: &SidecarConfig) {
             Err(e) => eprintln!("[swap-sidecar] could not pin the Monero node: {}", e),
         }
     }
+    // Trust policy for the Monero DAEMON. Runs on every start (not just
+    // prepare) because an install created before 2026-09-22 already has
+    // `trusted_daemon: true` on disk, and prepare does not run again.
+    // Non-fatal like every other policy write here.
+    match normalize_trusted_daemon(datadir) {
+        Ok(true) => eprintln!(
+            "[swap-sidecar] trusted_daemon: rewrote a hardcoded `true` to `auto` \
+             (trust now follows the node's address, not the fact that it is remote)"
+        ),
+        Ok(false) => {}
+        Err(e) => eprintln!("[swap-sidecar] could not normalize trusted_daemon: {}", e),
+    }
     // C9. LAST, deliberately: this pins the MAIN WALLET-RPC (whose wallet
     // holds the user's XMR), an entirely different axis from the chainclient
     // pin above (which daemon the engine talks to) — order between the two
@@ -8958,12 +9204,13 @@ pub fn split_daemon_url(url: &str) -> Option<(String, u16)> {
 }
 
 /// The remote daemon each host-wallet coin's chainclient points at — the same
-/// bootstrap node the app's own wallet-rpc uses, so the engine and the wallet
-/// see one chain.
+/// node the app's own wallet-rpc uses, so the engine and the wallet see one
+/// chain. For Zano that is Main's actual daemon since 2026-09-26
+/// ([`pick_zano_engine_daemon`]); Zephyr still uses its bootstrap.
 pub fn host_wallet_coin_daemon(coin: &str) -> Option<(String, u16)> {
     match coin {
         "zephyr" => split_daemon_url(ZPH_BOOTSTRAP_DAEMON),
-        "zano" => split_daemon_url(ZANO_BOOTSTRAP_DAEMON),
+        "zano" => split_daemon_url(&zano_engine_daemon()),
         _ => None,
     }
 }
@@ -10984,13 +11231,60 @@ pub(crate) fn console_trace(app: &AppHandle, line: &str) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("bsx-console-trace.log"))
-    {
-        use std::io::Write;
-        let _ = writeln!(f, "{} {}", stamp, line);
+    append_with_rotation(
+        &dir.join("bsx-console-trace.log"),
+        &format!("{} {}", stamp, line),
+        APP_LOG_ROTATE_MAX_BYTES,
+    );
+}
+
+/// Cap for the diagnostic logs this project's own code writes directly —
+/// `swap-sidecar.log`, `bsx-console-trace.log` here, and `zano-rpc.log` /
+/// `zano-scratch-rpc.log` in `zano_rpc.rs` (RAM plan Phase 1.3, 2026-09-22).
+/// Unlike the miner/monero/zephyr logs, which are subprocess
+/// `--log-file`/`--max-log-file-size`-style flags to an EXTERNAL binary that
+/// caps itself, none of these had a cap before this: `swap-sidecar.log` and
+/// `bsx-console-trace.log` are lines THIS process writes itself with a plain
+/// `OpenOptions::append`, and `simplewallet.exe` (Zano) takes `--log-file`
+/// but has no size-cap flag at all (verified via `--help`: only
+/// `--log-file`/`--log-level`). `pub(crate)` so `zano_rpc.rs` shares the
+/// same cap rather than picking its own number.
+pub(crate) const APP_LOG_ROTATE_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Rotate `path` if it is already at or over `max_bytes`: the live file
+/// becomes `<name>.1` (replacing whatever `.1` held before) and the caller
+/// starts fresh — either by appending (see `append_with_rotation`) or, for
+/// `zano_rpc.rs`, by letting the next `simplewallet.exe` spawn create a new
+/// file at that now-vacant path. Best-effort: a rename failure is swallowed,
+/// same as everywhere else in this diagnostics path. Only call this at a
+/// point where nothing else currently holds the file open for writing —
+/// renaming a file out from under a live writer's handle is a
+/// platform-dependent risk this project does not take (Zano callers rotate
+/// pre-spawn, before `simplewallet.exe` opens the path itself).
+pub(crate) fn rotate_log_if_large(path: &std::path::Path, max_bytes: u64) {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() >= max_bytes {
+            let backup_name = format!("{}.1", path.file_name().unwrap_or_default().to_string_lossy());
+            let backup = path.with_file_name(backup_name);
+            let _ = std::fs::remove_file(&backup);
+            let _ = std::fs::rename(path, &backup);
+        }
+    }
+}
+
+/// Append `stamped_line` to `path`, rotating first via
+/// [`rotate_log_if_large`]. Safe here specifically because THIS process is
+/// the only writer of `swap-sidecar.log`/`bsx-console-trace.log` and always
+/// reopens by path rather than holding a long-lived handle, so there is no
+/// writer to race. Best-effort throughout — a rotation or open failure
+/// falls through to "nothing written this time" rather than panicking;
+/// these are diagnostics, never allowed to be load-bearing for whatever
+/// they're tracing.
+fn append_with_rotation(path: &std::path::Path, stamped_line: &str, max_bytes: u64) {
+    use std::io::Write;
+    rotate_log_if_large(path, max_bytes);
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", stamped_line);
     }
 }
 
@@ -11016,10 +11310,7 @@ pub fn supervisor_log(app: &AppHandle, line: &str) {
             return;
         }
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&p) {
-        use std::io::Write;
-        let _ = writeln!(f, "{} {}", stamp, line);
-    }
+    append_with_rotation(&p, &format!("{} {}", stamp, line), APP_LOG_ROTATE_MAX_BYTES);
 }
 
 /// Where [`supervisor_log`] writes.
@@ -13761,11 +14052,12 @@ mod tests {
     /// (which deadlocked the boot: the key is pushed only once the node runs).
     #[test]
     fn the_unlock_signal_is_a_spawned_wallet_rpc_not_the_key() {
-        let f: &str = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let f: &str = &include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let body = &f[f.find("pub async fn host_wallet_spawned(").expect("moved")..];
-        let body = &body[..body.find("
-}
-").expect("end")];
+        let body = &body[..body.find("\n}\n").expect("end")];
         for probe in ["XmrRpcChild", "ZphRpcChild", "zano_rpc_child_spawned"] {
             assert!(body.contains(probe), "missing {probe}");
         }
@@ -13775,7 +14067,10 @@ mod tests {
     #[test]
     fn autostart_waits_for_the_wallets_the_node_needs() {
         // Pins D-81 (defect register): the gate must not wait on the wallet key.
-        let f: &str = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let f: &str = &include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let body = &f[f.find("pub fn on_app_ready(").expect("on_app_ready moved")..];
         let body = &body[..body.find("swap_sidecar_start(").expect("start call moved")];
         assert!(
@@ -13791,8 +14086,7 @@ mod tests {
         let gate = &f[f
             .find("pub async fn autostart_not_ready_because(")
             .expect("gate moved")..];
-        let gate = &gate[..gate.find("
-pub fn on_app_ready(").expect("gate end moved")];
+        let gate = &gate[..gate.find("\npub fn on_app_ready(").expect("gate end moved")];
         // The vault is deliberately NOT part of ready: waiting on the key
         // deadlocked the boot (the key is pushed only once the node runs).
         // The old assertion here required `wallet_pwd.is_some()` and stayed
@@ -13974,7 +14268,10 @@ Please restart with -reindex or -reindex-chainstate to recover.
     /// case at most once. Source-level: all three need a live node to drive.
     #[test]
     fn a_failed_start_reads_particld_tears_down_and_repairs_once() {
-        let f: &str = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let f: &str = &include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let core = &f[f.find("pub async fn start_node_core<").expect("core moved")..];
         let core = &core[..core.find("async fn unlock_if_configured").expect("core end")];
         assert!(core.contains("chain_daemon_fatal(&cfg.datadir, spawned_at)"), "health loop must read particld");
@@ -15477,11 +15774,14 @@ Please restart with -reindex or -reindex-chainstate to recover.
         // that hoisted the push outside the match, or above the success
         // arm, goes red here rather than silently starting to adopt a
         // mismatched wallet.
-        const THIS_FILE: &str = include_str!("swap_sidecar.rs");
-        let cmd_at = THIS_FILE
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so the 8000-byte window below covered fewer lines and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let this_file = include_str!("swap_sidecar.rs").replace("\r\n", "\n");
+        let cmd_at = this_file
             .find("pub async fn swap_sidecar_push_account_keys(")
             .expect("the push command must exist");
-        let body = &THIS_FILE[cmd_at..(cmd_at + 8000).min(THIS_FILE.len())];
+        let body = &this_file[cmd_at..(cmd_at + 8000).min(this_file.len())];
 
         let match_at = body
             .find("match account_key_mismatch(&ticker, addr.as_deref(), &k.expected_address)")
@@ -16024,7 +16324,7 @@ Please restart with -reindex or -reindex-chainstate to recover.
         assert_eq!(z["scratchwalletrpcjwt"], "scratch-jwt");
         assert_eq!(
             z["external_main_wallet"], true,
-            "without this flag ZanoInterface.initialiseWallet runs the reference port's \
+            "without this flag ZanoInterface.initialiseWallet runs REU26's \
              engine-owned-wallet path against a wallet-rpc Grove never intends \
              the engine to provision"
         );
@@ -17402,7 +17702,10 @@ Please restart with -reindex or -reindex-chainstate to recover.
     /// posted to, and that a non-list reply is an error rather than a zero.
     #[test]
     fn the_in_flight_count_reads_both_halves_and_fails_closed() {
-        let src = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the negative check
+        // below could never fail. See PwndaWalletVault/log.md 2026-09-25.
+        let src = include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let start = src.find("pub(crate) async fn active_bids_for(").expect("moved");
         let body = &src[start..start + 2600];
         assert!(body.contains(r#"["bids", "sentbids"]"#), "both halves of the book");
@@ -19074,8 +19377,9 @@ Please restart with -reindex or -reindex-chainstate to recover.
         assert!("40".parse::<u32>().unwrap() > 20);
     }
 
-    /// dbcache is the IBD speed lever. It must be present, larger than Core's
-    /// 450 MB default, and it must respect a user's own value.
+    /// dbcache is the IBD speed lever. It must be present, within the
+    /// formula's `[64, 512]` range, marked as ours, and it must respect a
+    /// user's own (unmarked) value.
     #[test]
     fn harden_daemon_confs_sets_a_real_dbcache() {
         let dir = std::env::temp_dir().join(format!(
@@ -19090,8 +19394,9 @@ Please restart with -reindex or -reindex-chainstate to recover.
         std::fs::write(part.join("particl.conf"), "rpcport=19792
 ").unwrap();
 
-        // A coin whose conf already pins dbcache — a user override that must
-        // NOT be second-guessed.
+        // A coin whose conf already pins dbcache with NO marker — a user
+        // override (or a pre-marker auto-write, indistinguishable from one)
+        // that must NOT be second-guessed.
         let btc = dir.join("bitcoin");
         std::fs::create_dir_all(&btc).unwrap();
         std::fs::write(btc.join("bitcoin.conf"), "dbcache=300
@@ -19105,16 +19410,23 @@ rpcport=19796
             .lines()
             .find(|l| l.trim_start().starts_with("dbcache="))
             .expect("particl.conf must gain a dbcache line");
-        let mb: u64 = line.trim().trim_start_matches("dbcache=").parse().unwrap();
-        assert!(
-            mb > 450,
-            "dbcache must beat Core's 450 MB default or it is pointless: {mb}"
-        );
-        assert!(mb <= 4096, "the ceiling must hold: {mb}");
+        assert!(line.ends_with(DBCACHE_MARKER), "a fresh write must carry the marker: {line}");
+        let num_str = line
+            .trim()
+            .trim_start_matches("dbcache=")
+            .trim_end_matches(DBCACHE_MARKER)
+            .trim();
+        let mb: u64 = num_str.parse().unwrap();
+        assert!(mb >= 64, "the floor must hold: {mb}");
+        assert!(mb <= 512, "the ceiling must hold: {mb}");
 
-        // The user's 300 MB stays. Lower than we would choose, but theirs.
+        // The user's 300 MB stays, UNMARKED. Lower than we would choose, but
+        // theirs. It is below anything the pre-marker formula could write
+        // (>= 512), so even the 2026-09-25 legacy migration cannot take it
+        // for ours — see `migrate_legacy_dbcache`.
         let btc_conf = std::fs::read_to_string(btc.join("bitcoin.conf")).unwrap();
         assert!(btc_conf.contains("dbcache=300"), "{btc_conf}");
+        assert!(!btc_conf.contains(DBCACHE_MARKER), "{btc_conf}");
         assert_eq!(btc_conf.matches("dbcache=").count(), 1, "no second dbcache");
 
         // Idempotent.
@@ -19122,6 +19434,192 @@ rpcport=19796
         let again = std::fs::read_to_string(part.join("particl.conf")).unwrap();
         assert_eq!(again.matches("dbcache=").count(), 1, "second pass duplicated dbcache");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// RAM plan Phase 4 (2026-09-25): the pre-marker auto-write is migrated,
+    /// and nothing else is. The operator's node ran `particld` at 1,437 MB on
+    /// `Config file arg: dbcache="4096"` because Phase 1.1 left every
+    /// unmarked value alone, including the one its own predecessor wrote.
+    #[test]
+    fn migrate_legacy_dbcache_rewrites_only_the_old_formulas_own_value() {
+        const GB: u64 = 1024;
+        // The operator's case: 64 GB host, old formula 4096.
+        let conf = "txindex=1\nspentindex=1\ndbcache=4096\n";
+        let out = migrate_legacy_dbcache(conf, Some(64 * GB), 512).expect("the operator's own conf");
+        assert_eq!(out, format!("txindex=1\nspentindex=1\ndbcache=512 {}\n", DBCACHE_MARKER));
+        // The old formula, at other sizes.
+        assert_eq!(legacy_dbcache_mb(16 * GB), 2048);
+        assert_eq!(legacy_dbcache_mb(2 * GB), 512);
+        assert_eq!(legacy_dbcache_mb(128 * GB), 4096);
+        // A user's own number.
+        assert_eq!(migrate_legacy_dbcache("dbcache=300\n", Some(64 * GB), 512), None);
+        // 4096 where the old formula gave 2048 was not written by us.
+        assert_eq!(migrate_legacy_dbcache("dbcache=4096\n", Some(16 * GB), 512), None);
+        // RAM unreadable: never guess.
+        assert_eq!(migrate_legacy_dbcache("dbcache=4096\n", None, 512), None);
+        // Anything but a bare integer is someone's edit.
+        assert_eq!(migrate_legacy_dbcache("dbcache=4096 # mine\n", Some(64 * GB), 512), None);
+        assert_eq!(migrate_legacy_dbcache("dbcache=\"4096\"\n", Some(64 * GB), 512), None);
+        // Two dbcache lines (per-network sections) are ambiguous.
+        assert_eq!(
+            migrate_legacy_dbcache("dbcache=4096\n[test]\ndbcache=4096\n", Some(64 * GB), 512),
+            None
+        );
+        // A marked line belongs to the marked path, not this one.
+        assert_eq!(
+            migrate_legacy_dbcache(&format!("dbcache=4096 {}\n", DBCACHE_MARKER), Some(64 * GB), 512),
+            None
+        );
+        // Already at the target: nothing to do.
+        assert_eq!(migrate_legacy_dbcache("dbcache=512\n", Some(2 * GB), 512), None);
+        // A CRLF conf is still recognised.
+        assert!(migrate_legacy_dbcache("dbcache=4096\r\nrpcport=1\r\n", Some(64 * GB), 512).is_some());
+    }
+
+    /// The same migration through `harden_daemon_confs`, on this machine's
+    /// real RAM: a conf holding exactly the old formula's value ends up with
+    /// the current one, marked, once.
+    #[test]
+    fn harden_daemon_confs_migrates_a_pre_marker_auto_write() {
+        let Some(ram) = system_ram_mb() else { return };
+        let legacy = legacy_dbcache_mb(ram);
+        let now = daemon_dbcache_mb();
+        if legacy == now {
+            return; // nothing to migrate on this machine
+        }
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-dbcache-legacy-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let part = dir.join("particl");
+        std::fs::create_dir_all(&part).unwrap();
+        std::fs::write(part.join("particl.conf"), format!("txindex=1\ndbcache={legacy}\n")).unwrap();
+        harden_daemon_confs(&dir).expect("harden");
+        let conf = std::fs::read_to_string(part.join("particl.conf")).unwrap();
+        assert!(conf.contains(&format!("dbcache={now} {DBCACHE_MARKER}")), "{conf}");
+        assert_eq!(conf.matches("dbcache=").count(), 1, "{conf}");
+        harden_daemon_confs(&dir).unwrap();
+        assert_eq!(std::fs::read_to_string(part.join("particl.conf")).unwrap(), conf, "idempotent");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The self-correction this marker exists for: a value THIS code wrote
+    /// under an earlier formula (carrying the marker) is safely rewritten
+    /// when the formula's output changes — the exact scenario every
+    /// already-provisioned install was stuck in before the marker existed.
+    #[test]
+    fn harden_daemon_confs_corrects_its_own_marked_value_on_formula_change() {
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-dbcache-correct-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let part = dir.join("particl");
+        std::fs::create_dir_all(&part).unwrap();
+        // Simulates an install provisioned under the OLD (pre-2026-09-22)
+        // formula: a marked line, but at the old ceiling.
+        std::fs::write(
+            part.join("particl.conf"),
+            "dbcache=4096 # pwnda:auto\nrpcport=19792\n",
+        )
+        .unwrap();
+
+        harden_daemon_confs(&dir).expect("harden");
+
+        let conf = std::fs::read_to_string(part.join("particl.conf")).unwrap();
+        assert_eq!(conf.matches("dbcache=").count(), 1, "rewritten in place, not duplicated");
+        assert!(!conf.contains("dbcache=4096"), "the stale value must be gone: {conf}");
+        assert!(conf.contains("rpcport=19792"), "unrelated lines survive: {conf}");
+        let line = conf.lines().find(|l| l.starts_with("dbcache=")).unwrap();
+        let mb: u64 = line
+            .trim_start_matches("dbcache=")
+            .trim_end_matches(DBCACHE_MARKER)
+            .trim()
+            .parse()
+            .unwrap();
+        assert!((64..=512).contains(&mb), "corrected value out of range: {mb}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // =====================================================================
+    // RAM plan Phase 1.3 (2026-09-22) — app-written log rotation
+    // =====================================================================
+
+    fn rotate_test_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pwnda-{}-{}",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn small_file_is_not_rotated() {
+        let dir = rotate_test_dir("rotate-small");
+        let path = dir.join("x.log");
+        std::fs::write(&path, "short\n").unwrap();
+        rotate_log_if_large(&path, APP_LOG_ROTATE_MAX_BYTES);
+        assert!(path.exists(), "the live file must still be there");
+        assert!(!path.with_file_name("x.log.1").exists(), "no backup for a small file");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_at_or_over_the_cap_is_rotated_to_dot_one() {
+        let dir = rotate_test_dir("rotate-big");
+        let path = dir.join("x.log");
+        std::fs::write(&path, vec![b'a'; 10]).unwrap();
+        rotate_log_if_large(&path, 10); // exactly at the cap — must still rotate
+        assert!(!path.exists(), "the old content must have moved, not stayed live");
+        let backup = path.with_file_name("x.log.1");
+        assert!(backup.exists());
+        assert_eq!(std::fs::read(&backup).unwrap().len(), 10);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotation_replaces_a_prior_dot_one_rather_than_erroring() {
+        let dir = rotate_test_dir("rotate-replace");
+        let path = dir.join("x.log");
+        let backup = path.with_file_name("x.log.1");
+        std::fs::write(&backup, "stale backup from a previous rotation").unwrap();
+        std::fs::write(&path, vec![b'b'; 20]).unwrap();
+        rotate_log_if_large(&path, 10);
+        assert_eq!(std::fs::read(&backup).unwrap(), vec![b'b'; 20], "new content replaced the old backup");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_with_rotation_keeps_writing_after_a_rotation() {
+        let dir = rotate_test_dir("rotate-append");
+        let path = dir.join("x.log");
+        std::fs::write(&path, vec![b'c'; 10]).unwrap();
+        append_with_rotation(&path, "new line", 10);
+        // The old 10 bytes moved to .1; the live file now holds only the new line.
+        assert!(path.with_file_name("x.log.1").exists());
+        let live = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(live.trim_end(), "new line");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rotating_a_file_that_does_not_exist_yet_is_a_quiet_noop() {
+        let dir = rotate_test_dir("rotate-missing");
+        let path = dir.join("never-written.log");
+        rotate_log_if_large(&path, APP_LOG_ROTATE_MAX_BYTES); // must not panic
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -19434,13 +19932,32 @@ rpcport=19796
         );
     }
 
-    /// The sizing formula: never below Core's default, never a runaway
-    /// reservation, and it scales with RAM in between.
+    /// The sizing formula: never a runaway reservation, never below the
+    /// floor, and it scales with RAM in between. Deliberately does NOT
+    /// assert "never below Core's 450 MB default" — the 2026-09-22 ceiling
+    /// cut (4096 -> 512) intentionally allows going below that on a modest
+    /// machine; see `daemon_dbcache_mb`'s doc comment for the tradeoff.
     #[test]
     fn dbcache_formula_is_clamped_and_scales() {
         // The live value on this machine must be sane.
         let mb = daemon_dbcache_mb();
-        assert!((512..=4096).contains(&mb), "out of range: {mb}");
+        assert!((64..=512).contains(&mb), "out of range: {mb}");
+    }
+
+    /// The formula's shape, independent of the live host's RAM (which the
+    /// test above already covers): floor, ceiling, and linear in between.
+    #[test]
+    fn dbcache_formula_floor_ceiling_and_midpoint() {
+        // `daemon_dbcache_mb` itself reads the live host, so exercise the
+        // same `/32` + clamp shape directly rather than duplicating it —
+        // this pins the FORMULA'S numbers, so a future change to them (as
+        // happened 2026-09-22) is a deliberate edit here, not a silent drift.
+        let formula = |total_mb: u64| (total_mb / 32).clamp(64, 512);
+        assert_eq!(formula(0), 64, "floor holds even at zero");
+        assert_eq!(formula(1024), 64, "a 1 GB box still gets the floor, not less");
+        assert_eq!(formula(16 * 1024), 512, "16 GB is exactly where the ceiling starts");
+        assert_eq!(formula(64 * 1024), 512, "a 64 GB box does not exceed the ceiling");
+        assert_eq!(formula(8 * 1024), 256, "8 GB midpoint: 8192 / 32 = 256");
     }
 
     /// The firewall fix: harden_daemon_confs adds `listen=0` to a btc-family
@@ -19738,7 +20255,10 @@ rpcport=19796
     /// zero over a real count.
     #[test]
     fn swaps_in_progress_count_is_the_engines_own_and_never_invents_zero() {
-        let src = include_str!("swap_sidecar.rs");
+        // Normalized (2026-09-25): on a Windows checkout (core.autocrlf) this source is
+        // CRLF, so a search for a "\n...\n" shape never matched and the test failed
+        // for line endings, not code. See PwndaWalletVault/log.md 2026-09-25.
+        let src = include_str!("swap_sidecar.rs").replace("\r\n", "\n");
         let start = src
             .find("pub(crate) async fn swaps_in_progress_now(")
             .expect("swaps_in_progress_now moved");
@@ -21674,5 +22194,124 @@ mod itest {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod trusted_daemon_tests {
+    use super::*;
+
+    fn write_cfg(dir: &Path, monero: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("basicswap.json"),
+            format!(r#"{{"chainclients":{{"monero":{monero},"particl":{{"manage_daemon":true}}}}}}"#),
+        )
+        .unwrap();
+    }
+
+    fn monero_of(dir: &Path) -> serde_json::Value {
+        let s = std::fs::read_to_string(dir.join("basicswap.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        v["chainclients"]["monero"].clone()
+    }
+
+    fn tmp(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("pwnda-trusted-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        d
+    }
+
+    /// The live 2026-09-22 shape: a PUBLIC node marked trusted.
+    #[test]
+    fn a_hardcoded_true_becomes_auto() {
+        let d = tmp("true");
+        write_cfg(&d, r#"{"rpchost":"node.monerodevs.org","trusted_daemon":true}"#);
+        assert!(normalize_trusted_daemon(&d).unwrap());
+        assert_eq!(monero_of(&d)["trusted_daemon"], "auto");
+        // The rest of the block survives.
+        assert_eq!(monero_of(&d)["rpchost"], "node.monerodevs.org");
+        // Idempotent.
+        assert!(!normalize_trusted_daemon(&d).unwrap());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// An explicit `false` is someone's deliberate choice; a missing key is
+    /// upstream's business. Neither is ours to rewrite.
+    #[test]
+    fn an_explicit_false_or_a_missing_key_is_left_alone() {
+        let d = tmp("false");
+        write_cfg(&d, r#"{"trusted_daemon":false}"#);
+        assert!(!normalize_trusted_daemon(&d).unwrap());
+        assert_eq!(monero_of(&d)["trusted_daemon"], false);
+        std::fs::remove_dir_all(&d).ok();
+
+        let d2 = tmp("absent");
+        write_cfg(&d2, r#"{"rpchost":"127.0.0.1"}"#);
+        assert!(!normalize_trusted_daemon(&d2).unwrap());
+        assert!(monero_of(&d2).get("trusted_daemon").is_none());
+        std::fs::remove_dir_all(&d2).ok();
+    }
+
+    /// A datadir with no config yet (pre-prepare) is not an error.
+    #[test]
+    fn a_missing_config_is_a_no_op() {
+        let d = tmp("nocfg");
+        std::fs::create_dir_all(&d).unwrap();
+        assert!(!normalize_trusted_daemon(&d).unwrap());
+        std::fs::remove_dir_all(&d).ok();
+    }
+
+    /// The plan must never ask prepare for blanket trust again.
+    #[test]
+    fn the_prepare_plan_never_passes_trustremotenode() {
+        let src = include_str!("swap_sidecar.rs");
+        assert!(
+            src.contains("trust_remote_node: false,"),
+            "the config builder must not request trust for a remote node"
+        );
+    }
+}
+
+/// 2026-09-26: the swap node's Zano daemon follows the user's own Zano wallet.
+/// See `pick_zano_engine_daemon` and log.md 2026-09-26.
+#[cfg(test)]
+mod zano_engine_daemon_tests {
+    use super::*;
+
+    #[test]
+    fn follows_the_node_the_users_wallet_uses() {
+        assert_eq!(pick_zano_engine_daemon(Some("http://10.0.0.5:11211")), "http://10.0.0.5:11211");
+        assert_eq!(
+            split_daemon_url(&pick_zano_engine_daemon(Some("http://10.0.0.5:11211"))),
+            Some(("10.0.0.5".to_string(), 11211))
+        );
+    }
+
+    #[test]
+    fn falls_back_to_the_bootstrap_before_main_starts_or_on_an_unusable_value() {
+        assert_eq!(pick_zano_engine_daemon(None), ZANO_BOOTSTRAP_DAEMON);
+        assert_eq!(pick_zano_engine_daemon(Some("")), ZANO_BOOTSTRAP_DAEMON);
+        // The chainclient needs host AND port.
+        assert_eq!(pick_zano_engine_daemon(Some("http://no-port.example")), ZANO_BOOTSTRAP_DAEMON);
+    }
+
+    /// Neither consumer may reach for the bootstrap constant directly again —
+    /// that is exactly how a user's own node never reached their swaps.
+    #[test]
+    fn scratch_and_chainclient_both_go_through_the_pick() {
+        let src = include_str!("swap_sidecar.rs").replace("\r\n", "\n");
+        let bootstrap_scratch = concat!("zano_scratch_start(app, ", "ZANO_BOOTSTRAP_DAEMON)");
+        let bootstrap_chain = concat!("\"zano\" => split_daemon_url(", "ZANO_BOOTSTRAP_DAEMON)");
+        assert!(!src.contains(bootstrap_scratch), "Scratch is pinned to the bootstrap node again");
+        assert!(!src.contains(bootstrap_chain), "the engine chainclient is pinned to the bootstrap node again");
+        assert!(src.contains(concat!("zano_scratch_start(app, &", "zano_daemon)")));
+        let zano = include_str!("zano_rpc.rs").replace("\r\n", "\n");
+        let start = &zano[zano.find("pub async fn zano_start_rpc(").expect("zano_start_rpc")..];
+        let spawn = start.find("cmd.spawn()").expect("Main's spawn");
+        assert!(
+            start[..spawn].contains("MAIN_DAEMON_ADDRESS"),
+            "Main must record its daemon before it spawns, or the swap node cannot follow it"
+        );
     }
 }

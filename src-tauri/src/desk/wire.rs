@@ -336,7 +336,7 @@ pub struct AcceptResponse {
 ///
 /// The slots are the chain-A two-timelock refund window, and the LEADER commits
 /// them because only the scripted-coin holder can hold an on-chain refund — that
-/// is structural in section 8.1 of the swap protocol, not a convention (engine v7,
+/// is structural in REU26 8.1, not a convention (engine v7,
 /// `DESK-ANSWER-v7.md`). So they ride M1 when the desk leads and M2 when we do,
 /// the exact mirror of how the adaptor/view fields already flip. The desk (as
 /// follower) feeds them to `ingest_counterparty` -> `set_lock_slots` so it

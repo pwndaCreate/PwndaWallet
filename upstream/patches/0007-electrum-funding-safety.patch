@@ -76,7 +76,7 @@ _fundTxElectrum, plus one in electrumx.py and one in basicswap.py's own
 None of this enables swapping FROM a purely legacy-derivation wallet -- (1)
 is a refusal, not a workaround, because the protocol requirement is real
 (see PwndaWalletVault/wiki/synthesis/pwnda-basicswap-convergence-plan.md
-and the reference port's chain-A lock analysis). It closes the gap
+and the REU26 ResearchWiki's chain-A lock analysis). It closes the gap
 between "silently unsafe or silently wrong" and "cleanly refused or
 cleanly correct" for everything this patch touches. Swap participation
 from a legacy-only wallet remains future work, gated on giving the wallet
