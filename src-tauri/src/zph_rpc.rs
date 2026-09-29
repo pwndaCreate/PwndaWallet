@@ -673,6 +673,20 @@ pub async fn zph_start_rpc(
     cmd.stderr(std::process::Stdio::null());
     cmd.stdin(std::process::Stdio::null());
 
+    // RandomX's 256 MiB light-mode cache. This wallet builds one to hash
+    // Zephyr's GENESIS block every time it opens or creates a wallet, and
+    // throws the result away (`generate_genesis_block` →
+    // `find_nonce_for_given_block` → `rx_slow_hash`; Monero's genesis is
+    // CryptoNight, so monero-wallet-rpc never does this). On an account
+    // holding "Lock pages in memory", which this app grants for the miners'
+    // huge pages, the cache lands in LOCKED large pages: 256 MiB of physical
+    // RAM that no working-set figure shows and nothing can page out. Masking
+    // RandomX's large-pages flag puts it in ordinary pages instead, which
+    // `zph_rpc_call` then trims once the wallet is open. No security effect;
+    // a trusted daemon or `--offline` do not avoid the cache. Measured
+    // 2026-09-29 — PwndaWalletVault/log.md.
+    cmd.env("MONERO_RANDOMX_UMASK", "1");
+
     let child = cmd
         .spawn()
         .map_err(|e| format!("Failed to spawn zephyr-wallet-rpc: {}", e))?;
@@ -770,8 +784,29 @@ pub async fn zph_rpc_call(
         std::time::Duration::from_secs(30)
     };
 
-    do_rpc_call_at(&zph_rpc_url(), creds.as_ref(), &method, params, timeout).await
+    let result = do_rpc_call_at(&zph_rpc_url(), creds.as_ref(), &method, params, timeout).await;
+    // Opening or creating a wallet has just built RandomX's 256 MiB cache
+    // (see `zph_start_rpc`), used for a few hashes and not again until the
+    // next open. Trim the process shortly after, so those pages leave RAM.
+    if result.is_ok() && ZPH_WALLET_OPENING_METHODS.contains(&method.as_str()) {
+        let pid = state.0.lock().ok().and_then(|g| g.child.as_ref().and_then(|c| c.id()));
+        if let Some(pid) = pid {
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                crate::miners::trim_working_set(pid);
+            });
+        }
+    }
+    result
 }
+
+/// wallet-rpc methods after which the wallet has just built RandomX's cache.
+const ZPH_WALLET_OPENING_METHODS: &[&str] = &[
+    "open_wallet",
+    "create_wallet",
+    "restore_deterministic_wallet",
+    "generate_from_keys",
+];
 
 /// Release `lease`'s claim on the wallet-rpc process. Only actually stops
 /// the child once the lease set is empty — mirrors `xmr_stop_rpc` exactly.
@@ -1062,6 +1097,9 @@ pub async fn zph_swap_wallet_start(
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
     cmd.stdin(std::process::Stdio::null());
+    // Keep RandomX's genesis-hash cache out of locked large pages; see
+    // `zph_start_rpc`.
+    cmd.env("MONERO_RANDOMX_UMASK", "1");
 
     let child = cmd
         .spawn()

@@ -224,6 +224,21 @@ fn log_mining_event(
     detail: Option<&str>,
     exit_code: Option<i32>,
 ) {
+    write_mining_event(app, lane, miner, reason.as_str(), detail, exit_code);
+}
+
+/// The writer behind [`log_mining_event`]. `reason` is a stop's
+/// [`StopReason`], or one of the miner supervisor's housekeeping events:
+/// `"trim"` (working set emptied) and `"recycle"` (process restarted to hand
+/// back memory it leaked). See "Miner memory supervision".
+fn write_mining_event(
+    app: &AppHandle,
+    lane: MinerLane,
+    miner: &str,
+    reason: &str,
+    detail: Option<&str>,
+    exit_code: Option<i32>,
+) {
     let enabled = cfg!(debug_assertions)
         || matches!(
             std::env::var("PWNDA_MEM_WATCH").as_deref(),
@@ -255,7 +270,7 @@ fn log_mining_event(
         "t": chrono::Utc::now().timestamp_millis(),
         "lane": lane.as_str(),
         "miner": miner,
-        "reason": reason.as_str(),
+        "reason": reason,
         "detail": detail,
         "exitCode": exit_code,
     });
@@ -678,6 +693,11 @@ const MINER_DEATH_POLL_SECS: u64 = 3;
 /// taken and dropped inside this function, so no `MutexGuard` is ever held
 /// across an `.await` in the watch loop (that would make the task `!Send`).
 fn poll_lane(app: &AppHandle, lane: MinerLane) -> LaneState {
+    // A recycle empties the lane's slot for a few seconds on purpose; the lane
+    // is still mining. See "Miner memory supervision".
+    if lane_recycling(lane) {
+        return LaneState::Running;
+    }
     match lane {
         MinerLane::Cpu => {
             // `stop_xmrig` clears `MinerPid` FIRST, so an empty pid slot is
@@ -753,11 +773,16 @@ fn poll_lane(app: &AppHandle, lane: MinerLane) -> LaneState {
 /// transport-agnostic: it works identically for direct pool connections and
 /// SOCKS5-proxied ones, and needs no stratum plumbing.
 ///
-/// Emits at most once, then exits. Stays silent on an intentional stop.
-pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
+/// Emits at most once, then exits. Stays silent on an intentional stop, and
+/// stands down when a newer process takes the lane (`generation`, bumped by
+/// every spawn — which is how a memory recycle retires the old watch).
+pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane, generation: u64) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(MINER_DEATH_POLL_SECS)).await;
+            if lane_generation(lane) != generation {
+                return;
+            }
             match poll_lane(&app, lane) {
                 LaneState::Running => continue,
                 LaneState::UserStopped => return,
@@ -830,6 +855,601 @@ pub(crate) fn spawn_miner_death_watch(app: AppHandle, lane: MinerLane) {
             }
         }
     });
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Miner memory supervision (2026-09-29)
+// ─────────────────────────────────────────────────────────────────────
+//
+// SRBMiner-MULTI 3.6.2 leaks its own default-process heap at a steady
+// ~50–84 MB/h: while mining, and equally when idle with no GPU, no pool, no
+// work and no API traffic. No flag stops it. The leaked pages are written once
+// and never read again (log.md 2026-09-29; [[SRBMiner]] § Memory growth).
+// Without altering the binary, the wallet does two things per SRBMiner lane:
+//
+// - **Trim** the working set once it has grown `trim_growth` past the reading
+//   taken after warm-up. The cold leaked pages go to the pagefile and stay
+//   there (measured: 82 MB → 1.4 MB, back to only 13 MB two minutes later).
+//   Frees RAM, not commit.
+// - **Recycle** the process: stop it and start it again with the same launch
+//   inputs once its commit has grown `recycle_growth` past that reading, at
+//   most once per `recycle_min_age`. The only way to hand the commit back.
+//   Costs a few seconds of hashing. The lane reads as mining throughout
+//   (`*_RECYCLING`), the old death watch stands down (generation), a stop
+//   waits for the new process, and share counters carry over.
+//
+// xmrig is not supervised: no leak was measured, it runs elevated, and its
+// RandomX dataset is hot memory a trim would only fault back in.
+
+/// Working set and commit (private bytes) of a process, in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProcMem {
+    pub working_set: u64,
+    pub private_bytes: u64,
+}
+
+#[cfg(target_os = "windows")]
+mod proc_mem_win {
+    use super::ProcMem;
+    use std::ffi::c_void;
+
+    /// `PROCESS_MEMORY_COUNTERS_EX` (psapi.h).
+    #[repr(C)]
+    #[derive(Default)]
+    struct ProcessMemoryCountersEx {
+        cb: u32,
+        page_fault_count: u32,
+        peak_working_set_size: usize,
+        working_set_size: usize,
+        quota_peak_paged_pool_usage: usize,
+        quota_paged_pool_usage: usize,
+        quota_peak_non_paged_pool_usage: usize,
+        quota_non_paged_pool_usage: usize,
+        pagefile_usage: usize,
+        peak_pagefile_usage: usize,
+        private_usage: usize,
+    }
+
+    // kernel32 exports both K32 functions (Windows 7 and later), so neither
+    // needs a `windows` crate feature.
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn OpenProcess(desired_access: u32, inherit_handle: i32, process_id: u32) -> *mut c_void;
+        fn CloseHandle(handle: *mut c_void) -> i32;
+        fn K32GetProcessMemoryInfo(
+            process: *mut c_void,
+            counters: *mut ProcessMemoryCountersEx,
+            cb: u32,
+        ) -> i32;
+        fn K32EmptyWorkingSet(process: *mut c_void) -> i32;
+    }
+
+    const PROCESS_SET_QUOTA: u32 = 0x0100;
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+
+    struct Handle(*mut c_void);
+    impl Drop for Handle {
+        fn drop(&mut self) {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+
+    fn open(pid: u32, access: u32) -> Option<Handle> {
+        let h = unsafe { OpenProcess(access, 0, pid) };
+        if h.is_null() {
+            None
+        } else {
+            Some(Handle(h))
+        }
+    }
+
+    pub(super) fn memory(pid: u32) -> Option<ProcMem> {
+        let h = open(pid, PROCESS_QUERY_LIMITED_INFORMATION)?;
+        let mut c = ProcessMemoryCountersEx::default();
+        c.cb = std::mem::size_of::<ProcessMemoryCountersEx>() as u32;
+        let ok = unsafe { K32GetProcessMemoryInfo(h.0, &mut c, c.cb) };
+        (ok != 0).then(|| ProcMem {
+            working_set: c.working_set_size as u64,
+            private_bytes: c.private_usage as u64,
+        })
+    }
+
+    pub(super) fn trim(pid: u32) -> bool {
+        match open(pid, PROCESS_SET_QUOTA | PROCESS_QUERY_LIMITED_INFORMATION) {
+            Some(h) => unsafe { K32EmptyWorkingSet(h.0) != 0 },
+            None => false,
+        }
+    }
+}
+
+/// Working set and commit of `pid`; `None` when it cannot be read (gone, no
+/// access, or not Windows).
+pub(crate) fn process_memory(pid: u32) -> Option<ProcMem> {
+    #[cfg(target_os = "windows")]
+    {
+        proc_mem_win::memory(pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Empty `pid`'s working set. Its pages move to the standby list and, if
+/// nothing touches them again, out to the pagefile; commit is unchanged.
+/// `false` when the process could not be opened (or not Windows). Also used
+/// for the Zephyr wallet-rpc's RandomX cache (`zph_rpc::zph_rpc_call`).
+pub(crate) fn trim_working_set(pid: u32) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        proc_mem_win::trim(pid)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Bumped each time an SRBMiner lane spawns a process. A death watch or memory
+/// supervisor started for an older process stands down when it sees a newer
+/// generation, which is how a recycle retires them without a stop signal.
+static GPU_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static SRB_CPU_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set for the few seconds a lane is being recycled. While set the lane reads
+/// as mining (`is_*_mining`), its death watch sees "running", and a stop
+/// waits for the new process so that it stops that one.
+static GPU_RECYCLING: AtomicBool = AtomicBool::new(false);
+static SRB_CPU_RECYCLING: AtomicBool = AtomicBool::new(false);
+
+fn lane_generation(lane: MinerLane) -> u64 {
+    match lane {
+        MinerLane::Gpu => GPU_GENERATION.load(Ordering::SeqCst),
+        MinerLane::CpuSrb => SRB_CPU_GENERATION.load(Ordering::SeqCst),
+        MinerLane::Cpu => 0,
+    }
+}
+
+fn next_generation(lane: MinerLane) -> u64 {
+    match lane {
+        MinerLane::Gpu => GPU_GENERATION.fetch_add(1, Ordering::SeqCst) + 1,
+        MinerLane::CpuSrb => SRB_CPU_GENERATION.fetch_add(1, Ordering::SeqCst) + 1,
+        MinerLane::Cpu => 0,
+    }
+}
+
+fn recycling_flag(lane: MinerLane) -> Option<&'static AtomicBool> {
+    match lane {
+        MinerLane::Gpu => Some(&GPU_RECYCLING),
+        MinerLane::CpuSrb => Some(&SRB_CPU_RECYCLING),
+        MinerLane::Cpu => None,
+    }
+}
+
+fn lane_recycling(lane: MinerLane) -> bool {
+    recycling_flag(lane).is_some_and(|f| f.load(Ordering::SeqCst))
+}
+
+/// Let a recycle in flight finish (at most a minute), so a stop acts on the
+/// process the recycle started.
+async fn wait_out_recycle(lane: MinerLane) {
+    for _ in 0..600 {
+        if !lane_recycling(lane) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
+/// Thresholds for one supervised miner. The defaults are sized for the
+/// measured ~83 MB/h: a trim roughly every three hours, a recycle about twice
+/// a day. Environment overrides exist to exercise a recycle in minutes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MinerMemPolicy {
+    pub every_secs: u64,
+    pub baseline_after_secs: u64,
+    pub trim_growth: u64,
+    /// 0 = never recycle for memory.
+    pub recycle_growth: u64,
+    pub recycle_min_age_secs: u64,
+    /// Also recycle on a schedule, whatever the memory: every this many
+    /// seconds of a process's life. 0 (the default) = off. The usual
+    /// "restart the miner every N hours" setting, for a leak this supervisor
+    /// does not measure (a pageable one, or another miner's).
+    pub recycle_every_secs: u64,
+}
+
+impl MinerMemPolicy {
+    pub(crate) const DEFAULT: MinerMemPolicy = MinerMemPolicy {
+        every_secs: 300,
+        baseline_after_secs: 600,
+        trim_growth: 256 * 1024 * 1024,
+        recycle_growth: 1024 * 1024 * 1024,
+        recycle_min_age_secs: 6 * 3600,
+        recycle_every_secs: 0,
+    };
+
+    /// `PWNDA_MINER_SUPERVISE_SECS`, `PWNDA_MINER_BASELINE_AFTER_SECS`,
+    /// `PWNDA_MINER_TRIM_MB`, `PWNDA_MINER_RECYCLE_MB` (0 disables recycling),
+    /// `PWNDA_MINER_RECYCLE_MIN_AGE_SECS`, `PWNDA_MINER_RECYCLE_EVERY_SECS`
+    /// (0 = off). A value that does not parse is ignored.
+    pub(crate) fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Self {
+        let num = |k: &str| get(k).and_then(|v| v.trim().parse::<u64>().ok());
+        let d = Self::DEFAULT;
+        Self {
+            every_secs: num("PWNDA_MINER_SUPERVISE_SECS").unwrap_or(d.every_secs).max(1),
+            baseline_after_secs: num("PWNDA_MINER_BASELINE_AFTER_SECS").unwrap_or(d.baseline_after_secs),
+            trim_growth: num("PWNDA_MINER_TRIM_MB").map(|m| m * 1024 * 1024).unwrap_or(d.trim_growth),
+            recycle_growth: num("PWNDA_MINER_RECYCLE_MB").map(|m| m * 1024 * 1024).unwrap_or(d.recycle_growth),
+            recycle_min_age_secs: num("PWNDA_MINER_RECYCLE_MIN_AGE_SECS").unwrap_or(d.recycle_min_age_secs),
+            recycle_every_secs: num("PWNDA_MINER_RECYCLE_EVERY_SECS").unwrap_or(d.recycle_every_secs),
+        }
+    }
+
+    fn from_env() -> Self {
+        Self::from_lookup(|k| std::env::var(k).ok())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MinerMemAction {
+    Nothing,
+    Trim,
+    Recycle,
+}
+
+/// What to do about a miner's memory now. Pure. `baseline` is the reading
+/// taken after warm-up, `now` the latest, `age_secs` how long this process has
+/// run. A recycle outranks a trim; a process younger than
+/// `recycle_min_age_secs` is only recycled by the schedule
+/// (`recycle_every_secs`), never for memory.
+pub(crate) fn miner_mem_action(p: &MinerMemPolicy, baseline: ProcMem, now: ProcMem, age_secs: u64) -> MinerMemAction {
+    if p.recycle_every_secs > 0 && age_secs >= p.recycle_every_secs {
+        return MinerMemAction::Recycle;
+    }
+    let commit_growth = now.private_bytes.saturating_sub(baseline.private_bytes);
+    if p.recycle_growth > 0 && commit_growth >= p.recycle_growth && age_secs >= p.recycle_min_age_secs {
+        return MinerMemAction::Recycle;
+    }
+    if p.trim_growth > 0 && now.working_set.saturating_sub(baseline.working_set) >= p.trim_growth {
+        return MinerMemAction::Trim;
+    }
+    MinerMemAction::Nothing
+}
+
+/// What a GPU-lane session was started with, kept so a recycle can start the
+/// same miner again. `gpu_indices` are the miner's own device ids, already
+/// resolved. Set by `start_gpu_miner`, cleared by `stop_gpu_miner`.
+#[derive(Clone, Debug)]
+struct GpuLaunch {
+    miner: String,
+    pool: String,
+    user_string: String,
+    algorithm: String,
+    pass: String,
+    worker: Option<String>,
+    proxy: Option<String>,
+    show_window: bool,
+    gpu_intensity: Option<u32>,
+    gpu_indices: Option<Vec<u32>>,
+    gpu_vram_limit_mb: Option<u32>,
+}
+
+/// The same for the SRBMiner CPU lane: `start_srbminer_cpu`'s inputs.
+#[derive(Clone, Debug)]
+struct SrbCpuLaunch {
+    pool: String,
+    user_string: String,
+    algorithm: String,
+    pass: String,
+    proxy: Option<String>,
+    worker: Option<String>,
+    intensity: Option<String>,
+    threads: Option<usize>,
+}
+
+static GPU_LAUNCH: Mutex<Option<GpuLaunch>> = Mutex::new(None);
+static SRB_CPU_LAUNCH: Mutex<Option<SrbCpuLaunch>> = Mutex::new(None);
+
+fn remember_gpu_launch(launch: GpuLaunch) {
+    if let Ok(mut g) = GPU_LAUNCH.lock() {
+        *g = Some(launch);
+    }
+}
+
+fn remember_srb_cpu_launch(launch: SrbCpuLaunch) {
+    if let Ok(mut g) = SRB_CPU_LAUNCH.lock() {
+        *g = Some(launch);
+    }
+}
+
+/// Shares and uptime of the processes a recycle retired this session, added
+/// to the live process's numbers so the Mine view's counters carry on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SessionCarry {
+    pub accepted: u64,
+    pub rejected: u64,
+    pub uptime_secs: u64,
+}
+
+impl SessionCarry {
+    pub(crate) fn apply(&self, s: &mut SrbApiSnapshot) {
+        s.accepted += self.accepted;
+        s.rejected += self.rejected;
+        s.uptime_secs += self.uptime_secs;
+    }
+
+    fn add(&mut self, s: &SrbApiSnapshot) {
+        self.accepted += s.accepted;
+        self.rejected += s.rejected;
+        self.uptime_secs += s.uptime_secs;
+    }
+}
+
+static GPU_CARRY: Mutex<SessionCarry> = Mutex::new(SessionCarry { accepted: 0, rejected: 0, uptime_secs: 0 });
+static SRB_CPU_CARRY: Mutex<SessionCarry> = Mutex::new(SessionCarry { accepted: 0, rejected: 0, uptime_secs: 0 });
+
+fn carry_slot(lane: MinerLane) -> Option<&'static Mutex<SessionCarry>> {
+    match lane {
+        MinerLane::Gpu => Some(&GPU_CARRY),
+        MinerLane::CpuSrb => Some(&SRB_CPU_CARRY),
+        MinerLane::Cpu => None,
+    }
+}
+
+fn session_carry(lane: MinerLane) -> SessionCarry {
+    carry_slot(lane)
+        .and_then(|m| m.lock().ok().map(|g| *g))
+        .unwrap_or_default()
+}
+
+fn reset_session_carry(lane: MinerLane) {
+    if let Some(Ok(mut g)) = carry_slot(lane).map(|m| m.lock()) {
+        *g = SessionCarry::default();
+    }
+}
+
+/// The lane stopped: nothing left to restart, nothing left to carry.
+fn forget_launch(lane: MinerLane) {
+    match lane {
+        MinerLane::Gpu => {
+            if let Ok(mut g) = GPU_LAUNCH.lock() {
+                *g = None;
+            }
+        }
+        MinerLane::CpuSrb => {
+            if let Ok(mut g) = SRB_CPU_LAUNCH.lock() {
+                *g = None;
+            }
+        }
+        MinerLane::Cpu => {}
+    }
+    reset_session_carry(lane);
+}
+
+fn lane_child_pid(app: &AppHandle, lane: MinerLane) -> Option<u32> {
+    match lane {
+        MinerLane::Gpu => {
+            let state = app.state::<GpuMinerProcess>();
+            let guard = state.0.lock().ok()?;
+            guard.as_ref().and_then(|c| c.id())
+        }
+        MinerLane::CpuSrb => {
+            let state = app.state::<SrbCpuMinerProcess>();
+            let guard = state.0.lock().ok()?;
+            guard.as_ref().and_then(|c| c.id())
+        }
+        MinerLane::Cpu => None,
+    }
+}
+
+fn take_lane_child(app: &AppHandle, lane: MinerLane) -> Option<tokio::process::Child> {
+    match lane {
+        MinerLane::Gpu => {
+            let state = app.state::<GpuMinerProcess>();
+            let mut guard = state.0.lock().ok()?;
+            guard.take()
+        }
+        MinerLane::CpuSrb => {
+            let state = app.state::<SrbCpuMinerProcess>();
+            let mut guard = state.0.lock().ok()?;
+            guard.take()
+        }
+        MinerLane::Cpu => None,
+    }
+}
+
+fn mib(bytes: u64) -> u64 {
+    bytes / (1024 * 1024)
+}
+
+/// Watch one launched SRBMiner process: trim it when its working set has
+/// grown, recycle it when its commit has. Stands down when the lane stops or a
+/// newer process (a recycle, or a new session) takes the lane.
+fn spawn_miner_memory_supervisor(app: AppHandle, lane: MinerLane, generation: u64) {
+    if !matches!(lane, MinerLane::Gpu | MinerLane::CpuSrb) {
+        return;
+    }
+    let policy = MinerMemPolicy::from_env();
+    tokio::spawn(async move {
+        let started = std::time::Instant::now();
+        let mut baseline: Option<ProcMem> = None;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(policy.every_secs)).await;
+            if lane_generation(lane) != generation {
+                return;
+            }
+            let Some(pid) = lane_child_pid(&app, lane) else {
+                return;
+            };
+            let Some(now) = process_memory(pid) else {
+                continue;
+            };
+            let age = started.elapsed().as_secs();
+            let Some(base) = baseline else {
+                if age >= policy.baseline_after_secs {
+                    baseline = Some(now);
+                }
+                continue;
+            };
+            match miner_mem_action(&policy, base, now, age) {
+                MinerMemAction::Nothing => {}
+                MinerMemAction::Trim => {
+                    let trimmed = trim_working_set(pid);
+                    let after = process_memory(pid).map(|a| mib(a.working_set));
+                    write_mining_event(
+                        &app,
+                        lane,
+                        lane.miner_binary(),
+                        "trim",
+                        Some(&format!(
+                            "working set {} MB -> {} MB (baseline {} MB), commit {} MB{}",
+                            mib(now.working_set),
+                            after.map(|a| a.to_string()).unwrap_or_else(|| "?".into()),
+                            mib(base.working_set),
+                            mib(now.private_bytes),
+                            if trimmed { "" } else { "; trim refused" }
+                        )),
+                        None,
+                    );
+                }
+                MinerMemAction::Recycle => {
+                    let trigger = if policy.recycle_every_secs > 0 && age >= policy.recycle_every_secs {
+                        format!("scheduled (every {} s)", policy.recycle_every_secs)
+                    } else {
+                        "memory".to_string()
+                    };
+                    let detail = format!(
+                        "{}: commit {} MB, {} MB over its {} MB baseline, after {} s",
+                        trigger,
+                        mib(now.private_bytes),
+                        mib(now.private_bytes.saturating_sub(base.private_bytes)),
+                        mib(base.private_bytes),
+                        age
+                    );
+                    if recycle_srbminer_lane(&app, lane, &detail).await {
+                        // The new process has its own supervisor.
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+/// Stop an SRBMiner lane's process and start it again with the same launch
+/// inputs, keeping the lane "mining" throughout. Returns `false` when it did
+/// not run (a user start or stop owns the lane right now, or there is no
+/// launch to repeat), so the supervisor tries again later.
+async fn recycle_srbminer_lane(app: &AppHandle, lane: MinerLane, detail: &str) -> bool {
+    let Some(flag) = recycling_flag(lane) else {
+        return false;
+    };
+    // A start in flight owns the lane; so does this recycle while it runs.
+    let gpu_starting = app.state::<GpuMinerStarting>();
+    let cpu_starting = app.state::<MinerStarting>();
+    let starting = if lane == MinerLane::Gpu { &gpu_starting.0 } else { &cpu_starting.0 };
+    let Some(_starting_guard) = StartGuard::try_acquire(starting) else {
+        return false;
+    };
+    let gpu_launch = GPU_LAUNCH.lock().ok().and_then(|g| g.clone());
+    let cpu_launch = SRB_CPU_LAUNCH.lock().ok().and_then(|g| g.clone());
+    let have_launch = match lane {
+        MinerLane::Gpu => gpu_launch.is_some(),
+        _ => cpu_launch.is_some(),
+    };
+    if !have_launch {
+        return false;
+    }
+
+    struct ClearOnDrop(&'static AtomicBool);
+    impl Drop for ClearOnDrop {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    flag.store(true, Ordering::SeqCst);
+    let _clear = ClearOnDrop(flag);
+
+    // Carry the retiring process's shares and uptime into the session.
+    let (port, srb_lane) = match lane {
+        MinerLane::Gpu => (GPU_API_PORT.load(Ordering::Relaxed), SrbLane::Gpu),
+        _ => (SRB_CPU_API_PORT.load(Ordering::Relaxed), SrbLane::Cpu),
+    };
+    if let Ok(Some(v)) = fetch_miner_api_json(port).await {
+        let retiring = parse_srbminer_api(&v, srb_lane);
+        if let Some(Ok(mut g)) = carry_slot(lane).map(|m| m.lock()) {
+            g.add(&retiring);
+        }
+    }
+
+    // Retire the old process. Its slot stays empty for a moment; the flag
+    // keeps the death watch and `is_*_mining` reading "running".
+    if let Some(mut old) = take_lane_child(app, lane) {
+        let _ = old.kill().await;
+    }
+
+    // Start it again: a new generation, a new launch record, and a new death
+    // watch and supervisor for the new process.
+    let started = match (lane, gpu_launch, cpu_launch) {
+        (MinerLane::Gpu, Some(l), _) => {
+            build_and_spawn_gpu_miner(
+                app,
+                &l.miner,
+                &l.pool,
+                &l.user_string,
+                &l.algorithm,
+                &l.pass,
+                l.worker.as_deref(),
+                l.proxy.as_deref(),
+                l.show_window,
+                l.gpu_intensity,
+                l.gpu_indices.as_deref(),
+                l.gpu_vram_limit_mb,
+            )
+            .await
+        }
+        (MinerLane::CpuSrb, _, Some(l)) => spawn_srbminer_cpu(app, &l).await,
+        _ => Err("no launch to repeat".to_string()),
+    };
+    match started {
+        Ok(()) => {
+            eprintln!("[miners] recycled the {} miner to hand back leaked memory: {}", lane.as_str(), detail);
+            write_mining_event(app, lane, lane.miner_binary(), "recycle", Some(detail), None);
+        }
+        Err(e) => {
+            // The lane is down now. Report it the way a crash is reported, so
+            // the UI stops showing it as mining.
+            eprintln!("[miners] recycling the {} miner failed: {}", lane.as_str(), e);
+            let record_lane = if lane == MinerLane::Gpu { RecordLane::Gpu } else { RecordLane::CpuSrb };
+            delete_launch_record(app, record_lane);
+            forget_launch(lane);
+            write_mining_event(
+                app,
+                lane,
+                lane.miner_binary(),
+                "died",
+                Some(&format!("restart after a memory recycle failed: {}", e)),
+                None,
+            );
+            crate::emit_meter::bump("mining-error");
+            let _ = app.emit(
+                "mining-error",
+                serde_json::json!({
+                    "code": "MINER_PROCESS_DIED",
+                    "kind": lane.as_str(),
+                    "message": format!(
+                        "The {} miner was restarted to free memory it had leaked, and it did not come back ({}). Start it again from the Mine tab.",
+                        lane.as_str().to_uppercase(),
+                        e
+                    ),
+                }),
+            );
+        }
+    }
+    true
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -1196,14 +1816,14 @@ fn adopt_lane(app: &AppHandle, lane: RecordLane) {
                 *g = Some(AdoptedProc { pid: rec.pid, handle });
             }
             GPU_API_PORT.store(rec.api_port, Ordering::Relaxed);
-            spawn_miner_death_watch(app.clone(), MinerLane::Gpu);
+            spawn_miner_death_watch(app.clone(), MinerLane::Gpu, lane_generation(MinerLane::Gpu));
         }
         RecordLane::CpuSrb => {
             if let Ok(mut g) = ADOPTED_SRB_CPU.lock() {
                 *g = Some(AdoptedProc { pid: rec.pid, handle });
             }
             SRB_CPU_API_PORT.store(rec.api_port, Ordering::Relaxed);
-            spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb);
+            spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb, lane_generation(MinerLane::CpuSrb));
         }
         RecordLane::CpuXmrig => {
             {
@@ -1221,7 +1841,7 @@ fn adopt_lane(app: &AppHandle, lane: RecordLane) {
                 }
             }
             XMRIG_API_PORT.store(rec.api_port, Ordering::Relaxed);
-            spawn_miner_death_watch(app.clone(), MinerLane::Cpu);
+            spawn_miner_death_watch(app.clone(), MinerLane::Cpu, lane_generation(MinerLane::Cpu));
         }
     }
     eprintln!(
@@ -3741,7 +4361,7 @@ pub async fn start_xmrig(
     // surface it to the UI. Started only after the pid + watcher slots are
     // populated, so the first poll can't race the launch. See
     // `spawn_miner_death_watch`.
-    spawn_miner_death_watch(app.clone(), MinerLane::Cpu);
+    spawn_miner_death_watch(app.clone(), MinerLane::Cpu, lane_generation(MinerLane::Cpu));
 
     // Phase 7: spawn the log-tail task on the SAME file xmrig writes via
     // `--log-file`, so MSR / huge-pages / ready status flows to the UI. Only
@@ -4096,7 +4716,9 @@ pub async fn get_gpu_miner_snapshot(miner: String) -> Result<Option<GpuMinerSnap
     // `as_u64()` returned None) and `pool.uptime`. POOL DIFF therefore
     // rendered "—" for every SRBMiner session, and uptime stayed 0, which
     // also kept shares/min (gated on uptime ≥ 30 s) permanently null.
-    let s = parse_srbminer_api(&v, SrbLane::Gpu);
+    let mut s = parse_srbminer_api(&v, SrbLane::Gpu);
+    // Shares and uptime of processes a memory recycle retired this session.
+    session_carry(MinerLane::Gpu).apply(&mut s);
     Ok(Some(GpuMinerSnapshot {
         hashrate: s.hashrate,
         accepted: s.accepted,
@@ -5270,6 +5892,8 @@ pub async fn start_gpu_miner(
     // Spawn the miner pointed straight at the user's pool with the
     // user's wallet. No proxy wrap, no time-slice scheduler — the miner
     // owns the pool connection for the whole session.
+    // A new session: no retired process's shares to carry.
+    reset_session_carry(MinerLane::Gpu);
     build_and_spawn_gpu_miner(
         &app,
         &miner,
@@ -5285,6 +5909,20 @@ pub async fn start_gpu_miner(
         gpu_vram_limit_mb,
     )
     .await?;
+    // Kept so the memory supervisor can start this same miner again.
+    remember_gpu_launch(GpuLaunch {
+        miner,
+        pool,
+        user_string,
+        algorithm,
+        pass,
+        worker,
+        proxy,
+        show_window: show_miner_window,
+        gpu_intensity,
+        gpu_indices,
+        gpu_vram_limit_mb,
+    });
 
     Ok(())
 }
@@ -6271,11 +6909,13 @@ pub(crate) async fn build_and_spawn_gpu_miner(
         .spawn()
         .map_err(|e| format!("Failed to start GPU miner: {}", e))?;
 
-    {
+    let generation = {
         let state = app.state::<GpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
         *process = Some(child);
-    }
+        // This process now owns the lane; watchers of an older one stand down.
+        next_generation(MinerLane::Gpu)
+    };
 
     // Brief health check: if the process exits within ~500ms it crashed on init.
     // This catches missing DLLs, unsupported GPU, or bad arguments early.
@@ -6303,7 +6943,8 @@ pub(crate) async fn build_and_spawn_gpu_miner(
     // it can stop this miner hands it to the next one.
     #[cfg(target_os = "windows")]
     record_child_launch(app, RecordLane::Gpu);
-    spawn_miner_death_watch(app.clone(), MinerLane::Gpu);
+    spawn_miner_death_watch(app.clone(), MinerLane::Gpu, generation);
+    spawn_miner_memory_supervisor(app.clone(), MinerLane::Gpu, generation);
 
     Ok(())
 }
@@ -6314,6 +6955,9 @@ pub async fn stop_gpu_miner(app: AppHandle, reason: Option<String>) -> Result<()
     // Put back anything a killed previous session left running first, so
     // this lane's answer covers it. See "Orphan adoption".
     ensure_orphans_adopted(&app);
+    // Let a recycle in flight finish, so this stops the NEW process rather
+    // than leaving it running behind an already-emptied slot.
+    wait_out_recycle(MinerLane::Gpu).await;
     // The GPU time-slice scheduler, dev-fee proxy, and per-session logger
     // were all removed 2026-07-06 (pure-wallet cutover), so there is
     // nothing to cancel ahead of the kill — just terminate the process.
@@ -6329,6 +6973,7 @@ pub async fn stop_gpu_miner(app: AppHandle, reason: Option<String>) -> Result<()
         let _ = c.kill().await;
     }
     delete_launch_record(&app, RecordLane::Gpu);
+    forget_launch(MinerLane::Gpu);
 
     // RAM plan Phase 0.3 (2026-09-22): `reason` added to match `stop_xmrig`'s
     // existing shape (the frontend already sends "…miner process died…" text
@@ -6358,6 +7003,10 @@ pub async fn is_gpu_mining(app: AppHandle) -> Result<bool, String> {
     // Put back anything a killed previous session left running first, so
     // this lane's answer covers it. See "Orphan adoption".
     ensure_orphans_adopted(&app);
+    // Mid-recycle the slot is empty on purpose; the lane is still mining.
+    if lane_recycling(MinerLane::Gpu) {
+        return Ok(true);
+    }
     if adopted_running(&app, RecordLane::Gpu) {
         return Ok(true);
     }
@@ -6721,7 +7370,30 @@ pub async fn start_srbminer_cpu(
         }
     }
 
-    let miners_dir = get_miners_dir(&app)?;
+    // A new session: no retired process's shares to carry.
+    reset_session_carry(MinerLane::CpuSrb);
+    let launch = SrbCpuLaunch {
+        pool,
+        user_string,
+        algorithm,
+        pass,
+        proxy,
+        worker,
+        intensity,
+        threads,
+    };
+    spawn_srbminer_cpu(&app, &launch).await?;
+    // Kept so the memory supervisor can start this same miner again.
+    remember_srb_cpu_launch(launch);
+    Ok(())
+}
+
+/// Spawn the SRBMiner CPU-lane process for `launch` into its slot,
+/// health-check it, and start its death watch and memory supervisor. Shared by
+/// `start_srbminer_cpu` and the supervisor's recycle, which is why it takes
+/// the launch inputs as one value.
+async fn spawn_srbminer_cpu(app: &AppHandle, launch: &SrbCpuLaunch) -> Result<(), String> {
+    let miners_dir = get_miners_dir(app)?;
     let exe_name = format!("SRBMiner-MULTI{}", crate::platform::EXE_SUFFIX);
     let exe_path = miners_dir.join(&exe_name);
     if !exe_path.exists() {
@@ -6732,9 +7404,9 @@ pub async fn start_srbminer_cpu(
     }
 
     let logical = detect_logical_processors().await;
-    let threads = match threads {
+    let threads = match launch.threads {
         Some(n) if n > 0 => srb_cpu_thread_args_for_count(n, logical),
-        _ => srb_cpu_thread_args(intensity.as_deref().unwrap_or("high"), logical),
+        _ => srb_cpu_thread_args(launch.intensity.as_deref().unwrap_or("high"), logical),
     };
 
     // Never the GPU lane's port, even if both fall back to an OS-assigned one.
@@ -6742,23 +7414,23 @@ pub async fn start_srbminer_cpu(
     let api_port = pick_loopback_api_port(SRB_CPU_HTTP_PORT, &[gpu_port]);
     SRB_CPU_API_PORT.store(api_port, std::sync::atomic::Ordering::Relaxed);
 
-    let log_path = resolve_miner_log_path(&app, &algorithm, "cpu");
+    let log_path = resolve_miner_log_path(app, &launch.algorithm, "cpu");
     let args = build_srbminer_cpu_args(
-        &pool,
-        &user_string,
-        &algorithm,
-        &pass,
-        worker.as_deref(),
-        proxy.as_deref(),
+        &launch.pool,
+        &launch.user_string,
+        &launch.algorithm,
+        &launch.pass,
+        launch.worker.as_deref(),
+        launch.proxy.as_deref(),
         threads,
         api_port,
         log_path.as_deref(),
     );
     if let Some(p) = log_path {
-        record_miner_log_path(&app, "cpu", p);
+        record_miner_log_path(app, "cpu", p);
     }
 
-    let show_window = read_show_miner_window(&app);
+    let show_window = read_show_miner_window(app);
     let mut cmd = miner_command(exe_path.to_string_lossy().as_ref(), show_window);
     cmd.args(&args);
     cmd.current_dir(miners_dir.to_string_lossy().to_string());
@@ -6768,11 +7440,13 @@ pub async fn start_srbminer_cpu(
         .spawn()
         .map_err(|e| format!("Failed to start the CPU miner: {}", e))?;
 
-    {
+    let generation = {
         let state = app.state::<SrbCpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
         *process = Some(child);
-    }
+        // This process now owns the lane; watchers of an older one stand down.
+        next_generation(MinerLane::CpuSrb)
+    };
 
     // Same brief health check as the GPU lane: an immediate exit is a bad
     // argument or a missing DLL, and says so clearly instead of surfacing
@@ -6794,8 +7468,9 @@ pub async fn start_srbminer_cpu(
     }
 
     #[cfg(target_os = "windows")]
-    record_child_launch(&app, RecordLane::CpuSrb);
-    spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb);
+    record_child_launch(app, RecordLane::CpuSrb);
+    spawn_miner_death_watch(app.clone(), MinerLane::CpuSrb, generation);
+    spawn_miner_memory_supervisor(app.clone(), MinerLane::CpuSrb, generation);
     Ok(())
 }
 
@@ -6807,6 +7482,8 @@ pub async fn stop_srbminer_cpu(app: AppHandle, reason: Option<String>) -> Result
     // Put back anything a killed previous session left running first, so
     // this lane's answer covers it. See "Orphan adoption".
     ensure_orphans_adopted(&app);
+    // Let a recycle in flight finish, so this stops the NEW process.
+    wait_out_recycle(MinerLane::CpuSrb).await;
     let mut child = {
         let state = app.state::<SrbCpuMinerProcess>();
         let mut process = state.0.lock().map_err(|e| format!("Lock error: {}", e))?;
@@ -6819,6 +7496,7 @@ pub async fn stop_srbminer_cpu(app: AppHandle, reason: Option<String>) -> Result
         let _ = c.kill().await;
     }
     delete_launch_record(&app, RecordLane::CpuSrb);
+    forget_launch(MinerLane::CpuSrb);
 
     // RAM plan Phase 0.3 (2026-09-22) — see `stop_gpu_miner`'s identical
     // comment for why `reason` exists and why it's gated on `was_running`.
@@ -6844,6 +7522,10 @@ pub async fn is_srbminer_cpu_mining(app: AppHandle) -> Result<bool, String> {
     // Put back anything a killed previous session left running first, so
     // this lane's answer covers it. See "Orphan adoption".
     ensure_orphans_adopted(&app);
+    // Mid-recycle the slot is empty on purpose; the lane is still mining.
+    if lane_recycling(MinerLane::CpuSrb) {
+        return Ok(true);
+    }
     if adopted_running(&app, RecordLane::CpuSrb) {
         return Ok(true);
     }
@@ -6878,7 +7560,9 @@ pub async fn get_srbminer_cpu_snapshot() -> Result<Option<XmrigSnapshot>, String
         Some(v) => v,
         None => return Ok(None),
     };
-    let s = parse_srbminer_api(&v, SrbLane::Cpu);
+    let mut s = parse_srbminer_api(&v, SrbLane::Cpu);
+    // Shares and uptime of processes a memory recycle retired this session.
+    session_carry(MinerLane::CpuSrb).apply(&mut s);
     Ok(Some(XmrigSnapshot {
         hashrate: s.hashrate,
         accepted: s.accepted,
@@ -8143,7 +8827,10 @@ mod orphan_adoption_tests {
         let src = include_str!("miners.rs").replace("\r\n", "\n");
         assert!(body(&src, "pub async fn start_xmrig(").contains("write_launch_record(&app, RecordLane::CpuXmrig"));
         assert!(body(&src, "pub(crate) async fn build_and_spawn_gpu_miner(").contains("record_child_launch(app, RecordLane::Gpu)"));
-        assert!(body(&src, "pub async fn start_srbminer_cpu(").contains("record_child_launch(&app, RecordLane::CpuSrb)"));
+        // Since 2026-09-29 the CPU lane spawns in `spawn_srbminer_cpu`, shared by a
+        // start and by the memory supervisor's recycle.
+        assert!(body(&src, "async fn spawn_srbminer_cpu(").contains("record_child_launch(app, RecordLane::CpuSrb)"));
+        assert!(body(&src, "pub async fn start_srbminer_cpu(").contains("spawn_srbminer_cpu(&app, &launch)"));
         assert!(body(&src, "pub async fn stop_xmrig(").contains("delete_launch_record(&app, RecordLane::CpuXmrig)"));
         assert!(body(&src, "pub async fn stop_gpu_miner(").contains("terminate_adopted(&app, RecordLane::Gpu)"));
         assert!(body(&src, "pub async fn stop_srbminer_cpu(").contains("terminate_adopted(&app, RecordLane::CpuSrb)"));
@@ -8197,5 +8884,244 @@ mod orphan_adoption_windows_tests {
         assert_eq!(reopen_recorded_process(&other_binary).unwrap_err(), "a different process now has this PID");
         let _ = child.kill();
         let _ = child.wait();
+    }
+}
+
+/// Pins the miner memory supervisor (2026-09-29): SRBMiner 3.6.2 leaks its own
+/// heap at ~50–84 MB/h, and the wallet trims and recycles it without altering
+/// the binary. See "Miner memory supervision" and log.md 2026-09-29.
+#[cfg(test)]
+mod miner_memory_supervision_tests {
+    use super::*;
+
+    const MB: u64 = 1024 * 1024;
+
+    fn mem(ws_mb: u64, private_mb: u64) -> ProcMem {
+        ProcMem { working_set: ws_mb * MB, private_bytes: private_mb * MB }
+    }
+
+    const HOURS: u64 = 3600;
+
+    #[test]
+    fn nothing_while_both_growths_are_under_their_thresholds() {
+        let p = MinerMemPolicy::DEFAULT;
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(500, 3000), 7 * HOURS), MinerMemAction::Nothing);
+    }
+
+    #[test]
+    fn trims_once_the_working_set_grew_past_its_threshold() {
+        let p = MinerMemPolicy::DEFAULT;
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(556, 2600), 2 * HOURS), MinerMemAction::Trim);
+    }
+
+    #[test]
+    fn recycles_once_commit_grew_a_gigabyte_and_the_process_is_old_enough() {
+        let p = MinerMemPolicy::DEFAULT;
+        // The live GPU lane on 2026-09-28/29: ~2.3 GB committed at start,
+        // +83 MB/h. +1 GB is about 12 hours in.
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(400, 3324), 13 * HOURS), MinerMemAction::Recycle);
+    }
+
+    #[test]
+    fn a_young_process_is_trimmed_never_recycled() {
+        let p = MinerMemPolicy::DEFAULT;
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(600, 3400), HOURS), MinerMemAction::Trim);
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(400, 3400), HOURS), MinerMemAction::Nothing);
+    }
+
+    #[test]
+    fn zero_recycle_growth_turns_recycling_off() {
+        let p = MinerMemPolicy { recycle_growth: 0, ..MinerMemPolicy::DEFAULT };
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(400, 9000), 99 * HOURS), MinerMemAction::Nothing);
+    }
+
+    #[test]
+    fn the_schedule_recycles_on_age_alone_and_is_off_by_default() {
+        let p = MinerMemPolicy { recycle_every_secs: 24 * HOURS, ..MinerMemPolicy::DEFAULT };
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(300, 2300), 24 * HOURS), MinerMemAction::Recycle);
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(300, 2300), 23 * HOURS), MinerMemAction::Nothing);
+        assert_eq!(MinerMemPolicy::DEFAULT.recycle_every_secs, 0);
+        assert_eq!(miner_mem_action(&MinerMemPolicy::DEFAULT, mem(300, 2300), mem(300, 2300), 999 * HOURS), MinerMemAction::Nothing);
+    }
+
+    #[test]
+    fn a_process_that_shrank_below_its_baseline_is_left_alone() {
+        // A trim takes the working set well under the baseline reading.
+        let p = MinerMemPolicy::DEFAULT;
+        assert_eq!(miner_mem_action(&p, mem(300, 2300), mem(13, 2250), 7 * HOURS), MinerMemAction::Nothing);
+    }
+
+    #[test]
+    fn overrides_are_read_in_megabytes_and_junk_is_ignored() {
+        let p = MinerMemPolicy::from_lookup(|k| match k {
+            "PWNDA_MINER_SUPERVISE_SECS" => Some("15".into()),
+            "PWNDA_MINER_TRIM_MB" => Some(" 20 ".into()),
+            "PWNDA_MINER_RECYCLE_MB" => Some("forty".into()),
+            "PWNDA_MINER_RECYCLE_MIN_AGE_SECS" => Some("60".into()),
+            "PWNDA_MINER_RECYCLE_EVERY_SECS" => Some("86400".into()),
+            _ => None,
+        });
+        assert_eq!(p.every_secs, 15);
+        assert_eq!(p.trim_growth, 20 * MB);
+        assert_eq!(p.recycle_growth, MinerMemPolicy::DEFAULT.recycle_growth, "unparseable: default kept");
+        assert_eq!(p.recycle_min_age_secs, 60);
+        assert_eq!(p.recycle_every_secs, 86_400);
+        assert_eq!(p.baseline_after_secs, MinerMemPolicy::DEFAULT.baseline_after_secs);
+        // A zero interval would spin; it is clamped to one second.
+        let q = MinerMemPolicy::from_lookup(|k| (k == "PWNDA_MINER_SUPERVISE_SECS").then(|| "0".to_string()));
+        assert_eq!(q.every_secs, 1);
+    }
+
+    #[test]
+    fn the_carry_adds_retired_processes_shares_and_uptime() {
+        let mut carry = SessionCarry::default();
+        carry.add(&SrbApiSnapshot { accepted: 120, rejected: 1, uptime_secs: 43_200, ..Default::default() });
+        let mut live = SrbApiSnapshot { accepted: 3, rejected: 0, uptime_secs: 90, hashrate: Some(6900.0), ..Default::default() };
+        carry.apply(&mut live);
+        assert_eq!((live.accepted, live.rejected, live.uptime_secs), (123, 1, 43_290));
+        assert_eq!(live.hashrate, Some(6900.0), "the rate is the live process's own");
+    }
+
+    /// `include_str!` keeps CRLF on a Windows checkout; compare on LF.
+    fn source(name: &str) -> String {
+        match name {
+            "miners.rs" => include_str!("miners.rs"),
+            "zph_rpc.rs" => include_str!("zph_rpc.rs"),
+            _ => unreachable!(),
+        }
+        .replace("\r\n", "\n")
+    }
+
+    fn body<'a>(src: &'a str, sig: &str) -> &'a str {
+        let start = src.find(&format!("\n{sig}")).unwrap_or_else(|| panic!("{sig} not found"));
+        let rest = &src[start + 1..];
+        let end = rest[1..].find("\n}\n").map(|i| i + 3).unwrap_or(rest.len());
+        &rest[..end]
+    }
+
+    #[test]
+    fn the_lane_reads_as_mining_while_it_is_being_recycled() {
+        let src = source("miners.rs");
+        for (sig, lane) in [
+            ("pub async fn is_gpu_mining(", "lane_recycling(MinerLane::Gpu)"),
+            ("pub async fn is_srbminer_cpu_mining(", "lane_recycling(MinerLane::CpuSrb)"),
+        ] {
+            let b = body(&src, sig);
+            let recycling = b.find(lane).unwrap_or_else(|| panic!("{sig} must check {lane}"));
+            let slot = b.find("state.0.lock()").expect("reads its slot");
+            assert!(recycling < slot, "{sig}: the recycle check must come before the (empty) slot");
+        }
+        assert!(body(&src, "fn poll_lane(").contains("if lane_recycling(lane)"));
+    }
+
+    #[test]
+    fn a_stop_waits_out_a_recycle_and_forgets_the_launch() {
+        let src = source("miners.rs");
+        for (sig, lane) in [
+            ("pub async fn stop_gpu_miner(", "MinerLane::Gpu"),
+            ("pub async fn stop_srbminer_cpu(", "MinerLane::CpuSrb"),
+        ] {
+            let b = body(&src, sig);
+            let wait = b.find(&format!("wait_out_recycle({lane}).await")).unwrap_or_else(|| panic!("{sig} must wait"));
+            let take = b.find(".take()").expect("takes the child");
+            assert!(wait < take, "{sig}: wait BEFORE taking the child");
+            assert!(b.contains(&format!("forget_launch({lane})")), "{sig} must forget the launch");
+        }
+    }
+
+    #[test]
+    fn every_spawn_starts_a_death_watch_and_a_supervisor_under_a_new_generation() {
+        let src = source("miners.rs");
+        for (sig, lane) in [
+            ("pub(crate) async fn build_and_spawn_gpu_miner(", "MinerLane::Gpu"),
+            ("async fn spawn_srbminer_cpu(", "MinerLane::CpuSrb"),
+        ] {
+            let b = body(&src, sig);
+            assert!(b.contains(&format!("next_generation({lane})")), "{sig}");
+            assert!(b.contains(&format!("spawn_miner_death_watch(app.clone(), {lane}, generation)")), "{sig}");
+            assert!(b.contains(&format!("spawn_miner_memory_supervisor(app.clone(), {lane}, generation)")), "{sig}");
+        }
+        let watch = body(&src, "pub(crate) fn spawn_miner_death_watch(");
+        assert!(watch.contains("if lane_generation(lane) != generation"), "an old watch must stand down");
+    }
+
+    #[test]
+    fn snapshots_carry_what_recycled_processes_counted() {
+        let src = source("miners.rs");
+        assert!(body(&src, "pub async fn get_gpu_miner_snapshot(").contains("session_carry(MinerLane::Gpu).apply(&mut s)"));
+        assert!(body(&src, "pub async fn get_srbminer_cpu_snapshot(").contains("session_carry(MinerLane::CpuSrb).apply(&mut s)"));
+        assert!(body(&src, "pub async fn start_gpu_miner(").contains("reset_session_carry(MinerLane::Gpu)"));
+        assert!(body(&src, "pub async fn start_srbminer_cpu(").contains("reset_session_carry(MinerLane::CpuSrb)"));
+    }
+
+    #[test]
+    fn zephyr_wallet_rpcs_keep_randomx_out_of_locked_large_pages() {
+        let src = source("zph_rpc.rs");
+        assert_eq!(src.matches("cmd.env(\"MONERO_RANDOMX_UMASK\", \"1\");").count(), 2, "both Zephyr spawns");
+        let call = body(&src, "pub async fn zph_rpc_call(");
+        assert!(call.contains("ZPH_WALLET_OPENING_METHODS.contains(&method.as_str())"));
+        assert!(call.contains("crate::miners::trim_working_set(pid)"));
+    }
+}
+
+/// Real processes: the memory probe and the trim the supervisor relies on.
+#[cfg(all(test, target_os = "windows"))]
+mod proc_mem_windows_tests {
+    use super::*;
+    use std::io::{BufRead, BufReader};
+
+    const CHILD_ENV: &str = "PWNDA_MEM_PROBE_CHILD";
+    const CHILD_MB: usize = 96;
+
+    /// The child process for the test below; a no-op in a normal run. Touches
+    /// `CHILD_MB` MiB once (like a leak: written, never read again), says so,
+    /// then idles until killed.
+    #[test]
+    fn mem_probe_child() {
+        if std::env::var(CHILD_ENV).is_err() {
+            return;
+        }
+        let mut block = vec![0u8; CHILD_MB * 1024 * 1024];
+        for i in (0..block.len()).step_by(4096) {
+            block[i] = 1;
+        }
+        println!("PWNDA_MEM_PROBE_READY");
+        std::thread::sleep(std::time::Duration::from_secs(60));
+        std::hint::black_box(&block);
+    }
+
+    #[test]
+    fn the_probe_reads_a_real_process_and_a_trim_empties_its_working_set() {
+        let exe = std::env::current_exe().expect("test binary");
+        let mut child = std::process::Command::new(exe)
+            .args([
+                "miners::proc_mem_windows_tests::mem_probe_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn the probe child");
+        let mut out = BufReader::new(child.stdout.take().expect("stdout"));
+        let mut line = String::new();
+        while out.read_line(&mut line).unwrap_or(0) > 0 && !line.contains("PWNDA_MEM_PROBE_READY") {
+            line.clear();
+        }
+        let pid = child.id();
+        let before = process_memory(pid);
+        let trimmed = trim_working_set(pid);
+        let after = process_memory(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+
+        let (before, after) = (before.expect("readable before"), after.expect("readable after"));
+        let floor = (CHILD_MB as u64) * 1024 * 1024;
+        assert!(before.private_bytes >= floor, "commit {} < {} MiB", before.private_bytes, CHILD_MB);
+        assert!(before.working_set >= floor * 9 / 10, "working set {} before the trim", before.working_set);
+        assert!(trimmed, "EmptyWorkingSet refused");
+        assert!(after.working_set < before.working_set / 4, "working set {} -> {}", before.working_set, after.working_set);
+        assert!(after.private_bytes >= floor, "a trim must not change commit");
     }
 }
