@@ -10,6 +10,7 @@ import ReactDOM from "react-dom/client";
 import App from "./App";
 import { AppStateProvider } from "./state/AppStateContext";
 import { installDevPerfTrackGuard, reactPerfTracksWanted } from "./lib/devPerfTrackGuard";
+import { holdAmbientAnimationsWhileIdle } from "./lib/decorativeMotion";
 import "./styles.css";
 
 // Dev-only, before the first render: React 19.2's development build records a
@@ -19,6 +20,12 @@ import "./styles.css";
 if (import.meta.env.DEV && !reactPerfTracksWanted()) {
   installDevPerfTrackGuard();
 }
+
+// Every build: hold infinite CSS animations still while nobody is using the
+// window. WebView2 composites on the CPU here, so each one repaints the window
+// every frame — the header's status-dot pulse alone cost ~60% of a core on the
+// operator's display, all day (2026-09-29). See `lib/decorativeMotion.ts`.
+holdAmbientAnimationsWhileIdle();
 
 if (import.meta.env.VITE_DEV_INSTANCE === "sandbox") {
   // eslint-disable-next-line no-console

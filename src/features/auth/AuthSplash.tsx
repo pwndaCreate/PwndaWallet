@@ -15,6 +15,12 @@ import { DitherCanvas } from "../../components/DitherCanvas";
  * When the window is wide (landscape) the brand and the form sit SIDE BY SIDE,
  * so the full-resolution logo fits a short (720px / scaled) window without a
  * scrollbar; when narrow (portrait) they stack vertically.
+ *
+ * Motion: the scan line is an infinite CSS animation, so it is held still with
+ * every other one while nobody is using the window
+ * (`holdAmbientAnimationsWhileIdle`, installed in main.tsx); the logo's canvas
+ * throttles itself (`DitherCanvas`). A locked wallet left on screen used to
+ * keep WebView2 near a full CPU core busy (log.md 2026-09-29).
  */
 export function AuthSplash({ children }: { children: ReactNode }) {
   const [wide, setWide] = useState(

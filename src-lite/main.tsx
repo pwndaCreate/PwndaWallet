@@ -3,6 +3,7 @@ import ReactDOM from "react-dom/client";
 import { LiteApp } from "./LiteApp";
 import { AppStateLiteProvider } from "./state/AppStateLite";
 import { installDevPerfTrackGuard, reactPerfTracksWanted } from "../src/lib/devPerfTrackGuard";
+import { holdAmbientAnimationsWhileIdle } from "../src/lib/decorativeMotion";
 import "../src/styles.css";
 
 // Dev-only: see `src/lib/devPerfTrackGuard.ts` (mining past the 1-hour sample
@@ -10,6 +11,10 @@ import "../src/styles.css";
 if (import.meta.env.DEV && !reactPerfTracksWanted()) {
   installDevPerfTrackGuard();
 }
+
+// Every build: infinite CSS animations are held still while nobody is using the
+// window — see `src/lib/decorativeMotion.ts` (CPU-only compositing, 2026-09-29).
+holdAmbientAnimationsWhileIdle();
 
 if (import.meta.env.VITE_DEV_INSTANCE === "sandbox") {
   // eslint-disable-next-line no-console

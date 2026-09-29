@@ -1,5 +1,22 @@
 import { useEffect, useRef, type CSSProperties } from "react";
+import { prefersReducedMotion, useDecorativeMotion } from "../lib/decorativeMotion";
 
+/**
+ * The idle shimmer's frame interval: ~8 fps. The canvas used to redraw on
+ * every display refresh (75–144 Hz), which under CPU-only compositing kept the
+ * lock screen near a full core busy (log.md 2026-09-29). The hover glitch
+ * still runs at the display rate, but only while the pointer is over it.
+ */
+const SHIMMER_FRAME_MS = 125;
+
+/**
+ * A dithered, glitch-on-hover rendering of an image.
+ *
+ * Frames are drawn only when they can be seen to change:
+ * - pointer over the canvas → every animation frame (the glitch);
+ * - someone using the window (see `useDecorativeMotion`) → a shimmer at ~8 fps;
+ * - otherwise, or with reduced motion requested → one still frame, no timers.
+ */
 export function DitherCanvas({
   src,
   width = 360,
@@ -27,8 +44,11 @@ export function DitherCanvas({
   const wrapRef = useRef<HTMLDivElement>(null);
   const gridRef = useRef<Uint8Array | null>(null);
   const cursorRef = useRef({ x: -9999, y: -9999, active: false });
-  const rafRef = useRef<number | null>(null);
   const tRef = useRef(0);
+  const motion = useDecorativeMotion();
+  const motionRef = useRef(motion);
+  // Redraw now and pick the next frame's timing; set by the drawing effect.
+  const kickRef = useRef<() => void>(() => {});
 
   const cols = Math.floor(width / cell);
   const rows = Math.floor(height / cell);
@@ -81,6 +101,7 @@ export function DitherCanvas({
         }
       }
       gridRef.current = grid;
+      kickRef.current();
     };
     img.src = src;
   }, [src, cols, rows]);
@@ -90,7 +111,9 @@ export function DitherCanvas({
     if (!wrap) return;
     const onMove = (e: PointerEvent) => {
       const r = wrap.getBoundingClientRect();
+      const wasActive = cursorRef.current.active;
       cursorRef.current = { x: e.clientX - r.left, y: e.clientY - r.top, active: true };
+      if (!wasActive) kickRef.current();
     };
     const onLeave = () => {
       cursorRef.current.active = false;
@@ -111,15 +134,15 @@ export function DitherCanvas({
     canvas.height = height * dpr;
     const ctx = canvas.getContext("2d")!;
     ctx.scale(dpr, dpr);
-    const render = () => {
+    const reduced = prefersReducedMotion();
+    let raf: number | null = null;
+    let timer: number | undefined;
+    const draw = () => {
       tRef.current += 1;
       const grid = gridRef.current;
       ctx.clearRect(0, 0, width, height);
-      if (!grid) {
-        rafRef.current = requestAnimationFrame(render);
-        return;
-      }
-      const cur = cursorRef.current;
+      if (!grid) return;
+      const cur = reduced ? { x: 0, y: 0, active: false } : cursorRef.current;
       const rSq = glitchRadius * glitchRadius;
       for (let y = 0; y < rows; y++) {
         for (let x = 0; x < cols; x++) {
@@ -153,13 +176,47 @@ export function DitherCanvas({
           }
         }
       }
-      rafRef.current = requestAnimationFrame(render);
     };
-    rafRef.current = requestAnimationFrame(render);
+    const stop = () => {
+      if (raf !== null) cancelAnimationFrame(raf);
+      raf = null;
+      window.clearTimeout(timer);
+      timer = undefined;
+    };
+    const schedule = () => {
+      stop();
+      if (reduced || !gridRef.current || document.visibilityState !== "visible") return;
+      if (cursorRef.current.active) {
+        raf = requestAnimationFrame(() => {
+          raf = null;
+          draw();
+          schedule();
+        });
+      } else if (motionRef.current) {
+        timer = window.setTimeout(() => {
+          timer = undefined;
+          draw();
+          schedule();
+        }, SHIMMER_FRAME_MS);
+      }
+    };
+    kickRef.current = () => {
+      draw();
+      schedule();
+    };
+    kickRef.current();
     return () => {
-      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      stop();
+      kickRef.current = () => {};
     };
   }, [width, height, cell, cols, rows, color, dimColor, glitchRadius]);
+
+  // The window started or stopped being looked at: redraw, then keep or drop
+  // the shimmer.
+  useEffect(() => {
+    motionRef.current = motion;
+    kickRef.current();
+  }, [motion]);
 
   return (
     <div ref={wrapRef} style={{ position: "relative", width, height, ...style }}>
