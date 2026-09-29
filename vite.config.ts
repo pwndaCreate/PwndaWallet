@@ -3,6 +3,9 @@ import react from "@vitejs/plugin-react";
 import { nodePolyfills } from "vite-plugin-node-polyfills";
 import wasm from "vite-plugin-wasm";
 import topLevelAwait from "vite-plugin-top-level-await";
+import { statSync, type Stats } from "node:fs";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const host = process.env.TAURI_DEV_HOST;
 
@@ -64,6 +67,65 @@ const entryHtml =
 // imports a wasm module.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// What the dev server watches
+// ---------------------------------------------------------------------------
+// Vite watches its whole project root unless told otherwise, and one file
+// watch costs one OS handle plus a native buffer. This root holds far more
+// than the app: local work trees, build output, caches and docs. On
+// 2026-09-29 the `tauri dev` server held 1.5–2.3 GB and 142,351 handles,
+// almost all of them outside the app's sources, and it sat outside the
+// wallet's process tree, where the wallet's own memory sampler never looked.
+//
+// So the dev server watches the root's own files (entry HTML, env files,
+// configs) and the folders the app is built from, and nothing else. It is an
+// allowlist on purpose: a folder added at the root later is ignored until it
+// is named here, instead of being watched until someone notices. The Rust
+// side (`src-tauri`) was already excluded; it has its own watcher.
+export const WATCHED_ROOT_DIRS: ReadonlySet<string> = new Set(["src", "src-lite", "public"]);
+
+/**
+ * A chokidar `ignored` matcher: true for every folder directly under `root`
+ * that is not in `watched`, and for everything inside one. Paths outside
+ * `root`, the root itself and files directly in it are kept.
+ */
+export function watchOnlyAppSources(
+  root: string,
+  watched: ReadonlySet<string> = WATCHED_ROOT_DIRS,
+): (candidate: string, stats?: Pick<Stats, "isDirectory">) => boolean {
+  const base = root.replace(/\\/g, "/").replace(/\/+$/, "");
+  const baseLower = base.toLowerCase();
+  const rootEntryIsDir = new Map<string, boolean>();
+  return (candidate, stats) => {
+    const p = candidate.replace(/\\/g, "/");
+    if (
+      p.length <= base.length + 1 ||
+      p[base.length] !== "/" ||
+      p.slice(0, base.length).toLowerCase() !== baseLower
+    ) {
+      return false;
+    }
+    const rel = p.slice(base.length + 1);
+    const cut = rel.indexOf("/");
+    const top = cut < 0 ? rel : rel.slice(0, cut);
+    if (!top || watched.has(top)) return false;
+    if (cut >= 0) return true;
+    // Directly in the root: drop folders, keep files.
+    if (stats) return stats.isDirectory();
+    const known = rootEntryIsDir.get(top);
+    if (known !== undefined) return known;
+    try {
+      const isDir = statSync(candidate).isDirectory();
+      rootEntryIsDir.set(top, isDir);
+      return isDir;
+    } catch {
+      return false;
+    }
+  };
+}
+
+export const ignoreOutsideAppSources = watchOnlyAppSources(dirname(fileURLToPath(import.meta.url)));
+
 export default defineConfig(async () => ({
   plugins: [
     react(),
@@ -98,7 +160,8 @@ export default defineConfig(async () => ({
         }
       : undefined,
     watch: {
-      ignored: ["**/src-tauri/**"],
+      // See "What the dev server watches" above.
+      ignored: ["**/src-tauri/**", ignoreOutsideAppSources],
     },
   },
 }));
