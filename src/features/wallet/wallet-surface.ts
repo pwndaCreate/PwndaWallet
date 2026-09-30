@@ -231,6 +231,22 @@ function isSendSyncGated(chain: ChainType): chain is SendSyncGatedChain {
 }
 
 /**
+ * Chains this wallet cannot send from at all yet, and why (2026-09-29
+ * send-safety audit).
+ *
+ * Hedera and Conflux showed an enabled Send and a fee, took the recipient and
+ * amount, and only then did their adapters throw "not yet implemented". The
+ * gate says so before anyone fills the form in. `wallet-surface.test.ts`
+ * pins it both ways: each entry's adapter must still refuse to send (so the
+ * gate goes when sending arrives), and every adapter whose send is a stub
+ * must be listed here.
+ */
+export const SEND_UNSUPPORTED: Readonly<Partial<Record<ChainType, string>>> = {
+  hedera: "Sending HBAR is not supported yet: this wallet cannot sign Hedera transactions.",
+  conflux: "Sending CFX is not supported yet: this wallet cannot sign Conflux Core Space transactions.",
+};
+
+/**
  * Why Send is disabled for `chain`, or null when it is not.
  *
  * `ready` is a `Record` over every gated chain, so a caller that forgets one
@@ -241,6 +257,8 @@ export function sendBlockedReason(
   chain: ChainType,
   ready: Record<SendSyncGatedChain, boolean>,
 ): string | null {
+  const unsupported = SEND_UNSUPPORTED[chain];
+  if (unsupported) return unsupported;
   if (!isSendSyncGated(chain)) return null;
   if (ready[chain]) return null;
   const name = getAdapter(chain).displayName;

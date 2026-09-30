@@ -5,6 +5,8 @@
  * actually call these.
  */
 import { describe, it, expect } from "vitest";
+import { readdirSync, readFileSync } from "node:fs";
+import { join, resolve } from "node:path";
 import { ALL_CHAINS, getAdapter } from "../../wallets";
 import type { ChainType, WalletInfo } from "../../wallets";
 import { ASSET_CAPABILITIES } from "../swap/asset-capabilities";
@@ -22,6 +24,7 @@ import {
   historySurfaceFor,
   importableChains,
   receiveBlockedReason,
+  SEND_UNSUPPORTED,
   sendBlockedReason,
   swapAssetKeyFor,
   swapBlockedReason,
@@ -213,6 +216,52 @@ describe("Send is gated on the chain's own sync, in both layouts", () => {
     const none = { monero: false, zephyr: false, zano: false, xelis: false };
     expect(sendBlockedReason("bitcoin", none)).toBeNull();
     expect(sendBlockedReason("ethereum", none)).toBeNull();
+  });
+});
+
+/**
+ * 2026-09-29 send-safety audit: Hedera and Conflux showed an enabled Send and
+ * a fee; their adapters then threw "not yet implemented" after the form was
+ * filled in. The gate is the shared rule, so both layouts (and landscape's
+ * Quick send, which reads the same reason) disable it.
+ */
+describe("Send is gated for chains that cannot send yet (2026-09-29 send-safety audit)", () => {
+  const allSynced = { monero: true, zephyr: true, zano: true, xelis: true };
+
+  it("blocks Hedera and Conflux, and says why", () => {
+    expect(sendBlockedReason("hedera", allSynced)).toMatch(/HBAR is not supported yet/);
+    expect(sendBlockedReason("conflux", allSynced)).toMatch(/CFX is not supported yet/);
+  });
+
+  it("keeps the gate only while the adapter still cannot send", async () => {
+    // When sending is implemented this fails, and the gate must go with it.
+    const gated = Object.keys(SEND_UNSUPPORTED) as ChainType[];
+    expect(gated.length).toBeGreaterThanOrEqual(2);
+    for (const chain of gated) {
+      await expect(getAdapter(chain).sendTransaction("", "", "1"), chain).rejects.toThrow(
+        /not yet implemented/,
+      );
+    }
+  });
+
+  it("gates every adapter whose send is a stub, found by source rather than by memory", () => {
+    const dir = resolve(__dirname, "../../wallets");
+    const stubs = readdirSync(dir)
+      .filter((f) => /-wallet\.ts$/.test(f) && !f.endsWith(".test.ts"))
+      .map((f) => ({ f, src: readFileSync(join(dir, f), "utf8") }))
+      .filter(({ src }) => /send is not yet implemented/.test(src));
+    // Control: the detector finds the two known stubs, so the check below is not vacuous.
+    expect(stubs.map((s) => s.f).sort()).toEqual(expect.arrayContaining(["cfx-wallet.ts", "hbar-wallet.ts"]));
+    for (const { f, src } of stubs) {
+      const chain = /^\s*chain:\s*"([a-z-]+)"/m.exec(src)?.[1];
+      expect(chain, f).toBeTruthy();
+      expect(SEND_UNSUPPORTED[chain as ChainType], `${f} has a stub send and no Send gate`).toBeTruthy();
+    }
+  });
+
+  it("does not gate a chain that can send", () => {
+    expect(sendBlockedReason("bitcoin", allSynced)).toBeNull();
+    expect(sendBlockedReason("cardano", allSynced)).toBeNull();
   });
 });
 
