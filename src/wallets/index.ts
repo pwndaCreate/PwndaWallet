@@ -172,6 +172,7 @@ export type {
   ChainTx,
   TxDirection,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
   FeeTier,
   SendQuote,

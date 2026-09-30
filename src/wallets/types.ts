@@ -153,6 +153,38 @@ export interface ChainTx {
   meta?: Record<string, unknown>;
 }
 
+/**
+ * Who sent one transaction and who received it, read from the chain by
+ * hash (2026-09-30, operator request: "in the info I can see which address
+ * each transaction was sent and received from").
+ *
+ * History rows do not always name both sides: a row is built from ONE
+ * address's point of view, and several list sources (Solana signatures,
+ * BlockCypher txrefs, Sui balance changes) carry no addresses at all. The
+ * details views ask for this when a row lacks a side, and the swap details
+ * ask for it for each leg of a swap. Asked once per opened transaction,
+ * never by the history poll.
+ */
+export interface TxParties {
+  /** Addresses the value came from, in the chain's own order (a UTXO
+   *  transaction lists every input address; duplicates removed). Empty when
+   *  the chain does not reveal it — then `senderHidden` says why. */
+  from: string[];
+  /** Addresses the value went to (every output of a UTXO transaction,
+   *  change included; the view marks the wallet's own). */
+  to: string[];
+  /** The protocol hides the sender (Monero, Zephyr, Zano): not a failed
+   *  read, and never "unknown sender". */
+  senderHidden?: boolean;
+  /** Only when the list row could not say (SPL): the wallet's side of the
+   *  transfer, its amount in display units, and the fee it paid. */
+  direction?: TxDirection;
+  amount?: string;
+  fee?: string;
+  /** The host it was read from, for the details' "source" line. */
+  source?: string;
+}
+
 /** Cursor token for paging through history. Opaque to callers. */
 export interface TxHistoryPage {
   items: ChainTx[];
@@ -567,6 +599,16 @@ export interface ChainAdapter {
     address: string,
     opts?: { limit?: number; cursor?: string }
   ): Promise<TxHistoryPage>;
+
+  /**
+   * Optional. One transaction's sender and recipient addresses, read from
+   * the chain by `hash` (see `TxParties`). `ownAddress` is the wallet's
+   * address on this chain, for adapters that must pick the wallet's side
+   * (SPL `direction` / `amount`). Resolves `null` when the chain does not
+   * know the transaction (yet); throws when every source failed. Reads
+   * only public data through the same hosts the adapter already uses.
+   */
+  getTransactionParties?(hash: string, ownAddress: string): Promise<TxParties | null>;
 
   /**
    * Current network fee estimate, structured. Adapters that only have one
