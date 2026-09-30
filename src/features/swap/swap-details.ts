@@ -482,10 +482,11 @@ export function depositMemoOf(row: SwapHistoryEntry): string | null {
   return typeof m === "string" && m.trim() ? m.trim() : null;
 }
 
-/** A stored minimum-received amount, if a writer ever records one. No path
- *  writes it today; the modal falls back to the quote 1Click echoes. */
+/** The stored minimum-received amount. `SwapConfirmModal` writes it since
+ *  2026-09-30; for older rows the modal falls back to the quote 1Click
+ *  echoes. */
 export function minReceivedOf(row: SwapHistoryEntry): string | null {
-  const m = (row as unknown as { minReceived?: unknown }).minReceived;
+  const m: unknown = row.minReceived;
   return typeof m === "string" && m.trim() ? m.trim() : null;
 }
 

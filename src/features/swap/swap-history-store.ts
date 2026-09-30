@@ -90,6 +90,12 @@ export interface SwapHistoryEntry {
    * failed. Cleared when 1Click reports a status for the deposit address.
    */
   outcomeUnknown?: boolean;
+  /**
+   * The quote's minimum received, display units of `toAsset` (2026-09-30).
+   * Written with the row so the details view can show it after the quote
+   * is gone; older rows have none and fall back to 1Click's echo.
+   */
+  minReceived?: string;
 }
 
 // ─── Drift helpers ────────────────────────────────────────────────────

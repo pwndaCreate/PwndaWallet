@@ -416,6 +416,7 @@ export function SwapConfirmModal({
         ...(r.depositMemo ? { depositMemo: r.depositMemo } : {}),
         depositDeadline,
         ...(r.outcomeUnknown ? { outcomeUnknown: true } : {}),
+        ...(q.minReceived ? { minReceived: q.minReceived } : {}),
       };
       if (historyWritten) {
         await updateSwapHistoryEntry(id, entry);

@@ -69,7 +69,7 @@ import { useXelisSession, useXelisNodes } from "./features/xelis";
 import { useMiner } from "./features/mining/useMiner";
 import { useMiningOptIn } from "./features/mining/miningOptIn";
 import { useMemoryTracker, usePeriodicGc } from "./features/mining/useMemoryTrace";
-import { useDeskTracker } from "./features/swap";
+import { useDeskTracker, resumePendingIntentsSwapsOnce } from "./features/swap";
 import {
   applySharedCoinBalances,
   fetchSharedCoinOverrides,
@@ -1085,6 +1085,14 @@ function App() {
   useEffect(() => {
     activeChainRef.current = activeChain;
   }, [activeChain]);
+
+  // Re-track unfinished NEAR Intents swaps once per session as soon as a
+  // wallet is open (2026-09-30). It used to start only when the Swap form
+  // mounted, so after a restart a swap that had finished or been refunded
+  // read "pending" everywhere until the user happened to open Swap.
+  useEffect(() => {
+    if (Object.keys(walletsByChain).length > 0) resumePendingIntentsSwapsOnce();
+  }, [walletsByChain]);
 
   // A scan describes ONE wallet's accounts. On logout (or any transition that
   // empties the wallet set) the summaries must go with it, or the next wallet

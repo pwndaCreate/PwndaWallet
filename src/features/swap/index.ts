@@ -36,6 +36,9 @@ export {
   SWAP_ROW_OPEN_STYLE,
   swapRowOpenProps,
 } from "./SwapDetailsModal";
+// Unfinished NEAR Intents swaps are re-tracked at app start (2026-09-30),
+// not only once the Swap tab mounts.
+export { resumePendingIntentsSwapsOnce } from "./intents-status-resume";
 
 // Desk tracker: owns in-flight desk swaps + their history projection. Routed
 // through the barrel so the App shell (and, later, the activity feature) can
