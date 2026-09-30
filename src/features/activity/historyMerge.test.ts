@@ -169,8 +169,12 @@ describe("the details name the wallet's side of a UTXO transaction exactly", () 
   it("a send: from the address that actually paid (you), to the other party", () => {
     const [row] = mergeChainTx({ txByChain: txByChainFor([SEND]) }, "litecoin").txs;
     const m = txDetailsModel(row, { ownAddress: PRIMARY, ownAddresses: own });
-    expect(m.from).toEqual({ address: PRIMARY, you: true });
-    expect(m.to).toEqual({ address: EXTERNAL, you: false });
+    expect(m.from).toEqual([{ address: PRIMARY, you: true }]);
+    // Every output: the other party, and the change back to this wallet.
+    expect(m.to).toEqual([
+      { address: EXTERNAL, you: false },
+      { address: CHANGE20, you: true, change: true },
+    ]);
   });
 
   it("a receipt at a change address: to that address (you), from the sender's input", () => {
@@ -183,8 +187,8 @@ describe("the details name the wallet's side of a UTXO transaction exactly", () 
     const [row] = mergeChainTx({ txByChain: txByChainFor([receipt]) }, "litecoin").txs;
     // Before: "to" was the displayed address, whatever address received.
     const m = txDetailsModel(row, { ownAddress: PRIMARY, ownAddresses: own });
-    expect(m.to).toEqual({ address: CHANGE[1], you: true });
-    expect(m.from).toEqual({ address: EXTERNAL, you: false });
+    expect(m.to).toEqual([{ address: CHANGE[1], you: true }]);
+    expect(m.from).toEqual([{ address: EXTERNAL, you: false }]);
   });
 
   it("both views pass the chain's addresses to the details", () => {

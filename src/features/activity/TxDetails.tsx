@@ -34,6 +34,7 @@ import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
 import { ModalBackdrop } from "../../components/ModalBackdrop";
+import { useTxParties, type TxPartiesState } from "../../lib/txParties";
 
 /** Confirmations at which a counted row reads "confirmed" (display only). */
 export const CONFIRMED_AT = 6;
@@ -47,6 +48,9 @@ export interface TxDetailsContext {
   pricesByTicker?: Record<string, number>;
   /** Zephyr oracle prices for ZEPHUSD / ZEPHRSV / ZEPHYRS rows. */
   zphStats?: ZphLiveStats | null;
+  /** What the chain said when asked for this transaction's parties
+   *  (`useTxParties`); absent when nobody asked. */
+  parties?: TxPartiesState;
 }
 
 export type Tone = "in" | "out" | "failed" | "pending" | "neutral";
@@ -54,6 +58,8 @@ export type Tone = "in" | "out" | "failed" | "pending" | "neutral";
 export interface TxParty {
   address: string;
   you: boolean;
+  /** The wallet's own output on a send that also paid someone else. */
+  change?: boolean;
 }
 
 export interface TxDetailsModel {
@@ -73,8 +79,15 @@ export interface TxDetailsModel {
   counted: boolean;
   confirmations: number;
   fee: string | null;
-  from: TxParty | null;
-  to: TxParty | null;
+  /** Every address the value came from / went to, the wallet's marked. */
+  from: TxParty[];
+  to: TxParty[];
+  /** Why a side is empty: hidden by the protocol, still being read, … */
+  fromNote: string | null;
+  toNote: string | null;
+  /** The row leaves a side (or, for SPL, the direction or amount) unsaid,
+   *  so the details should ask the chain (`getTransactionParties`). */
+  needsParties: boolean;
   time: { absolute: string; relative: string } | null;
   block: string | null;
   method: string | null;
@@ -108,11 +121,143 @@ function metaString(tx: ChainTx, key: string): string | undefined {
   return typeof v === "string" && v ? v : undefined;
 }
 
+/** A row's `meta[key]` as a list of addresses: a string or a string array. */
+function metaList(tx: ChainTx, key: "from" | "to"): string[] {
+  const v = tx.meta?.[key];
+  if (typeof v === "string") return v ? [v] : [];
+  return Array.isArray(v) ? v.filter((a): a is string => typeof a === "string" && a !== "") : [];
+}
+
+function uniqAddresses(list: ReadonlyArray<string>): string[] {
+  const out: string[] = [];
+  for (const a of list) if (!out.some((b) => sameAddress(a, b))) out.push(a);
+  return out;
+}
+
+/** Chains whose protocol hides who sent a transaction: an empty sender is
+ *  the answer there, not a failed read. */
+const SENDER_HIDDEN_CHAINS: ReadonlySet<string> = new Set(["monero", "zephyr", "zano"]);
+
+/** The wallet's side of a row. A failed or mempool row keeps the way it was
+ *  meant to go in `meta.intended` / `meta.netDirection`. */
+function sideOf(tx: ChainTx): "in" | "out" | "self" | "unknown" {
+  const d = tx.direction;
+  if (d === "in" || d === "out" || d === "self") return d;
+  const hint = metaString(tx, "intended") ?? metaString(tx, "netDirection");
+  if (hint === "in" || hint === "out" || hint === "self") return hint;
+  return "unknown";
+}
+
+/**
+ * The row, with what the chain said filled in where the row could not say:
+ * an SPL row's direction and amount, a fee. Never overrides a value the row
+ * has.
+ */
+export function withPartiesFill(tx: ChainTx, parties?: TxPartiesState): ChainTx {
+  if (parties?.status !== "done" || !parties.parties) return tx;
+  const p = parties.parties;
+  // `pending` with a block is an adapter that did not read the direction.
+  const unsettled = tx.direction === "pending" && !!tx.height;
+  return {
+    ...tx,
+    direction: unsettled && p.direction ? p.direction : tx.direction,
+    amount: tx.amount ? tx.amount : (p.amount ?? tx.amount),
+    fee: tx.fee ?? p.fee,
+  };
+}
+
+export interface TxSides {
+  from: TxParty[];
+  to: TxParty[];
+  fromNote: string | null;
+  toNote: string | null;
+  needsParties: boolean;
+}
+
+/**
+ * Who sent the transaction and who received it (2026-09-30, operator
+ * request: "which address each transaction was sent and received from").
+ *
+ *  - Every address the row lists: `meta.from` / `meta.to` (account chains),
+ *    `meta.inputs` / `meta.outputs` (UTXO: every input and output, change
+ *    included, the wallet's own marked).
+ *  - Otherwise derived from the direction: a receipt came from the
+ *    counterparty to this wallet; a send went from this wallet to it.
+ *  - A side still empty is filled from what the chain said when asked
+ *    (`ctx.parties`), and otherwise carries a note saying why it is blank.
+ */
+export function txSides(
+  tx: ChainTx,
+  ctx: {
+    own?: string;
+    isOwn: (a: string | undefined) => boolean;
+    parties?: TxPartiesState;
+    chainName: string;
+  },
+): TxSides {
+  const side = sideOf(tx);
+  const listedFrom = uniqAddresses([...metaList(tx, "from"), ...metaAddresses(tx, "inputs")]);
+  const listedTo = uniqAddresses([...metaList(tx, "to"), ...metaAddresses(tx, "outputs")]);
+  let from = listedFrom;
+  let to = listedTo;
+  if (!from.length) {
+    if (side === "in") from = tx.counterparty ? [tx.counterparty] : [];
+    else if (side !== "unknown" && ctx.own) from = [ctx.own];
+  }
+  if (!to.length) {
+    if (side === "in" || side === "self") to = ctx.own ? [ctx.own] : [];
+    else if (side === "out" && tx.counterparty) to = [tx.counterparty];
+  }
+
+  const hiddenIn = SENDER_HIDDEN_CHAINS.has(tx.chain) && side === "in";
+  // A UTXO row with no input/output lists (BlockCypher, older cache) only
+  // guessed the wallet's side as the displayed address: ask the chain.
+  const utxoGuess =
+    !!getAdapter(tx.chain)?.utxoAccounts && (!listedFrom.length || !listedTo.length);
+  const needsParties =
+    (from.length === 0 && !hiddenIn) || to.length === 0 || side === "unknown" || !tx.amount || utxoGuess;
+
+  const asked = ctx.parties;
+  const p = asked?.status === "done" ? asked.parties : null;
+  if (p) {
+    if (!listedFrom.length && p.from.length) from = uniqAddresses(p.from);
+    if (!listedTo.length && p.to.length) to = uniqAddresses(p.to);
+  }
+
+  const hidden = hiddenIn || p?.senderHidden === true;
+  const noteFor = (what: "sender" | "recipient"): string => {
+    if (what === "sender" && hidden) {
+      return `Hidden: ${ctx.chainName} does not reveal who sent a transaction.`;
+    }
+    if (asked?.status === "loading") return `Reading the ${what} from ${ctx.chainName}…`;
+    if (asked?.status === "error") return `Could not read the ${what}: ${asked.message}`;
+    if (asked?.status === "done" && !asked.parties) {
+      return `${ctx.chainName} does not show this transaction yet.`;
+    }
+    return `This chain's history does not name the ${what}. The explorer shows it.`;
+  };
+  // On a send that also paid someone else, the wallet's own outputs are change.
+  const paidOthers = side === "out" && to.some((a) => !ctx.isOwn(a));
+  const mark = (a: string, change: boolean): TxParty => ({
+    address: a,
+    you: ctx.isOwn(a),
+    ...(change ? { change: true } : {}),
+  });
+  return {
+    from: from.map((a) => mark(a, false)),
+    to: to.map((a) => mark(a, paidOthers && ctx.isOwn(a))),
+    fromNote: from.length ? null : noteFor("sender"),
+    toNote: to.length ? null : noteFor("recipient"),
+    needsParties,
+  };
+}
+
 /**
  * Everything the details view shows, derived from one row. Pure: no React,
  * no I/O — the component renders exactly this, and tests read it directly.
  */
-export function txDetailsModel(tx: ChainTx, ctx: TxDetailsContext = {}): TxDetailsModel {
+export function txDetailsModel(row: ChainTx, ctx: TxDetailsContext = {}): TxDetailsModel {
+  const tx = withPartiesFill(row, ctx.parties);
   const adapter = getAdapter(tx.chain);
   const adapterTicker = adapter?.ticker ?? tx.chain.toUpperCase();
   const ticker = txDisplayTicker(tx, adapterTicker);
@@ -189,22 +334,12 @@ export function txDetailsModel(tx: ChainTx, ctx: TxDetailsContext = {}): TxDetai
   const own = ctx.ownAddress;
   const owned = [own, ...(ctx.ownAddresses ?? [])].filter((a): a is string => !!a);
   const isOwn = (a: string | undefined) => owned.some((o) => sameAddress(a, o));
-  const received = tx.direction === "in" || (tx.direction === "failed" && intended === "in");
-  // A UTXO row names its inputs' and outputs' addresses (2026-09-30), so the
-  // wallet's side is the address that actually took part — a change address
-  // the account scan found, say — not assumed to be the displayed one, and
-  // a receipt's sender is the first input that is not the wallet's.
-  const inputs = metaAddresses(tx, "inputs");
-  const outputs = metaAddresses(tx, "outputs");
-  const ownInput = inputs.find(isOwn);
-  const ownOutput = outputs.find(isOwn);
-  const otherInput = inputs.find((a) => !isOwn(a));
-  const otherOutput = outputs.find((a) => !isOwn(a));
-  const fromAddr =
-    metaString(tx, "from") ?? (received ? (tx.counterparty ?? otherInput) : (ownInput ?? own));
-  const toAddr =
-    metaString(tx, "to") ?? (received ? (ownOutput ?? own) : (tx.counterparty ?? otherOutput));
-  const party = (a: string | undefined): TxParty | null => (a ? { address: a, you: isOwn(a) } : null);
+  const sides = txSides(tx, {
+    own,
+    isOwn,
+    parties: ctx.parties,
+    chainName: adapter?.displayName ?? tx.chain,
+  });
 
   const amountApprox = tx.meta?.amountApprox === true;
   let note: string | null = null;
@@ -227,14 +362,20 @@ export function txDetailsModel(tx: ChainTx, ctx: TxDetailsContext = {}): TxDetai
     counted,
     confirmations,
     fee,
-    from: party(fromAddr),
-    to: party(toAddr),
+    from: sides.from,
+    to: sides.to,
+    fromNote: sides.fromNote,
+    toNote: sides.toNote,
+    needsParties: sides.needsParties,
     time: tx.timestamp
       ? { absolute: new Date(tx.timestamp * 1000).toLocaleString(), relative: fmtRelative(tx.timestamp) }
       : null,
     block: tx.height ? tx.height.toLocaleString("en-US") : null,
     method: metaString(tx, "method") ?? null,
-    source: metaString(tx, "source") ?? null,
+    source:
+      metaString(tx, "source") ??
+      (ctx.parties?.status === "done" ? ctx.parties.parties?.source : undefined) ??
+      null,
     note,
     hash: tx.hash,
     explorerUrl: explorerTxUrl(tx.chain, tx.hash),
@@ -308,17 +449,54 @@ function Row({ k, v, color }: { k: string; v: string; color?: string }) {
   );
 }
 
-/** Long value (address, hash): label above, the whole value wrapped below. */
-function LongRow({ k, v, you }: { k: string; v: string; you?: boolean }) {
+/** Long value (a hash): label above, the whole value wrapped below. */
+function LongRow({ k, v }: { k: string; v: string }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 3 }}>
-      <Label>
-        {k}
-        {you ? <span style={{ color: "var(--accent)", marginLeft: 6, letterSpacing: 0.5 }}>· you</span> : null}
-      </Label>
+      <Label>{k}</Label>
       <span className="tnum" style={{ ...mono, fontSize: 10, color: "var(--text)", wordBreak: "break-all", lineHeight: 1.45 }}>
         {v}
       </span>
+    </div>
+  );
+}
+
+/** Addresses shown per side before "+N more" (a consolidation can have
+ *  dozens of inputs; the explorer lists them all). */
+const ADDRESS_LIST_MAX = 8;
+
+/** Every address of one side, each on its own line, the wallet's marked. */
+function AddressList({ k, parties, note }: { k: string; parties: TxParty[]; note: string | null }) {
+  const shown = parties.slice(0, ADDRESS_LIST_MAX);
+  const more = parties.length - shown.length;
+  return (
+    <div data-tx-side={k} style={{ display: "flex", flexDirection: "column", gap: 3 }}>
+      <Label>
+        {k}
+        {parties.length > 1 ? ` (${parties.length})` : ""}
+      </Label>
+      {shown.map((p) => (
+        <span
+          key={p.address}
+          className="tnum"
+          style={{ ...mono, fontSize: 10, color: "var(--text)", wordBreak: "break-all", lineHeight: 1.45 }}
+        >
+          {p.address}
+          {p.you ? (
+            <span style={{ color: "var(--accent)", marginLeft: 6, letterSpacing: 0.5 }}>
+              {p.change ? "· you (change)" : "· you"}
+            </span>
+          ) : null}
+        </span>
+      ))}
+      {more > 0 && (
+        <span style={{ ...mono, fontSize: 9, color: "var(--text-dim)" }}>
+          +{more} more; the explorer lists them all
+        </span>
+      )}
+      {note && (
+        <span style={{ ...mono, fontSize: 9, color: "var(--text-dim)", lineHeight: 1.5 }}>{note}</span>
+      )}
     </div>
   );
 }
@@ -414,8 +592,8 @@ export function TxDetailsView({ tx, model: m, onExplorer }: TxDetailsViewProps) 
         <Row k="block" v={m.block ?? "—"} />
         <Row k="confirmations" v={m.counted ? m.confirmations.toLocaleString("en-US") : "—"} />
         {m.method && <Row k="method" v={m.method} />}
-        {m.from && <LongRow k="from" v={m.from.address} you={m.from.you} />}
-        {m.to && <LongRow k="to" v={m.to.address} you={m.to.you} />}
+        <AddressList k="from" parties={m.from} note={m.fromNote} />
+        <AddressList k="to" parties={m.to} note={m.toNote} />
         <LongRow k="hash" v={m.hash} />
         {m.source && <Row k="source" v={m.source} color="var(--text-dim)" />}
       </div>
@@ -461,12 +639,12 @@ export interface TxDetailsProps extends TxDetailsContext {
 }
 
 /**
- * The details for one row. Landscape mounts this in its right column;
- * portrait inside `TxDetailsSheet`. No hooks of its own, so a test can call
- * it and follow the explorer button to `openExternal`.
+ * The details for one row, as the row (and `parties`, when given) say. No
+ * hooks, so a test can call it and follow the explorer button to
+ * `openExternal`.
  */
-export function TxDetails({ tx, ownAddress, ownAddresses, pricesByTicker, zphStats }: TxDetailsProps) {
-  const model = txDetailsModel(tx, { ownAddress, ownAddresses, pricesByTicker, zphStats });
+export function TxDetailsStatic({ tx, ...ctx }: TxDetailsProps) {
+  const model = txDetailsModel(tx, ctx);
   return (
     <TxDetailsView
       tx={tx}
@@ -476,6 +654,19 @@ export function TxDetails({ tx, ownAddress, ownAddresses, pricesByTicker, zphSta
       }}
     />
   );
+}
+
+/**
+ * The details for one row. Landscape mounts this in its right column;
+ * portrait inside `TxDetailsSheet`. When the row does not name both sides
+ * (or, for SPL, which way it went), it asks the chain once, by hash
+ * (`useTxParties`, 2026-09-30).
+ */
+export function TxDetails(props: TxDetailsProps) {
+  const { tx, ownAddress, ownAddresses } = props;
+  const need = txDetailsModel(tx, { ownAddress, ownAddresses }).needsParties;
+  const parties = useTxParties(tx.chain, tx.hash, ownAddress, need);
+  return <TxDetailsStatic {...props} parties={parties} />;
 }
 
 /**

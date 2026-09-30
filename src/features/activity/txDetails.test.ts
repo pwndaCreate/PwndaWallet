@@ -24,7 +24,7 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { openExternal } from "../../utils/openExternal";
 import { Btn } from "../../components/PrimitivesV2";
 import type { ChainTx } from "../../wallets/types";
-import { TxDetails, TxDetailsView, openTxInExplorer, txDetailsModel } from "./TxDetails";
+import { TxDetails, TxDetailsStatic, TxDetailsView, openTxInExplorer, txDetailsModel } from "./TxDetails";
 
 const ME = "0x9858EfFD232B4033E47d90003D41EC34EcaEda94";
 const PEER = "0x44A3831B70E4cfBA7d73262Dc78443664cAbe644";
@@ -65,8 +65,8 @@ describe("txDetailsModel: every field the operator asked for", () => {
   });
 
   it("both parties, with the wallet's own address marked", () => {
-    expect(m.from).toEqual({ address: ME, you: true });
-    expect(m.to).toEqual({ address: PEER, you: false });
+    expect(m.from).toEqual([{ address: ME, you: true }]);
+    expect(m.to).toEqual([{ address: PEER, you: false }]);
   });
 
   it("the full hash, the block, and a working explorer link", () => {
@@ -91,8 +91,8 @@ describe("txDetailsModel: every field the operator asked for", () => {
       { ownAddress: "TPrk", pricesByTicker: { TRX: 0.3 } },
     );
     expect(received).toMatchObject({ directionLabel: "▼ received", sign: "+", usd: "$2.40" });
-    expect(received.from).toEqual({ address: "TGZp", you: false });
-    expect(received.to).toEqual({ address: "TPrk", you: true });
+    expect(received.from).toEqual([{ address: "TGZp", you: false }]);
+    expect(received.to).toEqual([{ address: "TPrk", you: true }]);
     const failed = txDetailsModel(
       { chain: "ethereum", hash: "0x01", direction: "failed", amount: "1", meta: { intended: "in", failure: "Reverted" } },
       { pricesByTicker: { ETH: 3000 } },
@@ -114,7 +114,9 @@ function walk(node: ReactNode, out: ReactElement[] = []): ReactElement[] {
 
 describe("the explorer opens through openExternal (a plain <a href> does nothing in the webview)", () => {
   it("pressing 'View on explorer' in TxDetails calls openExternal with the transaction's URL", () => {
-    const details = TxDetails({ tx: usdcArbSend, ownAddress: ME }) as ReactElement<Parameters<typeof TxDetailsView>[0]>;
+    // `TxDetails` reads missing parties with a hook; `TxDetailsStatic` is
+    // the same details without it, callable here as a function.
+    const details = TxDetailsStatic({ tx: usdcArbSend, ownAddress: ME }) as ReactElement<Parameters<typeof TxDetailsView>[0]>;
     expect(details.type).toBe(TxDetailsView);
     const tree = walk(TxDetailsView(details.props));
     const button = tree.find(
