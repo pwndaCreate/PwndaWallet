@@ -33,9 +33,11 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { UtxoAccountSpec } from "./utxo-account";
 import { planAccountSpend, P2PKH_SIZING } from "./utxo-account";
 import type { UtxoProbeResult } from "./_utxo-probes";
@@ -86,6 +88,18 @@ const BLOCKBOOK_URL = "https://blockbook.ravencoin.org";
 const INSIGHT_URLS = [
   "https://api.ravencoin.org/api",
   "https://rvn.cryptoscope.io/api",
+];
+
+/**
+ * Where `getTransactionParties` reads a transaction: the history's order,
+ * BlockBook then the Insight mirrors, through the proxy. Both mirrors failed
+ * a transaction read on 2026-09-30 (api.ravencoin.org: no connection;
+ * rvn.cryptoscope.io: 301 to an HTML 404 page), so BlockBook is in practice
+ * the only source — they stay for the history's sake, and read as failures.
+ */
+const RVN_PARTIES_SOURCES: UtxoPartiesSource[] = [
+  { kind: "blockbook", base: BLOCKBOOK_URL, via: "proxy" },
+  ...INSIGHT_URLS.map((base): UtxoPartiesSource => ({ kind: "insight", base, via: "proxy" })),
 ];
 const DERIVATION_PATH = "m/44'/175'/0'/0/0";
 
@@ -685,6 +699,11 @@ export const rvnAdapter: ChainAdapter = {
       const cursor = items.length === limit ? String(to) : undefined;
       return { items, cursor };
     }
+  },
+
+  /** Every input's and output's address, by txid (`parties-a-utxo.ts`). */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return readUtxoParties("RVN", hash, RVN_PARTIES_SOURCES);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

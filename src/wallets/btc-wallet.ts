@@ -10,11 +10,13 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
   SendOptions,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
 import { withFallback } from "./_fallback";
+import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { TxSizing, UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
@@ -96,6 +98,16 @@ const BTC_BROADCAST: BroadcastEndpoint[] = BTC_API_URLS.map((base) => ({
     const resp = await fetch(`${base}/tx`, { method: "POST", body: rawHex });
     return acceptPushReply(resp.status, await resp.text(), (b) => b.trim());
   },
+}));
+
+/**
+ * Where `getTransactionParties` reads a transaction: the history's Esplora
+ * hosts, in its order, over `fetch` as the history reaches them.
+ */
+const BTC_PARTIES_SOURCES: UtxoPartiesSource[] = BTC_API_URLS.map((base) => ({
+  kind: "esplora",
+  base,
+  via: "fetch",
 }));
 
 /** Esplora `GET /tx/:txid` — used only when every push errored. */
@@ -765,6 +777,11 @@ export const btcAdapter: ChainAdapter = {
     const cursor =
       items.length === limit && txs.length > 0 ? txs[txs.length - 1].txid : undefined;
     return { items, cursor };
+  },
+
+  /** Every input's and output's address, by txid (`parties-a-utxo.ts`). */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return readUtxoParties("BTC", hash, BTC_PARTIES_SOURCES);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

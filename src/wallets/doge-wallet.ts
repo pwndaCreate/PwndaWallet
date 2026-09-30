@@ -47,9 +47,11 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
@@ -115,6 +117,17 @@ const DOGECHAIN_BASE = "https://dogechain.info/api/v1";
 // {confirmed,unconfirmed,balance} in satoshis).
 const BITCORE_DOGE_BALANCE = (addr: string) =>
   `https://api.bitcore.io/api/DOGE/mainnet/address/${addr}/balance`;
+
+/**
+ * Where `getTransactionParties` reads a transaction: Blockchair, the
+ * history's only source, then BlockCypher, the other host this adapter
+ * already looks transactions up on (`DOGE_LOOKUPS`) — Blockchair blacklists a
+ * busy IP (HTTP 430), which would otherwise leave no way to read one.
+ */
+const DOGE_PARTIES_SOURCES: UtxoPartiesSource[] = [
+  { kind: "blockchair", base: BLOCKCHAIR_BASE, via: "proxy" },
+  { kind: "blockcypher", base: BLOCKCYPHER_BASE, via: "proxy" },
+];
 const DERIVATION_PATH = "m/44'/3'/0'/0/0";
 
 // Standard 1-in 2-out P2PKH tx is ~226 bytes — the size the modal's
@@ -916,6 +929,11 @@ export const dogeAdapter: ChainAdapter = {
 
     const cursor = txids.length === limit ? String(offset + limit) : undefined;
     return { items, cursor };
+  },
+
+  /** Every input's and output's address, by txid (`parties-a-utxo.ts`). */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return readUtxoParties("DOGE", hash, DOGE_PARTIES_SOURCES);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

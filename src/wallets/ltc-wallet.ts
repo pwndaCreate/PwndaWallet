@@ -34,11 +34,13 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
   SendOptions,
 } from "./types";
 import { proxyGetJson, httpProxyCall } from "./_proxy";
 import { esploraTxToChainTx, type EsploraTx } from "./esplora-history";
+import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   scanUtxoAccount,
@@ -124,6 +126,17 @@ const BLOCKCHAIR_BASE = "https://api.blockchair.com/litecoin";
 // 429/outage can't strand a transaction. Must be on the Rust allowlist
 // (src-tauri/src/http_proxy.rs). See [[remote-connections-inventory]].
 const LITECOINSPACE_BASE = "https://litecoinspace.org/api";
+
+/**
+ * Where `getTransactionParties` reads a transaction: the history's three
+ * sources in its first-page order (Esplora, BlockCypher, Blockchair), all
+ * through the Rust proxy as the history reaches them.
+ */
+const LTC_PARTIES_SOURCES: UtxoPartiesSource[] = [
+  { kind: "esplora", base: LITECOINSPACE_BASE, via: "proxy" },
+  { kind: "blockcypher", base: BLOCKCYPHER_BASE, via: "proxy" },
+  { kind: "blockchair", base: BLOCKCHAIR_BASE, via: "proxy" },
+];
 
 // Multi-source try-each for READS — same pattern as doge/bch/dash, so one
 // provider rate-limiting cannot blank a balance. Throws only if ALL fail,
@@ -1627,6 +1640,11 @@ export const ltcAdapter: ChainAdapter = {
     } catch {
       return await fetchHistoryBlockchair(address, limit, 0);
     }
+  },
+
+  /** Every input's and output's address, by txid (`parties-a-utxo.ts`). */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return readUtxoParties("LTC", hash, LTC_PARTIES_SOURCES);
   },
 
   /**

@@ -58,10 +58,12 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
   SendOptions,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
@@ -122,6 +124,31 @@ const HASKOIN_BASES = [
   "https://api.blockchain.info/haskoin-store/bch",
   "https://api.haskoin.com/bch",
 ] as const;
+
+/**
+ * Where `getTransactionParties` reads a transaction: the history's sources in
+ * its order (both haskoin deployments, then Blockchair), through the proxy.
+ */
+const BCH_PARTIES_SOURCES: UtxoPartiesSource[] = [
+  ...HASKOIN_BASES.map((base): UtxoPartiesSource => ({ kind: "haskoin", base, via: "proxy" })),
+  { kind: "blockchair", base: BLOCKCHAIR_BASE, via: "proxy" },
+];
+
+/**
+ * An explorer's BCH address in the form this wallet shows its own:
+ * `bitcoincash:`-prefixed CashAddr. haskoin prints that already; Blockchair
+ * prints bare CashAddr (`qrepx94s…`, read live 2026-09-30), which would never
+ * match the wallet's own address. Anything that is not a mainnet CashAddr is
+ * left as the explorer printed it.
+ */
+function bchDisplayAddress(address: string): string {
+  try {
+    const { type, hash } = decodeCashAddr(address);
+    return encodeCashAddr(hash, type);
+  } catch {
+    return address;
+  }
+}
 // Bitpay Bitcore — keyless public node API, no Cloudflare gate, and not subject
 // to Blockchair's free-tier IP blacklist (HTTP 430) that used to blank BCH ("—")
 // when the multi-chain sweep exhausted the shared Blockchair quota (2026-06-17).
@@ -1668,6 +1695,14 @@ export const bchAdapter: ChainAdapter = {
 
     const cursor = txids.length === limit ? String(offset + limit) : undefined;
     return { items, cursor };
+  },
+
+  /**
+   * Every input's and output's address, by txid (`parties-a-utxo.ts`), as
+   * `bitcoincash:` CashAddr like the wallet's own.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return readUtxoParties("BCH", hash, BCH_PARTIES_SOURCES, bchDisplayAddress);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

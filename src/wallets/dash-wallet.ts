@@ -25,10 +25,12 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
   SendOptions,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
@@ -89,6 +91,18 @@ const BLOCKCHAIR_BASE = "https://api.blockchair.com/dash";
 // {balanceSat, unconfirmedBalanceSat}.
 const INSIGHT_BASE = "https://insight.dash.org/insight-api";
 const DERIVATION_PATH = "m/44'/5'/0'/0/0"; // BIP-44, SLIP-44 coin type 5 = Dash
+
+/**
+ * Where `getTransactionParties` reads a transaction: BlockCypher (the
+ * history's source, whose txrefs name no addresses — the reason this read is
+ * needed at all), then the other two hosts this adapter already looks
+ * transactions up on, in `DASH_LOOKUPS` order. All through the proxy.
+ */
+const DASH_PARTIES_SOURCES: UtxoPartiesSource[] = [
+  { kind: "blockcypher", base: BLOCKCYPHER_BASE, via: "proxy" },
+  { kind: "blockchair", base: BLOCKCHAIR_BASE, via: "proxy" },
+  { kind: "insight", base: INSIGHT_BASE, via: "proxy" },
+];
 
 // Standard 1-in 2-out P2PKH tx is ~226 bytes. Same as DOGE.
 const STANDARD_TX_BYTES = 226;
@@ -702,6 +716,11 @@ export const dashAdapter: ChainAdapter = {
     // throws once every source has failed, and this is the only one.
     const items = await fetchHistoryBlockcypher(address, limit);
     return { items };
+  },
+
+  /** Every input's and output's address, by txid (`parties-a-utxo.ts`). */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return readUtxoParties("DASH", hash, DASH_PARTIES_SOURCES);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {
