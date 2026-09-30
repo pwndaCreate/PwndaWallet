@@ -1,18 +1,23 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { openExternal } from "../../utils/openExternal";
 import {
   ZPH_ASSETS,
   ZPH_ASSET_NAME,
   ZPH_UI_TICKER,
   atomicToZph,
+  zphToAtomic,
   ZPH_ASSET_COLOR,
   clampZphDisplayDecimals,
   quoteAssetTransfer,
-  relayTransfer,
   type ZphAssetType,
   type ZphAssetBalance,
   type ZphTransferResponse,
 } from "../../wallets/zph-rpc";
+import { getZphSessionEpoch, relayZphTransaction } from "../../wallets/zph-wallet";
+import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
+import { SEND_QUOTE_MAX_AGE_MS } from "../../wallets/send-quote";
+import type { TxResult } from "../../wallets/types";
+import { errorText } from "../../lib/errorText";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { CoinIcon } from "../../components/CoinIcon";
 
@@ -33,23 +38,192 @@ import { CoinIcon } from "../../components/CoinIcon";
  * — pricing record updates per block (~120s), so a stale quote could be
  * silently re-priced on relay. We pre-empt that by re-quoting on a timer.
  *
+ * The quote/confirm timing lives in `createSwapFlow` below (2026-09-29
+ * send-safety audit, finding 2), free of React so it is unit-tested
+ * (`__tests__/zephyrSwapFlow.test.ts`).
+ *
  * See [[zephyr-ecosystem-swap-plan]] for Phase 2/4/5/6 work this modal
  * does not yet do (reserve-ratio pre-flight, ZRS leverage warning,
  * etc.).
  */
 
-type ModalState =
+/** A built, unrelayed conversion and when/by which wallet session it was built. */
+export interface SwapQuote {
+  response: ZphTransferResponse;
+  quotedAt: number;
+  /** `getZphSessionEpoch()` at build time; the relay refuses another session's build. */
+  epoch: number | null;
+}
+
+export type SwapModalState =
   | { kind: "edit" }
   | { kind: "quote"; loading: true }
-  | { kind: "quote"; loading: false; quote: ZphTransferResponse; quotedAt: number }
+  | { kind: "quote"; loading: false; quote: SwapQuote }
   | { kind: "submitting" }
-  | { kind: "success"; txHash: string }
+  | { kind: "success"; txHash: string; pending: boolean }
+  /** The relay may have gone out (`SendOutcomeUnknownError`): no way back to Confirm. */
+  | { kind: "unknown"; txHash: string; message: string }
   | { kind: "error"; message: string };
 
 /** Auto-refresh cadence — kept under one block (~120s) so the user
  *  always sees a quote that's no more than ~60s away from a freshly
  *  re-priced tx. */
 const QUOTE_REFRESH_MS = 60_000;
+
+/**
+ * May a quote built at `quotedAt` still be relayed as built? Under 90 s, the
+ * same window `useSend` applies to Send-modal quotes (`SEND_QUOTE_MAX_AGE_MS`).
+ */
+export function swapQuoteIsFresh(quotedAt: number, now: number): boolean {
+  const age = now - quotedAt;
+  return age >= 0 && age < SEND_QUOTE_MAX_AGE_MS;
+}
+
+export interface SwapFlow {
+  /** Leave any quote for the edit form; a build still running is dropped. */
+  edit(): void;
+  /**
+   * Price the modal's current inputs. `silent` is the background refresh of a
+   * SHOWN quote: it keeps that quote when it fails.
+   */
+  quote(silent?: boolean): Promise<void>;
+  /** Relay the shown quote, or re-price it first when it is too old. */
+  confirm(): Promise<void>;
+  /** The modal is closing: every result still in flight is dropped. */
+  dispose(): void;
+  state(): SwapModalState;
+}
+
+/**
+ * The quote → confirm → relay sequence (2026-09-29 send-safety audit,
+ * finding 2).
+ *
+ * # The double conversion this exists to stop
+ *
+ * The modal re-quoted silently every 60 s. A re-quote in flight when Confirm
+ * was pressed resolved DURING "submitting", put the modal back into "quote"
+ * with a NEW signed transaction and a live Confirm button while relay #1 was
+ * still running, so a second press relayed that one too: two conversions,
+ * both spendable because the second build did not know the first's inputs were
+ * being spent. And nothing checked a quote's age: a silent re-quote that
+ * failed left an arbitrarily old transaction relayable.
+ *
+ * So, as in `quoteController.ts`: a generation counter, bumped whenever the
+ * modal leaves a quote (Edit, Back, Confirm, close) or starts pricing a new
+ * one. A build that finishes under an older generation describes a quote the
+ * modal no longer shows, and is dropped. Confirm relays nothing older than
+ * 90 s (`swapQuoteIsFresh`) — it re-prices instead, and the user confirms the
+ * new quote — and one relay runs at a time.
+ */
+export function createSwapFlow(deps: {
+  build: () => Promise<SwapQuote>;
+  relay: (quote: SwapQuote) => Promise<TxResult>;
+  onChange: (state: SwapModalState) => void;
+  now?: () => number;
+}): SwapFlow {
+  const now = deps.now ?? (() => Date.now());
+  let current: SwapModalState = { kind: "edit" };
+  let generation = 0;
+  let relaying = false;
+  let disposed = false;
+
+  const set = (next: SwapModalState) => {
+    current = next;
+    if (!disposed) deps.onChange(next);
+  };
+
+  async function quote(silent = false): Promise<void> {
+    if (disposed || relaying) return;
+    // A background refresh only ever replaces a quote that is on screen.
+    if (silent && !(current.kind === "quote" && !current.loading)) return;
+    const mine = ++generation;
+    if (!silent) set({ kind: "quote", loading: true });
+    let built: SwapQuote;
+    try {
+      built = await deps.build();
+    } catch (e) {
+      if (disposed || mine !== generation) return;
+      if (silent) {
+        // The shown quote stays; Confirm re-prices it once it is 90 s old.
+        console.warn("[ZephyrSwapModal] auto-requote failed:", errorText(e));
+        return;
+      }
+      set({ kind: "error", message: errorText(e, "Quote failed") });
+      return;
+    }
+    if (disposed || mine !== generation) return;
+    set({ kind: "quote", loading: false, quote: built });
+  }
+
+  return {
+    state: () => current,
+    edit() {
+      if (disposed || relaying) return;
+      generation++;
+      set({ kind: "edit" });
+    },
+    quote,
+    async confirm() {
+      if (disposed || relaying) return;
+      if (current.kind !== "quote" || current.loading) return;
+      const q = current.quote;
+      if (!swapQuoteIsFresh(q.quotedAt, now())) {
+        await quote(false);
+        return;
+      }
+      generation++; // any re-quote still building is for a quote being left
+      relaying = true;
+      set({ kind: "submitting" });
+      try {
+        const r = await deps.relay(q);
+        set({ kind: "success", txHash: r.hash, pending: r.pending === true });
+      } catch (e) {
+        if (isSendOutcomeUnknown(e)) {
+          set({ kind: "unknown", txHash: e.hash ?? q.response.tx_hash, message: errorText(e, "") });
+        } else {
+          set({ kind: "error", message: errorText(e, "Broadcast failed") });
+        }
+      } finally {
+        relaying = false;
+      }
+    },
+    dispose() {
+      disposed = true;
+      generation++;
+    },
+  };
+}
+
+/**
+ * Keep this much of the source asset back for the network fee when MAX fills
+ * the amount, unless a quote for that asset has shown a larger fee: 0.001, a
+ * wide margin over the 0.0000254 a two-input Zephyr transfer is quoted at in
+ * `zph-wallet.test.ts`. A conversion over many small outputs can need more;
+ * its quote then fails with the wallet's own "not enough unlocked money"
+ * (a build, so nothing is sent) and the user lowers the amount.
+ */
+export const ZPH_CONVERSION_FEE_RESERVE_ATOMIC = 1_000_000_000n;
+
+/**
+ * The amount MAX fills in (2026-09-29 send-safety audit, finding 9): unlocked
+ * minus the fee reserve, clamped DOWN to the 4 decimals a conversion allows.
+ * Null when nothing convertible is left.
+ *
+ * It was the whole unlocked balance, clamped. The fee is paid in the SOURCE
+ * asset, so a balance with ≤4 decimals left nothing for it and the quote
+ * failed with "not enough unlocked money".
+ */
+export function maxConvertibleAmount(
+  unlockedAtomic: number | bigint,
+  feeReserveAtomic: bigint
+): string | null {
+  const unlocked =
+    typeof unlockedAtomic === "bigint" ? unlockedAtomic : BigInt(Math.trunc(unlockedAtomic));
+  const spendable = unlocked - (feeReserveAtomic > 0n ? feeReserveAtomic : 0n);
+  if (spendable <= 0n) return null;
+  const clamped = clampZphDisplayDecimals(atomicToZph(spendable), 4);
+  return zphToAtomic(clamped) > 0n ? clamped : null;
+}
 
 const EXPLORER_TX_URL = (txid: string) =>
   `https://explorer.zephyrprotocol.com/tx/${txid}`;
@@ -246,7 +420,13 @@ function AssetPill({
 // once every cell is filled. ~1.5s total.
 // ===========================================================================
 
-function CompletionAnimation() {
+/**
+ * `settled` is false while the relay is still running (2026-09-29). The fill
+ * used to turn green and read "✓ SWAP COMPLETE" after ~1.1 s whatever the
+ * relay was doing, so a broadcast still waiting on a slow node, or about to
+ * fail, was already announced as complete.
+ */
+function CompletionAnimation({ settled = true }: { settled?: boolean }) {
   const TOTAL_CELLS = 14;
   const FRAME_MS = 80;
   const [filled, setFilled] = useState(0);
@@ -257,7 +437,7 @@ function CompletionAnimation() {
     return () => window.clearTimeout(t);
   }, [filled]);
 
-  const done = filled >= TOTAL_CELLS;
+  const done = settled && filled >= TOTAL_CELLS;
   const cells = Array.from({ length: TOTAL_CELLS }, (_, i) => i < filled);
   const color = done ? "var(--success, #4ad97a)" : ASSET_COLOR.ZPH;
 
@@ -344,8 +524,64 @@ export function ZephyrSwapModal({
     return validDestinationsFor(initialSource)[0] ?? "ZSD";
   });
   const [amount, setAmount] = useState("");
-  const [state, setState] = useState<ModalState>({ kind: "edit" });
+  const [state, setState] = useState<SwapModalState>({ kind: "edit" });
   const [copied, setCopied] = useState(false);
+
+  // What a build reads when it runs: the inputs as they are THEN, not as they
+  // were when the flow was created.
+  const inputsRef = useRef({ walletAddress, amount, sourceAsset, destAsset });
+  inputsRef.current = { walletAddress, amount, sourceAsset, destAsset };
+  const onSuccessRef = useRef(onSuccess);
+  onSuccessRef.current = onSuccess;
+  /** The fee of the latest quote per source asset, for MAX's reserve. */
+  const lastFeeRef = useRef<Partial<Record<ZphAssetType, bigint>>>({});
+
+  // Created in an effect, not in render, so StrictMode's mount → unmount →
+  // mount gets a live flow rather than the disposed first one.
+  const flowRef = useRef<SwapFlow | null>(null);
+  useEffect(() => {
+    const flow = createSwapFlow({
+      build: async () => {
+        const { walletAddress: dest, amount: typed, sourceAsset: src, destAsset: dst } =
+          inputsRef.current;
+        // Mint/redeem permits ≤4 decimals — clamp (round down) and reflect
+        // it in the input so the quoted amount matches what's shown.
+        const sendAmount = clampZphDisplayDecimals(typed, 4);
+        if (sendAmount !== typed) setAmount(sendAmount);
+        const epoch = getZphSessionEpoch();
+        const response = await quoteAssetTransfer({
+          destination: dest,
+          amountZph: sendAmount,
+          sourceAsset: src,
+          destinationAsset: dst,
+        });
+        if (!response.tx_metadata || !response.tx_hash) {
+          throw new Error(
+            "Quote returned no tx_metadata — wallet-rpc may not support get_tx_metadata. Cannot offer a binding quote."
+          );
+        }
+        if (Number.isSafeInteger(response.fee) && response.fee >= 0) {
+          lastFeeRef.current[src] = BigInt(response.fee);
+        }
+        return { response, quotedAt: Date.now(), epoch };
+      },
+      relay: async (q) => {
+        const r = await relayZphTransaction({
+          txMetadata: q.response.tx_metadata ?? "",
+          txHash: q.response.tx_hash,
+          epoch: q.epoch,
+        });
+        onSuccessRef.current?.(r.hash);
+        return r;
+      },
+      onChange: setState,
+    });
+    flowRef.current = flow;
+    return () => {
+      flow.dispose();
+      if (flowRef.current === flow) flowRef.current = null;
+    };
+  }, []);
 
   // 1-second ticker drives the auto-refresh countdown between requotes.
   const [tickNow, setTickNow] = useState(Date.now());
@@ -365,7 +601,7 @@ export function ZephyrSwapModal({
     if (validDests.includes(destAsset)) return;
     const next = sourceAsset === "ZSD" ? "ZYS" : validDests[0];
     if (next) setDestAsset(next);
-    if (state.kind === "quote") setState({ kind: "edit" });
+    if (state.kind === "quote") flowRef.current?.edit();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sourceAsset, validDests]);
 
@@ -399,78 +635,50 @@ export function ZephyrSwapModal({
 
   // ---- Actions ----
 
-  const handleQuote = async (silent = false) => {
+  const handleQuote = (silent = false) => {
     if (!canQuote) return;
-    if (!silent) setState({ kind: "quote", loading: true });
-    try {
-      // Mint/redeem permits ≤4 decimals — clamp (round down) and reflect
-      // it in the input so the quoted amount matches what's shown.
-      const sendAmount = clampZphDisplayDecimals(amount, 4);
-      if (sendAmount !== amount) setAmount(sendAmount);
-      const quote = await quoteAssetTransfer({
-        destination: walletAddress,
-        amountZph: sendAmount,
-        sourceAsset,
-        destinationAsset: destAsset,
-      });
-      if (!quote.tx_metadata) {
-        throw new Error(
-          "Quote returned no tx_metadata — wallet-rpc may not support get_tx_metadata. Cannot offer a binding quote."
-        );
-      }
-      setState({ kind: "quote", loading: false, quote, quotedAt: Date.now() });
-    } catch (e: any) {
-      if (silent) {
-        console.warn("[ZephyrSwapModal] auto-requote failed:", e);
-        return;
-      }
-      setState({
-        kind: "error",
-        message: typeof e === "string" ? e : (e?.message ?? "Quote failed"),
-      });
-    }
+    void flowRef.current?.quote(silent);
   };
 
-  // Auto-requote while quote is loaded.
+  // Auto-requote while quote is loaded. The flow drops a result that arrives
+  // after the modal left this quote (Edit, Confirm, close).
   useEffect(() => {
     if (state.kind !== "quote" || state.loading) return;
     const id = window.setInterval(() => {
-      void handleQuote(true);
+      void flowRef.current?.quote(true);
     }, QUOTE_REFRESH_MS);
     return () => window.clearInterval(id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     state.kind,
-    state.kind === "quote" && !state.loading ? state.quotedAt : 0,
+    state.kind === "quote" && !state.loading ? state.quote.quotedAt : 0,
     sourceAsset,
     destAsset,
     amount,
   ]);
 
-  const handleConfirm = async () => {
-    if (state.kind !== "quote" || state.loading) return;
-    setState({ kind: "submitting" });
-    try {
-      const r = await relayTransfer(state.quote.tx_metadata!);
-      const finalHash = r.tx_hash || state.quote.tx_hash;
-      setState({ kind: "success", txHash: finalHash });
-      onSuccess?.(finalHash);
-    } catch (e: any) {
-      setState({
-        kind: "error",
-        message: typeof e === "string" ? e : (e?.message ?? "Broadcast failed"),
-      });
-    }
+  const handleConfirm = () => {
+    void flowRef.current?.confirm();
   };
 
-  const reset = () => setState({ kind: "edit" });
+  const reset = () => flowRef.current?.edit();
+
+  // MAX keeps the network fee back (2026-09-29, finding 9): the fee is paid in
+  // the SOURCE asset, so the whole unlocked balance could never convert.
+  const maxAmount = maxConvertibleAmount(
+    srcBal.unlocked,
+    (() => {
+      const quoted = lastFeeRef.current[sourceAsset] ?? 0n;
+      return quoted > ZPH_CONVERSION_FEE_RESERVE_ATOMIC ? quoted : ZPH_CONVERSION_FEE_RESERVE_ATOMIC;
+    })()
+  );
 
   const handleSetMax = () => {
-    if (srcBal.unlocked <= 0) return;
+    if (maxAmount == null) return;
     // Zephyr swaps are always mint/redeem → ≤4 decimals. Show the clamped
     // amount so the user sees what will actually be sent.
-    setAmount(clampZphDisplayDecimals(atomicToZph(srcBal.unlocked), 4));
-    if (state.kind === "quote") setState({ kind: "edit" });
+    setAmount(maxAmount);
+    if (state.kind === "quote") flowRef.current?.edit();
   };
 
   const handleFlipDirection = () => {
@@ -480,7 +688,7 @@ export function ZephyrSwapModal({
     setSourceAsset(newSrc);
     setDestAsset(newDst);
     setAmount("");
-    if (state.kind === "quote") setState({ kind: "edit" });
+    if (state.kind === "quote") flowRef.current?.edit();
   };
   const canFlip = isDirectPair(destAsset, sourceAsset);
 
@@ -490,13 +698,67 @@ export function ZephyrSwapModal({
     if (state.kind === "submitting") {
       return (
         <div style={{ padding: "30px 0" }}>
-          <CompletionAnimation />
+          <CompletionAnimation settled={false} />
         </div>
       );
     }
 
+    /** The txid, clickable to the explorer, shift-click to copy. */
+    const hashBlock = (txHash: string) => {
+      const url = EXPLORER_TX_URL(txHash);
+      return (
+        <div className="form-group" style={{ marginBottom: 4 }}>
+          <label
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              letterSpacing: 1,
+              color: "var(--text-dim)",
+            }}
+          >
+            TRANSACTION HASH
+          </label>
+          <code
+            onClick={(e) => {
+              if (e.shiftKey) {
+                void navigator.clipboard.writeText(txHash);
+                setCopied(true);
+                window.setTimeout(() => setCopied(false), 1200);
+                return;
+              }
+              void openExternal(url);
+            }}
+            title={`${txHash}\n(click: open in explorer · shift-click: copy)`}
+            style={{
+              display: "block",
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              wordBreak: "break-all",
+              cursor: "pointer",
+              textDecoration: "underline",
+              color: copied ? "var(--success, #4ad97a)" : ASSET_COLOR.ZPH,
+              padding: "10px 12px",
+              border: "1px solid rgba(255,255,255,0.12)",
+              borderRadius: 2,
+              background: "rgba(255,255,255,0.03)",
+              transition: "color .15s",
+            }}
+          >
+            {txHash}
+          </code>
+          <p
+            className="gas-info"
+            style={{ marginTop: 4, fontSize: 9, letterSpacing: 0.5 }}
+          >
+            {copied
+              ? "Copied to clipboard."
+              : "Click to open in explorer · shift-click to copy."}
+          </p>
+        </div>
+      );
+    };
+
     if (state.kind === "success") {
-      const url = EXPLORER_TX_URL(state.txHash);
       return (
         <>
           <CompletionAnimation />
@@ -508,54 +770,38 @@ export function ZephyrSwapModal({
             block (~2 minutes).
           </p>
 
-          <div className="form-group" style={{ marginBottom: 4 }}>
-            <label
-              style={{
-                fontFamily: "var(--mono)",
-                fontSize: 10,
-                letterSpacing: 1,
-                color: "var(--text-dim)",
-              }}
-            >
-              TRANSACTION HASH
-            </label>
-            <code
-              onClick={(e) => {
-                if (e.shiftKey) {
-                  void navigator.clipboard.writeText(state.txHash);
-                  setCopied(true);
-                  window.setTimeout(() => setCopied(false), 1200);
-                  return;
-                }
-                void openExternal(url);
-              }}
-              title={`${state.txHash}\n(click: open in explorer · shift-click: copy)`}
-              style={{
-                display: "block",
-                fontFamily: "var(--mono)",
-                fontSize: 10,
-                wordBreak: "break-all",
-                cursor: "pointer",
-                textDecoration: "underline",
-                color: copied ? "var(--success, #4ad97a)" : ASSET_COLOR.ZPH,
-                padding: "10px 12px",
-                border: "1px solid rgba(255,255,255,0.12)",
-                borderRadius: 2,
-                background: "rgba(255,255,255,0.03)",
-                transition: "color .15s",
-              }}
-            >
-              {state.txHash}
-            </code>
-            <p
-              className="gas-info"
-              style={{ marginTop: 4, fontSize: 9, letterSpacing: 0.5 }}
-            >
-              {copied
-                ? "Copied to clipboard."
-                : "Click to open in explorer · shift-click to copy."}
-            </p>
+          {hashBlock(state.txHash)}
+
+          <div className="button-row" style={{ marginTop: 16 }}>
+            <button className="btn-primary" onClick={onClose}>
+              Close
+            </button>
           </div>
+        </>
+      );
+    }
+
+    // The relay may have reached the network (2026-09-29, finding 2). No
+    // "Back": from Back, Get Quote + Confirm built and relayed a SECOND
+    // conversion while the first could still land.
+    if (state.kind === "unknown") {
+      return (
+        <>
+          <p
+            className="warning"
+            style={{ marginTop: 0, whiteSpace: "pre-wrap" }}
+          >
+            Not confirmed: this conversion may have been broadcast. Check
+            Activity or the explorer before converting again.
+          </p>
+
+          {hashBlock(state.txHash)}
+
+          {state.message && (
+            <p className="gas-info" style={{ marginTop: 4, fontSize: 9 }}>
+              {state.message}
+            </p>
+          )}
 
           <div className="button-row" style={{ marginTop: 16 }}>
             <button className="btn-primary" onClick={onClose}>
@@ -589,12 +835,16 @@ export function ZephyrSwapModal({
 
     const quoteLoaded = state.kind === "quote" && !state.loading;
     const quoteLoading = state.kind === "quote" && state.loading;
-    const quote = quoteLoaded ? state.quote : null;
-    const quoteAge = quoteLoaded ? tickNow - state.quotedAt : 0;
+    const quote = quoteLoaded ? state.quote.response : null;
+    const quoteAge = quoteLoaded ? tickNow - state.quote.quotedAt : 0;
     const refreshSec = Math.max(
       0,
       Math.round((QUOTE_REFRESH_MS - quoteAge) / 1000)
     );
+    // Past 90 s Confirm re-prices before it relays (`swapQuoteIsFresh`); say so
+    // instead of a countdown stuck at 0 after a failed refresh.
+    const quoteExpired =
+      quoteLoaded && !swapQuoteIsFresh(state.quote.quotedAt, tickNow);
 
     // Estimated destination amount (post-fee, oracle spot rate).
     let estimatedDest: number | null = null;
@@ -731,7 +981,7 @@ export function ZephyrSwapModal({
             <button
               type="button"
               onClick={handleSetMax}
-              disabled={state.kind !== "edit" || srcBal.unlocked <= 0}
+              disabled={state.kind !== "edit" || maxAmount == null}
               style={{
                 padding: "0 10px",
                 background: "transparent",
@@ -742,7 +992,7 @@ export function ZephyrSwapModal({
                 fontSize: 10,
                 letterSpacing: 1,
                 cursor:
-                  state.kind === "edit" && srcBal.unlocked > 0
+                  state.kind === "edit" && maxAmount != null
                     ? "pointer"
                     : "not-allowed",
               }}
@@ -868,7 +1118,9 @@ export function ZephyrSwapModal({
               <span>QUOTE</span>
               {quoteLoaded && (
                 <span style={{ fontSize: 9 }}>
-                  ↻ refreshing in {refreshSec}s
+                  {quoteExpired
+                    ? "expired: Confirm re-quotes first"
+                    : `↻ refreshing in ${refreshSec}s`}
                 </span>
               )}
               {quoteLoading && <span style={{ fontSize: 9 }}>building…</span>}
@@ -1012,7 +1264,11 @@ export function ZephyrSwapModal({
   };
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    // No click-away while a relay runs: its outcome would be lost with the modal.
+    <div
+      className="modal-overlay"
+      onClick={state.kind === "submitting" ? undefined : onClose}
+    >
       <div
         className="modal-dialog send-modal"
         onClick={(e) => e.stopPropagation()}

@@ -17,6 +17,7 @@
 
 import { invoke } from "../lib/tauri";
 import type { XelisNetwork } from "./xelis-keys";
+import { SendOutcomeUnknownError } from "./send-outcome";
 
 export const XELIS_DECIMALS = 8;
 
@@ -535,6 +536,32 @@ export async function estimateTransferFee(
 }
 
 /**
+ * Could a failed `build_transaction {broadcast: true}` have broadcast?
+ * (2026-09-29 send-safety audit, finding 14.)
+ *
+ * The wallet builds and submits in one call. What is known of its failures:
+ *  - raised before any request reached the wallet (Rust, `xelis_rpc.rs`
+ *    `xelis_rpc_call` / `do_rpc_call`): not running, client build, 401 — nothing
+ *    was sent;
+ *  - a JSON-RPC error (`RPC error <code>: …`) is the wallet's own answer.
+ *    Building fails before anything is sent (BALANCE_NOT_FOUND,
+ *    NOT_ONLINE_MODE, "not enough funds", "Invalid address", …); a failed
+ *    SUBMISSION reads "Couldn't submit transaction: …" (a string in the
+ *    shipped `xelis_wallet.exe`; the RPC wrapping of it was never observed),
+ *    and a submission that failed may still have reached the node;
+ *  - any other transport failure (timeout, dropped connection, unreadable
+ *    reply) came after the request was sent, and is ambiguous.
+ */
+export function xelisSendMayHaveBroadcast(e: unknown): boolean {
+  const m = errorMessage(e).trim();
+  if (/^(Xelis RPC is not running|client build failed|Xelis RPC rejected our credentials)/.test(m)) {
+    return false;
+  }
+  if (/^RPC error /.test(m)) return /submit|broadcast/i.test(m);
+  return true;
+}
+
+/**
  * Build, sign and broadcast a native XEL transfer.
  *
  * `broadcast` is passed EXPLICITLY. `build_transaction` defaults it to **true**
@@ -546,6 +573,14 @@ export async function estimateTransferFee(
  * `-32004 BALANCE_NOT_FOUND "Balance for asset 0000…0000 was not found"`
  * (see {@link isXelisBalanceNotFound}), and `broadcast: true` while offline is
  * refused up front with NOT_ONLINE_MODE.
+ *
+ * Nothing after a successful answer may throw (2026-09-29 send-safety audit,
+ * finding 14): the transaction is out. The response of a broadcast was never
+ * observed live (the spike only built with `broadcast: false`), and `fee` was
+ * parsed strictly, AFTER the broadcast — an unexpected shape threw "expected a
+ * u64", the UI said "Transaction failed", and a retry paid twice. The fee is
+ * now read leniently (null when unreadable). A success with no hash throws
+ * `SendOutcomeUnknownError`: sent, but with no id to show.
  */
 export async function sendTransfer(
   to: string,
@@ -557,9 +592,17 @@ export async function sendTransfer(
   });
   const hash = typeof r?.hash === "string" ? r.hash : "";
   if (!hash) {
-    throw new Error("Xelis reported no transaction hash for the send.");
+    throw new SendOutcomeUnknownError(
+      "The Xelis wallet accepted the send but reported no transaction hash."
+    );
   }
-  return { hash, feeAtomic: optionalU64(r?.fee, "build_transaction.fee") };
+  let feeAtomic: bigint | null = null;
+  try {
+    feeAtomic = optionalU64(r?.fee, "build_transaction.fee");
+  } catch (e) {
+    console.warn("[xelis-rpc] unreadable fee on a broadcast transfer:", errorMessage(e));
+  }
+  return { hash, feeAtomic };
 }
 
 /**

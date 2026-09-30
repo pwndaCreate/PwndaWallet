@@ -21,6 +21,9 @@
 
 import { decimalToAtomic } from "./decimal-amount";
 import { invoke } from "../lib/tauri";
+// Monero-family helpers shared with `xmr-rpc.ts`: zephyr-wallet-rpc v2.3.0 is
+// a Monero fork behind the same Rust proxy (`wallet_rpc_common.rs`).
+import { atomicForRpc, isTxNotFound, ownTxState, type OwnTxState } from "./xmr-rpc";
 
 export const ZPH_WALLET_FILENAME = "pwnda-zph-active";
 
@@ -453,27 +456,46 @@ export interface ZphTransferResponse {
 }
 
 /**
- * Transfer `amountZph` of `sourceAsset` to `destination`.
+ * `transfer` fee priority: 0, the wallet's default (2026-09-29 send-safety
+ * audit, finding 10). It was 1, which in wallet2 is the LOWEST multiplier, not
+ * "normal". See `XMR_TRANSFER_PRIORITY` for what 0 does; that Zephyr v2.3.0
+ * keeps wallet2's priority rules is inference (it is a Monero v0.18 fork; its
+ * source was not read).
+ */
+export const ZPH_TRANSFER_PRIORITY = 0;
+
+/**
+ * Build and sign a transfer of `amountZph` of `sourceAsset` to `destination`
+ * WITHOUT broadcasting it (`do_not_relay` + `get_tx_metadata`).
  *
  * If `sourceAsset === destinationAsset`, this is a plain send.
  * If they differ, this is a protocol-level conversion (mint / redeem)
  * under the same `transfer` RPC. The fee + effective destination amount
  * are returned by wallet-rpc based on Zephyr's oracle pricing.
  *
- * The two `getTxMetadata` / `doNotRelay` flags are paired by typical use:
- * the swap UI's quote step sets BOTH true so it can show the user a
- * binding fee and then `relayTransfer(metadata)` only after confirmation.
- * Plain sends leave both as default (relay immediately, no metadata).
+ * Since 2026-09-29 this is the only way this module calls `transfer`: every
+ * send and conversion is built first and broadcast with {@link relayTransfer},
+ * so its txid is known before anything can reach the network (send-safety
+ * audit, finding 1). The one-call relaying variant (`transferAsset`) was
+ * removed: a timeout in it could broadcast while the caller reported failure,
+ * and the retry paid again. `transfer` with `do_not_relay` never reaches
+ * `commit_tx` (wallet_rpc_server.cpp:1093-1094 at v2.3.0), the only place the
+ * wallet broadcasts or marks outputs spent, so a failed build sent nothing.
  *
- * Returns tx hash, key, amount, fee, and (optionally) tx_metadata blob.
+ * For cross-asset conversions, the returned `amount` and `fee` are the
+ * amounts the protocol *will* commit if relayed — the dual-oracle
+ * worst-of pricing rule has already been applied. The transaction is
+ * fully built and signed; the metadata blob is just held back from
+ * broadcast until the user confirms.
+ *
+ * Quote staleness window: pricing record updates per block (~120s).
+ * Treat quotes older than ~90s as stale and re-quote.
  */
-export async function transferAsset(args: {
+export async function buildAssetTransfer(args: {
   destination: string;
   amountZph: string; // decimal string in source asset
   sourceAsset: ZphAssetType;
   destinationAsset: ZphAssetType;
-  doNotRelay?: boolean;
-  getTxMetadata?: boolean;
 }): Promise<ZphTransferResponse> {
   // Mint/redeem (cross-asset conversion) amounts must have ≤4 decimal
   // places — the daemon rejects more with `RPC error -4`. Clamp (round
@@ -485,32 +507,23 @@ export async function transferAsset(args: {
       : args.amountZph;
   const atomic = zphToAtomic(amountZph);
   return rpc<ZphTransferResponse>("transfer", {
-    destinations: [{ address: args.destination, amount: Number(atomic) }],
+    // Exact above 2^53 as well (finding 11): `atomicForRpc` in xmr-rpc.ts.
+    destinations: [{ address: args.destination, amount: atomicForRpc(atomic) }],
     account_index: 0,
-    priority: 1,
+    priority: ZPH_TRANSFER_PRIORITY,
     ring_size: 16,
     get_tx_key: true,
-    do_not_relay: args.doNotRelay ?? false,
-    get_tx_metadata: args.getTxMetadata ?? false,
+    do_not_relay: true,
+    get_tx_metadata: true,
     source_asset: args.sourceAsset,
     destination_asset: args.destinationAsset,
   });
 }
 
 /**
- * Quote a transfer / conversion without broadcasting. Always sets
- * `do_not_relay: true` and `get_tx_metadata: true` so the UI can show
- * the user a binding fee + amount and then `relayTransfer(metadata)`
- * only after confirmation.
- *
- * For cross-asset conversions, the returned `amount` and `fee` are the
- * amounts the protocol *will* commit if relayed — the dual-oracle
- * worst-of pricing rule has already been applied. The transaction is
- * fully built and signed; the metadata blob is just held back from
- * broadcast until the user confirms.
- *
- * Quote staleness window: pricing record updates per block (~120s).
- * Treat quotes older than ~90s as stale and re-quote.
+ * The same build, under the name the quote callers use (`zphAdapter.quoteSend`,
+ * `ZephyrSwapModal`): a quote IS the built transaction that `relayTransfer`
+ * later broadcasts unchanged.
  */
 export async function quoteAssetTransfer(args: {
   destination: string;
@@ -518,23 +531,35 @@ export async function quoteAssetTransfer(args: {
   sourceAsset: ZphAssetType;
   destinationAsset: ZphAssetType;
 }): Promise<ZphTransferResponse> {
-  return transferAsset({
-    ...args,
-    doNotRelay: true,
-    getTxMetadata: true,
-  });
+  return buildAssetTransfer(args);
 }
 
 /**
- * Broadcast a transaction previously built with `quoteAssetTransfer`
- * (i.e. `do_not_relay: true` + `get_tx_metadata: true`). Pass the
- * `tx_metadata` blob from the quote response.
+ * Broadcast a transaction previously built with `buildAssetTransfer`. Pass the
+ * `tx_metadata` blob from the build response.
  *
- * Returns the tx hash post-broadcast — should match the quote's
- * tx_hash, since the metadata blob is the same fully-signed tx.
+ * Returns the tx hash post-broadcast — should match the build's tx_hash,
+ * since the metadata blob is the same fully-signed tx. A failure is NOT proof
+ * that nothing was sent: callers settle it by txid (`zph-wallet.ts`
+ * `relayZphTransaction`).
  */
-export async function relayTransfer(txMetadata: string): Promise<{ tx_hash: string }> {
-  return rpc<{ tx_hash: string }>("relay_tx", { hex: txMetadata });
+export async function relayTransfer(txMetadata: string): Promise<{ tx_hash?: string } | null> {
+  return rpc<{ tx_hash?: string } | null>("relay_tx", { hex: txMetadata });
+}
+
+/**
+ * One of this wallet's transactions by txid, as an `OwnTxState`
+ * (`get_transfer_by_txid`). Never throws: "not found" is `absent`, any other
+ * failure `unknown`. Used to settle a relay that did not report success.
+ */
+export async function lookupOwnZphTransfer(txid: string): Promise<OwnTxState> {
+  let r: unknown;
+  try {
+    r = await rpc("get_transfer_by_txid", { txid, account_index: 0 });
+  } catch (e) {
+    return isTxNotFound(e) ? "absent" : "unknown";
+  }
+  return ownTxState(r);
 }
 
 // =========================================================================

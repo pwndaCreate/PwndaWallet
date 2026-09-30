@@ -264,10 +264,67 @@ export interface ZanoTransferResponse {
 }
 
 /**
- * Build (and by default broadcast) a transfer. `mixin` is documented as
- * network-ruled at 15+ post-Zarcanum — omit it and let the daemon apply the
- * enforced minimum rather than hardcoding a number that could drift from a
- * future consensus change.
+ * The fee every send pays: 0.01 ZANO (2026-09-29 send-safety audit, finding 5).
+ *
+ * `transfer` used to omit `fee`. simplewallet value-initializes the request
+ * (epee `PREPARE_OBJECTS_FROM_JSON`, http_server_handlers_map2.h:449), so the
+ * fee was 0, and it refuses any fee under `tx_pool_min_fee` before building
+ * anything: `Given fee is too low: 0, minimum is: 10000000000`
+ * (wallet_rpc_server.cpp `on_transfer`, lines 656-661). All of that is the
+ * vendored v2.2.1.506 source (`.swap-sidecar-work/zano-build`), the version
+ * this app runs. `TX_DEFAULT_FEE` and `TX_MINIMUM_FEE` are both 1e10 there
+ * (currency_config.h:77-78), and every Zano transfer the repo has proven live
+ * pays exactly this (the engine's `ZanoInterface.get_fee_rate`, and
+ * `ZANO_FEE` in scripts/swap/tests/zano_matrix.py). So every send from this
+ * wallet was refused until now (from the source; no send from this app was
+ * ever observed).
+ */
+export const ZANO_TRANSFER_FEE_ATOMIC = 10_000_000_000n;
+
+/**
+ * An atomic amount as simplewallet's JSON `amount` / `fee`.
+ *
+ * A JSON number up to 2^53, as every live-proven call sends it. Above that a
+ * number cannot carry every digit, so the amount goes out as a decimal
+ * string: the vendored v2.2.1.506 epee converts a string into a u64 field with
+ * `std::stoull` (portable_storage_val_converters.h, `convert_to_integral`), so
+ * it arrives exact. Until 2026-09-29 every amount was sent as a string.
+ */
+export function atomicForZanoRpc(atomic: bigint): number | string {
+  if (atomic < 0n) throw new Error("A negative amount cannot be sent.");
+  return atomic <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(atomic) : atomic.toString();
+}
+
+/**
+ * Could a failed `transfer` have broadcast? (2026-09-29 send-safety audit.)
+ *
+ * simplewallet's `transfer` builds AND sends in one call, and there is no
+ * build-only variant for a full wallet, so the txid is not known until it
+ * succeeds. From its errors (vendored v2.2.1.506, `WALLET_RPC_CATCH_TRY_ENTRY`
+ * and `wallet2::send_transaction_to_network`):
+ *  - a daemon's own answer is final: `tx_rejected`, BUSY, DISCONNECTED and the
+ *    freeze period are statuses it returned, having accepted nothing;
+ *  - `no_connection_to_daemon` is thrown when the send call itself fails,
+ *    which can happen after the node received the transaction. It is also
+ *    thrown before building (decoy fetches), and the message does not say
+ *    which: treat it as ambiguous;
+ *  - a transport failure between this app and simplewallet (a timeout, a
+ *    dropped or unreadable reply) is ambiguous, except the ones raised before
+ *    any request was made.
+ */
+export function zanoSendMayHaveBroadcast(e: unknown): boolean {
+  const m = (typeof e === "string" ? e : e instanceof Error ? e.message : String(e ?? "")).trim();
+  if (/^(Zano RPC is not running|client build failed|Zano RPC rejected the JWT)/.test(m)) return false;
+  if (/^Zano RPC error:/.test(m)) return /no_connection_to_daemon|no connection to daemon/i.test(m);
+  return true;
+}
+
+/**
+ * Build and broadcast a transfer, paying {@link ZANO_TRANSFER_FEE_ATOMIC}
+ * unless told otherwise. `mixin: 0` mirrors every live-proven call: the field
+ * only applies to pre-Zarcanum outputs; post-Zarcanum the network rule (15+
+ * decoys) is applied regardless (the field's own doc in
+ * wallet_public_structs_defs.h).
  */
 export async function transfer(args: {
   destinations: ZanoTransferDestination[];
@@ -282,10 +339,11 @@ export async function transfer(args: {
   }>("transfer", {
     destinations: args.destinations.map((d) => ({
       address: d.address,
-      amount: d.amount.toString(),
+      amount: atomicForZanoRpc(d.amount),
       ...(d.assetId ? { asset_id: d.assetId } : {}),
     })),
-    ...(args.fee !== undefined ? { fee: args.fee.toString() } : {}),
+    fee: atomicForZanoRpc(args.fee ?? ZANO_TRANSFER_FEE_ATOMIC),
+    mixin: 0,
     ...(args.comment ? { comment: args.comment } : {}),
   });
   return {

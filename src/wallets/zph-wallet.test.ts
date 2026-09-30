@@ -14,6 +14,11 @@
  *   - `get_fee_estimate` (a daemon method the wallet-rpc lacks) is never called;
  *   - balances are selected by `asset_type`, not by array position;
  *   - an incoming mempool transfer is a pending receipt, not a send.
+ *
+ * 2026-09-29 send-safety audit: a plain send is now built (`do_not_relay`)
+ * and then relayed, and a relay that does not report success is settled by
+ * txid — found → success, provably not relayed → plain Error, otherwise
+ * `SendOutcomeUnknownError(txid)`. "Try again" is only ever said about a build.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -36,13 +41,15 @@ vi.mock("./zph-keys", () => ({
 
 import { invoke } from "../lib/tauri";
 import { SendQuoteError, isDefinitiveQuoteError } from "./send-quote";
+import { isSendOutcomeUnknown } from "./send-outcome";
 import type { ZphTransfer } from "./zph-rpc";
 import {
   classifyZphTransferError,
-  describeZphRelayError,
+  getZphSessionEpoch,
   initZphSession,
   lockZphWallet,
   onZphSent,
+  relayZphTransaction,
   zphAdapter,
   zphRecipientProblem,
   zphSyncRefusal,
@@ -60,6 +67,8 @@ type RpcHandler = (params: any) => unknown;
 let rpc: Record<string, RpcHandler>;
 let walletHeight = 1_900_000;
 let probeHeight = 1_900_000;
+/** Builds so far: each build's signed blob is distinct, like a real wallet's. */
+let builds = 0;
 
 function defaultRpc(): Record<string, RpcHandler> {
   return {
@@ -85,9 +94,12 @@ function defaultRpc(): Record<string, RpcHandler> {
       tx_key: "k",
       amount: p.destinations[0].amount,
       fee: 25_400_000,
-      ...(p.do_not_relay ? { tx_metadata: METADATA } : {}),
+      ...(p.do_not_relay ? { tx_metadata: `${METADATA}${String(++builds).padStart(4, "0")}` } : {}),
     }),
     relay_tx: () => ({ tx_hash: TX_HASH }),
+    get_transfer_by_txid: () => {
+      throw "RPC error -8: Transaction not found.";
+    },
   };
 }
 
@@ -234,22 +246,13 @@ describe("zphSyncRefusal", () => {
   });
 });
 
-describe("zphRecipientProblem / describeZphRelayError", () => {
+describe("zphRecipientProblem", () => {
   it("refuses invalid and non-mainnet addresses definitively", () => {
     const base = { valid: true, integrated: false, subaddress: false, nettype: "mainnet", openalias_address: "" };
     expect(zphRecipientProblem(base)).toBeNull();
     expect(zphRecipientProblem({ ...base, valid: false })?.kind).toBe("invalid-address");
     expect(zphRecipientProblem({ ...base, nettype: "testnet" })?.message).toBe(
       "Address is for testnet, not mainnet.",
-    );
-  });
-
-  it("does not claim nothing was sent when relay_tx fails to commit", () => {
-    expect(describeZphRelayError("RPC error -4: Failed to commit tx.").message).toMatch(
-      /check Activity before sending again/,
-    );
-    expect(describeZphRelayError("RPC error -26: Failed to parse hex.").message).toBe(
-      "RPC error -26: Failed to parse hex.",
     );
   });
 });
@@ -320,17 +323,24 @@ describe("quoteSend", () => {
 });
 
 describe("sendTransaction", () => {
-  it("sends ZSD as a relayed ZSD→ZSD transfer and announces it", async () => {
+  it("sends ZSD as a ZSD→ZSD build, then relays that build, and announces it", async () => {
     const heard = vi.fn();
     const off = onZphSent(heard);
     const r = await zphAdapter.sendTransaction("", TO, "3", "ZSD");
     off();
     expect(r).toEqual({ hash: TX_HASH });
-    expect(rpcCalls().find((c) => c.method === "transfer")!.params).toMatchObject({
+    const calls = rpcCalls();
+    expect(calls.find((c) => c.method === "transfer")!.params).toMatchObject({
       source_asset: "ZSD",
       destination_asset: "ZSD",
-      do_not_relay: false,
+      // 2026-09-29: built without relaying; `relay_tx` broadcasts it.
+      do_not_relay: true,
+      get_tx_metadata: true,
+      priority: 0,
     });
+    const relays = calls.filter((c) => c.method === "relay_tx");
+    expect(relays).toHaveLength(1);
+    expect(relays[0].params.hex).toMatch(new RegExp(`^${METADATA}`));
     expect(heard).toHaveBeenCalledTimes(1);
   });
 
@@ -383,6 +393,8 @@ describe("getFeeEstimate / balances", () => {
 });
 
 describe("sendQuoted", () => {
+  const quotedBlob = (q: { ticket: unknown }) => (q.ticket as { txMetadata: string }).txMetadata;
+
   it("relays the quoted transaction as built and announces it", async () => {
     const q = await zphAdapter.quoteSend!({ to: TO, amount: "2", assetType: "ZRS" });
     invokeMock.mockClear();
@@ -390,26 +402,35 @@ describe("sendQuoted", () => {
     const off = onZphSent(heard);
     const r = await zphAdapter.sendQuoted!(q);
     off();
-    expect(rpcCalls()).toEqual([{ method: "relay_tx", params: { hex: METADATA } }]);
+    expect(rpcCalls()).toEqual([{ method: "relay_tx", params: { hex: quotedBlob(q) } }]);
     expect(r).toEqual({ hash: TX_HASH });
     expect(heard).toHaveBeenCalledTimes(1);
   });
 
-  it("does not claim nothing was sent when relay_tx fails to commit", async () => {
+  it("-4 Failed to commit tx. is an unknown outcome with the txid, not a failure (2026-09-29)", async () => {
     const q = await zphAdapter.quoteSend!({ to: TO, amount: "2" });
     rpc.relay_tx = () => {
       throw "RPC error -4: Failed to commit tx.";
     };
-    await expect(zphAdapter.sendQuoted!(q)).rejects.toThrow(/check Activity/);
+    const heard = vi.fn();
+    const off = onZphSent(heard);
+    const err = await zphAdapter.sendQuoted!(q).catch((e) => e);
+    off();
+    expect(isSendOutcomeUnknown(err)).toBe(true);
+    expect(err.hash).toBe(TX_HASH);
+    // It may have gone out: balances are refreshed all the same.
+    expect(heard).toHaveBeenCalledTimes(1);
   });
 
-  it("builds fresh instead of relaying a quote that aged out", async () => {
+  it("builds fresh (and relays the NEW build) instead of relaying a quote that aged out", async () => {
     const q = await zphAdapter.quoteSend!({ to: TO, amount: "2" });
     invokeMock.mockClear();
     await zphAdapter.sendQuoted!({ ...q, quotedAt: Date.now() - 91_000 });
-    const methods = rpcCalls().map((c) => c.method);
-    expect(methods).not.toContain("relay_tx");
-    expect(rpcCalls().find((c) => c.method === "transfer")!.params.do_not_relay).toBe(false);
+    const calls = rpcCalls();
+    expect(calls.find((c) => c.method === "transfer")!.params.do_not_relay).toBe(true);
+    const relays = calls.filter((c) => c.method === "relay_tx");
+    expect(relays).toHaveLength(1);
+    expect(relays[0].params.hex).not.toBe(quotedBlob(q));
   });
 
   it("never relays a transaction built by an earlier wallet session", async () => {
@@ -417,9 +438,92 @@ describe("sendQuoted", () => {
     await initZphSession(SEED_2, "master-password"); // a new session (new epoch)
     invokeMock.mockClear();
     await zphAdapter.sendQuoted!(q);
+    const calls = rpcCalls();
+    expect(calls.map((c) => c.method)).toContain("transfer");
+    expect(calls.filter((c) => c.method === "relay_tx").map((c) => c.params.hex)).not.toContain(
+      quotedBlob(q),
+    );
+  });
+});
+
+describe("relay outcomes (2026-09-29 send-safety audit, finding 1)", () => {
+  it("relay timeout, then the wallet lists the txid as pending → submitted, not failed", async () => {
+    rpc.relay_tx = () => {
+      throw "RPC timed out after 30s";
+    };
+    rpc.get_transfer_by_txid = ({ txid }) => ({ transfers: [{ txid, type: "pending" }] });
+    await expect(zphAdapter.sendTransaction("", TO, "1")).resolves.toEqual({
+      hash: TX_HASH,
+      pending: true,
+    });
+  });
+
+  it("relay timeout and the txid is unknown → SendOutcomeUnknownError(txid); relayed once, built once", async () => {
+    rpc.relay_tx = () => {
+      throw "RPC timed out after 30s";
+    };
+    const err = await zphAdapter.sendTransaction("", TO, "1").catch((e) => e);
+    expect(isSendOutcomeUnknown(err)).toBe(true);
+    expect(err.hash).toBe(TX_HASH);
+    expect(err.message).not.toMatch(/try again/i);
     const methods = rpcCalls().map((c) => c.method);
-    expect(methods).not.toContain("relay_tx");
-    expect(methods).toContain("transfer");
+    expect(methods.filter((m) => m === "relay_tx")).toHaveLength(1);
+    expect(methods.filter((m) => m === "transfer")).toHaveLength(1);
+  });
+
+  it("a -38 from the BUILD is 'nothing was sent; try again shortly', and nothing is relayed", async () => {
+    rpc.transfer = () => {
+      throw "RPC error -38: no connection to daemon";
+    };
+    const err = await zphAdapter.sendTransaction("", TO, "1").catch((e) => e);
+    expect(isSendOutcomeUnknown(err)).toBe(false);
+    expect(err.message).toMatch(/Nothing was sent; try again shortly/);
+    expect(rpcCalls().map((c) => c.method)).not.toContain("relay_tx");
+  });
+
+  it("a -38 from the RELAY is never 'try again'", async () => {
+    rpc.relay_tx = () => {
+      throw "RPC error -38: no connection to daemon";
+    };
+    const err = await zphAdapter.sendTransaction("", TO, "1").catch((e) => e);
+    expect(isSendOutcomeUnknown(err)).toBe(true);
+    expect(err.message).not.toMatch(/try again/i);
+  });
+
+  it("a relay that provably sent nothing (-26) is a plain Error", async () => {
+    rpc.relay_tx = () => {
+      throw "RPC error -26: Failed to parse hex.";
+    };
+    const err = await zphAdapter.sendTransaction("", TO, "1").catch((e) => e);
+    expect(isSendOutcomeUnknown(err)).toBe(false);
+    expect(err.message).toMatch(/Nothing was sent/);
+  });
+
+  it("relayZphTransaction refuses a build from another wallet session", async () => {
+    const epoch = getZphSessionEpoch();
+    await expect(
+      relayZphTransaction({ txMetadata: METADATA, txHash: TX_HASH, epoch: (epoch ?? 0) - 1 }),
+    ).rejects.toThrow(/no longer open/);
+    expect(rpcCalls().map((c) => c.method)).not.toContain("relay_tx");
+  });
+
+  it("never hands the wallet a name to resolve (OpenAlias), even when validate_address is down", async () => {
+    rpc.validate_address = () => {
+      throw "RPC timed out after 30s";
+    };
+    await expect(zphAdapter.sendTransaction("", "donate.example.org", "1")).rejects.toThrow(
+      /OpenAlias/,
+    );
+    expect(rpcCalls().map((c) => c.method)).not.toContain("transfer");
+  });
+
+  it("history asks for failed transfers, and a failed row names its recipient", async () => {
+    rpc.get_transfers = () => ({
+      failed: [{ txid: "ff", amount: 1, fee: 1, timestamp: 1, confirmations: 0, height: 0, destinations: [{ address: TO, amount: 1 }] }],
+    });
+    const page = await zphAdapter.getTransactionHistory("");
+    expect(rpcCalls().find((c) => c.method === "get_transfers")!.params.failed).toBe(true);
+    expect(page.items[0]).toMatchObject({ direction: "failed", counterparty: TO });
   });
 });
 

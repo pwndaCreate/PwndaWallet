@@ -36,6 +36,8 @@ import type {
   SendableBalance,
 } from "./types";
 import { SEND_QUOTE_MAX_AGE_MS, SendQuoteError } from "./send-quote";
+import { isSendOutcomeUnknown } from "./send-outcome";
+import { settleRelayFailure } from "./xmr-rpc";
 import { errorText } from "../lib/errorText";
 import {
   generateZephyrSeed,
@@ -65,7 +67,8 @@ import {
   getHeight,
   getSyncStatus,
   setDaemon,
-  transferAsset,
+  buildAssetTransfer,
+  lookupOwnZphTransfer,
   validateAddress,
   createAddress,
   getTransfers,
@@ -78,7 +81,6 @@ import {
   downloadZphWalletRpc,
   checkZphDefenderExclusion,
   addZphDefenderExclusion,
-  quoteAssetTransfer,
   relayTransfer,
   parseZphAssetSelector,
   ZPH_UI_TICKER,
@@ -192,6 +194,27 @@ export function zphRecipientProblem(v: ZphValidateAddressResult): SendQuoteError
 }
 
 /**
+ * A recipient that is not even shaped like an address, or null.
+ *
+ * Base58 only (2026-09-29). Zephyr's wallet-rpc is a Monero fork, and
+ * Monero's `transfer` resolves anything that does not parse as an address as an
+ * OpenAlias name through DNS (`validate_transfer` in wallet_rpc_server.cpp;
+ * that Zephyr kept it is inference). `validate_address` is called with
+ * `allow_openalias: false`, but when that call fails the send goes ahead, so
+ * a name would have been paid to whatever address DNS returned.
+ */
+export function zphRecipientShapeProblem(to: string): SendQuoteError | null {
+  if (!to) return new SendQuoteError("invalid-address", "Enter a Zephyr address.");
+  if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(to)) {
+    return new SendQuoteError(
+      "invalid-address",
+      "That is not a Zephyr address. Paste the address itself; this wallet does not look up names (OpenAlias)."
+    );
+  }
+  return null;
+}
+
+/**
  * Ask the wallet whether `to` is a mainnet Zephyr address.
  *
  * A failing `validate_address` CALL is not a verdict: the transfer checks the
@@ -201,6 +224,8 @@ export function zphRecipientProblem(v: ZphValidateAddressResult): SendQuoteError
  * "Cannot read properties of undefined (reading 'startsWith')".
  */
 async function checkZphRecipient(to: string): Promise<SendQuoteError | null> {
+  const shape = zphRecipientShapeProblem(to);
+  if (shape) return shape;
   let v: ZphValidateAddressResult;
   try {
     v = await validateAddress(to);
@@ -222,6 +247,12 @@ async function checkZphRecipient(to: string): Promise<SendQuoteError | null> {
  * `wallet_rpc_common.rs` formats them: `RPC error <code>: <message>`. Only the
  * two definitive kinds block a send; the raw text is kept in every message so
  * the exact string stays searchable.
+ *
+ * Applies to BUILDS only (`do_not_relay`), which broadcast nothing, so "try
+ * again" is safe here. Until 2026-09-29 it also classified the one-call send
+ * that built AND relayed, where -38/-3 could come from `commit_tx` after the
+ * node had the transaction, and "Try again shortly" invited a second payment.
+ * Relay failures are settled by txid instead (`relayZphTransaction`).
  */
 export function classifyZphTransferError(e: unknown, asset: ZphAssetType): SendQuoteError {
   if (e instanceof SendQuoteError) return e;
@@ -257,26 +288,97 @@ export function classifyZphTransferError(e: unknown, asset: ZphAssetType): SendQ
   ) {
     return new SendQuoteError(
       "not-ready",
-      `The Zephyr wallet cannot reach its node, or the node is busy. Try again shortly. (${raw})`
+      `The Zephyr wallet cannot reach its node, or the node is busy. Nothing was sent; try again shortly. (${raw})`
     );
   }
   return new SendQuoteError("other", raw);
 }
 
+/** A built, signed, not yet relayed Zephyr transaction (a send or a conversion). */
+export interface ZphBuiltTransaction {
+  /** `transfer`'s `tx_metadata`, for `relay_tx`. */
+  txMetadata: string;
+  txHash: string;
+  /** The wallet session that built it (`getZphSessionEpoch`). */
+  epoch: number | null;
+}
+
+/** The open session's epoch, or null. A build records it; the relay checks it. */
+export function getZphSessionEpoch(): number | null {
+  return session?.epoch ?? null;
+}
+
 /**
- * A `relay_tx` failure. `-4 Failed to commit tx.` drops the daemon's reason
- * (`wallet_rpc_server.cpp:1817-1821`) and can be raised after the broadcast, so
- * the message must not claim that nothing was sent.
+ * Broadcast a built transaction (`relay_tx`), for the Send modal and the
+ * conversion modal alike (2026-09-29 send-safety audit, findings 1 and 2).
+ *
+ * Refuses (plain Error, nothing sent) a transaction built by another wallet
+ * session: relaying it would broadcast one wallet's transaction through the
+ * next one's wallet-rpc, and mark that wallet's outputs spent.
+ *
+ * A relay that does not report success is settled by txid
+ * (`settleRelayFailure`): the wallet lists it → the result; provably not
+ * relayed → a plain Error; otherwise `SendOutcomeUnknownError` with the txid.
+ * `-4 Failed to commit tx.` is the common case: it drops the daemon's reason
+ * (`wallet_rpc_server.cpp:1817-1821`) and can be raised after the broadcast.
+ * Until 2026-09-29 that surfaced as an ordinary error with the form still
+ * filled, and the Zephyr swap modal offered "◄ Back" to confirm again.
  */
-export function describeZphRelayError(e: unknown): Error {
-  const raw = errorText(e, "The Zephyr wallet returned no error message.");
-  if (/^RPC error -4:/.test(raw.trim())) {
-    return new Error(
-      `The prepared transaction was not accepted (${raw}). The wallet does not report why, ` +
-        "or whether the network saw it: check Activity before sending again."
+export async function relayZphTransaction(built: ZphBuiltTransaction): Promise<TxResult> {
+  if (!session || built.epoch == null || session.epoch !== built.epoch) {
+    throw new Error(
+      "This transaction was built by a Zephyr wallet session that is no longer open. " +
+        "Nothing was sent; build it again."
     );
   }
-  return new Error(raw);
+  let r: { tx_hash?: string } | null;
+  try {
+    r = await relayTransfer(built.txMetadata);
+  } catch (e) {
+    let settled: TxResult;
+    try {
+      settled = await settleRelayFailure({
+        chain: "Zephyr",
+        txHash: built.txHash,
+        error: e,
+        lookup: lookupOwnZphTransfer,
+      });
+    } catch (outcome) {
+      // Balances may have moved if it went out.
+      if (isSendOutcomeUnknown(outcome)) notifyZphSent();
+      throw outcome;
+    }
+    notifyZphSent();
+    return settled;
+  }
+  notifyZphSent();
+  return { hash: r?.tx_hash || built.txHash };
+}
+
+/**
+ * Build a send of one asset to itself without relaying it. Throws a classified
+ * `SendQuoteError` (nothing was broadcast), or an Error when the wallet built
+ * nothing relayable.
+ */
+async function buildZphSend(recipient: string, amount: string, asset: ZphAssetType) {
+  let r;
+  try {
+    r = await buildAssetTransfer({
+      destination: recipient,
+      amountZph: amount,
+      sourceAsset: asset,
+      destinationAsset: asset,
+    });
+  } catch (e) {
+    throw classifyZphTransferError(e, asset);
+  }
+  if (!r || typeof r.tx_metadata !== "string" || r.tx_metadata.length === 0 || !r.tx_hash) {
+    throw new SendQuoteError(
+      "other",
+      "The wallet priced this send but returned no transaction to broadcast (no tx_metadata). Nothing was sent."
+    );
+  }
+  return r as typeof r & { tx_metadata: string };
 }
 
 // =========================================================================
@@ -740,7 +842,14 @@ export async function getZphDaemonTipHeight(): Promise<number> {
  */
 export async function getZphTransactionHistory(): Promise<ZphTransfer[]> {
   try {
-    const transfers = await getTransfers({ in: true, out: true, pending: true, pool: true });
+    // `failed` too (2026-09-29): see the adapter's `getTransactionHistory`.
+    const transfers = await getTransfers({
+      in: true,
+      out: true,
+      pending: true,
+      pool: true,
+      failed: true,
+    });
     return transfers.sort((a, b) => b.timestamp - a.timestamp);
   } catch {
     return [];
@@ -846,25 +955,18 @@ export const zphAdapter: ChainAdapter = {
     // (12 decimals, same for every Zephyr asset), and so is the network fee.
     // An unknown selector throws here, before anything reaches the wallet.
     const asset = parseZphAssetSelector(assetType);
+    const epoch = session.epoch;
     // Require sync to be within 2 blocks of tip before sending.
     const refusal = zphSyncRefusal(await getZphSyncProgress());
     if (refusal) throw new Error(refusal);
     const recipient = to.trim();
     const badRecipient = await checkZphRecipient(recipient);
     if (badRecipient) throw badRecipient;
-    let result;
-    try {
-      result = await transferAsset({
-        destination: recipient,
-        amountZph: amount.trim(),
-        sourceAsset: asset,
-        destinationAsset: asset,
-      });
-    } catch (e) {
-      throw classifyZphTransferError(e, asset);
-    }
-    notifyZphSent();
-    return { hash: result.tx_hash };
+    // Build, then relay (2026-09-29 send-safety audit, finding 1). This was one
+    // relaying `transfer`: a timeout or a -38/-3 from its broadcast step read
+    // "...Try again shortly." while the transaction could be on the network.
+    const built = await buildZphSend(recipient, amount.trim(), asset);
+    return relayZphTransaction({ txMetadata: built.tx_metadata, txHash: built.tx_hash, epoch });
   },
 
   /**
@@ -892,23 +994,7 @@ export const zphAdapter: ChainAdapter = {
     const priced = amount.trim();
     const badRecipient = await checkZphRecipient(recipient);
     if (badRecipient) throw badRecipient;
-    let r;
-    try {
-      r = await quoteAssetTransfer({
-        destination: recipient,
-        amountZph: priced,
-        sourceAsset: asset,
-        destinationAsset: asset,
-      });
-    } catch (e) {
-      throw classifyZphTransferError(e, asset);
-    }
-    if (!r.tx_metadata) {
-      throw new SendQuoteError(
-        "other",
-        "The wallet priced this send but returned no transaction to broadcast (no tx_metadata)."
-      );
-    }
+    const r = await buildZphSend(recipient, priced, asset);
     if (!Number.isSafeInteger(r.fee) || r.fee < 0) {
       throw new SendQuoteError("other", "The wallet returned no usable fee for this send.");
     }
@@ -930,7 +1016,8 @@ export const zphAdapter: ChainAdapter = {
    * `useSend` calls this only for a quote that matches the send and is under
    * 90 s old. The adapter re-checks what only it can see: a ticket from an
    * earlier wallet session, or one that aged out in between, is not relayed;
-   * the same send is built fresh instead.
+   * the same send is built fresh instead. A ticket without its txid is not
+   * relayed either: a relay that fails ambiguously is settled by that txid.
    */
   async sendQuoted(quote: SendQuote): Promise<TxResult> {
     if (!session) {
@@ -942,20 +1029,19 @@ export const zphAdapter: ChainAdapter = {
       !!t &&
       typeof t.txMetadata === "string" &&
       t.txMetadata.length > 0 &&
+      typeof t.txHash === "string" &&
+      t.txHash.length > 0 &&
       t.epoch === session.epoch &&
       age >= 0 &&
       age < SEND_QUOTE_MAX_AGE_MS;
     if (!relayable) {
       return zphAdapter.sendTransaction("", quote.to, quote.amount, quote.assetType);
     }
-    let r: { tx_hash: string };
-    try {
-      r = await relayTransfer(t.txMetadata as string);
-    } catch (e) {
-      throw describeZphRelayError(e);
-    }
-    notifyZphSent();
-    return { hash: r.tx_hash || t.txHash || "" };
+    return relayZphTransaction({
+      txMetadata: t.txMetadata as string,
+      txHash: t.txHash as string,
+      epoch: t.epoch ?? null,
+    });
   },
 
   /** Unlocked and total balance of the asset a send draws on (2026-09-15). */
@@ -1003,12 +1089,14 @@ export const zphAdapter: ChainAdapter = {
   ): Promise<TxHistoryPage> {
     if (!session) return { items: [] };
     const limit = opts?.limit ?? 50;
+    // `failed: true` since 2026-09-29 (send-safety audit, finding 10): with
+    // `false`, a send the pool later dropped vanished from Activity.
     const transfers = await getTransfers({
       in: true,
       out: true,
       pending: true,
       pool: true,
-      failed: false,
+      failed: true,
     });
     transfers.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
     const items: ChainTx[] = transfers.slice(0, limit).map(zphTransferToChainTx);
@@ -1054,8 +1142,9 @@ export const zphAdapter: ChainAdapter = {
  * `pool` mapped to direction "pending", which every renderer and the Sent
  * filter treat as outgoing, so an unconfirmed receipt read "▲ sent". It is now
  * "in" with 0 confirmations, which the renderers already show as a pending
- * receipt. (`xmr-wallet.ts` still maps Monero's `pool` the old way; that file
- * is not changed here.)
+ * receipt. (`xmr-wallet.ts` maps Monero's `pool` the same way since
+ * 2026-09-29.) A `failed` row is an outgoing send the pool dropped, so it names
+ * its recipient like any other send.
  */
 export function zphTransferToChainTx(t: ZphTransfer): ChainTx {
   let direction: ChainTx["direction"];
@@ -1077,7 +1166,7 @@ export function zphTransferToChainTx(t: ZphTransfer): ChainTx {
       break;
   }
   const counterparty =
-    direction === "out" || direction === "pending"
+    direction === "out" || direction === "pending" || direction === "failed"
       ? t.destinations?.[0]?.address
       : undefined;
   return {

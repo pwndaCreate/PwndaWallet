@@ -13,6 +13,9 @@
 
 import { decimalToAtomic } from "./decimal-amount";
 import { invoke } from "../lib/tauri";
+import { errorText } from "../lib/errorText";
+import { SendOutcomeUnknownError } from "./send-outcome";
+import type { TxResult } from "./types";
 
 /**
  * PWNDA-LEASE (C9): who wants the wallet-rpc process alive. Mirrors the Rust
@@ -360,28 +363,209 @@ export function xmrToPiconero(amount: string): bigint {
 }
 
 /**
- * Send `amountXmr` XMR to `destination`.
+ * An atomic amount as the wallet-rpc's JSON `amount` (2026-09-29 send-safety
+ * audit, finding 11). Shared with `zph-rpc.ts`: Zephyr's wallet-rpc is a
+ * Monero fork with the same JSON layer.
  *
- * If `doNotRelay` is true the transaction is constructed and signed but NOT
- * broadcast — use this to preview the fee before confirming. Call `transfer`
- * again with `doNotRelay: false` (or omit it) to actually broadcast.
- *
- * Returns the transaction hash, key, amount, and fee.
+ * A JSON number is exact only up to 2^53 (about 9,007 XMR in piconero), and
+ * `Number(piconero)` above that silently asked the wallet for the nearest
+ * representable double instead of the amount typed. Up to the limit the amount
+ * still goes out as a number, exactly as before; above it, as a decimal string,
+ * which carries every digit. That monero-wallet-rpc (and Zephyr's fork) reads a
+ * digit string into its u64 is inference (epee's string-to-uint64 converter;
+ * not tested against the shipped binary). If it does not, the wallet rejects
+ * the request before building anything, so nothing can be sent.
  */
-export async function transfer(
+export function atomicForRpc(atomic: bigint): number | string {
+  if (atomic < 0n) throw new Error("A negative amount cannot be sent.");
+  return atomic <= BigInt(Number.MAX_SAFE_INTEGER) ? Number(atomic) : atomic.toString();
+}
+
+/**
+ * `transfer` fee priority: 0, the wallet's own default (2026-09-29 send-safety
+ * audit, finding 10).
+ *
+ * It was 1, commented "default / normal". In wallet2 1 is "unimportant", the
+ * LOWEST multiplier; 0 is "default" (read in a Monero source snapshot on the
+ * audit machine: `wallet2::get_fee_multiplier` and `adjust_priority`, with
+ * `m_default_priority = Default` and `m_auto_low_priority = true`). Default
+ * pays the low fee while the pool has no backlog at that fee and the last 10
+ * blocks are under 80% full, and the normal fee otherwise. Always-lowest could
+ * leave a send waiting behind a backlog until the pool dropped it (see the
+ * `failed` history rows `xmr-wallet.ts` now shows); always-normal (2) would
+ * overpay five-fold whenever the network is quiet. That the shipped v0.18
+ * build behaves like the snapshot is inference.
+ */
+export const XMR_TRANSFER_PRIORITY = 0;
+
+/** `transfer` built with `do_not_relay` + `get_tx_metadata`: signed, not sent. */
+export interface XmrBuiltTransfer {
+  tx_hash: string;
+  tx_key?: string;
+  amount: number;
+  fee: number;
+  /** The signed transaction for `relay_tx`'s `hex`. */
+  tx_metadata?: string;
+}
+
+/**
+ * Build and sign a transfer of `amountXmr` to `destination` WITHOUT
+ * broadcasting it (2026-09-29 send-safety audit, finding 1).
+ *
+ * The send used to be one `transfer` with `do_not_relay: false`: build and
+ * broadcast in a single call, under the Rust proxy's 30 s timeout, on a
+ * single-threaded wallet-rpc that also serves the 3 s sync polls and runs
+ * auto-refresh in the same thread. A call that timed out at the client could
+ * still broadcast (inference: epee does not cancel a request whose client went
+ * away); the UI said "Transaction failed", and the retry, queued behind the
+ * first, picked other outputs once the first had marked its inputs spent and
+ * paid a second time.
+ *
+ * With `do_not_relay` the wallet never reaches `commit_tx`, the only place it
+ * broadcasts or marks outputs spent (`fill_response` in wallet_rpc_server.cpp),
+ * so a build that fails or times out sent nothing and is safe to retry. The
+ * txid is known before {@link relayTransfer} can put anything on the network.
+ */
+export async function buildTransfer(
   destination: string,
-  amountXmr: string,
-  doNotRelay = false
-): Promise<{ tx_hash: string; tx_key: string; amount: number; fee: number }> {
+  amountXmr: string
+): Promise<XmrBuiltTransfer> {
   const piconero = xmrToPiconero(amountXmr);
-  return rpc("transfer", {
-    destinations: [{ address: destination, amount: Number(piconero) }],
+  return rpc<XmrBuiltTransfer>("transfer", {
+    destinations: [{ address: destination, amount: atomicForRpc(piconero) }],
     account_index: 0,
-    priority: 1, // 1 = default / normal
+    priority: XMR_TRANSFER_PRIORITY,
     ring_size: 16, // current consensus default
     get_tx_key: true,
-    do_not_relay: doNotRelay,
+    do_not_relay: true,
+    get_tx_metadata: true,
   });
+}
+
+/**
+ * Broadcast a transaction {@link buildTransfer} built (`relay_tx`, param `hex`).
+ * A failure here is not proof that nothing was sent: settle it with
+ * {@link settleRelayFailure}.
+ */
+export async function relayTransfer(txMetadata: string): Promise<{ tx_hash?: string } | null> {
+  return rpc<{ tx_hash?: string } | null>("relay_tx", { hex: txMetadata });
+}
+
+// ---------- Relay outcome (shared with Zephyr) ----------
+
+/**
+ * What the wallet says about one of its own transactions, by txid.
+ *  - `confirmed`: listed as mined (`out`/`in`).
+ *  - `pending`:   listed as unconfirmed (`pending`/`pool`).
+ *  - `failed`:    listed only as failed (dropped from the pool).
+ *  - `absent`:    the wallet does not know it ("Transaction not found.").
+ *  - `unknown`:   the lookup itself failed; no answer.
+ */
+export type OwnTxState = "confirmed" | "pending" | "failed" | "absent" | "unknown";
+
+/** A `get_transfer_by_txid` answer as an {@link OwnTxState}. Exported for tests. */
+export function ownTxState(result: unknown): OwnTxState {
+  const r = (result ?? {}) as { transfer?: { type?: unknown }; transfers?: { type?: unknown }[] };
+  const types = [
+    ...(Array.isArray(r.transfers) ? r.transfers : []),
+    ...(r.transfer ? [r.transfer] : []),
+  ].map((t) => t?.type);
+  if (types.includes("out") || types.includes("in")) return "confirmed";
+  if (types.includes("pending") || types.includes("pool")) return "pending";
+  if (types.includes("failed")) return "failed";
+  return "unknown";
+}
+
+/** `get_transfer_by_txid`'s not-found answer (`-8 WRONG_TXID`, "Transaction not found."). */
+export function isTxNotFound(e: unknown): boolean {
+  const raw = errorText(e, "").trim();
+  return /^RPC error -8:/.test(raw) || /Transaction not found/i.test(raw);
+}
+
+/** Look one of this wallet's transactions up by txid. Never throws. */
+export async function lookupOwnTransfer(txid: string): Promise<OwnTxState> {
+  let r: unknown;
+  try {
+    r = await rpc("get_transfer_by_txid", { txid });
+  } catch (e) {
+    return isTxNotFound(e) ? "absent" : "unknown";
+  }
+  return ownTxState(r);
+}
+
+/**
+ * Rust proxy failures raised before the wallet-rpc could run the method
+ * (`wallet_rpc_common.rs` / `xmr_rpc.rs::do_rpc_call_at`): no connection, a
+ * request that was never built, or an authentication step that failed, so the
+ * authenticated request never went out or was refused unread.
+ */
+const NOT_SENT_TRANSPORT =
+  /^(TCP connect (failed|timed out)|Only http:\/\/ URLs are supported|Bad port in URL|Body serialization failed|RPC returned 401|RPC HTTP 401\b|WWW-Authenticate missing|Unsupported Digest algorithm|Unsupported qop|Lock error)/;
+
+/**
+ * wallet-rpc errors `relay_tx` raises BEFORE `commit_tx` (`on_relay_tx`):
+ * restricted mode (-7), no wallet open (-13), unparseable hex (-26) or tx
+ * metadata (-27), and the JSON-RPC protocol errors. `-4 Failed to commit tx.`
+ * is deliberately absent: `commit_tx` throws it for a daemon's rejection and
+ * for a lost daemon connection alike, and the second can come after the node
+ * received the transaction. The daemon's reason is dropped either way.
+ */
+const NOT_RELAYED_CODES = new Set([-7, -13, -26, -27, -32600, -32601, -32602, -32700]);
+
+/**
+ * True when a failed `relay_tx` provably broadcast nothing. Everything else —
+ * a timeout, a dropped or truncated reply, `-4 Failed to commit tx.`, an
+ * unrecognised code — MAY have reached the network.
+ */
+export function relayFailureIsDefinitive(e: unknown): boolean {
+  const raw = errorText(e, "").trim();
+  if (NOT_SENT_TRANSPORT.test(raw)) return true;
+  const m = /^RPC error (-?\d+):/.exec(raw);
+  return m != null && NOT_RELAYED_CODES.has(Number(m[1]));
+}
+
+/**
+ * Settle a `relay_tx` that did not report success (2026-09-29 send-safety
+ * audit, finding 1). Used by Monero and by Zephyr, whose v2.3.0 wallet-rpc is a
+ * Monero fork with the same `relay_tx` / `get_transfer_by_txid` (inference for
+ * Zephyr: its source was not read).
+ *
+ * - A definitive failure ({@link relayFailureIsDefinitive}) throws a plain
+ *   Error: nothing was broadcast, and building the send again is safe.
+ * - Otherwise the wallet is asked about the txid. `commit_tx` lists a
+ *   transaction only after the daemon accepted it, so finding it is success.
+ *   A lookup that itself failed is asked once more: on the single-threaded
+ *   wallet-rpc it queues behind a relay that may still be running.
+ * - Anything else throws `SendOutcomeUnknownError` with the txid. Not finding
+ *   it is NOT proof of failure: a daemon connection lost after the node
+ *   received the transaction fails `commit_tx` before it records anything.
+ *
+ * Never "try again": the send hook closes the form on the unknown outcome, so
+ * one more press cannot build a second transaction.
+ */
+export async function settleRelayFailure(args: {
+  /** "Monero" / "Zephyr", for the messages. */
+  chain: string;
+  txHash: string;
+  error: unknown;
+  lookup: (txid: string) => Promise<OwnTxState>;
+}): Promise<TxResult> {
+  const raw = errorText(args.error, `The ${args.chain} wallet returned no error message.`);
+  if (relayFailureIsDefinitive(args.error)) {
+    throw new Error(
+      `The ${args.chain} wallet did not broadcast the transaction (${raw}). Nothing was sent.`
+    );
+  }
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const state = await args.lookup(args.txHash);
+    if (state === "confirmed") return { hash: args.txHash };
+    if (state === "pending") return { hash: args.txHash, pending: true };
+    if (state !== "unknown") break;
+  }
+  throw new SendOutcomeUnknownError(
+    `The ${args.chain} wallet did not confirm the broadcast (${raw}).`,
+    args.txHash
+  );
 }
 
 // ---------- Seed / keys ----------
@@ -533,25 +717,10 @@ export async function getTransfers(opts: GetTransfersOpts = {}): Promise<XmrTran
   return all;
 }
 
-/**
- * `get_fee_estimate` raw response. `fees` is per-priority (slow/normal/fast/
- * fastest) atomic-units per byte for a typical transaction, when present.
- * Older wallet-rpc builds only return `fee`; we treat that as the single
- * "normal" tier.
- */
-export interface XmrFeeEstimate {
-  fee: number;
-  quantization_mask?: number;
-  fees?: number[];
-}
-
-/**
- * Ask wallet-rpc for the current network fee estimate. Optionally pass a
- * `grace_blocks` hint (default 10 — same as Monero CLI's default).
- */
-export async function getXmrFeeEstimate(graceBlocks: number = 10): Promise<XmrFeeEstimate> {
-  return rpc<XmrFeeEstimate>("get_fee_estimate", { grace_blocks: graceBlocks });
-}
+// `getXmrFeeEstimate` was removed 2026-09-29: `get_fee_estimate` is a DAEMON
+// method monero-wallet-rpc does not have, so it answered `-32601 Method not
+// found` on every call (see `xmrAdapter.getFeeEstimate`). Nothing called it
+// successfully, ever.
 
 /** Fetch a single transaction by its txid. */
 export async function getTransferByTxid(txid: string): Promise<XmrTransfer | null> {

@@ -29,7 +29,9 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendableBalance,
 } from "./types";
+import { errorText } from "../lib/errorText";
 import {
   generateXmrSeed,
   xmrAddressFromSeed,
@@ -69,7 +71,10 @@ import {
   getHeight,
   getSyncStatus,
   setDaemon,
-  transfer,
+  buildTransfer,
+  relayTransfer,
+  lookupOwnTransfer,
+  settleRelayFailure,
   validateAddress,
   createAddress,
   getTransfers,
@@ -83,8 +88,8 @@ import {
   downloadWalletRpc,
   checkXmrDefenderExclusion,
   addXmrDefenderExclusion,
-  getXmrFeeEstimate,
   type XmrTransfer,
+  type XmrValidateAddressResult,
 } from "./xmr-rpc";
 
 /** Which on-disk seed format a given vault entry holds. */
@@ -112,9 +117,16 @@ interface XmrSession {
   restoreHeight: number;
   /** On-disk wallet filename this session opened (per-wallet, multi-wallet). */
   walletFilename: string;
+  /**
+   * Which session this is. A send records it between building and relaying,
+   * so a transaction built by one wallet is never relayed through the next
+   * one's wallet-rpc (2026-09-29, the same guard Zephyr's quotes carry).
+   */
+  epoch: number;
 }
 
 let session: XmrSession | null = null;
+let sessionEpoch = 0;
 
 // =========================================================================
 // Helpers
@@ -627,6 +639,7 @@ export async function initXmrSession(
     currentReceiveAddress,
     restoreHeight,
     walletFilename,
+    epoch: ++sessionEpoch,
   };
 
   // 6. Kick off the background health loop so the Settings UI always has
@@ -690,7 +703,14 @@ export async function refreshXmrReceiveAddress(): Promise<string> {
 export async function getXmrTransactionHistory(): Promise<XmrTransfer[]> {
   if (!session) return [];
   try {
-    const transfers = await getTransfers({ in: true, out: true, pending: true, pool: true });
+    // `failed` too (2026-09-29): see the adapter's `getTransactionHistory`.
+    const transfers = await getTransfers({
+      in: true,
+      out: true,
+      pending: true,
+      pool: true,
+      failed: true,
+    });
     return transfers.sort((a, b) => b.timestamp - a.timestamp);
   } catch {
     return [];
@@ -735,6 +755,196 @@ export async function getXmrSyncProgress(): Promise<{
   } catch {
     return null;
   }
+}
+
+// =========================================================================
+// Send helpers (2026-09-29 send-safety audit)
+// =========================================================================
+
+interface XmrSyncStatus {
+  walletHeight: number;
+  daemonHeight: number;
+  synced: boolean;
+  percent: number;
+  daemonOk: boolean;
+}
+
+/**
+ * Why a send must wait, or `null` when the wallet is synced. Zephyr's
+ * `zphSyncRefusal` wording, ported (finding 7).
+ *
+ * A failed daemon probe (`daemonOk: false`, `daemonHeight: 0`) used to read
+ * "Monero wallet not fully synced (0.0% — N / 0)", blaming the wallet for a
+ * node it could not reach; a busy `get_height` (no status at all) printed
+ * "(?% — 0 / 0)".
+ */
+export function xmrSyncRefusal(status: XmrSyncStatus | null): string | null {
+  if (!status) {
+    return (
+      "The Monero wallet did not report whether it is synced (it may be busy). " +
+      "Please wait a moment and try again."
+    );
+  }
+  if (status.synced) return null;
+  if (!status.daemonOk) {
+    return (
+      `Could not reach a Monero node to confirm the wallet is synced (wallet at block ${status.walletHeight}). ` +
+      "Check the Monero node in Settings, then try again."
+    );
+  }
+  return (
+    `Monero wallet not fully synced (${status.percent.toFixed(1)}% — ${status.walletHeight} / ${status.daemonHeight}). ` +
+    "Please wait for sync to complete before sending."
+  );
+}
+
+/**
+ * A recipient that is not even shaped like an address, or null.
+ *
+ * Base58 only. `transfer` resolves anything that does not parse as an address
+ * as an OpenAlias name through DNS (`validate_transfer` →
+ * `get_account_address_from_str_or_url` in wallet_rpc_server.cpp), so when
+ * `validate_address` (which this app calls with `allow_openalias: false`) is
+ * unavailable, a name like `donate.example.org` would have been paid to
+ * whatever address DNS returned, never shown to the user.
+ */
+export function xmrRecipientShapeProblem(to: string): string | null {
+  if (!to) return "Enter a Monero address.";
+  if (!/^[1-9A-HJ-NP-Za-km-z]+$/.test(to)) {
+    return (
+      "That is not a Monero address. Paste the address itself; this wallet does not " +
+      "look up names (OpenAlias)."
+    );
+  }
+  return null;
+}
+
+/** A `validate_address` answer that rules the recipient out, or null. */
+export function xmrRecipientProblem(v: XmrValidateAddressResult): Error | null {
+  if (!v.valid) return new Error("Invalid Monero address.");
+  if (v.nettype !== "mainnet") return new Error(`Address is for ${v.nettype}, not mainnet.`);
+  return null;
+}
+
+/**
+ * Ask the wallet whether `to` is a mainnet Monero address (finding 6).
+ *
+ * A failing `validate_address` CALL is not a verdict: the build checks the
+ * address again and fails with its own error. This catch used to read
+ * `e.message.startsWith(...)`; Tauri rejects with a plain string, so the catch
+ * itself threw "Cannot read properties of undefined (reading 'startsWith')"
+ * and the send died on a TypeError. The pattern is Zephyr's `checkZphRecipient`.
+ */
+async function checkXmrRecipient(to: string): Promise<Error | null> {
+  const shape = xmrRecipientShapeProblem(to);
+  if (shape) return new Error(shape);
+  let v: XmrValidateAddressResult;
+  try {
+    v = await validateAddress(to);
+  } catch (e) {
+    console.warn(
+      "[xmr-wallet] validate_address failed; the build will check the address itself:",
+      errorText(e)
+    );
+    return null;
+  }
+  return xmrRecipientProblem(v);
+}
+
+/**
+ * A failed BUILD (`transfer` with `do_not_relay`), as a readable error.
+ * Nothing was broadcast by a build, so every one of these is safe to retry.
+ * Codes are wallet_rpc_server's, as `wallet_rpc_common.rs` formats them
+ * (`RPC error <code>: <message>`); the raw text is kept in every message.
+ */
+export function classifyXmrBuildError(e: unknown): Error {
+  const raw = errorText(e, "The Monero wallet returned no error message.");
+  const m = /^RPC error (-?\d+):\s*([\s\S]*)$/.exec(raw.trim());
+  const code = m ? Number(m[1]) : null;
+  const msg = m ? m[2] : raw;
+  if (code === -37 || /not enough unlocked money/i.test(msg)) {
+    return new Error(
+      "Not enough unlocked XMR for this amount plus the network fee. Received funds and change " +
+        `unlock after 10 blocks (about 20 minutes). Nothing was sent. (${raw})`
+    );
+  }
+  if (
+    code === -17 ||
+    /not enough money/i.test(msg) ||
+    (code === -16 && /^Transaction not possible/i.test(msg))
+  ) {
+    return new Error(`Not enough XMR for this amount plus the network fee. Nothing was sent. (${raw})`);
+  }
+  if (code === -2 || /WALLET_RPC_ERROR_CODE_WRONG_ADDRESS/.test(msg)) {
+    return new Error(`That is not a valid Monero address. Nothing was sent. (${raw})`);
+  }
+  if (code === -38 || code === -3) {
+    return new Error(
+      `The Monero wallet cannot reach its node, or the node is busy. Nothing was sent; try again shortly. (${raw})`
+    );
+  }
+  if (/TCP connect|actively refused|Connection refused|RPC returned 401|No wallet file/i.test(raw)) {
+    return new Error(
+      `The Monero wallet is not running or has no wallet open yet. Nothing was sent. (${raw})`
+    );
+  }
+  if (/timed out/i.test(raw)) {
+    return new Error(
+      `The Monero wallet took too long to build the transaction. Nothing was sent; try again in a moment. (${raw})`
+    );
+  }
+  return new Error(`${raw} (Nothing was sent.)`);
+}
+
+/** A built, signed, unrelayed Monero transaction. */
+interface XmrBuiltSend {
+  txMetadata: string;
+  txHash: string;
+  /** The session that built it. */
+  epoch: number;
+}
+
+/** Build `amount` to `recipient` without broadcasting it. Throws readable errors. */
+async function buildXmrSend(recipient: string, amount: string, epoch: number): Promise<XmrBuiltSend> {
+  let r;
+  try {
+    r = await buildTransfer(recipient, amount);
+  } catch (e) {
+    throw classifyXmrBuildError(e);
+  }
+  if (!r || typeof r.tx_metadata !== "string" || r.tx_metadata.length === 0 || !r.tx_hash) {
+    throw new Error(
+      "The Monero wallet built this send but returned no transaction to broadcast (no tx_metadata). " +
+        "Nothing was sent."
+    );
+  }
+  return { txMetadata: r.tx_metadata, txHash: r.tx_hash, epoch };
+}
+
+/**
+ * Broadcast a built send (`relay_tx`). Once this starts the transaction may be
+ * on the network, so a failure is settled by txid (`settleRelayFailure`):
+ * found → the result; provably not relayed → a plain Error; anything else →
+ * `SendOutcomeUnknownError(txid)`. Never "try again".
+ */
+async function relayXmrSend(built: XmrBuiltSend): Promise<TxResult> {
+  if (!session || session.epoch !== built.epoch) {
+    throw new Error(
+      "The Monero wallet changed before this transaction was broadcast. Nothing was sent."
+    );
+  }
+  let r: { tx_hash?: string } | null;
+  try {
+    r = await relayTransfer(built.txMetadata);
+  } catch (e) {
+    return settleRelayFailure({
+      chain: "Monero",
+      txHash: built.txHash,
+      error: e,
+      lookup: lookupOwnTransfer,
+    });
+  }
+  return { hash: r?.tx_hash || built.txHash };
 }
 
 // =========================================================================
@@ -815,35 +1025,47 @@ export const xmrAdapter: ChainAdapter = {
     }
   },
 
+  /**
+   * Build, then relay (2026-09-29 send-safety audit, finding 1).
+   *
+   * Until then this was ONE `transfer` that built and broadcast together; a
+   * timeout could leave it broadcast while the UI said "failed", and the retry
+   * paid again. Now the build (`do_not_relay`) sends nothing whatever happens
+   * to it, the txid is known before `relay_tx`, and a relay that does not
+   * report success is settled by that txid (`relayXmrSend`).
+   *
+   * Everything refused here — sync, recipient, a failed build — is decided
+   * before anything could reach the network, so it throws a plain Error.
+   */
   async sendTransaction(_seed: string, to: string, amount: string): Promise<TxResult> {
     if (!session) {
       throw new Error("Monero session not initialized. Please wait for sync.");
     }
+    const epoch = session.epoch;
     // Require sync to be within 2 blocks of the tip before sending.
-    const status = await getXmrSyncProgress();
-    if (!status || !status.synced) {
-      const pct = status?.percent.toFixed(1) ?? "?";
-      throw new Error(
-        `Monero wallet not fully synced (${pct}% — ${status?.walletHeight ?? 0} / ${
-          status?.daemonHeight ?? 0
-        }). Please wait for sync to complete before sending.`
-      );
+    const refusal = xmrSyncRefusal(await getXmrSyncProgress());
+    if (refusal) throw new Error(refusal);
+    const recipient = to.trim();
+    const badRecipient = await checkXmrRecipient(recipient);
+    if (badRecipient) throw badRecipient;
+    const built = await buildXmrSend(recipient, amount.trim(), epoch);
+    return relayXmrSend(built);
+  },
+
+  /**
+   * Unlocked and total XMR (finding 8), so the Send modal shows what can be
+   * sent now: the displayed balance includes change that stays locked for 10
+   * blocks, and sending it failed after the press with a raw wallet error.
+   */
+  async getSendableBalance(): Promise<SendableBalance> {
+    if (!session) {
+      throw new Error("Monero session not initialized");
     }
-    // Validate address via RPC before attempting the transfer.
-    try {
-      const validation = await validateAddress(to);
-      if (!validation.valid) {
-        throw new Error("Invalid Monero address.");
-      }
-      if (validation.nettype !== "mainnet") {
-        throw new Error(`Address is for ${validation.nettype}, not mainnet.`);
-      }
-    } catch (e: any) {
-      if (e.message.startsWith("Invalid") || e.message.startsWith("Address is")) throw e;
-      // If validate_address itself fails (RPC error), proceed — don't block sends.
-    }
-    const result = await transfer(to, amount);
-    return { hash: result.tx_hash };
+    const bal = await getBalance();
+    return {
+      unlocked: piconeroToXmr(bal.unlocked_balance),
+      total: piconeroToXmr(bal.balance),
+    };
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -873,12 +1095,15 @@ export const xmrAdapter: ChainAdapter = {
   ): Promise<TxHistoryPage> {
     if (!session) return { items: [] };
     const limit = opts?.limit ?? 50;
+    // `failed: true` since 2026-09-29 (finding 10). With `false`, a send the
+    // pool later dropped vanished from Activity: no row, no hint, only a
+    // balance that came back.
     const transfers = await getTransfers({
       in: true,
       out: true,
       pending: true,
       pool: true,
-      failed: false,
+      failed: true,
     });
     transfers.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
     const items: ChainTx[] = transfers.slice(0, limit).map((t) => xmrTransferToChainTx(t));
@@ -892,56 +1117,51 @@ export const xmrAdapter: ChainAdapter = {
    */
   networkComputesFee: true,
 
+  /**
+   * No estimate exists without building the transaction.
+   *
+   * This called `get_fee_estimate`, a DAEMON method monero-wallet-rpc does not
+   * have: `-32601 Method not found` on every call, on a healthy wallet, for
+   * every Send modal open and every 30 s refresh — each one a request queued on
+   * the single-threaded wallet-rpc. Since 2026-09-29 it throws a readable reason
+   * without calling anything; `networkComputesFee` keeps the missing value from
+   * blocking Send, as before.
+   *
+   * Not replaced by a `quoteSend` dry run the way Zephyr's is (finding 8): each
+   * dry-run `transfer` asks the node for the real output alongside a fresh set
+   * of decoys (`wallet2::get_outs`: "start with real one", then the request is
+   * sorted "to ensure the daemon doesn't know which output is ours"), and a
+   * quote is rebuilt on every edit and every 60 s. A remote node that sees two
+   * such requests for the same spend can intersect them and find the real
+   * input (inference from the source; the ring database that would reuse a
+   * ring is filled only in `process_outgoing`, after a send). The fee is set
+   * by the wallet at build time either way.
+   */
   async getFeeEstimate(): Promise<FeeEstimate> {
     if (!session) {
       throw new Error("Monero session not initialized");
     }
-    /**
-     * `get_fee_estimate` is a DAEMON method, not a wallet-rpc one.
-     *
-     * `getXmrFeeEstimate` routes through `xmr_rpc_call`, which talks to
-     * monero-wallet-rpc — an RPC with no such method. It answered `-32601
-     * Method not found` on every call, on every send attempt, on a healthy
-     * wallet. Not intermittent: this call could never have worked.
-     *
-     * The throw is kept — the adapter contract says this method throws when
-     * no source is reachable, and inventing a fee here would be worse. What
-     * changed is the CONSUMER: `networkComputesFee` tells `SendModal` that
-     * this value is an ornament, so its absence no longer blocks the send.
-     *
-     * The real repair is a daemon-routed call;
-     * `wallet_rpc_common::probe_node` already reaches the daemon, so the Rust
-     * side of it is a small addition. Tracked as a follow-up.
-     */
-    const r = await getXmrFeeEstimate(10);
-    // wallet-rpc returns fees in piconero "per byte" for a typical tx.
-    // We surface them in XMR (the user-facing unit) and let the UI label
-    // them as "per kB" to match Monero CLI's convention. Rounding via
-    // piconeroToXmr keeps consistency with balance/amount formatting.
-    const fees = r.fees && r.fees.length > 0 ? r.fees : [r.fee];
-    const tier = (i: number) =>
-      fees[i] !== undefined ? { value: piconeroToXmr(fees[i] * 1024) } : undefined;
-    const slow = tier(0);
-    const normal = tier(1) ?? tier(0)!;
-    const fast = tier(2) ?? tier(1) ?? normal;
-    return {
-      slow,
-      normal,
-      fast,
-      unit: "XMR/kB",
-      fetchedAt: Date.now(),
-      raw: r,
-    };
+    throw new Error("Not estimated in advance for Monero.");
   },
 };
 
-/** Map a single XMR transfer record into the unified `ChainTx` shape. */
-function xmrTransferToChainTx(t: XmrTransfer): ChainTx {
+/**
+ * One wallet-rpc transfer as a unified history row. Exported for tests.
+ *
+ * `pool` is INCOMING money seen in the mempool; `pending` is the OUTGOING
+ * unconfirmed one (wallet-rpc `get_transfers` categories). Until 2026-09-29
+ * `pool` mapped to "pending", which every renderer and the Sent filter treat
+ * as outgoing, so an unconfirmed receipt read "▲ sent" (send-safety audit,
+ * finding 12). It is now "in" with 0 confirmations, the way Zephyr's rows have
+ * been since 2026-09-15. A `failed` row is an outgoing send the pool dropped,
+ * so it names its recipient like any other send.
+ */
+export function xmrTransferToChainTx(t: XmrTransfer): ChainTx {
   let direction: ChainTx["direction"];
   switch (t.type) {
     case "in":
     case "pool":
-      direction = t.type === "pool" ? "pending" : "in";
+      direction = "in";
       break;
     case "out":
       direction = "out";
@@ -957,7 +1177,7 @@ function xmrTransferToChainTx(t: XmrTransfer): ChainTx {
   // destination is the counterparty (multi-out splits aren't surfaced in
   // the table — they live in `meta.destinations` for the detail drawer).
   const counterparty =
-    direction === "out" || direction === "pending"
+    direction === "out" || direction === "pending" || direction === "failed"
       ? t.destinations?.[0]?.address
       : undefined;
   return {
@@ -967,7 +1187,9 @@ function xmrTransferToChainTx(t: XmrTransfer): ChainTx {
     amount: piconeroToXmr(t.amount),
     fee: t.fee ? piconeroToXmr(t.fee) : undefined,
     timestamp: t.timestamp || undefined,
-    confirmations: t.confirmations,
+    // A mempool receipt has no confirmations by definition; "0" is what marks
+    // the row pending in the renderers.
+    confirmations: t.type === "pool" ? 0 : t.confirmations,
     height: t.height || undefined,
     counterparty,
     meta: {

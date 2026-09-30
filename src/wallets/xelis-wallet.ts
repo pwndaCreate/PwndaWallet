@@ -37,6 +37,7 @@ import type {
   WalletInfo,
 } from "./types";
 import { SEND_QUOTE_MAX_AGE_MS, SendQuoteError } from "./send-quote";
+import { SendOutcomeUnknownError, isSendOutcomeUnknown } from "./send-outcome";
 import {
   generateXelisSeed,
   isXelisAddressShape,
@@ -64,6 +65,7 @@ import {
   startXelisRpc,
   stopXelisRpc,
   switchDaemon,
+  xelisSendMayHaveBroadcast,
   xelisToAtomic,
   type XelisSyncStatus,
   type XelisTransferEntry,
@@ -523,13 +525,42 @@ export const xelisAdapter: ChainAdapter = {
     return detail.total;
   },
 
+  /**
+   * Build, sign and broadcast (2026-09-29 send-safety audit, finding 14).
+   *
+   * Waits for sync first, as `quoteSend` and the balance already did: a wallet
+   * short of the tip builds against balances and a nonce it has not scanned
+   * yet. The wallet builds and submits in ONE call, so a failure that could
+   * have come after the submission (`xelisSendMayHaveBroadcast`) is reported
+   * as `SendOutcomeUnknownError`, never as a failure the form invites again;
+   * and nothing after a successful answer throws (`sendTransfer`).
+   */
   async sendTransaction(_seed: string, to: string, amount: string): Promise<TxResult> {
     if (!session) throw new Error("Xelis session not initialized.");
     const recipient = to.trim();
     if (!isXelisAddressShape(recipient, session.network)) {
       throw new Error(`That is not a valid Xelis ${session.network} address.`);
     }
-    const result = await sendTransfer(recipient, xelisToAtomic(amount));
+    const amountAtomic = xelisToAtomic(amount);
+    const status = await getSyncStatus();
+    if (!status.synced) {
+      throw new Error(
+        status.online
+          ? "The Xelis wallet is still scanning the chain. Nothing was sent; wait for it to finish."
+          : "The Xelis wallet is not connected to a node. Nothing was sent."
+      );
+    }
+    let result;
+    try {
+      result = await sendTransfer(recipient, amountAtomic);
+    } catch (e) {
+      if (isSendOutcomeUnknown(e)) throw e;
+      const raw = e instanceof Error ? e.message : String(e);
+      if (xelisSendMayHaveBroadcast(e)) {
+        throw new SendOutcomeUnknownError(`The Xelis wallet did not confirm the send (${raw}).`);
+      }
+      throw e instanceof Error ? e : new Error(raw);
+    }
     return { hash: result.hash };
   },
 

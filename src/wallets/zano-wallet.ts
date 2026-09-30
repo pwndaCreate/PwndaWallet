@@ -25,7 +25,11 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendableBalance,
 } from "./types";
+import { keccak_256 } from "@noble/hashes/sha3.js";
+import { SendOutcomeUnknownError } from "./send-outcome";
+import { errorText } from "../lib/errorText";
 import {
   generateZanoSeed,
   validateZanoSeed,
@@ -47,6 +51,8 @@ import {
   storeWallet,
   zanoToAtomic,
   atomicToZano,
+  zanoSendMayHaveBroadcast,
+  ZANO_TRANSFER_FEE_ATOMIC,
   ZANO_NATIVE_ASSET_ID,
   ZANO_NATIVE_DECIMALS,
   type ZanoAssetBalance,
@@ -383,6 +389,132 @@ export function zanoTransfersToChainTx(
 }
 
 // =========================================================================
+// Recipient validation (2026-09-29 send-safety audit, finding 4)
+// =========================================================================
+//
+// The send used to hand `to` to simplewallet untouched, not even trimmed, and
+// simplewallet accepts more than addresses (vendored v2.2.1.506 source):
+//  - `@name` is an ALIAS, resolved by asking the daemon (`alias_helper.h`,
+//    `get_transfer_address_cb`). This app talks to public nodes, so the node,
+//    not the user, would have decided who got paid.
+//  - a 42-character `0x…` string is a WRAP: the funds go to the bridge's
+//    custody wallet with an ERC-20 withdrawal request attached
+//    (`fill_destination_helper.h`, `is_address_like_wrapped`). This app does
+//    not bridge; a pasted Ethereum address must not become a bridge deposit.
+// So a recipient must be a Zano address this code can check itself: CryptoNote
+// base58, a known prefix, a matching keccak checksum, and a body of the size
+// that prefix carries (`get_account_address_and_payment_id_from_str`).
+
+const CN_B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+/** Encoded length of a 0..8-byte block (Monero/Zano block base58). */
+const CN_B58_ENCODED_BLOCK = [0, 2, 3, 5, 6, 7, 9, 10, 11];
+
+function cnBase58DecodeBlock(chunk: string, size: number): Uint8Array | null {
+  let n = 0n;
+  for (const ch of chunk) {
+    const digit = CN_B58.indexOf(ch);
+    if (digit < 0) return null;
+    n = n * 58n + BigInt(digit);
+  }
+  if (n >= 1n << BigInt(8 * size)) return null; // overflows the block
+  const out = new Uint8Array(size);
+  for (let i = size - 1; i >= 0; i--) {
+    out[i] = Number(n & 0xffn);
+    n >>= 8n;
+  }
+  return out;
+}
+
+/** CryptoNote block base58 → bytes, or null when malformed. */
+function cnBase58Decode(s: string): Uint8Array | null {
+  const full = Math.floor(s.length / 11);
+  const lastSize = CN_B58_ENCODED_BLOCK.indexOf(s.length % 11);
+  if (lastSize < 0) return null;
+  const out = new Uint8Array(full * 8 + lastSize);
+  for (let i = 0; i < full; i++) {
+    const block = cnBase58DecodeBlock(s.slice(i * 11, i * 11 + 11), 8);
+    if (!block) return null;
+    out.set(block, i * 8);
+  }
+  if (lastSize > 0) {
+    const block = cnBase58DecodeBlock(s.slice(full * 11), lastSize);
+    if (!block) return null;
+    out.set(block, full * 8);
+  }
+  return out;
+}
+
+/** Varint (7 bits per byte, little-endian) at the start of `b`. */
+function readVarint(b: Uint8Array): { value: number; length: number } | null {
+  let value = 0;
+  for (let i = 0; i < b.length && i < 8; i++) {
+    value += (b[i] & 0x7f) * 2 ** (7 * i);
+    if ((b[i] & 0x80) === 0) return { value, length: i + 1 };
+  }
+  return null;
+}
+
+/** Payment-id size limit, `BC_PAYMENT_ID_SERVICE_SIZE_MAX` (bc_payments_id_service.h:10). */
+const ZANO_PAYMENT_ID_MAX = 128;
+
+/**
+ * Accepted prefixes (currency_config.h:29-33) and the body each carries:
+ * spend key + view key (64 bytes), the newer layout adds a flags byte (65),
+ * and an integrated address appends a payment id.
+ */
+const ZANO_ADDRESS_PREFIXES: ReadonlyMap<number, (bodyLength: number) => boolean> = new Map([
+  // "Zx…": standard, old (64) or new (65) layout.
+  [0xc5, (n: number) => n === 64 || n === 65],
+  // "iZ…": integrated, old layout + payment id.
+  [0x3678, (n: number) => n > 64 && n <= 64 + ZANO_PAYMENT_ID_MAX],
+  // "iZ…": integrated, new layout + payment id.
+  [0x36f8, (n: number) => n > 65 && n <= 65 + ZANO_PAYMENT_ID_MAX],
+  // "aZx…": auditable; an ordinary destination for a sender.
+  [0x98c8, (n: number) => n === 65],
+  // "aiZX…": auditable integrated.
+  [0x8a49, (n: number) => n > 65 && n <= 65 + ZANO_PAYMENT_ID_MAX],
+]);
+
+/** Gateway addresses ("gwZ…", "gwiZ…", currency_config.h:35-36): not supported here. */
+const ZANO_GATEWAY_PREFIXES = new Set([0x656e, 0x14276e]);
+
+/**
+ * Why `to` cannot be sent to, or null for a Zano address this wallet accepts.
+ * `to` is expected trimmed. Exported for tests.
+ */
+export function zanoRecipientProblem(to: string): string | null {
+  if (!to) return "Enter a Zano address.";
+  if (to.startsWith("@")) {
+    return (
+      "Zano aliases (@name) are not accepted here: the public node this wallet uses would decide " +
+      "which address the alias means. Paste the recipient's Zano address (Zx… or iZ…) instead."
+    );
+  }
+  if (/^0x/i.test(to)) {
+    return (
+      "That is an Ethereum-style address. Zano's wallet would turn it into a bridge withdrawal " +
+      "through a custody wallet, which this app does not do. Paste a Zano address (Zx… or iZ…)."
+    );
+  }
+  const invalid = "That is not a valid Zano address (Zx… or iZ…).";
+  const raw = cnBase58Decode(to);
+  if (!raw || raw.length <= 4) return invalid;
+  const payload = raw.subarray(0, raw.length - 4);
+  const sum = keccak_256(payload).subarray(0, 4);
+  for (let i = 0; i < 4; i++) {
+    if (sum[i] !== raw[raw.length - 4 + i]) return invalid;
+  }
+  const prefix = readVarint(payload);
+  if (!prefix) return invalid;
+  if (ZANO_GATEWAY_PREFIXES.has(prefix.value)) {
+    return "Zano gateway addresses (gw…) are not supported by this wallet yet.";
+  }
+  const bodyFits = ZANO_ADDRESS_PREFIXES.get(prefix.value);
+  if (!bodyFits || !bodyFits(payload.length - prefix.length)) return invalid;
+  return null;
+}
+
+// =========================================================================
 // ChainAdapter implementation
 // =========================================================================
 
@@ -443,6 +575,19 @@ export const zanoAdapter: ChainAdapter = {
     return detail.total;
   },
 
+  /**
+   * Send native ZANO (2026-09-29 send-safety audit, findings 4 and 5).
+   *
+   * The recipient is checked here first (`zanoRecipientProblem`): no aliases,
+   * no bridge wraps, a real Zano address. The fee is explicit
+   * (`ZANO_TRANSFER_FEE_ATOMIC`): without it simplewallet refused every send.
+   *
+   * simplewallet's `transfer` builds and broadcasts in ONE call and cannot do
+   * one without the other for a full wallet, so the txid exists only once it
+   * succeeds. A failure that could have come after the broadcast
+   * (`zanoSendMayHaveBroadcast`) is reported as `SendOutcomeUnknownError`,
+   * which closes the form, rather than "failed" with the form still filled.
+   */
   async sendTransaction(
     _seed: string,
     to: string,
@@ -455,11 +600,44 @@ export const zanoAdapter: ChainAdapter = {
     // `_assetType` is intentionally unused in v1: send is native-ZANO-only
     // (see file header). Wiring confidential-asset sends is Phase 5 scope,
     // once ZanoAssetsCard exists to pick a specific asset_id.
+    const recipient = to.trim();
+    const problem = zanoRecipientProblem(recipient);
+    if (problem) throw new Error(problem);
     const atomic = zanoToAtomic(amount, ZANO_NATIVE_DECIMALS);
-    const result = await transfer({
-      destinations: [{ address: to, amount: atomic }],
-    });
+    let result;
+    try {
+      result = await transfer({
+        destinations: [{ address: recipient, amount: atomic }],
+        fee: ZANO_TRANSFER_FEE_ATOMIC,
+      });
+    } catch (e) {
+      const raw = errorText(e, "The Zano wallet returned no error message.");
+      if (zanoSendMayHaveBroadcast(e)) {
+        throw new SendOutcomeUnknownError(
+          `The Zano wallet did not confirm the send (${raw}).`
+        );
+      }
+      throw new Error(raw);
+    }
+    if (!result.txHash) {
+      // It answered success; the transaction went out without an id we can show.
+      throw new SendOutcomeUnknownError("The Zano wallet reported the send without a transaction id.");
+    }
     return { hash: result.txHash };
+  },
+
+  /**
+   * Unlocked and total native ZANO, so the Send modal shows what can be sent
+   * now (finding 8). Zano's `getbalance` reports both per asset.
+   */
+  async getSendableBalance(): Promise<SendableBalance> {
+    if (!session) throw new Error("Zano session not initialized.");
+    const bal = await getNativeBalance();
+    if (!bal) return { unlocked: "0", total: "0" };
+    return {
+      unlocked: atomicToZano(bal.unlocked, bal.assetInfo.decimalPoint),
+      total: atomicToZano(bal.total, bal.assetInfo.decimalPoint),
+    };
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -479,13 +657,14 @@ export const zanoAdapter: ChainAdapter = {
     return { items: zanoTransfersToChainTx(entries, limit) };
   },
 
+  /**
+   * The fee a send pays, exactly: this app sets it (`ZANO_TRANSFER_FEE_ATOMIC`,
+   * 0.01 ZANO) since 2026-09-29. It used to report "network-determined" while
+   * the send passed no fee at all, which simplewallet refused (finding 5).
+   */
   async getFeeEstimate(): Promise<FeeEstimate> {
-    // No dedicated fee-estimate RPC was exercised against the live binary
-    // (see zano-rpc.ts's transfer() note on `mixin`/`fee` — the daemon
-    // applies network-ruled minimums). Report unknown rather than a
-    // fabricated number; the send flow lets the daemon set the fee.
     return {
-      normal: { value: "network-determined", label: "Normal" } as any,
+      normal: { value: atomicToZano(ZANO_TRANSFER_FEE_ATOMIC, ZANO_NATIVE_DECIMALS) },
       unit: "ZANO",
       fetchedAt: Date.now(),
     };
