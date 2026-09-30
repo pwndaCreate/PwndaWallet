@@ -30,7 +30,15 @@ import {
 } from "../swap-sidecar";
 import { formatAmount } from "../swap-sidecar/types";
 import { sidecarFeesReserve } from "../../api/basicswap";
-import { feeAppliesToSend, spendableAfterReserve } from "./feeReserve";
+import {
+  evmReserveFromGasPrice,
+  feeAppliesToSend,
+  formatPresetAmount,
+  nativeMaxReserve,
+  spendableAfterReserve,
+} from "./feeReserve";
+import { jsonRpcCall } from "../../wallets/chain-rpcs";
+import { resumePendingIntentsSwapsOnce } from "./intents-status-resume";
 import { minPresetTitle, planMinPreset } from "./minPreset";
 import { coinAmountFromUsd } from "../../lib/usdAmount";
 import {
@@ -250,6 +258,15 @@ export function SwapForm({
   const meta = getPairMeta(fromCoin, toCoin);
   const liveRate = liveCrossRate(fromCoin, toCoin, pricesByTicker);
   const numericFrom = parseFloat(fromAmt) || 0;
+  // The latest amount, for an async preset (MAX's live gas reserve) that
+  // must not overwrite something the user typed after pressing it.
+  const fromAmtRef = useRef(fromAmt);
+  fromAmtRef.current = fromAmt;
+  // Follow NEAR Intents swaps still pending in history (2026-09-29, F5):
+  // once per session, the first time either layout mounts the swap form.
+  useEffect(() => {
+    resumePendingIntentsSwapsOnce();
+  }, []);
 
   /**
    * Quick-pair tiles (canvas frame 1b).
@@ -598,8 +615,44 @@ export function SwapForm({
 
   const setPercent = (pct: number) => {
     if (fromBalance == null) return;
-    const v = (fromBalance * pct).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+    const presetDecimals = fromMetaResolved?.decimals ?? 8;
+    // MAX on a NEAR Intents swap of a NATIVE coin leaves the deposit's own
+    // network fee behind (2026-09-29 send-safety audit, F8). It used to set
+    // the whole balance, and the executor then refused every such swap as
+    // TX_NOT_FUNDABLE with "please report it" copy. A token leg keeps its full
+    // balance (`nativeMaxReserve` is 0 for it): its fee is paid in the chain's
+    // native coin. The P2P route has its own reserve, further down.
+    const intentsMax = pct >= 1 && preferredRouter !== "basicswap" && intentsRoutable;
+    const staticReserve = intentsMax ? nativeMaxReserve(fromMetaResolved) : 0;
+    // Rounded DOWN (`formatPresetAmount`), never up past the balance.
+    const v = formatPresetAmount(
+      spendableAfterReserve(fromBalance * pct, staticReserve),
+      presetDecimals,
+    );
     setFromAmt(v);
+    if (intentsMax && staticReserve > 0 && fromMetaResolved?.chainKind === "EVM") {
+      // EVM: replace the static reserve with one from the live gas price,
+      // unless the user has typed something else in the meantime.
+      const rpcUrls =
+        fromMetaResolved.rpcFallbacks && fromMetaResolved.rpcFallbacks.length > 0
+          ? fromMetaResolved.rpcFallbacks
+          : fromMetaResolved.defaultRpcUrl
+            ? [fromMetaResolved.defaultRpcUrl]
+            : [];
+      if (rpcUrls.length > 0) {
+        void jsonRpcCall(rpcUrls, "eth_gasPrice", [], { ticker: fromMetaResolved.ticker })
+          .then((hex) => {
+            const live = evmReserveFromGasPrice(BigInt(hex), presetDecimals);
+            if (!(live > 0) || fromAmtRef.current !== v) return;
+            setFromAmt(
+              formatPresetAmount(spendableAfterReserve(fromBalance, live), presetDecimals),
+            );
+          })
+          .catch(() => {
+            /* keep the static reserve */
+          });
+      }
+    }
     // MAX on a peer-to-peer swap that SENDS the scripted leg must leave the
     // fee behind (2026-09-05). Otherwise the swap completes, the watcher goes
     // to collect, the balance is zero, and the record defers forty times and

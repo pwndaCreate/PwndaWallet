@@ -9,11 +9,16 @@
  *   - EVM: implemented inline in `executeIntentsTrade` (legacy reasons).
  *   - SOL: this file — Solana SystemProgram::transfer via @solana/web3.js.
  *   - NEAR: this file — hand-rolled borsh-encoded Transfer action.
- *   - BTC + LTC: this file — Esplora UTXO fetch + bitcoinjs-lib PSBT build.
- *   - DOGE + BCH: not implemented — see `sourceCapable: false` in
- *     `swap-data.ts`. Address derivation works (so users can RECEIVE);
- *     source-tx signing requires legacy P2PKH + (BCH) SIGHASH_FORKID
- *     signers in the Rust core, which lands in v1.1.
+ *   - BTC / LTC / DOGE / BCH / DASH: since 2026-09-29 (F10) through the
+ *     wallet adapter's ACCOUNT-WIDE send (`executeAccountUtxoTransfer`),
+ *     the call the Send button makes. The single-address Rust PSBT builders
+ *     below (`executeUtxoTransfer`, legacy DOGE/BCH) remain only as the
+ *     fallback for a wallet the adapter's account scan does not cover.
+ *
+ * Once a deposit is SIGNED, every helper here broadcasts it once and turns an
+ * ambiguous broadcast failure into `SendOutcomeUnknownError` carrying the
+ * transaction id (2026-09-29 send-safety audit, F2) — never an ordinary error
+ * the UI would offer to retry.
  */
 import { sha256 } from "@noble/hashes/sha2.js";
 import { ed25519 } from "@noble/curves/ed25519.js";
@@ -33,9 +38,21 @@ import {
   assertSolTransferShape,
 } from "./safety-invariants";
 import { httpProxyCall, proxyGetJson, proxyPostJson } from "../../wallets/_proxy";
-import { decodeCashAddr } from "../../wallets/bch-wallet";
-import { atomicToDecimal } from "../../wallets/decimal-amount";
-import type { ChainType } from "../../wallets/types";
+// `encodeCashAddr` is imported here with `decodeCashAddr`, statically. It used
+// to be pulled in with `require()` inside `addressFromScript` — an ESM module
+// in a Vite build has no `require`, so every BCH swap deposit died there with
+// a ReferenceError before signing (2026-09-29 send-safety audit, F7). The
+// comment beside it feared an import cycle; `decodeCashAddr` from the same
+// module was already a static import, so there was none.
+import { decodeCashAddr, encodeCashAddr } from "../../wallets/bch-wallet";
+import { atomicToDecimal, decimalToAtomic } from "../../wallets/decimal-amount";
+import { SendOutcomeUnknownError } from "../../wallets/send-outcome";
+import type { ChainAdapter, ChainType } from "../../wallets/types";
+import {
+  errorText,
+  isDefinitiveBroadcastRefusal,
+  withTimeout,
+} from "./broadcast-outcome";
 
 // ─── Solana ─────────────────────────────────────────────────────
 
@@ -144,8 +161,64 @@ export async function executeSolanaTransfer(args: {
   // Skip web3's pre-broadcast verification — it'd recompute the signature
   // (we don't have the secret here).
   const wire = tx.serialize({ requireAllSignatures: true, verifySignatures: true });
-  const txHash = await broadcastTx("SOLANA", args.rpcUrl, bytesToBase64(wire));
-  return { txHash };
+  return broadcastSolanaOnce({
+    connection,
+    rpcUrl: args.rpcUrl,
+    wireB64: bytesToBase64(wire),
+    // A Solana transaction's id IS its fee payer's signature.
+    signatureB58: encodeBase58(sigBytes),
+    ticker: "SOL",
+  });
+}
+
+/**
+ * Broadcast signed Solana bytes ONCE, and never report a deposit that may
+ * have gone out as a plain failure (2026-09-29 send-safety audit, F2).
+ *
+ * A rejected `sendTransaction` is ambiguous: a timeout or a dropped
+ * connection can come after the node forwarded the transaction. The id is
+ * known before broadcasting (the signature), so a failure is resolved by
+ * asking for that signature's status; if it is still unknown and the error
+ * was not a definite refusal (a failed preflight simulation, say), the caller
+ * gets `SendOutcomeUnknownError` carrying the signature — and the swap modal
+ * shows "check this on the explorer", not Retry.
+ */
+async function broadcastSolanaOnce(args: {
+  connection: { getSignatureStatuses: (sigs: string[]) => Promise<{ value: Array<unknown | null> }> };
+  rpcUrl: string;
+  wireB64: string;
+  signatureB58: string;
+  ticker: string;
+}): Promise<{ txHash: string }> {
+  try {
+    const txHash = await broadcastTx("SOLANA", args.rpcUrl, args.wireB64);
+    return { txHash };
+  } catch (e) {
+    const msg = errorText(e);
+    let seen = false;
+    try {
+      const st = await withTimeout(
+        args.connection.getSignatureStatuses([args.signatureB58]),
+        8_000,
+        "Solana signature lookup",
+      );
+      seen = !!st?.value?.[0];
+    } catch {
+      /* lookup unavailable — fall through to classification */
+    }
+    if (seen) return { txHash: args.signatureB58 };
+    if (isDefinitiveBroadcastRefusal(msg)) {
+      throw new Error(
+        `The Solana network refused the ${args.ticker} deposit, so it was not sent: ${msg}`,
+      );
+    }
+    throw new SendOutcomeUnknownError(
+      `The ${args.ticker} deposit may have been sent — the broadcast failed ` +
+        `ambiguously (${msg}). Check ${args.signatureB58} on a Solana explorer ` +
+        `before trying again.`,
+      args.signatureB58,
+    );
+  }
 }
 
 // ─── Solana SPL token transfer (Phase 2) ───────────────────────
@@ -283,8 +356,13 @@ export async function executeSplTransfer(args: {
   tx.addSignature(owner, Buffer.from(sigBytes));
 
   const wire = tx.serialize({ requireAllSignatures: true, verifySignatures: true });
-  const txHash = await broadcastTx("SOLANA", args.rpcUrl, bytesToBase64(wire));
-  return { txHash };
+  return broadcastSolanaOnce({
+    connection,
+    rpcUrl: args.rpcUrl,
+    wireB64: bytesToBase64(wire),
+    signatureB58: encodeBase58(sigBytes),
+    ticker: "SPL token",
+  });
 }
 
 // ─── NEAR native ────────────────────────────────────────────────
@@ -565,24 +643,6 @@ function stripEd25519Prefix(pk: string): string {
   return pk.startsWith("ed25519:") ? pk.slice("ed25519:".length) : pk;
 }
 
-/** Base58 (Bitcoin alphabet) — NEAR's hash and key encoding. */
-function encodeBase58(bytes: Uint8Array): string {
-  const ALPHABET =
-    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
-  let n = 0n;
-  for (const b of bytes) n = (n << 8n) | BigInt(b);
-  let out = "";
-  while (n > 0n) {
-    out = ALPHABET[Number(n % 58n)] + out;
-    n /= 58n;
-  }
-  for (const b of bytes) {
-    if (b !== 0) break;
-    out = "1" + out;
-  }
-  return out;
-}
-
 /* ─── NEAR borsh encoder (hand-rolled, no near-api-js dep) ───── */
 //
 // Encodes the minimal transaction shape we need:
@@ -756,6 +816,32 @@ class BorshWriter {
   }
 }
 
+/** Base58 (Bitcoin alphabet) encoder — the inverse of `decodeBase58Variable`.
+ *  Used to name a signed Solana transaction by its signature before it is
+ *  broadcast, so an ambiguous broadcast can still be looked up (F2). */
+export function encodeBase58(bytes: Uint8Array): string {
+  const ALPHABET =
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let zeros = 0;
+  while (zeros < bytes.length && bytes[zeros] === 0) zeros++;
+  const digits: number[] = [];
+  for (let i = zeros; i < bytes.length; i++) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = Math.floor(carry / 58);
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = Math.floor(carry / 58);
+    }
+  }
+  let out = "1".repeat(zeros);
+  for (let i = digits.length - 1; i >= 0; i--) out += ALPHABET[digits[i]];
+  return out;
+}
+
 /** Variable-length base58 decoder. Returns however many bytes the input
  *  decodes to. */
 function decodeBase58Variable(s: string): Uint8Array {
@@ -882,15 +968,18 @@ export async function executeUtxoTransfer(args: {
   // 1. Fetch UTXOs from Esplora.
   const utxos = await fetchEsploraUtxos(args.rpcUrl, args.fromAddress);
   if (utxos.length === 0) {
-    throw new Error(
-      `No UTXOs found at ${args.fromAddress}. Did the funding tx confirm?`
-    );
+    throw new Error(singleAddressEmptyMessage(args.fromAddress, args.chain));
   }
   utxos.sort((a, b) => Number(a.value - b.value)); // smallest-first
 
   // 2. Greedy coin selection assuming ~110-vB tx baseline + 32 vB per
   //    extra input. Recalibrate as inputs are added.
-  const feeRate = args.feeRateSatVb ?? 5; // sane default for both chains
+  //
+  // The rate is the chain's live 3-block estimate when Esplora answers
+  // (2026-09-29, F4). It was a flat 5 sat/vB: in a fee spike that sits in the
+  // mempool for hours, and a deposit that lands after the quote's deadline is
+  // one 1Click documents as "funds may be lost". 5 remains the fallback.
+  const feeRate = args.feeRateSatVb ?? (await esploraFeeRate(args.rpcUrl)) ?? 5;
   const selected: typeof utxos = [];
   let inSum = 0n;
   let estVbytes = 110;
@@ -961,10 +1050,93 @@ export async function executeUtxoTransfer(args: {
   const psbtHex = psbt.toHex();
   const signed = await signPsbt(args.sessionId, psbtHex, args.chain);
 
-  // 5. Broadcast via Esplora POST /tx.
+  // 5. Broadcast via Esplora POST /tx — once. The txid is fixed by the signed
+  //    bytes, so an ambiguous failure is resolved by looking it up (F2).
   const broadcastChain = args.chain === "ltc" ? "LTC" : "BTC";
-  const txHash = await broadcastTx(broadcastChain, args.rpcUrl, signed.rawTx);
-  return { txHash };
+  const txid = utxoTxId(bitcoinjs, signed.rawTx);
+  try {
+    const txHash = await broadcastTx(broadcastChain, args.rpcUrl, signed.rawTx);
+    return { txHash };
+  } catch (e) {
+    const msg = errorText(e);
+    if (txid && (await esploraTxKnown(args.rpcUrl, txid))) return { txHash: txid };
+    throw postSignBroadcastFailure(broadcastChain, msg, txid);
+  }
+}
+
+/**
+ * The error for a UTXO deposit whose ONE address holds nothing.
+ *
+ * Replaces "No UTXOs found at X. Did the funding tx confirm?" (2026-09-29,
+ * F10). That question sent the operator looking for an unconfirmed funding
+ * transaction that did not exist: the address had been emptied by an ordinary
+ * spend on 2026-08-22, which moved the 4.02888049 LTC change to another
+ * address of the same account. This path spends a single address; the
+ * wallet's balance covers every address of the account.
+ */
+export function singleAddressEmptyMessage(address: string, chain: string): string {
+  const coin = chain.toUpperCase();
+  return (
+    `No ${coin} is held at ${address} itself. This swap path can only spend ` +
+    `that one address, and your ${coin} balance is on other addresses of the ` +
+    `same wallet (change from earlier sends). Nothing was sent.`
+  );
+}
+
+/** The error for a UTXO deposit whose signed broadcast failed: a refusal when
+ *  the node said so, otherwise an unknown outcome carrying the txid (F2). */
+function postSignBroadcastFailure(ticker: string, msg: string, txid: string | null): Error {
+  if (isDefinitiveBroadcastRefusal(msg)) {
+    return new Error(`The ${ticker} network refused the deposit, so it was not sent: ${msg}`);
+  }
+  return new SendOutcomeUnknownError(
+    `The ${ticker} deposit may have been sent — the broadcast failed ambiguously ` +
+      `(${msg}).` +
+      (txid ? ` Check ${txid} on a block explorer before trying again.` : ""),
+    txid ?? undefined,
+  );
+}
+
+/** The txid of signed raw hex, or null when bitcoinjs cannot parse it. */
+function utxoTxId(bjs: typeof import("bitcoinjs-lib"), rawHex: string): string | null {
+  try {
+    return bjs.Transaction.fromHex(rawHex).getId();
+  } catch {
+    return null;
+  }
+}
+
+/** Does this Esplora know `txid` (mempool or chain)? False on any failure. */
+async function esploraTxKnown(base: string, txid: string): Promise<boolean> {
+  try {
+    const resp = await withTimeout(
+      fetch(`${base.replace(/\/$/, "")}/tx/${encodeURIComponent(txid)}/status`),
+      8_000,
+      "Esplora tx lookup",
+    );
+    return resp.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** Esplora's ~3-block fee estimate in sat/vB, rounded up; null if unavailable. */
+async function esploraFeeRate(base: string): Promise<number | null> {
+  try {
+    const resp = await withTimeout(
+      fetch(`${base.replace(/\/$/, "")}/fee-estimates`),
+      8_000,
+      "Esplora fee estimate",
+    );
+    if (!resp.ok) return null;
+    const est = (await resp.json()) as Record<string, number>;
+    const rate = est["3"] ?? est["2"] ?? est["1"] ?? est["6"];
+    return typeof rate === "number" && Number.isFinite(rate) && rate > 0
+      ? Math.max(1, Math.ceil(rate))
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 interface EsploraUtxo {
@@ -1102,9 +1274,7 @@ async function executeLegacyUtxoTransfer(args: {
       ? await fetchDogeUtxos(args.fromAddress)
       : await fetchBchUtxos(args.fromAddress);
   if (utxos.length === 0) {
-    throw new Error(
-      `No UTXOs found at ${args.fromAddress}. Did the funding tx confirm?`
-    );
+    throw new Error(singleAddressEmptyMessage(args.fromAddress, args.chain));
   }
   utxos.sort((a, b) => Number(a.value - b.value)); // smallest-first
 
@@ -1183,7 +1353,13 @@ async function executeLegacyUtxoTransfer(args: {
   }));
   assertPsbtOutputShape({
     outputs,
-    expectedRecipient: args.depositAddress,
+    // BCH outputs decode to prefixed CashAddr; the deposit address is put in
+    // the same form so the comparison is like with like (a bare or legacy
+    // form of the SAME address used to read as a different recipient).
+    expectedRecipient:
+      args.chain === "bch"
+        ? canonicalBchAddress(bitcoinjs, args.depositAddress)
+        : args.depositAddress,
     expectedValueSat: amountSat,
     ticker: args.chain === "doge" ? "DOGE" : "BCH",
   });
@@ -1192,12 +1368,45 @@ async function executeLegacyUtxoTransfer(args: {
   const signed = await signPsbt(args.sessionId, psbtHex, args.chain);
 
   // Broadcast — legacy chains use BlockCypher (DOGE) / Blockchair (BCH)
-  // instead of the Esplora-shaped `POST /tx` the BTC/LTC path uses.
-  const txHash =
-    args.chain === "doge"
-      ? await broadcastDogeRawTx(signed.rawTx)
-      : await broadcastBchRawTx(signed.rawTx);
-  return { txHash };
+  // instead of the Esplora-shaped `POST /tx` the BTC/LTC path uses. Once:
+  // a failure after this point is a refusal or an unknown, never a retry (F2).
+  const ticker = args.chain === "doge" ? "DOGE" : "BCH";
+  const txid = utxoTxId(bitcoinjs, signed.rawTx);
+  try {
+    const txHash =
+      args.chain === "doge"
+        ? await broadcastDogeRawTx(signed.rawTx)
+        : await broadcastBchRawTx(signed.rawTx);
+    return { txHash };
+  } catch (e) {
+    throw postSignBroadcastFailure(ticker, errorText(e), txid);
+  }
+}
+
+/**
+ * Any BCH address (prefixed or bare CashAddr, or legacy base58) in canonical
+ * prefixed CashAddr form; returned unchanged when it is none of those, which
+ * then fails the output comparison rather than passing it.
+ */
+export function canonicalBchAddress(
+  bjs: typeof import("bitcoinjs-lib"),
+  address: string,
+): string {
+  const a = address.trim();
+  try {
+    const { hash, type } = decodeCashAddr(a);
+    return encodeCashAddr(hash, type);
+  } catch {
+    /* not CashAddr — try legacy below */
+  }
+  try {
+    const { hash, version } = bjs.address.fromBase58Check(a);
+    if (version === bjs.networks.bitcoin.pubKeyHash) return encodeCashAddr(hash, "p2pkh");
+    if (version === bjs.networks.bitcoin.scriptHash) return encodeCashAddr(hash, "p2sh");
+  } catch {
+    /* not legacy either */
+  }
+  return a;
 }
 
 // ─── DOGE source helpers ────────────────────────────────────────
@@ -1372,27 +1581,16 @@ function addressFromScript(
       script[23] === 0x88 &&
       script[24] === 0xac
     ) {
-      // We could re-encode to CashAddr here for a stricter match, but
-      // `assertPsbtOutputShape` only checks string equality — and the
-      // value match is what really matters. Return the legacy form;
-      // the caller can normalize.
+      // Encode back to prefixed CashAddr so the assertion compares
+      // like-shaped strings against the (canonicalized) deposit address.
+      // `encodeCashAddr` is a static import at the top of this file — the
+      // `require()` that used to sit here threw "require is not defined" in
+      // the ESM build before any BCH deposit could be signed (F7).
       const hash = script.subarray(3, 23);
-      const legacyAddr = bjs.address.toBase58Check(
-        hash,
-        bjs.networks.bitcoin.pubKeyHash
-      );
-      // Normalize the comparison: encode back to CashAddr so the
-      // assertion compares like-shaped strings against the deposit
-      // address (which 1Click returns as CashAddr).
-      // Lazy import to avoid a cyclic dep at module init.
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
-      const { encodeCashAddr } = require("../../wallets/bch-wallet") as {
-        encodeCashAddr: (h: Uint8Array, t: "p2pkh" | "p2sh") => string;
-      };
       try {
         return encodeCashAddr(hash, "p2pkh");
       } catch {
-        return legacyAddr;
+        return bjs.address.toBase58Check(hash, bjs.networks.bitcoin.pubKeyHash);
       }
     }
     return bjs.address.fromOutputScript(script, bjs.networks.bitcoin);
@@ -1514,7 +1712,7 @@ export async function executeAdapterTransfer(args: {
   decimals: number;
   /** For error copy only. */
   ticker: string;
-}): Promise<{ txHash: string }> {
+}): Promise<{ txHash: string; pending?: boolean }> {
   const atomic = atomicStringToBigInt(args.amountAtomic);
   if (atomic <= 0n) {
     throw new Error(
@@ -1537,15 +1735,149 @@ export async function executeAdapterTransfer(args: {
         `cannot be a swap source in this build.`,
     );
   }
+  // A `SendOutcomeUnknownError` from the adapter propagates untouched: the
+  // swap modal shows it as "may have been sent — check the hash" (F2).
   const result = await adapter.sendTransaction(
     args.privateKey,
     args.depositAddress,
     display,
   );
   if (!result?.hash) {
-    throw new Error(`${args.ticker} deposit did not return a transaction id.`);
+    // The adapter returned rather than threw, so it believes it sent. With no
+    // id there is nothing to look up — unknown, not failed (2026-09-29, F2).
+    throw new SendOutcomeUnknownError(
+      `The ${args.ticker} deposit was handed to the network but no transaction ` +
+        `id came back. Check your ${args.ticker} account before trying again.`,
+    );
   }
-  return { txHash: result.hash };
+  return { txHash: result.hash, pending: result.pending === true };
+}
+
+// ─── UTXO sources, account-wide — TS-signed through the adapter ──────
+
+/**
+ * Can this wallet's UTXO deposit go through the adapter's ACCOUNT-WIDE send?
+ * (2026-09-29 send-safety audit, F10.)
+ *
+ * The same three conditions the Send button checks (`useSend` →
+ * `shouldUseAccountSend`): the adapter implements `sendFromAccount`, we hold
+ * the mnemonic, and `supportsAccountSend` confirms the displayed address is on
+ * the account the adapter scans (LTC also has a BIP-44 legacy account; scanning
+ * the wrong one would report a false shortfall). The fourth Send condition —
+ * no token asset type — cannot arise: these are native coins.
+ */
+export async function accountSendAvailable(args: {
+  chainKey: ChainType;
+  mnemonic: string | undefined;
+  fromAddress: string;
+}): Promise<boolean> {
+  if (!args.mnemonic || !args.fromAddress) return false;
+  const { getAdapter } = await import("../../wallets");
+  const adapter = getAdapter(args.chainKey);
+  if (!adapter?.sendFromAccount || !adapter.supportsAccountSend) return false;
+  try {
+    return adapter.supportsAccountSend(args.mnemonic, args.fromAddress) === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Submit a NEAR Intents deposit from a UTXO wallet's WHOLE ACCOUNT, through
+ * the same `ChainAdapter.sendFromAccount` the Send button uses (2026-09-29
+ * send-safety audit, F10).
+ *
+ * # Why
+ *
+ * The Rust PSBT path (`executeUtxoTransfer`) fetches UTXOs for ONE address,
+ * the wallet's primary one. A UTXO wallet stops holding coins there the first
+ * time it spends: the change goes to a fresh address. The operator's
+ * 0.31324582 LTC → USDC-POL swap failed at Confirm with
+ * "No UTXOs found at ltc1qty7jwkskqt8m82w73hxcsrh7gxkf90x27pxjn3" while the
+ * wallet showed 4.03 LTC — the primary address had been emptied on
+ * 2026-08-22 and its change sat on another address of the same account.
+ *
+ * # Units
+ *
+ * `amountAtomic` is 1Click's `amountIn` (satoshis). The adapters take a
+ * decimal string and parse it back with `Math.round(parseFloat(amount) *
+ * 1e8)`. The conversion here is exact bigint arithmetic, and the adapter's
+ * parse is replayed before anything is signed: an amount that would not come
+ * back as the same number of satoshis is refused, never "close enough" —
+ * for an EXACT_INPUT quote a deposit one satoshi short is refunded, not
+ * swapped.
+ */
+export async function executeAccountUtxoTransfer(args: {
+  chainKey: ChainType;
+  mnemonic: string;
+  /** The wallet's displayed (primary) address; the adapter re-checks it. */
+  fromAddress: string;
+  depositAddress: string;
+  /** Atomic units as a decimal string, straight from `quote.amountIn`. */
+  amountAtomic: string;
+  decimals: number;
+  ticker: string;
+}): Promise<{ txHash: string; pending?: boolean }> {
+  const atomic = atomicStringToBigInt(args.amountAtomic);
+  if (atomic <= 0n) {
+    throw new Error(`${args.ticker} amount must be positive (got ${args.amountAtomic}).`);
+  }
+  const amountDecimal = atomicToDecimal(atomic, args.decimals);
+  // Exactness, both ways: our own parser, and the adapters' float parse.
+  if (decimalToAtomic(amountDecimal, args.decimals) !== atomic) {
+    throw new Error(`${args.ticker} amount ${args.amountAtomic} did not convert exactly. Nothing was sent.`);
+  }
+  if (
+    atomic > BigInt(Number.MAX_SAFE_INTEGER) ||
+    Math.round(parseFloat(amountDecimal) * 10 ** args.decimals) !== Number(atomic)
+  ) {
+    throw new Error(
+      `${args.ticker} amount ${amountDecimal} cannot be handed to the wallet's ` +
+        `send exactly, so the deposit could differ from the quote. Nothing was sent.`,
+    );
+  }
+  const { getAdapter } = await import("../../wallets");
+  const adapter = getAdapter(args.chainKey);
+  if (!adapter?.sendFromAccount) {
+    throw new Error(`The ${args.ticker} wallet cannot send from its whole account in this build. Nothing was sent.`);
+  }
+  const feeRate = await fastPerByteFeeRate(adapter);
+  const result = await adapter.sendFromAccount(
+    args.mnemonic,
+    args.depositAddress,
+    amountDecimal,
+    args.fromAddress,
+    feeRate !== undefined ? { feeRate } : undefined,
+  );
+  if (!result?.hash) {
+    throw new SendOutcomeUnknownError(
+      `The ${args.ticker} deposit was handed to the network but no transaction ` +
+        `id came back. Check your ${args.ticker} wallet before trying again.`,
+    );
+  }
+  return { txHash: result.hash, pending: result.pending === true };
+}
+
+/**
+ * The adapter's FAST tier as a per-(v)byte rate, or undefined to let the
+ * adapter pick its own (its live normal tier). A swap deposit has a deadline
+ * and the Send modal's default does not, hence fast. Mirrors
+ * `features/send/feeDisplay.ts::feeRateForSend` (the swap feature may not
+ * import `send`, per BOUNDARIES.md): only a live per-byte rate is passed,
+ * rounded UP, because a total-denominated estimate (DOGE's) is not a rate.
+ */
+async function fastPerByteFeeRate(adapter: ChainAdapter): Promise<number | undefined> {
+  try {
+    const est = await withTimeout(adapter.getFeeEstimate(), 8_000, "fee estimate");
+    if (!est || est.isFallback || !/^(sat|duffs)\/v?B$/i.test(String(est.unit).trim())) {
+      return undefined;
+    }
+    const n = Number((est.fast ?? est.normal)?.value);
+    if (!Number.isFinite(n) || n <= 0) return undefined;
+    return Math.max(Math.ceil(n), 1);
+  } catch {
+    return undefined;
+  }
 }
 
 // ─── shared helpers ─────────────────────────────────────────────

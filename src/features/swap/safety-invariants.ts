@@ -152,7 +152,18 @@ export type SafetyInvariantId =
   // QUOTE_AMOUNT_VS_USER_INTENT, plus a freshness check the aggregators
   // don't need because only the desk publishes a hard quote expiry.
   | "DESK_QUOTE_AMOUNT_VS_USER_INTENT"
-  | "DESK_QUOTE_EXPIRED";
+  | "DESK_QUOTE_EXPIRED"
+  // 2026-09-29 send-safety audit, F1: the source asset checked against the
+  // 1Click catalog entry the quote names, independently of the registry the
+  // rest of the pipeline reads. Every earlier invariant compared the built tx
+  // with the SAME registry reading that was wrong — a stablecoin leg with no
+  // `tokenContract` — so all six passed on a native-coin transfer of the
+  // token amount.
+  | "SOURCE_ASSET_NOT_IN_CATALOG"
+  | "SOURCE_ASSET_CATALOG_MISMATCH"
+  | "DEPOSIT_TX_SHAPE_DRIFT"
+  // F3: 1Click's echo of the request differs from what the wallet sent.
+  | "QUOTE_ECHO_MISMATCH";
 
 // ---------------------------------------------------------------------------
 // Invariant 1: quote.amountIn ≈ user-intended atomic amount
@@ -342,7 +353,13 @@ export function assertTxNotPlausibleOverspend(args: {
  *   - Legacy:    [nonce, gasPrice, gasLimit, to, value, data, v, r, s]
  *   - EIP-1559: 0x02 || rlp([chainId, nonce, maxPriority, maxFee, gasLimit, to, value, data, accessList, v, r, s])
  */
-export function decodeEvmSignedTx(rawTxHex: string): { to: string; value: bigint } {
+export function decodeEvmSignedTx(rawTxHex: string): {
+  to: string;
+  value: bigint;
+  /** `0x`-prefixed calldata (`"0x"` when empty). Added 2026-09-29 so the
+   *  post-sign check can see an ERC-20 transfer's recipient and amount. */
+  data: string;
+} {
   const cleaned = rawTxHex.startsWith("0x") ? rawTxHex.slice(2) : rawTxHex;
   if (cleaned.length === 0 || cleaned.length % 2 !== 0) {
     throw new SafetyInvariantError({
@@ -378,6 +395,7 @@ export function decodeEvmSignedTx(rawTxHex: string): { to: string; value: bigint
   // Robust approach: find `to` by checking 20-byte and `value` immediately after.
   let toIdx: number;
   let valueIdx: number;
+  // `data` always follows `value` in all four layouts.
   if (isLegacy) {
     toIdx = 3;
     valueIdx = 4;
@@ -405,7 +423,12 @@ export function decodeEvmSignedTx(rawTxHex: string): { to: string; value: bigint
   }
   const toBytes = list[toIdx];
   const valueBytes = list[valueIdx];
-  if (!(toBytes instanceof Uint8Array) || !(valueBytes instanceof Uint8Array)) {
+  const dataBytes = list[valueIdx + 1];
+  if (
+    !(toBytes instanceof Uint8Array) ||
+    !(valueBytes instanceof Uint8Array) ||
+    !(dataBytes instanceof Uint8Array)
+  ) {
     throw new SafetyInvariantError({
       invariant: "SIGNED_TX_VALUE_DRIFT",
       message: "Signed EVM tx fields decoded to non-bytes — corrupt structure.",
@@ -417,7 +440,7 @@ export function decodeEvmSignedTx(rawTxHex: string): { to: string; value: bigint
   for (const b of valueBytes) {
     value = (value << 8n) | BigInt(b);
   }
-  return { to, value };
+  return { to, value, data: "0x" + bytesToHex(dataBytes) };
 }
 
 export function assertSignedTxValueMatches(args: {
@@ -618,6 +641,173 @@ export function assertPsbtOutputShape(args: {
       },
     });
   }
+}
+
+// ---------------------------------------------------------------------------
+// Invariants 11-12: the source asset, checked against the 1Click catalog
+// (2026-09-29 send-safety audit, F1)
+// ---------------------------------------------------------------------------
+
+/** Contract / mint / TRC-20 address equality: 0x-hex case-insensitively,
+ *  everything else (base58 SPL mints, TRON) exactly. */
+function sameContract(a: string, b: string): boolean {
+  const hex = /^0x[0-9a-fA-F]{40}$/;
+  if (hex.test(a) && hex.test(b)) return a.toLowerCase() === b.toLowerCase();
+  return a.trim() === b.trim();
+}
+
+/**
+ * The asset the executor is about to send must be the asset 1Click's catalog
+ * says the quote is for — native coin or token, which contract, which
+ * decimals. Returns the contract the deposit must transfer (`null` for a
+ * native coin), taken from the CATALOG rather than the registry.
+ *
+ * Fails closed: an asset id the catalog does not carry, a token the catalog
+ * lists without the registry naming a contract, a contract that differs, a
+ * contract where the catalog lists a native coin, or decimals that disagree
+ * all throw before anything is built.
+ *
+ * Why the catalog and not the registry: F1 was a registry that had lost every
+ * stablecoin leg's contract, and each existing invariant compared the built
+ * transaction with that same registry, so they all agreed with each other and
+ * the wrong asset went out. The catalog is an independent, generated record
+ * of what 1Click itself says the asset is.
+ */
+export function assertSourceMetaMatchesCatalog(args: {
+  ticker: string;
+  nearIntentsAsset: string | null | undefined;
+  decimals: number;
+  tokenContract?: string | null;
+  catalogAsset:
+    | { assetId: string; decimals: number; contractAddress?: string }
+    | null
+    | undefined;
+}): { contract: string | null } {
+  const { catalogAsset } = args;
+  if (!args.nearIntentsAsset || !catalogAsset || catalogAsset.assetId !== args.nearIntentsAsset) {
+    throw new SafetyInvariantError({
+      invariant: "SOURCE_ASSET_NOT_IN_CATALOG",
+      message:
+        `${args.ticker}'s NEAR Intents asset id ${args.nearIntentsAsset ?? "(none)"} is not in ` +
+        `the 1Click catalog this build ships, so there is no independent record of ` +
+        `whether it is a native coin or a token. Refusing to build a deposit.`,
+      context: {
+        ticker: args.ticker,
+        nearIntentsAsset: String(args.nearIntentsAsset ?? ""),
+      },
+    });
+  }
+  const mismatch = (message: string): never => {
+    throw new SafetyInvariantError({
+      invariant: "SOURCE_ASSET_CATALOG_MISMATCH",
+      message,
+      context: {
+        ticker: args.ticker,
+        nearIntentsAsset: catalogAsset.assetId,
+        catalogContract: catalogAsset.contractAddress ?? "(native)",
+        registryContract: args.tokenContract ?? "(none)",
+        catalogDecimals: String(catalogAsset.decimals),
+        registryDecimals: String(args.decimals),
+      },
+    });
+  };
+  if (catalogAsset.decimals !== args.decimals) {
+    mismatch(
+      `${args.ticker}: the wallet converts amounts with ${args.decimals} decimals but 1Click ` +
+        `lists ${catalogAsset.assetId} with ${catalogAsset.decimals}. Refusing to build a deposit.`,
+    );
+  }
+  const catalogContract = catalogAsset.contractAddress?.trim() || null;
+  const registryContract = args.tokenContract?.trim() || null;
+  if (catalogContract && !registryContract) {
+    mismatch(
+      `${args.ticker} is a token (contract ${catalogContract}) but the wallet has no contract ` +
+        `for it, so the deposit would move the chain's NATIVE coin instead. Refusing to build it.`,
+    );
+  }
+  if (!catalogContract && registryContract) {
+    mismatch(
+      `${args.ticker} is a native coin on 1Click but the wallet names a token contract ` +
+        `(${registryContract}) for it. Refusing to build a deposit.`,
+    );
+  }
+  if (catalogContract && registryContract && !sameContract(catalogContract, registryContract)) {
+    mismatch(
+      `${args.ticker}: the wallet's contract ${registryContract} is not the contract 1Click ` +
+        `lists (${catalogContract}). Refusing to build a deposit.`,
+    );
+  }
+  return { contract: catalogContract };
+}
+
+/**
+ * An EVM deposit must be exactly one of two shapes, chosen by the catalog:
+ *
+ *   - token (`contract` set): `to` = the contract, `value` = 0, calldata =
+ *     `transfer(depositAddress, amountAtomic)`;
+ *   - native (`contract` null): `to` = the deposit address, `value` =
+ *     `amountAtomic`, no calldata.
+ *
+ * Run on the unsigned transaction (stage "post-build") and again on the
+ * signed bytes (stage "post-sign"), so neither the builder nor the signer can
+ * turn one shape into the other.
+ */
+export function assertEvmDepositShape(args: {
+  to: string;
+  value: bigint;
+  data: string;
+  depositAddress: string;
+  amountAtomic: bigint;
+  contract: string | null;
+  ticker: string;
+  stage: "post-build" | "post-sign";
+}): void {
+  const fail = (what: string): never => {
+    throw new SafetyInvariantError({
+      invariant: "DEPOSIT_TX_SHAPE_DRIFT",
+      message:
+        `${args.ticker} deposit (${args.stage}) is not the transfer the quote needs: ${what}. ` +
+        `Refusing to ${args.stage === "post-build" ? "sign" : "broadcast"}.`,
+      context: {
+        ticker: args.ticker,
+        stage: args.stage,
+        expected: args.contract ? `token ${args.contract}` : "native",
+        to: args.to,
+        value: args.value.toString(),
+        dataHead: args.data.slice(0, 10),
+        depositAddress: args.depositAddress,
+        amountAtomic: args.amountAtomic.toString(),
+      },
+    });
+  };
+  const data = args.data && args.data !== "" ? args.data.toLowerCase() : "0x";
+  if (args.contract) {
+    if (args.to.toLowerCase() !== args.contract.toLowerCase()) {
+      fail(`sent to ${args.to}, not the token contract ${args.contract}`);
+    }
+    if (args.value !== 0n) fail(`carries ${args.value} of the native coin`);
+    // Selector + two 32-byte words; the recipient word is left-padded.
+    const body = data.startsWith("0x") ? data.slice(2) : data;
+    if (body.length !== 136 || !body.startsWith("a9059cbb") || !/^0{24}/.test(body.slice(8, 72))) {
+      fail(`calldata is not transfer(address,uint256)`);
+    }
+    const recipient = "0x" + body.slice(32, 72);
+    const amount = BigInt("0x" + body.slice(72));
+    if (recipient !== args.depositAddress.toLowerCase()) {
+      fail(`transfers to ${recipient}, not the deposit address`);
+    }
+    if (amount !== args.amountAtomic) {
+      fail(`transfers ${amount}, not the quoted ${args.amountAtomic}`);
+    }
+    return;
+  }
+  if (args.to.toLowerCase() !== args.depositAddress.toLowerCase()) {
+    fail(`sent to ${args.to}, not the deposit address`);
+  }
+  if (args.value !== args.amountAtomic) {
+    fail(`value ${args.value}, not the quoted ${args.amountAtomic}`);
+  }
+  if (data !== "0x") fail(`a native transfer carries calldata ${data.slice(0, 10)}…`);
 }
 
 // ---------------------------------------------------------------------------

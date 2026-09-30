@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Backdrop, Row, Stat, truncate } from "./modal-parts";
 import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
@@ -32,9 +32,22 @@ import {
 import type { SourceSecret } from "./asset-capabilities";
 import type { NormalizedQuote } from "./useSwapQuote";
 import { effectiveModeForSource } from "./router-modes";
-import { decimalToBaseUnitsBigInt } from "./swap-sources";
+import { accountSendAvailable, decimalToBaseUnitsBigInt } from "./swap-sources";
 import type { IntentsBlockchain } from "./near-intents-assets.generated";
 import { getSwapCoinMeta } from "./swap-data";
+import { defaultBlockchainFor } from "./intents-dedup";
+import {
+  IntentsQuoteAlreadyUsedError,
+  intentsDepositAttempt,
+  recordIntentsDeposit,
+} from "./intents-attempts";
+import {
+  assertDepositWindowOpen,
+  assertQuoteBinding,
+  depositWindowMinutesLeft,
+} from "./intents-quote-binding";
+import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
+import { withTimeout } from "./broadcast-outcome";
 
 /**
  * Confirm modal for a SwapKit-routable swap. Renders the locked-in quote,
@@ -48,16 +61,23 @@ import { getSwapCoinMeta } from "./swap-data";
  * in `walletsByChain.cardano` for ADA Send).
  *
  * Lifecycle:
- *   review (default)
+ *   review (default)                — or `used`, if this quote already went out
  *     ↓ user clicks "Sign & Send"
  *   password
  *     ↓ user types vault password + confirms
- *   building → signing → broadcasting → pending
+ *   building → signing → broadcasting → pending   (cannot be closed until pending)
  *     ↓ status polling reaches a terminal state
- *   done | error
+ *   done | error | unknown
  *
  * Status polling continues in the background after the modal closes — the
  * History tab is the source of truth once `done`.
+ *
+ * 2026-09-29 send-safety audit (F2, F3, F4, F9, F10): the modal signs the
+ * quote it was OPENED on, re-checks that quote against the swap on screen
+ * and its deposit deadline before asking for the password, cannot be closed
+ * mid-signature, writes the history row the moment a hash exists, shows an
+ * ambiguous broadcast as "unknown — check the explorer" with the hash, and
+ * never offers Retry on a NEAR Intents quote: a new attempt is a new quote.
  */
 export function SwapConfirmModal({
   open,
@@ -85,11 +105,12 @@ export function SwapConfirmModal({
   quote: NormalizedQuote;
   sourceAddress: string;
   /**
-   * The signing secret for a TS-signed source chain (ADA, XRP, Tron), or
-   * `undefined` for the Rust-signed majority, which sign inside the swap
-   * session. The modal forwards it verbatim and never inspects it; both
-   * swap surfaces build it with the same `sourceSecretFor` helper so the
-   * "which chain needs which kind of secret" decision lives in one place.
+   * The signing secret for a TS-signed source chain (ADA, the UTXO chains'
+   * account-wide send, XRP, Tron), or `undefined` for the Rust-signed
+   * majority, which sign inside the swap session. The modal forwards it
+   * verbatim and never inspects its value; both swap surfaces build it with
+   * the same `sourceSecretFor` helper so the "which chain needs which kind of
+   * secret" decision lives in one place.
    */
   sourceSecret?: SourceSecret;
   destinationAddress: string;
@@ -101,52 +122,44 @@ export function SwapConfirmModal({
     | "executing"
     | "done"
     | "mockStop"
-    | "error";
+    | "error"
+    // 2026-09-29 send-safety audit, F2: the deposit may have gone out and
+    // its outcome is unknown — "check the explorer", never Retry.
+    | "unknown"
+    // F2: this quote's deposit address was already used.
+    | "used";
   const [stage, setStage] = useState<Stage>("review");
   const [password, setPassword] = useState("");
   const [pwError, setPwError] = useState<string | null>(null);
   const [exec, setExec] = useState<SwapExecutionStatus>({ phase: "idle" });
-  const [historyId, setHistoryId] = useState<string | null>(null);
   const [mockStop, setMockStop] = useState<MockSwapAttemptedError | null>(null);
   const [safetyError, setSafetyError] = useState<SafetyInvariantError | null>(null);
-  // Why this XRP payout must not be signed, or null (2026-09-29). See
-  // `xrpPayoutGuard.ts`: a first payment to an XRP account that does not
-  // exist yet is refused by the ledger below the base reserve.
-  const [xrpBlock, setXrpBlock] = useState<string | null>(null);
+  const [unknownOutcome, setUnknownOutcome] = useState<{
+    message: string;
+    hash?: string;
+  } | null>(null);
+  const [usedInfo, setUsedInfo] = useState<{ hash?: string } | null>(null);
+  // The XRP payout guard, as a state machine rather than a nullable string
+  // (2026-09-29, F9): while the ledger lookup is in flight Sign is disabled;
+  // a lookup that fails or takes too long allows Sign WITH a warning; the
+  // guard is asked again right before signing.
+  const [xrpCheck, setXrpCheck] = useState<XrpPayoutCheck>({ state: "idle" });
+  // Whether a UTXO source will spend its whole account (F10) — for the FROM
+  // line. Null until known.
+  const [accountWide, setAccountWide] = useState<boolean | null>(null);
+  // A tick so the deposit-window line and its gate re-evaluate while open.
+  const [nowMs, setNowMs] = useState(() => Date.now());
+  // Guards against a second submit while one is in flight (double Enter).
+  const submittingRef = useRef(false);
 
-  // Reset state every time the modal opens (a stale "done" should not
-  // persist between distinct swaps).
-  useEffect(() => {
-    if (!open) return;
-    setStage("review");
-    setPassword("");
-    setPwError(null);
-    setExec({ phase: "idle" });
-    setHistoryId(null);
-    setMockStop(null);
-    setSafetyError(null);
-  }, [open]);
-
-  // Asked once per opened quote. Unknown (the ledger could not be reached)
-  // never blocks — `xrpPayoutBlockReason` returns null for it.
-  useEffect(() => {
-    setXrpBlock(null);
-    if (!open || toAsset.toUpperCase() !== "XRP" || quote.source !== "intents") return;
-    let live = true;
-    void xrpAccountActivation(destinationAddress).then((activation) => {
-      if (!live) return;
-      setXrpBlock(
-        xrpPayoutBlockReason({
-          activation,
-          minReceived: quote.minReceived,
-          destination: destinationAddress,
-        }),
-      );
-    });
-    return () => {
-      live = false;
-    };
-  }, [open, toAsset, quote.source, quote.minReceived, destinationAddress]);
+  // The quote under review, captured when the modal OPENS (F2/F3). Whatever
+  // the parent passes afterwards, this modal shows and signs the quote the
+  // user opened it on. Captured during render, so there is no frame in which
+  // an old snapshot could be signed.
+  const snapRef = useRef<{ open: boolean; quote: NormalizedQuote }>({ open: false, quote });
+  if (open && !snapRef.current.open) snapRef.current = { open: true, quote };
+  if (!open && snapRef.current.open) snapRef.current = { open: false, quote };
+  const q = snapRef.current.open ? snapRef.current.quote : quote;
 
   // Resolve effective metadata for each side. When the user picked a
   // multi-chain symbol via the NetworkPill, `fromBlockchain` carries
@@ -155,7 +168,24 @@ export function SwapConfirmModal({
   const fromMeta =
     getSwapCoinMeta(fromAsset, fromBlockchain) ??
     SWAP_COIN_META[fromAsset.toUpperCase()];
-  const toMeta = SWAP_COIN_META[toAsset.toUpperCase()];
+  // The destination resolved the way the swap form resolves it (its
+  // `toBlockchain` is `defaultBlockchainFor(toAsset)`), so the asset id
+  // compared with the quote's request is the one the form asked for.
+  const toMeta =
+    getSwapCoinMeta(toAsset, defaultBlockchainFor(toAsset) ?? undefined) ??
+    SWAP_COIN_META[toAsset.toUpperCase()];
+  const depositAddr = q.intentsQuote?.depositAddress;
+  const depositDeadline = q.intentsQuote?.deadline ?? q.intentsRequest?.deadline;
+  const windowLeft =
+    q.source === "intents"
+      ? depositWindowMinutesLeft({
+          deadline: depositDeadline,
+          chainKind: fromMeta?.chainKind,
+          nowMs,
+        })
+      : null;
+  const windowClosed = q.source === "intents" && (windowLeft === null || windowLeft < 0);
+
   const sourceExplorer = useMemo(
     () => (exec.sourceTxHash && fromMeta ? fromMeta.explorerTxUrl(exec.sourceTxHash) : null),
     [exec.sourceTxHash, fromMeta]
@@ -165,12 +195,96 @@ export function SwapConfirmModal({
     [exec.destTxHash, toMeta]
   );
 
+  // Reset state every time the modal opens (a stale "done" should not
+  // persist between distinct swaps) — and if this quote's deposit address
+  // was already used, open on that fact instead of on a live Sign button.
+  useEffect(() => {
+    if (!open) return;
+    setPassword("");
+    setPwError(null);
+    setExec({ phase: "idle" });
+    setMockStop(null);
+    setSafetyError(null);
+    setUnknownOutcome(null);
+    setNowMs(Date.now());
+    const prior = intentsDepositAttempt(snapRef.current.quote.intentsQuote?.depositAddress);
+    if (prior) {
+      setUsedInfo({ hash: prior.txHash });
+      setStage("used");
+    } else {
+      setUsedInfo(null);
+      setStage("review");
+    }
+  }, [open]);
+
+  // Deposit-window clock (F4): the gate below is evaluated at render, so it
+  // needs renders. Only while the user can still press Sign.
+  useEffect(() => {
+    if (!open || q.source !== "intents") return;
+    if (stage !== "review" && stage !== "password") return;
+    const t = setInterval(() => setNowMs(Date.now()), 15_000);
+    return () => clearInterval(t);
+  }, [open, q.source, stage]);
+
+  // XRP payout guard (F9). Asked once per opened quote; Sign stays disabled
+  // while the answer is pending; an answer that never comes allows Sign with
+  // a warning after XRP_GUARD_TIMEOUT_MS.
+  useEffect(() => {
+    setXrpCheck({ state: "idle" });
+    if (!open || toAsset.toUpperCase() !== "XRP" || q.source !== "intents") return;
+    let live = true;
+    setXrpCheck({ state: "pending" });
+    void checkXrpPayout({
+      destination: destinationAddress,
+      minReceived: q.minReceived,
+      lookup: xrpAccountActivation,
+      timeoutMs: XRP_GUARD_TIMEOUT_MS,
+    }).then((result) => {
+      if (live) setXrpCheck(result);
+    });
+    return () => {
+      live = false;
+    };
+  }, [open, toAsset, q.source, q.minReceived, destinationAddress]);
+  const xrpGate = xrpSignGate(xrpCheck);
+  const xrpBlock = xrpGate.blockedReason;
+
+  // F10: will this UTXO source spend its whole account? Same question the
+  // executor asks, so the FROM line says what will actually happen.
+  // Keyed on strings, not on `sourceSecret`: the swap views rebuild that
+  // object on every render, and an effect keyed on it would re-derive the
+  // account (and flicker the FROM line) each time.
+  const utxoSigner = fromMeta?.tsSourceSigner;
+  const utxoChainKey = fromMeta?.walletsByChainKey;
+  const utxoMnemonic = sourceSecret?.kind === "mnemonic" ? sourceSecret.value : undefined;
+  useEffect(() => {
+    setAccountWide(null);
+    if (!open || utxoSigner !== "utxo-account") return;
+    const chainKey = utxoChainKey;
+    const mnemonic = utxoMnemonic;
+    if (!chainKey || !mnemonic) {
+      setAccountWide(false);
+      return;
+    }
+    let live = true;
+    void accountSendAvailable({ chainKey, mnemonic, fromAddress: sourceAddress })
+      .then((ok) => {
+        if (live) setAccountWide(ok);
+      })
+      .catch(() => {
+        if (live) setAccountWide(false);
+      });
+    return () => {
+      live = false;
+    };
+  }, [open, utxoSigner, utxoChainKey, utxoMnemonic, sourceAddress]);
+
   // Effective routing mode for this quote — drives the ROUTING row + the
   // dynamic button text. Live + non-mock-detected → green. Anything else
   // → yellow + the explicit "won't broadcast to real chain" copy.
   const modeInfo = useMemo(
-    () => effectiveModeForSource(quote.source, quote.swapKitRoute),
-    [quote.source, quote.swapKitRoute]
+    () => effectiveModeForSource(q.source, q.swapKitRoute),
+    [q.source, q.swapKitRoute]
   );
   const isMockMode = !modeInfo.isLive;
 
@@ -187,38 +301,144 @@ export function SwapConfirmModal({
 
   if (!open) return null;
 
+  // Closing is blocked while a deposit is being signed or broadcast (F2):
+  // closing and re-opening used to land on "review" with the same quote and a
+  // live Sign button while the first deposit was still in flight.
+  const busy = modalIsBusy(stage, exec.phase);
+  const requestClose = () => {
+    if (!busy) onClose();
+  };
+
+  const signBlockedReason =
+    xrpBlock ??
+    (windowClosed
+      ? "This quote's deposit window has closed (or is too close to closing for this chain). Close this window and let the form fetch a new quote."
+      : null);
+
   const submitPassword = async () => {
+    if (submittingRef.current) return;
     if (!password) {
       setPwError("Enter your vault password.");
       return;
     }
+    submittingRef.current = true;
     setPwError(null);
     setStage("executing");
     setExec({ phase: "building" });
 
-    try {
-      // Pull the encrypted vault directly from the store so we don't have
-      // to thread it through props. Same key the rest of the app uses.
-      const store = await getStore();
-      const encrypted = await store.get<EncryptedData>("wallet");
-      if (!encrypted) {
-        throw new Error("No saved vault found — create or import a wallet first.");
+    const id = newSwapId();
+    let historyWritten = false;
+    // Same blockchain-aware resolution as the render-time lookup —
+    // ensures the post-broadcast history entry uses the right
+    // explorer URL when the user picked a non-default chain.
+    const fromMetaLocal = fromMeta;
+    const toMetaLocal = toMeta;
+    const createdAt = new Date().toISOString();
+    const provider = `${q.routerLabel} · ${q.providerName}`;
+
+    const writeIntentsRow = async (r: {
+      sourceTxHash: string;
+      depositAddress: string;
+      outcomeUnknown?: boolean;
+    }) => {
+      const entry: SwapHistoryEntry = {
+        id,
+        fromAsset,
+        toAsset,
+        fromAmount,
+        toAmount: q.expectedReceive,
+        status: "pending",
+        sourceTxHash: r.sourceTxHash,
+        sourceExplorerUrl: r.sourceTxHash
+          ? (fromMetaLocal?.explorerTxUrl(r.sourceTxHash) ?? "")
+          : "",
+        provider,
+        createdAt,
+        depositAddress: r.depositAddress,
+        depositDeadline,
+        ...(r.outcomeUnknown ? { outcomeUnknown: true } : {}),
+      };
+      if (historyWritten) {
+        await updateSwapHistoryEntry(id, entry);
+      } else {
+        await appendSwapHistory(entry);
+        historyWritten = true;
       }
-      const session = await unlockSwap(encrypted, password);
+    };
 
-      const id = newSwapId();
-      setHistoryId(id);
+    const followIntents = (depositAddress: string) => {
+      void pollIntentsToTerminal({
+        depositAddress,
+        deadline: depositDeadline,
+        onUpdate: (resp) => {
+          setExec((prev) => ({
+            ...prev,
+            // Reuse `trackStatus` for the status badge — the modal's
+            // ExecutingFooter renders it as-is.
+            trackStatus: (typeof resp.status === "string"
+              ? resp.status.toLowerCase()
+              : undefined) as SwapExecutionStatus["trackStatus"],
+            rawTrack: undefined,
+          }));
+        },
+      })
+        .then(async (terminal) => {
+          const histStatus = intentsStatusToHistory(
+            typeof terminal.status === "string" ? terminal.status : undefined
+          );
+          // Drift capture (2026-05-26, #22). NEAR Intents reliably
+          // exposes the executed amount in `swap.amountOut` at SUCCESS
+          // time — that's the actual delivered atomic amount the user
+          // received. Only persist when terminal is success so we don't
+          // store a partial / refunded amount as the "actual".
+          const actualReceived =
+            histStatus === "success"
+              ? extractActualReceivedFromIntents(terminal)
+              : undefined;
+          if (historyWritten) {
+            await updateSwapHistoryEntry(id, {
+              status: histStatus,
+              outcomeUnknown: false,
+              completedAt: new Date().toISOString(),
+              ...(actualReceived
+                ? { actualReceived, actualReceivedAt: new Date().toISOString() }
+                : {}),
+            });
+          }
+          setExec((prev) => ({
+            ...prev,
+            phase: "done",
+            trackStatus: (typeof terminal.status === "string"
+              ? terminal.status.toLowerCase()
+              : undefined) as SwapExecutionStatus["trackStatus"],
+          }));
+          // A status from 1Click settles an "unknown" outcome too: it saw the
+          // deposit (or the deadline passed without one).
+          setStage("done");
+        })
+        .catch(() => {
+          // Still pending as far as anyone knows. The history row stays
+          // "pending" and is resumed on the next session
+          // (`intents-status-resume.ts`); nothing here says "failed".
+          setExec((prev) =>
+            prev.phase === "pending"
+              ? { ...prev, error: "Still waiting on NEAR Intents — the swap's status will keep updating in History." }
+              : prev,
+          );
+        });
+    };
 
-      // Same blockchain-aware resolution as the render-time lookup —
-      // ensures the post-broadcast history entry uses the right
-      // explorer URL when the user picked a non-default chain.
-      const fromMetaLocal =
-        getSwapCoinMeta(fromAsset, fromBlockchain) ??
-        SWAP_COIN_META[fromAsset.toUpperCase()];
-      const toMetaLocal = SWAP_COIN_META[toAsset.toUpperCase()];
-
-      if (quote.source === "swapkit") {
-        if (!quote.swapKitRoute) {
+    try {
+      if (q.source === "swapkit") {
+        // Pull the encrypted vault directly from the store so we don't have
+        // to thread it through props. Same key the rest of the app uses.
+        const store = await getStore();
+        const encrypted = await store.get<EncryptedData>("wallet");
+        if (!encrypted) {
+          throw new Error("No saved vault found — create or import a wallet first.");
+        }
+        const session = await unlockSwap(encrypted, password);
+        if (!q.swapKitRoute) {
           throw new Error("SwapKit quote missing route data");
         }
         let result: { sourceTxHash: string };
@@ -226,7 +446,7 @@ export function SwapConfirmModal({
           result = await executeSwapKitTrade({
             sessionId: session.sessionId,
             fromAsset,
-            route: quote.swapKitRoute,
+            route: q.swapKitRoute,
             sourceAddress,
             destinationAddress,
             onPhase: (s) => setExec(s),
@@ -251,14 +471,15 @@ export function SwapConfirmModal({
           fromAsset,
           toAsset,
           fromAmount,
-          toAmount: quote.expectedReceive,
+          toAmount: q.expectedReceive,
           status: "pending",
           sourceTxHash: result.sourceTxHash,
           sourceExplorerUrl: fromMetaLocal?.explorerTxUrl(result.sourceTxHash) ?? "",
-          provider: `${quote.routerLabel} · ${quote.providerName}`,
-          createdAt: new Date().toISOString(),
+          provider,
+          createdAt,
         };
         await appendSwapHistory(entry);
+        historyWritten = true;
 
         // Background poll — SwapKit /track. Modal stays open showing live
         // status. If the user closes the modal we still keep polling so
@@ -321,100 +542,140 @@ export function SwapConfirmModal({
               error: String((e as Error)?.message ?? e),
             }));
           });
-      } else {
-        // NEAR Intents path — execute the source-chain deposit then poll
-        // the 1Click status endpoint.
-        if (!quote.intentsQuote) {
-          throw new Error("NEAR Intents quote missing data");
-        }
-        // Compute the user-intended atomic amount up-front so the
-        // safety-invariant layer can sanity-check `quote.amountIn`
-        // against it. Same conversion as `useSwapQuote` performs when
-        // building the request body — the two MUST agree by construction.
-        if (!fromMeta) {
-          throw new Error(`Unknown source asset ${fromAsset}`);
-        }
-        const userIntendedAtomic = decimalToBaseUnitsBigInt(
-          fromAmount,
-          fromMeta.decimals
-        );
-        const result = await executeIntentsTrade({
-          sessionId: session.sessionId,
-          fromAsset,
-          intentsQuote: quote.intentsQuote,
-          sourceAddress,
-          userIntendedAtomic,
-          fromBlockchain,
-          // Set only for the TS-signed sources (ADA, XRP, Tron); undefined
-          // for every chain that signs via sessionId.
-          sourceSecret,
-          onPhase: (s) => setExec(s),
-        });
-
-        const entry: SwapHistoryEntry = {
-          id,
-          fromAsset,
-          toAsset,
-          fromAmount,
-          toAmount: quote.expectedReceive,
-          status: "pending",
-          sourceTxHash: result.sourceTxHash,
-          sourceExplorerUrl: fromMetaLocal?.explorerTxUrl(result.sourceTxHash) ?? "",
-          provider: `${quote.routerLabel} · ${quote.providerName}`,
-          createdAt: new Date().toISOString(),
-        };
-        await appendSwapHistory(entry);
-
-        void pollIntentsToTerminal({
-          depositAddress: result.depositAddress,
-          onUpdate: (resp) => {
-            setExec((prev) => ({
-              ...prev,
-              // Reuse `trackStatus` for the status badge — the modal's
-              // ExecutingFooter renders it as-is.
-              trackStatus: (typeof resp.status === "string"
-                ? resp.status.toLowerCase()
-                : undefined) as SwapExecutionStatus["trackStatus"],
-              rawTrack: undefined,
-            }));
-          },
-        })
-          .then(async (terminal) => {
-            const histStatus = intentsStatusToHistory(
-              typeof terminal.status === "string" ? terminal.status : undefined
-            );
-            // Drift capture (2026-05-26, #22). NEAR Intents reliably
-            // exposes the executed amount in `swap.amountOut` at SUCCESS
-            // time — that's the actual delivered atomic amount the user
-            // received. Only persist when terminal is success so we don't
-            // store a partial / refunded amount as the "actual".
-            const actualReceived =
-              histStatus === "success"
-                ? extractActualReceivedFromIntents(terminal)
-                : undefined;
-            await updateSwapHistoryEntry(id, {
-              status: histStatus,
-              completedAt: new Date().toISOString(),
-              ...(actualReceived
-                ? { actualReceived, actualReceivedAt: new Date().toISOString() }
-                : {}),
-            });
-            setExec((prev) => ({
-              ...prev,
-              phase: "done",
-              trackStatus: (typeof terminal.status === "string"
-                ? terminal.status.toLowerCase()
-                : undefined) as SwapExecutionStatus["trackStatus"],
-            }));
-            setStage("done");
-          })
-          .catch(async () => {
-            await updateSwapHistoryEntry(id, { status: "pending" });
-            setExec((prev) => ({ ...prev, phase: "error", error: "Status poll failed" }));
-          });
+        return;
       }
+
+      // ─── NEAR Intents ────────────────────────────────────────────────
+      if (!q.intentsQuote || !depositAddr) {
+        throw new Error("NEAR Intents quote missing data");
+      }
+      if (!fromMeta) {
+        throw new Error(`Unknown source asset ${fromAsset}`);
+      }
+      // Compute the user-intended atomic amount up-front so the
+      // safety-invariant layer can sanity-check `quote.amountIn`
+      // against it. Same conversion as `useSwapQuote` performs when
+      // building the request body — the two MUST agree by construction.
+      const userIntendedAtomic = decimalToBaseUnitsBigInt(
+        fromAmount,
+        fromMeta.decimals
+      );
+      const destinationAsset = toMeta?.nearIntentsAsset ?? "";
+
+      // Refusals that need no password and sign nothing (F2/F3/F4/F9). The
+      // executor repeats the first three; asking here first means the user
+      // hears it before typing into a vault prompt that cannot help.
+      const prior = intentsDepositAttempt(depositAddr);
+      if (prior) {
+        setUsedInfo({ hash: prior.txHash });
+        setExec({ phase: "idle" });
+        setStage("used");
+        return;
+      }
+      assertQuoteBinding(q.intentsRequest, {
+        originAsset: fromMeta.nearIntentsAsset,
+        destinationAsset,
+        amountAtomic: userIntendedAtomic,
+        recipient: destinationAddress,
+        refundTo: sourceAddress,
+      });
+      assertDepositWindowOpen({
+        deadline: depositDeadline,
+        chainKind: fromMeta.chainKind,
+        nowMs: Date.now(),
+        ticker: fromMeta.ticker,
+      });
+      if (toAsset.toUpperCase() === "XRP") {
+        // Asked again right before signing: the answer on screen may be old,
+        // and a lookup that was pending or unknown is worth one more try.
+        const recheck = await checkXrpPayout({
+          destination: destinationAddress,
+          minReceived: q.minReceived,
+          lookup: xrpAccountActivation,
+          timeoutMs: XRP_GUARD_TIMEOUT_MS,
+        });
+        setXrpCheck(recheck);
+        if (recheck.state === "blocked") throw new Error(recheck.reason);
+      }
+
+      // Pull the encrypted vault directly from the store so we don't have
+      // to thread it through props. Same key the rest of the app uses.
+      const store = await getStore();
+      const encrypted = await store.get<EncryptedData>("wallet");
+      if (!encrypted) {
+        throw new Error("No saved vault found — create or import a wallet first.");
+      }
+      const session = await unlockSwap(encrypted, password);
+
+      const result = await executeIntentsTrade({
+        sessionId: session.sessionId,
+        fromAsset,
+        intentsQuote: q.intentsQuote,
+        sourceAddress,
+        userIntendedAtomic,
+        fromBlockchain,
+        // Set only for the TS-signed sources (ADA, the UTXO chains, XRP,
+        // Tron); undefined for every chain that signs via sessionId.
+        sourceSecret,
+        // F3: what the quote was made for, and what the screen says.
+        quoteRequest: q.intentsRequest!,
+        quoteEcho: q.intentsEcho,
+        destinationAsset,
+        destinationAddress,
+        // F2: the history row exists the moment there is a hash — before
+        // the notify, before anything else that could fail.
+        onBroadcast: async ({ sourceTxHash, depositAddress }) => {
+          setExec((prev) => ({ ...prev, sourceTxHash }));
+          await writeIntentsRow({ sourceTxHash, depositAddress });
+        },
+        onPhase: (s) => setExec(s),
+      });
+      followIntents(result.depositAddress);
     } catch (e: any) {
       const msg = String(e?.message ?? e);
+      if (isSendOutcomeUnknown(e)) {
+        // The deposit may be on the network (F2). Record it, follow the
+        // deposit address (1Click's status settles the question), and tell
+        // the user to check the hash — no Retry, ever, on this quote.
+        if (depositAddr) {
+          recordIntentsDeposit(depositAddr, { state: "unknown", txHash: e.hash });
+          try {
+            await writeIntentsRow({
+              sourceTxHash: e.hash ?? "",
+              depositAddress: depositAddr,
+              outcomeUnknown: true,
+            });
+          } catch {
+            /* the on-screen hash is what matters now */
+          }
+          followIntents(depositAddr);
+        }
+        setUnknownOutcome({ message: msg, hash: e.hash });
+        setExec((prev) => ({ ...prev, phase: "idle", sourceTxHash: e.hash ?? prev.sourceTxHash }));
+        setStage("unknown");
+        return;
+      }
+      if (e instanceof IntentsQuoteAlreadyUsedError) {
+        setUsedInfo({ hash: e.attempt.txHash });
+        setExec({ phase: "idle" });
+        setStage("used");
+        return;
+      }
+      // The Rust keystore returns "decryption failed (wrong password or
+      // corrupted vault)" on bad password; that's the only case where we
+      // can recover by going back to the password stage — the executor has
+      // not run, so the quote is untouched.
+      if (/decryption failed|wrong password/i.test(msg)) {
+        setPwError("Incorrect password.");
+        setStage("password");
+        setExec({ phase: "idle" });
+        return;
+      }
+      // Any other failure retires the quote (F2): "try again" is a NEW quote
+      // with a new deposit address, fetched by the form once this closes.
+      if (q.source === "intents" && depositAddr) {
+        recordIntentsDeposit(depositAddr, { state: "retired" });
+      }
       // SafetyInvariantError is a wallet-self-detected bug — surface a
       // dedicated red banner with copy-friendly details. NO retry button:
       // the user must close + re-quote (the bug class is in the wallet,
@@ -423,30 +684,23 @@ export function SwapConfirmModal({
         setSafetyError(e);
         setExec({ phase: "idle" });
         setStage("error");
-        if (historyId) {
-          await updateSwapHistoryEntry(historyId, { status: "failed" });
+        if (historyWritten) {
+          await updateSwapHistoryEntry(id, { status: "failed" });
         }
         return;
       }
-      // The Rust keystore returns "decryption failed (wrong password or
-      // corrupted vault)" on bad password; that's the only case where we
-      // can recover by going back to the password stage.
-      if (/decryption failed|wrong password/i.test(msg)) {
-        setPwError("Incorrect password.");
-        setStage("password");
-        setExec({ phase: "idle" });
-      } else {
-        setExec({ phase: "error", error: msg });
-        setStage("error");
-        if (historyId) {
-          await updateSwapHistoryEntry(historyId, { status: "failed" });
-        }
+      setExec({ phase: "error", error: msg });
+      setStage("error");
+      if (historyWritten) {
+        await updateSwapHistoryEntry(id, { status: "failed" });
       }
+    } finally {
+      submittingRef.current = false;
     }
   };
 
   return (
-    <Backdrop onClick={onClose}>
+    <Backdrop onClick={busy ? undefined : requestClose}>
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
@@ -479,15 +733,18 @@ export function SwapConfirmModal({
             confirm swap
           </div>
           <button
-            onClick={onClose}
+            onClick={requestClose}
             aria-label="Close"
+            disabled={busy}
+            title={busy ? "The deposit is being signed and sent — this closes once it is on its way." : undefined}
             style={{
               background: "transparent",
               border: "none",
               color: "var(--text-dim)",
               fontFamily: "var(--font-mono)",
               fontSize: 16,
-              cursor: "pointer",
+              cursor: busy ? "not-allowed" : "pointer",
+              opacity: busy ? 0.35 : 1,
             }}
           >
             ×
@@ -518,13 +775,22 @@ export function SwapConfirmModal({
           <div style={{ flex: 1, minWidth: 0, textAlign: "right" }}>
             <div style={{ fontSize: 9, color: "var(--text-dim)", letterSpacing: 1, textTransform: "uppercase" }}>you receive</div>
             <div className="tnum" style={{ fontSize: 16, marginTop: 2, color: "var(--accent)" }}>
-              ~{quote.expectedReceive} <span style={{ color: "var(--text-dim)" }}>{toAsset}</span>
+              ~{q.expectedReceive} <span style={{ color: "var(--text-dim)" }}>{toAsset}</span>
             </div>
           </div>
         </div>
 
-        {/* Addresses */}
-        <Row label="From" value={truncate(sourceAddress)} fullValue={sourceAddress} />
+        {/* Addresses. An account-wide UTXO deposit (F10) spends from every
+            address of the wallet, so "From <one address>" would be untrue. */}
+        {accountWide ? (
+          <Row
+            label="From"
+            value={`${fromMeta?.ticker ?? fromAsset} wallet (all addresses) · primary ${truncate(sourceAddress)}`}
+            fullValue={sourceAddress}
+          />
+        ) : (
+          <Row label="From" value={truncate(sourceAddress)} fullValue={sourceAddress} />
+        )}
         <Row label="To" value={truncate(destinationAddress)} fullValue={destinationAddress} />
 
         {/* Fees + ETA */}
@@ -540,9 +806,9 @@ export function SwapConfirmModal({
             fontSize: 11,
           }}
         >
-          <RoutingRow modeInfo={modeInfo} quote={quote} />
-          <Stat k="min received" v={`${quote.minReceived} ${toAsset}`} />
-          <Stat k="network fees" v={`${quote.totalFeesSource} ${fromAsset}`} />
+          <RoutingRow modeInfo={modeInfo} quote={q} />
+          <Stat k="min received" v={`${q.minReceived} ${toAsset}`} />
+          <Stat k="network fees" v={`${q.totalFeesSource} ${fromAsset}`} />
           {/* Pwnda fee — proxy-injected SwapKit affiliate fee, already
               deducted from `expectedReceive` by SwapKit before the route
               reaches us. Surface it explicitly: hiding it would mean the
@@ -551,14 +817,17 @@ export function SwapConfirmModal({
               affiliateFeeSource is "0" there — row collapses to a "—". */}
           <Stat
             k="Pwnda fee"
-            v={formatPwndaFee(quote.affiliateFeeSource, fromAmount, fromAsset)}
+            v={formatPwndaFee(q.affiliateFeeSource, fromAmount, fromAsset)}
           />
           <Stat
             k="provider"
-            v={`${quote.routerLabel} · ${quote.providerName}`}
+            v={`${q.routerLabel} · ${q.providerName}`}
           />
-          <Stat k="est. time" v={quote.etaPretty} />
-          {quote.warnings.length > 0 && (
+          <Stat k="est. time" v={q.etaPretty} />
+          {q.source === "intents" && (
+            <Stat k="deposit by" v={formatDepositWindow(depositDeadline, windowLeft)} />
+          )}
+          {q.warnings.length > 0 && (
             <div
               style={{
                 marginTop: 6,
@@ -570,14 +839,14 @@ export function SwapConfirmModal({
                 lineHeight: 1.5,
               }}
             >
-              {quote.warnings.map((w, i) => (
+              {q.warnings.map((w, i) => (
                 <div key={i}>! {w}</div>
               ))}
             </div>
           )}
         </div>
 
-        {xrpBlock && (
+        {xrpCheck.state === "blocked" && (
           <div
             data-xrp-payout-block
             style={{
@@ -590,7 +859,23 @@ export function SwapConfirmModal({
               lineHeight: 1.5,
             }}
           >
-            ✗ {xrpBlock}
+            ✗ {xrpCheck.reason}
+          </div>
+        )}
+        {xrpGate.warning && (
+          <div
+            data-xrp-payout-warning
+            style={{
+              marginTop: 10,
+              padding: "8px 10px",
+              background: "rgba(255,170,0,0.08)",
+              border: "1px solid rgba(255,170,0,0.4)",
+              color: "var(--warn)",
+              fontSize: 10,
+              lineHeight: 1.5,
+            }}
+          >
+            ! {xrpGate.warning}
           </div>
         )}
 
@@ -598,10 +883,11 @@ export function SwapConfirmModal({
         <div style={{ marginTop: 16 }}>
           {stage === "review" && (
             <ReviewFooter
-              onCancel={onClose}
+              onCancel={requestClose}
               onSign={() => setStage("password")}
               isMockMode={isMockMode}
               blockedReason={xrpBlock}
+              gateReason={signBlockedReason}
             />
           )}
           {stage === "password" && (
@@ -610,6 +896,7 @@ export function SwapConfirmModal({
               setPassword={setPassword}
               error={pwError}
               isMockMode={isMockMode}
+              blockedReason={signBlockedReason}
               onCancel={() => {
                 setStage("review");
                 setPassword("");
@@ -626,35 +913,157 @@ export function SwapConfirmModal({
               exec={exec}
               sourceExplorer={sourceExplorer}
               destExplorer={destExplorer}
-              onClose={onClose}
+              onClose={requestClose}
+            />
+          )}
+          {stage === "unknown" && unknownOutcome && (
+            <UnknownOutcomeFooter
+              message={unknownOutcome.message}
+              hash={unknownOutcome.hash}
+              explorerUrl={
+                unknownOutcome.hash && fromMeta ? fromMeta.explorerTxUrl(unknownOutcome.hash) : null
+              }
+              trackStatus={exec.trackStatus}
+              onClose={requestClose}
+            />
+          )}
+          {stage === "used" && (
+            <UsedQuoteFooter
+              hash={usedInfo?.hash}
+              explorerUrl={usedInfo?.hash && fromMeta ? fromMeta.explorerTxUrl(usedInfo.hash) : null}
+              onClose={requestClose}
             />
           )}
           {stage === "mockStop" && mockStop && (
-            <MockStopFooter mockStop={mockStop} onClose={onClose} />
+            <MockStopFooter mockStop={mockStop} onClose={requestClose} />
           )}
           {stage === "error" && safetyError && (
-            <SafetyInvariantFooter error={safetyError} onClose={onClose} />
+            <SafetyInvariantFooter error={safetyError} onClose={requestClose} />
           )}
           {stage === "error" && !safetyError && (
             <ErrorFooter
               error={exec.error ?? "Unknown error"}
-              onClose={onClose}
-              onRetry={() => {
-                // Clear error state and re-enter the password stage so
-                // the user can retry without re-typing addresses or
-                // re-quoting. submitPassword will re-derive nonce/gas
-                // and re-broadcast — fees may have moved, but the
-                // route is still valid.
-                setExec({ phase: "idle" });
-                setHistoryId(null);
-                setStage("password");
-              }}
+              onClose={requestClose}
+              onRetry={
+                q.source === "swapkit"
+                  ? () => {
+                      // SwapKit only (archived router). A NEAR Intents quote
+                      // is never retried in place: it is bound to one deposit
+                      // address, and a retry means a new quote (F2).
+                      setExec({ phase: "idle" });
+                      setStage("password");
+                    }
+                  : undefined
+              }
             />
           )}
         </div>
       </div>
     </Backdrop>
   );
+}
+
+/** How long the XRP payout lookup may take before Sign is allowed with a
+ *  warning instead (F9). */
+const XRP_GUARD_TIMEOUT_MS = 8_000;
+
+/**
+ * The XRP payout guard's states (2026-09-29, F9). `idle` means the swap does
+ * not pay out XRP. Only `pending` and `blocked` stop Sign; `unknown` allows it
+ * with a warning, because an unreachable ledger is not evidence the account
+ * is missing.
+ */
+export type XrpPayoutCheck =
+  | { state: "idle" }
+  | { state: "pending" }
+  | { state: "ok" }
+  | { state: "blocked"; reason: string }
+  | { state: "unknown"; warning: string };
+
+/**
+ * Ask the XRP Ledger whether this payout can land, with a deadline. Never
+ * rejects. Before 2026-09-29 the modal let Sign through while this lookup was
+ * still in flight and never asked again, so a click inside the lookup window
+ * skipped the guard entirely.
+ */
+export async function checkXrpPayout(args: {
+  destination: string;
+  minReceived: string;
+  lookup: (address: string) => Promise<{ activated: boolean; reserveBaseXrp: number } | null>;
+  timeoutMs: number;
+}): Promise<XrpPayoutCheck> {
+  let activation: { activated: boolean; reserveBaseXrp: number } | null;
+  try {
+    activation = await withTimeout(
+      args.lookup(args.destination),
+      args.timeoutMs,
+      "XRP account lookup",
+    );
+  } catch {
+    return {
+      state: "unknown",
+      warning:
+        "Could not reach the XRP Ledger to check that your XRP account is activated. " +
+        "If it is not, a payout below the account reserve will be refused.",
+    };
+  }
+  if (!activation) {
+    return {
+      state: "unknown",
+      warning:
+        "The XRP Ledger did not say whether your XRP account is activated. If it is " +
+        "not, a payout below the account reserve will be refused.",
+    };
+  }
+  const reason = xrpPayoutBlockReason({
+    activation,
+    minReceived: args.minReceived,
+    destination: args.destination,
+  });
+  return reason ? { state: "blocked", reason } : { state: "ok" };
+}
+
+/** What the XRP guard does to the Sign button (F9). Pure, for tests. */
+export function xrpSignGate(c: XrpPayoutCheck): {
+  blockedReason: string | null;
+  warning: string | null;
+} {
+  switch (c.state) {
+    case "pending":
+      return {
+        blockedReason: "Checking that your XRP account can receive this payout…",
+        warning: null,
+      };
+    case "blocked":
+      return { blockedReason: c.reason, warning: null };
+    case "unknown":
+      return { blockedReason: null, warning: c.warning };
+    default:
+      return { blockedReason: null, warning: null };
+  }
+}
+
+/**
+ * True while the modal must not close: from the password submit until the
+ * deposit has a hash (F2). Closing then used to leave the signature running
+ * behind a modal that re-opened on "review" with the same quote.
+ */
+export function modalIsBusy(stage: string, phase: SwapExecutionStatus["phase"]): boolean {
+  return (
+    stage === "executing" &&
+    (phase === "building" || phase === "signing" || phase === "broadcasting")
+  );
+}
+
+/** "14:32 (in 23 min)" — or why the window is shut (F4). */
+function formatDepositWindow(deadline: string | undefined, minutesLeft: number | null): string {
+  if (!deadline || minutesLeft === null) return "unknown — get a new quote";
+  const at = new Date(Date.parse(deadline)).toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+  if (minutesLeft < 0) return `${at} — too close; get a new quote`;
+  return `${at} (${Math.floor(minutesLeft)} min to sign)`;
 }
 
 /* ─── helpers ───────────────────────────────────────────────── */
@@ -737,12 +1146,16 @@ function ReviewFooter({
   onSign,
   isMockMode,
   blockedReason,
+  gateReason,
 }: {
   onCancel: () => void;
   onSign: () => void;
   isMockMode: boolean;
   /** Set when the swap must not be signed as quoted (the XRP payout guard). */
   blockedReason?: string | null;
+  /** Every reason Sign is disabled — the XRP guard, a closed deposit window
+   *  (F4). Shown under the buttons unless the XRP box above already says it. */
+  gateReason?: string | null;
 }) {
   // Mock mode flips the button copy so the user can't accidentally
   // forget which upstream they're signing against. The button still
@@ -750,19 +1163,32 @@ function ReviewFooter({
   const label = isMockMode
     ? "Sign & Send (mock — won't broadcast to real chain)"
     : "Sign & Send";
+  const reason = gateReason ?? blockedReason ?? null;
   return (
-    <div style={{ display: "flex", gap: 8 }}>
-      <Btn variant="ghost" full onClick={onCancel}>Cancel</Btn>
-      <Btn
-        variant={isMockMode ? "ghost" : "accent"}
-        full
-        caret={false}
-        onClick={onSign}
-        disabled={!!blockedReason}
-        title={blockedReason ?? undefined}
-      >
-        {label}
-      </Btn>
+    <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+      <div style={{ display: "flex", gap: 8 }}>
+        <Btn variant="ghost" full onClick={onCancel}>Cancel</Btn>
+        <Btn
+          variant={isMockMode ? "ghost" : "accent"}
+          full
+          caret={false}
+          onClick={onSign}
+          disabled={!!reason}
+          title={reason ?? undefined}
+        >
+          {label}
+        </Btn>
+      </div>
+      {reason && reason !== blockedReason && (
+        <div data-sign-gate style={{ color: "var(--text-dim)", fontSize: 10, lineHeight: 1.5 }}>
+          {reason}
+        </div>
+      )}
+      {reason && reason === blockedReason && /^Checking/.test(reason) && (
+        <div data-sign-gate style={{ color: "var(--text-dim)", fontSize: 10, lineHeight: 1.5 }}>
+          {reason}
+        </div>
+      )}
     </div>
   );
 }
@@ -772,6 +1198,7 @@ function PasswordFooter({
   setPassword,
   error,
   isMockMode,
+  blockedReason,
   onCancel,
   onSubmit,
 }: {
@@ -779,6 +1206,8 @@ function PasswordFooter({
   setPassword: (v: string) => void;
   error: string | null;
   isMockMode: boolean;
+  /** Why Unlock & Sign is disabled right now (F4/F9), if it is. */
+  blockedReason?: string | null;
   onCancel: () => void;
   onSubmit: () => void;
 }) {
@@ -801,13 +1230,18 @@ function PasswordFooter({
         autoFocus
         onChange={(e) => setPassword(e.target.value)}
         onKeyDown={(e) => {
-          if (e.key === "Enter") onSubmit();
+          if (e.key === "Enter" && !blockedReason) onSubmit();
         }}
         placeholder="enter vault password"
         style={{ fontSize: 13, padding: "10px 12px" }}
       />
       {error && (
         <div style={{ color: "var(--danger)", fontSize: 10 }}>{error}</div>
+      )}
+      {blockedReason && (
+        <div data-sign-gate style={{ color: "var(--text-dim)", fontSize: 10, lineHeight: 1.5 }}>
+          {blockedReason}
+        </div>
       )}
       <div style={{ display: "flex", gap: 8 }}>
         <Btn variant="ghost" full onClick={onCancel}>Back</Btn>
@@ -816,6 +1250,8 @@ function PasswordFooter({
           full
           caret={false}
           onClick={onSubmit}
+          disabled={!!blockedReason}
+          title={blockedReason ?? undefined}
         >
           {isMockMode
             ? "Unlock & Sign (mock — won't broadcast)"
@@ -833,9 +1269,11 @@ function ExecutingFooter({
   exec: SwapExecutionStatus;
   sourceExplorer: string | null;
 }) {
+  // "Signing", not "Signing in Rust core": ADA, the UTXO account-wide sends
+  // (F10), XRP and Tron sign in TypeScript.
   const steps: Array<{ key: SwapExecutionStatus["phase"]; label: string }> = [
     { key: "building", label: "Building transaction" },
-    { key: "signing", label: "Signing in Rust core" },
+    { key: "signing", label: "Signing" },
     { key: "broadcasting", label: "Broadcasting to chain" },
     { key: "pending", label: "Waiting for swap to finalize" },
   ];
@@ -988,11 +1426,19 @@ function ErrorFooter({
   // immediately actionable.
   const isBroadcastFail = /broadcast|All \d+ EVM RPCs failed/i.test(headline);
   const isRateLimit = /\b429\b|Too Many Requests|RATE_LIMIT/i.test(error);
-  const guidance = isRateLimit
-    ? "Broadcast failed: rate-limited by every RPC in the fallback list. Wait ~30 s and retry."
-    : isBroadcastFail
-      ? "Broadcast failed. Retry — the wallet will try every RPC in the fallback list again, or set VITE_ETH_RPC_URL in .env.local to a paid endpoint."
-      : null;
+  // Without `onRetry` (every NEAR Intents quote since 2026-09-29, F2) the way
+  // to try again is a NEW quote, so the copy must not say "Retry". An error
+  // shown here was decided before anything went out — ambiguous broadcasts
+  // have their own "unknown" screen.
+  const guidance = !onRetry
+    ? isRateLimit
+      ? "Nothing was sent: every RPC rate-limited the request. Wait ~30 s, close this window, and the form will fetch a fresh quote to try again."
+      : "Nothing was sent. Close this window — the form fetches a fresh quote, and a new attempt uses that one."
+    : isRateLimit
+      ? "Broadcast failed: rate-limited by every RPC in the fallback list. Wait ~30 s and retry."
+      : isBroadcastFail
+        ? "Broadcast failed. Retry — the wallet will try every RPC in the fallback list again, or set VITE_ETH_RPC_URL in .env.local to a paid endpoint."
+        : null;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
@@ -1065,6 +1511,7 @@ function SafetyInvariantFooter({
     setCopied(true);
     setTimeout(() => setCopied(false), 1500);
   };
+  const copy = safetyFooterCopy(error.invariant);
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
       <div
@@ -1078,12 +1525,12 @@ function SafetyInvariantFooter({
         }}
       >
         <div style={{ fontWeight: 600, marginBottom: 8, fontSize: 12 }}>
-          ⚠ Safety check failed before broadcasting
+          ⚠ {copy.headline}
         </div>
         <div style={{ marginBottom: 6 }}>
-          The wallet detected an inconsistency in the transaction it built.
-          <strong> No funds have moved.</strong> Please screenshot this and
-          report it.
+          {copy.lead}
+          {copy.strong && <strong> {copy.strong}</strong>}
+          {copy.tail ? ` ${copy.tail}` : ""}
         </div>
         <div
           style={{
@@ -1124,6 +1571,170 @@ function SafetyInvariantFooter({
           {copied ? "Copied ✓" : "Copy Details"}
         </Btn>
       </div>
+    </div>
+  );
+}
+
+/**
+ * The words on the safety-check screen, by invariant (2026-09-29 send-safety
+ * audit, F8/F9). One sentence used to cover every invariant — "Safety check
+ * failed before broadcasting … No funds have moved. Please screenshot this
+ * and report it." — and two cases made it false:
+ *
+ *  - VERIFIED_HASH_MISMATCH fires AFTER the broadcast. "No funds have moved"
+ *    is exactly the wrong thing to tell someone whose deposit may be on chain.
+ *    (The executor now reports it as an unknown outcome; this copy is the
+ *    backstop if it ever reaches this screen again.)
+ *  - TX_NOT_FUNDABLE is not a wallet bug: the amount plus the fee is more
+ *    than the address holds — what pressing MAX on a native coin did. Asking
+ *    the user to report it as a bug sent them nowhere useful.
+ */
+export function safetyFooterCopy(invariant: string): {
+  headline: string;
+  lead: string;
+  strong: string | null;
+  tail: string | null;
+} {
+  if (invariant === "VERIFIED_HASH_MISMATCH") {
+    return {
+      headline: "Safety check failed after broadcasting",
+      lead: "The network reported a different transaction hash than the one the wallet signed.",
+      strong: "The deposit may have been sent.",
+      tail: "Check the transaction on a block explorer before doing anything else, and screenshot this.",
+    };
+  }
+  if (invariant === "TX_NOT_FUNDABLE") {
+    return {
+      headline: "Not enough balance for this swap and its network fee",
+      lead: "The amount plus the network fee is more than the sending address holds.",
+      strong: "Nothing was sent.",
+      tail: "Lower the amount (MAX leaves room for the fee) and let the form fetch a new quote.",
+    };
+  }
+  return {
+    headline: "Safety check failed before broadcasting",
+    lead: "The wallet detected an inconsistency in the transaction it built.",
+    strong: "No funds have moved.",
+    tail: "Please screenshot this and report it.",
+  };
+}
+
+/**
+ * The deposit MAY have gone out (2026-09-29 send-safety audit, F2). Shown
+ * instead of "Broadcast failed. Retry" — a retry on this quote would sign a
+ * second deposit to the same address. The hash is the one thing that settles
+ * it, so it leads; the swap is also being followed by its deposit address.
+ */
+function UnknownOutcomeFooter({
+  message,
+  hash,
+  explorerUrl,
+  trackStatus,
+  onClose,
+}: {
+  message: string;
+  hash?: string;
+  explorerUrl: string | null;
+  trackStatus?: string;
+  onClose: () => void;
+}) {
+  return (
+    <div data-swap-outcome="unknown" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div
+        style={{
+          padding: "12px 14px",
+          background: "rgba(255,170,0,0.08)",
+          border: "1.5px solid rgba(255,170,0,0.5)",
+          color: "var(--warn)",
+          fontSize: 11,
+          lineHeight: 1.5,
+        }}
+      >
+        <div style={{ fontWeight: 600, marginBottom: 6, fontSize: 12 }}>
+          Not confirmed — this deposit may have been sent
+        </div>
+        <div style={{ color: "var(--text)" }}>
+          Check the transaction below on a block explorer (or in History) before
+          swapping again. This quote will not be used a second time; the swap is
+          being followed by its deposit address and History will update.
+        </div>
+        {hash ? (
+          <div style={{ marginTop: 8, fontSize: 10, wordBreak: "break-all" }}>
+            tx:{" "}
+            {explorerUrl ? (
+              <a href={explorerUrl} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+                {hash}
+              </a>
+            ) : (
+              <span className="tnum" style={{ color: "var(--text)" }}>{hash}</span>
+            )}
+          </div>
+        ) : (
+          <div style={{ marginTop: 8, fontSize: 10, color: "var(--text)" }}>
+            No transaction id came back. Check this wallet's recent activity on the
+            source chain before swapping again.
+          </div>
+        )}
+        {trackStatus && (
+          <div style={{ marginTop: 6, fontSize: 10, color: "var(--text-dim)" }}>
+            NEAR Intents: <span style={{ color: "var(--text)" }}>{trackStatus}</span>
+          </div>
+        )}
+        <details style={{ marginTop: 8, fontSize: 10, color: "var(--text-dim)" }}>
+          <summary style={{ cursor: "pointer" }}>What the network said</summary>
+          <div style={{ marginTop: 4, fontFamily: "var(--font-mono)", wordBreak: "break-all", whiteSpace: "pre-wrap" }}>
+            {message}
+          </div>
+        </details>
+      </div>
+      <Btn variant="ghost" full caret={false} onClick={onClose}>
+        Close
+      </Btn>
+    </div>
+  );
+}
+
+/**
+ * This quote was already used (F2) — opened again after a close, or a second
+ * submit. Nothing new is signed; a new swap needs a new quote.
+ */
+function UsedQuoteFooter({
+  hash,
+  explorerUrl,
+  onClose,
+}: {
+  hash?: string;
+  explorerUrl: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <div data-swap-outcome="used" style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+      <div
+        style={{
+          padding: "10px 12px",
+          background: "var(--surface)",
+          border: "1px solid var(--border)",
+          fontSize: 11,
+          lineHeight: 1.5,
+        }}
+      >
+        This quote has already been used{hash ? " for the deposit below" : ""}. Nothing
+        new was signed. Close this window — the form fetches a fresh quote for a new swap.
+        {hash && (
+          <div style={{ marginTop: 6, fontSize: 10, wordBreak: "break-all" }}>
+            {explorerUrl ? (
+              <a href={explorerUrl} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
+                {hash}
+              </a>
+            ) : (
+              <span className="tnum">{hash}</span>
+            )}
+          </div>
+        )}
+      </div>
+      <Btn variant="ghost" full caret={false} onClick={onClose}>
+        Close
+      </Btn>
     </div>
   );
 }

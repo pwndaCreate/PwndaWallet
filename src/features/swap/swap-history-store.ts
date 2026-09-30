@@ -66,6 +66,23 @@ export interface SwapHistoryEntry {
   createdAt: string;
   /** ISO8601 of when we observed a terminal status. */
   completedAt?: string;
+  /**
+   * NEAR Intents only: the deposit address the quote minted (2026-09-29
+   * send-safety audit, F5). 1Click's status is looked up BY this address, so
+   * without it a row could not be followed once the confirm modal stopped
+   * polling — and only the open modal ever polled. With it, pending rows are
+   * resumed (`intents-status-resume.ts`).
+   */
+  depositAddress?: string;
+  /** NEAR Intents only: the quote's deposit deadline, ISO8601 (F5). A short
+   *  or late deposit is refunded by it, so tracking runs at least that long. */
+  depositDeadline?: string;
+  /**
+   * True when the deposit MAY have gone out but the wallet could not confirm
+   * it at the time (F2) — shown as "unknown, check the explorer", never as
+   * failed. Cleared when 1Click reports a status for the deposit address.
+   */
+  outcomeUnknown?: boolean;
 }
 
 // ─── Drift helpers ────────────────────────────────────────────────────

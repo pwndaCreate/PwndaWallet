@@ -133,10 +133,20 @@ export interface AssetCapability {
    * source-capable when EITHER `signerInRustCore` is true OR this is set —
    * see `isSourceCapable` / `capabilityToLegacyMeta` in `swap-data.ts`.
    * `signerInRustCore` stays the honest "is there a Rust signer" flag
-   * (false for all three below) so the `signerInRustCore → rpcsAvailable`
-   * invariant test doesn't trip.
+   * (false for cardano/xrp/tron below) so the `signerInRustCore →
+   * rpcsAvailable` invariant test doesn't trip.
    *
-   * The three, and why each signs in TypeScript:
+   * `utxo-account` (2026-09-29 send-safety audit, F10) is the one kind that
+   * sits BESIDE a Rust signer rather than instead of one: BTC, LTC, DOGE, BCH
+   * and DASH deposit through the wallet adapter's account-wide send
+   * (`ChainAdapter.sendFromAccount`, the call the Send button makes), because
+   * the Rust PSBT path reads ONE address and a UTXO wallet's coins move to
+   * change addresses the first time it spends. The operator's LTC → USDC swap
+   * failed on exactly that ("No UTXOs found at ltc1qty7…") while the wallet
+   * showed 4.03 LTC. The Rust path stays as the fallback for a wallet the
+   * adapter's account scan does not cover.
+   *
+   * The original three, and why each signs in TypeScript:
    *
    *  - `cardano` — BIP-32-Ed25519 (Icarus) + CBOR in `cardano-tx.ts` /
    *    `cardano-cip1852.ts`, broadcast via Koios. No `swap_sign_cardano`.
@@ -153,7 +163,7 @@ export interface AssetCapability {
    * versus a contract call). The executor tells them apart by
    * `walletsByChainKey`, which resolves each to its own adapter.
    */
-  tsSourceSigner?: "cardano" | "xrp" | "tron";
+  tsSourceSigner?: "cardano" | "xrp" | "tron" | "utxo-account";
 
   /**
    * True when `defaultRpcUrl` is set OR `rpcFallbacks` is non-empty.
@@ -253,6 +263,10 @@ import {
   OP_RPCS,
   POL_RPCS,
 } from "../../wallets/chain-rpcs";
+// Types-only module (no adapters, no RPC lists): safe to load with the
+// registry. The source of every stablecoin leg's contract — see
+// `withStablecoinContracts`.
+import { stablecoinNetworkFor } from "../../wallets/stablecoins";
 
 function rpcEnv(name: string, fallback: string): string {
   const env = (import.meta as unknown as { env?: Record<string, string> }).env;
@@ -269,8 +283,13 @@ function rpcEnv(name: string, fallback: string): string {
 //
 // Ordering is the legacy order from `SWAP_COIN_META` so a side-by-side
 // diff with `git log -p src/features/swap/swap-data.ts` stays readable.
+//
+// The literal is `REGISTRY_ENTRIES`; the exported `ASSET_CAPABILITIES` below
+// is the same table with every stablecoin leg's `tokenContract` filled in from
+// `wallets/stablecoins.ts` (see `withStablecoinContracts`). No entry here
+// states a contract by hand.
 
-export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
+const REGISTRY_ENTRIES: Record<string, AssetCapability> = {
   // ─── EVM chains (Rust EVM signer ready in v1) ────────────────────
   ETH: {
     ticker: "ETH",
@@ -355,6 +374,9 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
     decimals: 8,
     walletsByChainKey: "bitcoin",
     signerInRustCore: true,
+    // NEAR Intents deposits spend the whole account through the adapter
+    // (F10, 2026-09-29) — see `tsSourceSigner`'s doc.
+    tsSourceSigner: "utxo-account",
     rpcsAvailable: true,
     swapKitAsset: "BTC.BTC",
     nearIntentsAsset: "nep141:btc.omft.near",
@@ -369,6 +391,9 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
     decimals: 8,
     walletsByChainKey: "litecoin",
     signerInRustCore: true,
+    // Account-wide deposits (F10, 2026-09-29): the live incident was an LTC
+    // swap whose primary address had been empty since its first spend.
+    tsSourceSigner: "utxo-account",
     rpcsAvailable: true,
     swapKitAsset: "LTC.LTC",
     // Was `null` with "not in OMFT canonical list as of 2026-05" — true
@@ -398,6 +423,7 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
     // handles UtxoChain::Doge (legacy P2PKH BIP-44 with SIGHASH_ALL).
     // See `wiki/synthesis/bch-doge-source-integration-plan.md` Phase 1.
     signerInRustCore: true,
+    tsSourceSigner: "utxo-account", // F10, 2026-09-29
     rpcsAvailable: true,
     swapKitAsset: "DOGE.DOGE",
     nearIntentsAsset: "nep141:doge.omft.near",
@@ -417,6 +443,7 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
     // CashAddr deposit addresses decoded via decodeCashAddr from
     // `bch-wallet.ts`. See plan Phase 2.
     signerInRustCore: true,
+    tsSourceSigner: "utxo-account", // F10, 2026-09-29
     rpcsAvailable: true,
     swapKitAsset: "BCH.BCH",
     nearIntentsAsset: "nep141:bch.omft.near",
@@ -649,6 +676,10 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
     decimals: 8,
     walletsByChainKey: "dash",
     signerInRustCore: true,
+    // The ONLY deposit path DASH has (F10, 2026-09-29): the executor never
+    // had a DASH branch, so before this every quoted DASH swap threw at
+    // Confirm. It spends the account through `dashAdapter.sendFromAccount`.
+    tsSourceSigner: "utxo-account",
     rpcsAvailable: true,
     swapKitAsset: null,
     nearIntentsAsset: "nep141:dash.omft.near",
@@ -805,6 +836,14 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
   // ADDRESS, never by symbol — see the USDT0 rows for why that matters.
   // DAI is deliberately absent: the roster lists it, but the wallet has no
   // DAI adapter at all, so it was a phantom entry and is removed there.
+  //
+  // None of these rows carries a `tokenContract`. Until 2026-09-29 that was
+  // the whole entry, and the swap executor read the missing field as "native
+  // coin": 100 USDC-ETH was built as a 100 000 000 wei ETH transfer, 100
+  // USDT-BSC as 100 BNB, 100 USDC-SOL as 0.1 SOL (send-safety audit, F1).
+  // The contract is now DERIVED from `wallets/stablecoins.ts` by
+  // `withStablecoinContracts` below, the list the wallet's own balance and
+  // send code already use, so it cannot be forgotten here again.
   "USDC-ETH": {
     ticker: "USDC",
     network: "Ethereum",
@@ -1141,6 +1180,76 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> = {
 };
 
 /**
+ * Fill in `tokenContract` for every stablecoin leg from the wallet's own
+ * stablecoin registry (2026-09-29 send-safety audit, F1).
+ *
+ * The leg is identified by `walletsByChainKey` — `usdc-arb` here is the
+ * `usdc-arb` row there — so the contract the swap deposits is, by
+ * construction, the contract the wallet shows the balance of and the Send
+ * button spends. Those rows were verified on chain when they were added
+ * (see the header of `wallets/stablecoins.ts`); copying them here by hand
+ * would be a second list to drift, and the first list was never copied at
+ * all, which is the bug.
+ *
+ * A contract is never removed or invented for a non-stablecoin entry, and a
+ * leg the wallet registry does not know keeps no contract. The executor's
+ * catalog check (`assertSourceMetaMatchesCatalog`) is what refuses to build a
+ * native transfer for an asset 1Click lists with a contract, so a leg added
+ * here without a wallet row fails closed rather than sending the native coin.
+ */
+function withStablecoinContracts(
+  entries: Record<string, AssetCapability>,
+): Record<string, AssetCapability> {
+  const out: Record<string, AssetCapability> = {};
+  for (const [key, cap] of Object.entries(entries)) {
+    const leg = cap.walletsByChainKey
+      ? stablecoinNetworkFor(cap.walletsByChainKey)
+      : undefined;
+    out[key] = leg ? { ...cap, tokenContract: leg.contract } : cap;
+  }
+  return out;
+}
+
+export const ASSET_CAPABILITIES: Record<string, AssetCapability> =
+  withStablecoinContracts(REGISTRY_ENTRIES);
+
+/**
+ * The source chain kinds `executeIntentsTrade` can build a NEAR Intents
+ * deposit for (2026-09-29 send-safety audit, F7).
+ *
+ * STELLAR and SUI are deliberately absent although Rust signers exist for
+ * them: the executor has no Stellar or Sui branch, so a quoted XLM or SUI
+ * swap reached Confirm and threw after the password. XLM also needs
+ * `depositMode: "MEMO"`, which the quote request cannot carry today. Add a
+ * kind here in the same change that gives the executor a branch for it.
+ *
+ * DASH is present only because it deposits through the adapter's
+ * account-wide send (F10); it has no Rust-path branch in the executor.
+ */
+export const INTENTS_EXECUTABLE_SOURCE_KINDS: ReadonlySet<SwapChainKind> =
+  new Set<SwapChainKind>([
+    "EVM",
+    "SOLANA",
+    "NEAR",
+    "BTC",
+    "LTC",
+    "DOGE",
+    "BCH",
+    "DASH",
+    "CARDANO",
+    "XRP",
+    "TRON",
+  ]);
+
+/** True when a NEAR Intents deposit FROM `ticker` can actually be executed. */
+export function isIntentsSourceExecutable(ticker: string): boolean {
+  const cap = ASSET_CAPABILITIES[ticker.toUpperCase()];
+  if (!cap?.nearIntentsAsset) return false;
+  if (!INTENTS_EXECUTABLE_SOURCE_KINDS.has(cap.chainKind)) return false;
+  return cap.signerInRustCore || !!cap.tsSourceSigner;
+}
+
+/**
  * The secret a TS-signed source chain needs, tagged with which kind it is.
  *
  * Cardano needs the seed phrase (its Icarus derivation rebuilds a key set);
@@ -1181,9 +1290,12 @@ export function sourceSecretFor(
   // `walletsByChainKey` is required on every registry entry, but the lookup
   // above can miss, so both are checked together rather than asserted.
   if (!signer || !cap?.walletsByChainKey) return undefined;
-  if (signer === "cardano") {
+  if (signer === "cardano" || signer === "utxo-account") {
     // Cardano rebuilds a whole key set from the seed; a single private key
-    // cannot express its Icarus derivation.
+    // cannot express its Icarus derivation. The UTXO chains (F10,
+    // 2026-09-29) need the seed for the same kind of reason: an account-wide
+    // send derives every receive and change address it spends from, which
+    // one child key cannot do.
     const m = walletsByChain[cap.walletsByChainKey]?.mnemonic;
     return m ? { kind: "mnemonic", value: m } : undefined;
   }
@@ -1237,14 +1349,23 @@ export function isSwapKitRoutableFromRegistry(
   return !!(f?.swapKitAsset && t?.swapKitAsset);
 }
 
-/** True when both ends of the pair have a NEAR Intents asset id. */
+/**
+ * True when both ends of the pair have a NEAR Intents asset id AND the wallet
+ * can execute a deposit from the source.
+ *
+ * The second condition is new on 2026-09-29 (send-safety audit, F7). Before
+ * it, XLM and SUI were quotable as sources — both carry an asset id — and the
+ * swap then threw at Confirm, after the password, because the executor has no
+ * branch for either. Routability is a claim that the swap can happen; an asset
+ * id alone only says 1Click lists the coin.
+ */
 export function isIntentsRoutableFromRegistry(
   from: string,
   to: string
 ): boolean {
   const f = ASSET_CAPABILITIES[from.toUpperCase()];
   const t = ASSET_CAPABILITIES[to.toUpperCase()];
-  return !!(f?.nearIntentsAsset && t?.nearIntentsAsset);
+  return !!(f?.nearIntentsAsset && t?.nearIntentsAsset) && isIntentsSourceExecutable(from);
 }
 
 /**

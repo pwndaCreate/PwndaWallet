@@ -22,6 +22,7 @@ import { resolveAsset } from "./intents-dedup";
 import {
   ASSET_CAPABILITIES,
   isIntentsRoutableFromRegistry,
+  isIntentsSourceExecutable,
   isSwapKitRoutableFromRegistry,
   type AssetCapability,
   type SwapChainKind,
@@ -160,6 +161,14 @@ export interface SwapCoinMeta {
   sourcePrerequisiteHint?: string;
   tokenContract?: string;
   coverageNote?: string;
+  /**
+   * Copied from the registry (2026-09-29 send-safety audit, F6/F10) so the
+   * executor can tell a TS-signed source from a Rust-signed one without
+   * importing `asset-capabilities` itself. Absent on synthetic metas.
+   */
+  tsSourceSigner?: AssetCapability["tsSourceSigner"];
+  /** The registry's wallet key for this asset; absent on synthetic metas. */
+  walletsByChainKey?: AssetCapability["walletsByChainKey"];
 }
 
 /**
@@ -188,8 +197,13 @@ function capabilityToLegacyMeta(cap: AssetCapability): SwapCoinMeta {
     // (false for ADA) while still surfacing ADA on the FROM side.
     sourceCapable: cap.signerInRustCore || !!cap.tsSourceSigner,
     sourcePrerequisiteHint: cap.sourcePrerequisiteHint,
+    // Carried through, not re-derived: `ASSET_CAPABILITIES` fills it for every
+    // stablecoin leg (F1, 2026-09-29). Its absence used to be read downstream
+    // as "native coin".
     tokenContract: cap.tokenContract,
     coverageNote: cap.coverageNote,
+    tsSourceSigner: cap.tsSourceSigner,
+    walletsByChainKey: cap.walletsByChainKey,
   };
 }
 
@@ -654,8 +668,19 @@ const EXPLORER_BY_BLOCKCHAIN: Record<
   },
 };
 
-/** Map an IntentsBlockchain to the matching SwapChainKind for routing. */
-export function blockchainToChainKind(blockchain: IntentsBlockchain): SwapChainKind {
+/**
+ * Map an IntentsBlockchain to the matching SwapChainKind for routing, or null
+ * for a chain the wallet has no kind for.
+ *
+ * Corrected 2026-09-29 (send-safety audit, F6). `xrp` and `tron` fell to a
+ * `default: return "EVM"` with a comment calling them destination-only; they
+ * had been source-capable since 2026-09-09, so SwapView's `fromBlockchain:
+ * "xrp"` produced a synthetic chainKind-"EVM" meta for XRP and the executor
+ * refused it for having no RPC URL. A default that answers "EVM" for an
+ * unknown chain is the wrong kind of permissive in a function that picks a
+ * signer: `ton` now answers null, and `getSwapCoinMeta` returns null for it.
+ */
+export function blockchainToChainKind(blockchain: IntentsBlockchain): SwapChainKind | null {
   switch (blockchain) {
     case "eth":
     case "arb":
@@ -689,11 +714,14 @@ export function blockchainToChainKind(blockchain: IntentsBlockchain): SwapChainK
       // (symbol, "cardano") meta would fall to the EVM default and
       // mis-route ADA through the EVM branch of executeIntentsTrade.
       return "CARDANO";
-    // ton / xrp / tron don't have direct chain kinds in the existing
-    // union; they're destination-only so the chainKind value is never
-    // used for actual broadcasting. Pick a safe default.
-    default:
-      return "EVM";
+    case "xrp":
+      return "XRP";
+    case "tron":
+      return "TRON";
+    case "ton":
+      // No signer, no chain kind. Null makes `getSwapCoinMeta` refuse rather
+      // than hand the executor an EVM meta with no chain id.
+      return null;
   }
 }
 
@@ -727,6 +755,7 @@ export function getSwapCoinMeta(
   if (!asset) return null;
 
   const chainKind = blockchainToChainKind(blockchain);
+  if (!chainKind) return null;
   const rpcUrls = getRpcUrlsForBlockchain(blockchain);
   const explorer = EXPLORER_BY_BLOCKCHAIN[blockchain];
   const evmChainId = EVM_CHAIN_IDS[blockchain];
@@ -764,6 +793,17 @@ function staticEntryBlockchain(meta: SwapCoinMeta): IntentsBlockchain | null {
   if (meta.chainKind === "NEAR") return "near";
   if (meta.chainKind === "DOGE") return "doge";
   if (meta.chainKind === "CARDANO") return "cardano";
+  // Added 2026-09-29 (F6/F10). Without these, `getSwapCoinMeta("XRP", "xrp")`
+  // skipped the registry entry and synthesized a meta from the catalog, which
+  // carried no `tsSourceSigner` and (for XRP/TRON) the wrong chain kind. The
+  // registry entry is the one that knows how the asset is signed.
+  if (meta.chainKind === "XRP") return "xrp";
+  if (meta.chainKind === "TRON") return "tron";
+  if (meta.chainKind === "LTC") return "ltc";
+  if (meta.chainKind === "BCH") return "bch";
+  if (meta.chainKind === "DASH") return "dash";
+  if (meta.chainKind === "STELLAR") return "stellar";
+  if (meta.chainKind === "SUI") return "sui";
   if (meta.chainKind === "EVM") {
     // Map evmChainId back to an IntentsBlockchain key.
     const id = meta.evmChainId;
@@ -865,12 +905,17 @@ const PWNDA_INTENTS_SOURCE_TICKERS: readonly string[] = [
   "MON",
   // Phase 4 (BSC + L2 surface): BNB native + ETH on Arbitrum/Base/Optimism.
   "BNB",
-  // Phase 5 (Dash): UTXO chain, extends UtxoChain enum.
+  // Phase 5 (Dash): deposits through `dashAdapter.sendFromAccount` since
+  // 2026-09-29 (F10). Before that the executor had no DASH branch at all and
+  // every DASH swap threw at Confirm.
   "DASH",
-  // Phase 6 (Stellar): XDR signer.
-  "XLM",
-  // Phase 7 (Sui): BCS signer.
-  "SUI",
+  // XLM (Phase 6) and SUI (Phase 7) REMOVED as sources on 2026-09-29
+  // (send-safety audit, F7). Rust signers exist for both, but the executor
+  // never had a branch for either, so a quoted XLM or SUI swap threw after
+  // the password; XLM additionally needs `depositMode: "MEMO"`, which the
+  // quote request cannot carry. Both stay DESTINATIONS. Re-add here in the
+  // same change that adds their executor branch and
+  // `INTENTS_EXECUTABLE_SOURCE_KINDS` entry.
   // Native AVAX + POL: routed via HOT-Omni nep245 envelope (their OMFT
   // entries 400'd; nep245 form is live as of 2026-05-08). Both ride the
   // existing EVM signer + the chain's existing wallet adapter.
@@ -1014,6 +1059,11 @@ export function getDropdownTickers(opts: {
   if (opts.router === "intents") {
     return base
       .filter((t) => !!ASSET_CAPABILITIES[t.toUpperCase()]?.nearIntentsAsset)
+      // The FROM side also has to be executable (F7, 2026-09-29): an asset id
+      // says 1Click lists the coin, not that this wallet can deposit it. Same
+      // predicate `isIntentsRoutableFromRegistry` gates quotes on, so the
+      // picker and the gate still agree by construction.
+      .filter((t) => !opts.sourceOnly || isIntentsSourceExecutable(t))
       .sort((a, b) => {
         const ra = assetRank(a);
         const rb = assetRank(b);

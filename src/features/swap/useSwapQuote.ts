@@ -128,6 +128,11 @@ import {
   type SidecarQuote,
 } from "../swap-sidecar/useSidecarSwap";
 import { formatAmount } from "../swap-sidecar/types";
+import {
+  depositWindowFor,
+  type IntentsQuoteRequestEcho,
+} from "./intents-quote-binding";
+import { isIntentsDepositUsed } from "./intents-attempts";
 
 export interface NormalizedQuote {
   /** Which upstream answered. `auto` mode resolves to one or the other. */
@@ -144,6 +149,18 @@ export interface NormalizedQuote {
   swapKitRoute?: SwapKitRoute;
   /** NEAR Intents quote (when source === 'intents'). */
   intentsQuote?: IntentsQuote;
+  /**
+   * The request this Intents quote answers, as the wallet SENT it
+   * (2026-09-29 send-safety audit, F3). 1Click mints the deposit address for
+   * exactly this origin asset, amount, recipient and refund address; the
+   * confirm modal and `executeIntentsTrade` refuse to sign when the swap on
+   * screen differs. Dropping it (as `normalizeIntents` used to) left nothing
+   * that could tell an ETH quote from a BNB one.
+   */
+  intentsRequest?: IntentsQuoteRequestEcho;
+  /** 1Click's own echo of that request (`quoteRequest` in its response),
+   *  when the relay passes it through. Null when absent. */
+  intentsEcho?: Partial<IntentsQuoteRequestEcho> | null;
   /** Swap-desk quote (when source === 'pwnda-desk'). */
   deskQuote?: DeskQuote;
   /**
@@ -380,6 +397,62 @@ export const PLACEHOLDER_ADDRESSES = {
   // XRP and TRON until 2026-09-29).
 } as const satisfies Required<WalletAddresses>;
 
+/**
+ * The form inputs a quote was fetched for, as one comparable string
+ * (2026-09-29 send-safety audit, F3).
+ *
+ * The hook hands a quote to the form ONLY while this key still matches the
+ * form. Before, the previous quote stayed on screen for the whole 500 ms
+ * debounce with `loading` false, so the Swap button was live on a quote for
+ * the OLD pair: switch ETH → BNB with the same "0.5", click at once, and the
+ * modal opened on the ETH quote with BNB as the asset to send.
+ *
+ * Addresses are included as strings, not as the `walletAddresses` object, so
+ * a re-derived wallet map with the same addresses does not discard a quote.
+ */
+export function swapQuoteInputsKey(k: {
+  from: string;
+  to: string;
+  amount: string;
+  slippage: number;
+  preferredRouter: string;
+  fromBlockchain?: string;
+  toBlockchain?: string;
+  sourceAddress?: string;
+  destinationAddress?: string;
+}): string {
+  return JSON.stringify([
+    k.from.toUpperCase(),
+    k.to.toUpperCase(),
+    k.amount.trim(),
+    k.slippage,
+    k.preferredRouter,
+    k.fromBlockchain ?? "",
+    k.toBlockchain ?? "",
+    k.sourceAddress ?? "",
+    k.destinationAddress ?? "",
+  ]);
+}
+
+/** The binding-relevant fields of an Intents request body (F3). */
+function echoOfRequest(req: {
+  originAsset: string;
+  destinationAsset: string;
+  amount: string;
+  recipient: string;
+  refundTo: string;
+  deadline: string;
+}): IntentsQuoteRequestEcho {
+  return {
+    originAsset: req.originAsset,
+    destinationAsset: req.destinationAsset,
+    amount: req.amount,
+    recipient: req.recipient,
+    refundTo: req.refundTo,
+    deadline: req.deadline,
+  };
+}
+
 function walletAddressesWithPlaceholders(
   user: WalletAddresses | undefined,
 ): WalletAddresses {
@@ -415,6 +488,16 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
   const [rawIntents, setRawIntents] = useState<IntentsQuoteResponse | null>(null);
   const [rawDesk, setRawDesk] = useState<DeskQuote | null>(null);
   const [fetchedAt, setFetchedAt] = useState<string | null>(null);
+  // The inputs the quote in state answers (F3) — see `swapQuoteInputsKey`.
+  const [quoteKey, setQuoteKey] = useState<string | null>(null);
+  // While `paused` (a confirm modal is open), the quote handed out is frozen:
+  // the modal is mounted on it, and nothing may swap or clear it mid-review or
+  // mid-signing (F2/F3). Cleared when the modal closes.
+  const frozenQuoteRef = useRef<NormalizedQuote | null>(null);
+  // The deposit address a refetch was last asked for because its quote had
+  // been used (F2), so an upstream that hands back the same address cannot
+  // start a refetch loop.
+  const refetchedForRef = useRef<string | null>(null);
   // ── per-pair probe state ───────────────────────────────────────
   // `probingPair` is true while the descending probe loop is in flight.
   // `cacheBumpKey` increments after every cache mutation (probe success
@@ -455,8 +538,22 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
 
   const fetchOnce = useCallback(async () => {
     const reqId = ++reqIdRef.current;
+    // What this fetch is FOR, fixed now: the quote it produces is handed out
+    // only while the form still shows exactly this (F3).
+    const key = swapQuoteInputsKey({
+      from,
+      to,
+      amount,
+      slippage,
+      preferredRouter,
+      fromBlockchain,
+      toBlockchain,
+      sourceAddress,
+      destinationAddress,
+    });
     if (!eligible) {
       setQuote(null);
+      setQuoteKey(null);
       setError(null);
       setRawSwapKit(null);
       setRawIntents(null);
@@ -477,6 +574,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
     if (!fromMeta || !toMeta) {
       setError("Pair is not routable in v1.");
       setQuote(null);
+      setQuoteKey(null);
       setLoading(false);
       return;
     }
@@ -600,7 +698,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
         debugQuote("intents request body", { reqId, body: intentsReq });
         const resp = await getIntentsQuote(intentsReq);
         nextRawIntents = resp;
-        normalized = normalizeIntents(resp, slippage, toMeta);
+        normalized = normalizeIntents(resp, slippage, toMeta, echoOfRequest(intentsReq));
         if (!normalized) firstErr = "No NEAR Intents quote returned.";
       } else if (preferredRouter === "pwnda-desk") {
         if (!canDesk) {
@@ -644,6 +742,8 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       } else {
         // auto — fan out to whichever upstream(s) the pair is routable on.
         const calls: Promise<unknown>[] = [];
+        // The Intents body, kept so the quote carries the request it answers (F3).
+        let autoIntentsReq: ReturnType<typeof buildIntentsRequestSafely> | null = null;
         if (canSwapKit) {
           const swapKitReq = {
             sellAsset: fromMeta.swapKitAsset!,
@@ -699,6 +799,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
               walletAddresses,
             });
             debugQuote("intents request body (auto)", { reqId, body: intentsReq });
+            autoIntentsReq = intentsReq;
             calls.push(getIntentsQuote(intentsReq));
           } catch (e) {
             calls.push(Promise.reject(e as Error));
@@ -740,7 +841,12 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
         }
         if (intentsResult.status === "fulfilled") {
           nextRawIntents = intentsResult.value as IntentsQuoteResponse;
-          normIntents = normalizeIntents(nextRawIntents, slippage, toMeta);
+          normIntents = normalizeIntents(
+            nextRawIntents,
+            slippage,
+            toMeta,
+            autoIntentsReq ? echoOfRequest(autoIntentsReq) : undefined,
+          );
         }
         if (deskResult.status === "fulfilled") {
           nextRawDesk = deskResult.value as DeskQuote;
@@ -825,10 +931,12 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       setRawDesk(nextRawDesk);
       if (normalized) {
         setQuote(normalized);
+        setQuoteKey(key);
         setError(null);
         setFetchedAt(new Date().toISOString());
       } else {
         setQuote(null);
+        setQuoteKey(null);
         // firstErr === null means we learned a min and want the inline
         // hint to do the talking — render no top-level error.
         setError(firstErr ?? null);
@@ -855,6 +963,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
         toMetaForLearn,
       );
       setQuote(null);
+      setQuoteKey(null);
       if (learnedMinimum) {
         // Below-pair-minimum is communicated by the inline `intentsMinimum`
         // hint (green "Min: X TICKER" → red "Below minimum: X TICKER"
@@ -1020,6 +1129,19 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       setRawDesk(resp);
       if (normalized) {
         setQuote(normalized);
+        setQuoteKey(
+          swapQuoteInputsKey({
+            from,
+            to,
+            amount,
+            slippage,
+            preferredRouter,
+            fromBlockchain,
+            toBlockchain,
+            sourceAddress,
+            destinationAddress,
+          }),
+        );
         setError(null);
         setFetchedAt(new Date().toISOString());
       }
@@ -1028,12 +1150,23 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
     // explicitly asked for a fresh quote and must be able to act on it even if
     // the user has since changed the form underneath.
     return normalized;
-  }, [from, to, amount, toBlockchain]);
+  }, [
+    from,
+    to,
+    amount,
+    slippage,
+    preferredRouter,
+    fromBlockchain,
+    toBlockchain,
+    sourceAddress,
+    destinationAddress,
+  ]);
 
   // Debounced kickoff on every input change.
   useEffect(() => {
     if (!eligible) {
       setQuote(null);
+      setQuoteKey(null);
       setError(null);
       setRawSwapKit(null);
       setRawIntents(null);
@@ -1072,6 +1205,19 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       refreshTimerRef.current = null;
     };
   }, [eligible, paused, fetchOnce, quote?.expiresAt]);
+
+  // A quote whose deposit address has been claimed or retired (F2) is never
+  // handed out again, and the form gets a new one as soon as no modal is
+  // open — "try again" means a new quote and a new deposit address. Once per
+  // address, so an upstream that repeated an address could not loop us.
+  useEffect(() => {
+    if (paused || !eligible) return;
+    const dep = quote?.intentsQuote?.depositAddress;
+    if (!dep || !isIntentsDepositUsed(dep)) return;
+    if (refetchedForRef.current === dep) return;
+    refetchedForRef.current = dep;
+    void fetchOnce();
+  }, [paused, eligible, quote, fetchOnce]);
 
   // ── per-pair probe effect ──────────────────────────────────────
   // Fires `probePerPairMinimum` on (from, to) change after a short
@@ -1295,9 +1441,41 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
     return inputAtomic < minDisplayAtomic;
   }, [intentsMinimum, amount, from, fromBlockchain]);
 
-  return {
-    loading,
+  // ── the quote the form may act on (F2/F3) ───────────────────────────
+  // Only a quote fetched for EXACTLY the inputs on screen, and not one whose
+  // deposit address has already been used. While a confirm modal is open the
+  // hand-out is frozen at what the user opened it on — the modal is mounted on
+  // it, and must not have it replaced or cleared under a signature.
+  const currentKey = swapQuoteInputsKey({
+    from,
+    to,
+    amount,
+    slippage,
+    preferredRouter,
+    fromBlockchain,
+    toBlockchain,
+    sourceAddress,
+    destinationAddress,
+  });
+  const handedOut = selectHandedOutQuote({
     quote,
+    quoteKey,
+    currentKey,
+    isUsed: isIntentsDepositUsed,
+  });
+  if (!paused) {
+    frozenQuoteRef.current = null;
+  } else if (frozenQuoteRef.current === null) {
+    frozenQuoteRef.current = handedOut;
+  }
+  const visibleQuote = paused ? frozenQuoteRef.current : handedOut;
+  // A quote held back because the inputs moved on is a quote being fetched:
+  // say "loading" rather than let the form fall back to placeholder rates.
+  const staleHeldBack = !paused && eligible && quote !== null && handedOut === null;
+
+  return {
+    loading: loading || staleHeldBack,
+    quote: visibleQuote,
     error,
     rawSwapKit,
     rawIntents,
@@ -1309,6 +1487,28 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
     intentsMinimum,
     belowMinimum,
   };
+}
+
+/**
+ * Which quote the form may act on (2026-09-29 send-safety audit, F2/F3).
+ * Pure, so the rule is testable without mounting the hook:
+ *
+ *  - a quote fetched for different inputs than the form shows now → none
+ *    (the 500 ms debounce used to leave the OLD pair's quote live);
+ *  - an Intents quote whose deposit address was already claimed or retired
+ *    → none (one quote, one deposit).
+ */
+export function selectHandedOutQuote(args: {
+  quote: NormalizedQuote | null;
+  quoteKey: string | null;
+  currentKey: string;
+  isUsed: (depositAddress: string) => boolean;
+}): NormalizedQuote | null {
+  const { quote } = args;
+  if (!quote || args.quoteKey !== args.currentKey) return null;
+  const dep = quote.intentsQuote?.depositAddress;
+  if (dep && args.isUsed(dep)) return null;
+  return quote;
 }
 
 /** Tolerant BigInt parse — returns null on garbage input. */
@@ -1715,10 +1915,16 @@ export function normalizeSwapKit(
   };
 }
 
-function normalizeIntents(
+/**
+ * Exported for tests (2026-09-29): pins that the request a quote answers is
+ * carried with it (F3).
+ */
+export function normalizeIntents(
   resp: IntentsQuoteResponse,
   slippage: number,
-  toMeta: SwapCoinMeta
+  toMeta: SwapCoinMeta,
+  /** The body the wallet SENT for this quote (F3). */
+  sent?: IntentsQuoteRequestEcho,
 ): NormalizedQuote | null {
   const q = resp.quote;
   if (!q) return null;
@@ -1763,12 +1969,23 @@ function normalizeIntents(
 
   const etaSeconds = Math.max(0, Math.floor(Number(q.timeEstimate ?? 0)));
 
+  // 1Click answers with the request it quoted (`quoteRequest`) beside the
+  // quote. The proxy types do not declare it and the relay may not pass it,
+  // so it is read structurally and kept only when it is an object (F3).
+  const echoRaw = (resp as unknown as { quoteRequest?: unknown }).quoteRequest;
+  const intentsEcho =
+    echoRaw && typeof echoRaw === "object"
+      ? (echoRaw as Partial<IntentsQuoteRequestEcho>)
+      : null;
+
   return {
     source: "intents",
     routerLabel: ROUTER_MODES.intents.label,
     providerName: "solver-relay",
     mockDetected: false,
     intentsQuote: q,
+    ...(sent ? { intentsRequest: sent } : {}),
+    intentsEcho,
     expectedReceive: expectedDisplay,
     minReceived: minReceivedDisplay,
     // 1Click rolls all costs into amountOut — no separate fees field. Show 0.
@@ -1822,8 +2039,13 @@ export function buildIntentsRequestSafely(args: {
 
   // 1Click slippage is in basis points — 0.02 fraction → 200 bps.
   const slippageBps = Math.max(0, Math.round(args.slippage * 10_000));
-  // Deadline: 10 min from now in ISO8601.
-  const deadline = new Date(Date.now() + 10 * 60_000).toISOString();
+  // Deadline, sized for the ORIGIN chain (2026-09-29 send-safety audit, F4).
+  // It was a flat 10 minutes; 1Click documents the deadline as when "the
+  // deposit address becomes inactive and funds may be lost", and a BTC
+  // deposit alone was estimated at 812 s. See `INTENTS_DEPOSIT_WINDOWS`.
+  const deadline = new Date(
+    Date.now() + depositWindowFor(args.fromMeta.chainKind).requestMinutes * 60_000,
+  ).toISOString();
 
   // ─── amount conversion (display units → atomic units) ─────────
   // 1Click's quote endpoint expects `amount` in the smallest unit of

@@ -363,6 +363,26 @@ describe("executeIntentsTrade — deposit tx value bounds (P0 5-sextillion fix)"
   // atomic-units string, NOT a re-conversion through ×10^18.
   const EXPECTED_VALUE_HEX = "0x" + BigInt(AMOUNT_IN_WEI).toString(16);
 
+  // The request each quote answers, and the destination the confirm screen
+  // shows (2026-09-29 send-safety audit, F3): `executeIntentsTrade` refuses
+  // to sign unless the quote was made for exactly the swap being signed. The
+  // deadline leaves an ETH deposit its landing window (F4).
+  const DEST_ASSET = "nep141:btc.omft.near";
+  function bindingFor(amountAtomic: string) {
+    return {
+      quoteRequest: {
+        originAsset: "nep141:eth.omft.near",
+        destinationAsset: DEST_ASSET,
+        amount: amountAtomic,
+        recipient: BTC_ADDR,
+        refundTo: ETH_ADDR,
+        deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
+      },
+      destinationAsset: DEST_ASSET,
+      destinationAddress: BTC_ADDR,
+    };
+  }
+
   function makeMockChainRpcs(jsonRpcMockImpl: (
     urls: string[],
     method: string,
@@ -464,6 +484,7 @@ describe("executeIntentsTrade — deposit tx value bounds (P0 5-sextillion fix)"
         amountIn: AMOUNT_IN_WEI,
       } as any,
       userIntendedAtomic: BigInt(AMOUNT_IN_WEI),
+      ...bindingFor(AMOUNT_IN_WEI),
     });
 
     // The captured `unsignedTx.value` MUST be the wei BigInt hex of
@@ -554,6 +575,8 @@ describe("executeIntentsTrade — deposit tx value bounds (P0 5-sextillion fix)"
         // ABSURD (5e33), so the SafetyInvariant layer's first guard
         // fires and refuses to proceed.
         userIntendedAtomic: BigInt(AMOUNT_IN_WEI),
+        // The REQUEST was for 5e15 (bound); only the answer is absurd.
+        ...bindingFor(AMOUNT_IN_WEI),
       });
     } catch (e) {
       caught = e;
@@ -639,27 +662,37 @@ describe("executeIntentsTrade — deposit tx value bounds (P0 5-sextillion fix)"
 
     const isolated = await import("./swap-execute");
 
-    const baseArgs = {
+    // A retry is a NEW quote with a NEW deposit address (2026-09-29, F2):
+    // one quote, one signature. Each attempt below is therefore its own
+    // quote; what this test still pins is that none of them reuses a nonce.
+    const argsFor = (depositAddress: string) => ({
       sessionId: "deadbeef",
       fromAsset: "ETH",
       sourceAddress: ETH_ADDR,
       intentsQuote: {
-        depositAddress: ETH_ADDR,
+        depositAddress,
         amountIn: AMOUNT_IN_WEI,
       } as any,
       userIntendedAtomic: BigInt(AMOUNT_IN_WEI),
-    };
+      ...bindingFor(AMOUNT_IN_WEI),
+    });
 
     // First call.
-    await isolated.executeIntentsTrade(baseArgs);
+    await isolated.executeIntentsTrade(argsFor("0x" + "a1".repeat(20)));
     expect(nonceCallCount).toBe(1);
 
-    // Retry — must re-read nonce, not cache.
-    await isolated.executeIntentsTrade(baseArgs);
+    // Retry (new quote) — must re-read nonce, not cache.
+    await isolated.executeIntentsTrade(argsFor("0x" + "a2".repeat(20)));
     expect(nonceCallCount).toBe(2);
 
     // Third attempt — same.
-    await isolated.executeIntentsTrade(baseArgs);
+    await isolated.executeIntentsTrade(argsFor("0x" + "a3".repeat(20)));
+    expect(nonceCallCount).toBe(3);
+
+    // And the SAME quote twice is refused before anything is fetched (F2).
+    await expect(
+      isolated.executeIntentsTrade(argsFor("0x" + "a3".repeat(20))),
+    ).rejects.toThrow(/already used/);
     expect(nonceCallCount).toBe(3);
 
     vi.unstubAllEnvs();

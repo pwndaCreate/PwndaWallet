@@ -89,6 +89,7 @@ import {
   getSwapCoinMeta,
   tickerToChain,
   type SwapChainKind,
+  type SwapCoinMeta,
 } from "./swap-data";
 import {
   effectiveModeForSource,
@@ -102,6 +103,8 @@ import {
 // a value re-export defeats that mock from a direction the mock cannot see.
 import type { SourceSecret } from "./asset-capabilities";
 import {
+  accountSendAvailable,
+  executeAccountUtxoTransfer,
   executeAdapterTransfer,
   executeCardanoTransfer,
   executeNearNativeTransfer,
@@ -110,21 +113,45 @@ import {
   executeUtxoTransfer,
 } from "./swap-sources";
 import { getNearAddress, getSolanaAddress, getUtxoAddress } from "../../api/swap-rust";
-import {
-  AllRpcsFailedError,
-  jsonRpcCall,
-  tryRpcUrls,
-} from "../../wallets/chain-rpcs";
+import { jsonRpcCall } from "../../wallets/chain-rpcs";
 import {
   SafetyInvariantError,
+  assertEvmDepositShape,
   assertQuoteAmountMatchesUserIntent,
   assertSignedTxValueMatches,
+  assertSourceMetaMatchesCatalog,
   assertTxFundable,
   assertTxNotPlausibleOverspend,
   assertTxValueMatchesQuote,
   assertVerifiedHashMatches,
+  decodeEvmSignedTx,
   logSafetyIncident,
 } from "./safety-invariants";
+import { keccak_256 } from "@noble/hashes/sha3.js";
+import {
+  isSendOutcomeUnknown,
+  SendOutcomeUnknownError,
+} from "../../wallets/send-outcome";
+import { stablecoinNetworkFor } from "../../wallets/stablecoins";
+import type { ChainType } from "../../wallets/types";
+import { lookupByAssetId } from "./intents-dedup";
+import { claimIntentsDeposit, recordIntentsDeposit } from "./intents-attempts";
+import {
+  assertDepositWindowOpen,
+  assertQuoteBinding,
+  echoMismatches,
+  type IntentsQuoteRequestEcho,
+} from "./intents-quote-binding";
+import {
+  buildErc20BalanceOfCalldata,
+  buildErc20TransferCalldata,
+  parseErc20TransferCalldata,
+} from "./erc20-calldata";
+import {
+  errorText,
+  evmBroadcastRefusedEverywhere,
+  withTimeout,
+} from "./broadcast-outcome";
 
 // Re-export so consumers (UI banner, tests) can `instanceof` against it
 // from the same module they already import the executor from.
@@ -363,12 +390,12 @@ export async function executeSwapKitTrade(input: ExecuteSwapInput): Promise<{
  * plus the ticker + deposit address — useful diagnostic ground without
  * leaking key material.
  */
-async function runInvariant(
-  fn: () => void,
+async function runInvariant<T>(
+  fn: () => T,
   sessionContext: Record<string, string>
-): Promise<void> {
+): Promise<T> {
   try {
-    fn();
+    return fn();
   } catch (e) {
     if (e instanceof SafetyInvariantError) {
       // Fire-and-forget — never block the throw on telemetry I/O.
@@ -447,7 +474,7 @@ export function trackToHistoryStatus(
   return "pending";
 }
 
-/* ─── NEAR Intents execution (ETH source only in v1) ─────────────── */
+/* ─── NEAR Intents execution ─────────────────────────────────────── */
 
 export interface ExecuteIntentsInput {
   /** Active swap session token from `unlockSwap`. */
@@ -490,26 +517,61 @@ export interface ExecuteIntentsInput {
    * The secret for a TS-SIGNED source chain, tagged with what kind it is.
    *
    * Most source chains sign inside the Rust swap session and need nothing
-   * here. Three do not — Cardano, XRP and Tron — and they do not want the
-   * same secret:
+   * here. These do not:
    *
    *   - ADA rebuilds its whole key set from the vault's BIP-39 mnemonic
    *     (`{ kind: "mnemonic" }`), because Cardano's Icarus derivation needs
    *     the seed, not a single key.
+   *   - BTC, LTC, DOGE, BCH and DASH (2026-09-29, F10) deposit from the whole
+   *     account through the adapter, which derives every address it spends
+   *     from — also `{ kind: "mnemonic" }`.
    *   - XRP and Tron sign with one chain private key
    *     (`{ kind: "privateKey" }`), which is what their adapters take.
-   *
-   * Tagged rather than two optional fields (`cardanoMnemonic`, `xrpKey`, ...)
-   * so the shape stops growing a field per chain, and so a caller cannot pass
-   * a mnemonic where a private key is meant and have it fail deep inside a
-   * signer. The branch that consumes it checks the tag first.
    *
    * Same security posture as the mnemonic it replaces: held in memory for the
    * duration of the call, never logged, never persisted.
    */
   sourceSecret?: SourceSecret;
+  /**
+   * The request this quote answered — what 1Click minted the deposit address
+   * for (2026-09-29 send-safety audit, F3). Compared with the asset, amount
+   * and addresses about to be signed; any difference refuses before signing.
+   */
+  quoteRequest: IntentsQuoteRequestEcho;
+  /** 1Click's own echo of the request (`quoteRequest` in its response), when
+   *  the relay passes it through. Compared with `quoteRequest` (F3). */
+  quoteEcho?: Partial<IntentsQuoteRequestEcho> | null;
+  /** The destination asset id and address the confirm screen shows (F3). */
+  destinationAsset: string;
+  destinationAddress: string;
+  /**
+   * Called as soon as the deposit has a hash — BEFORE the 1Click notify —
+   * so the caller can persist the swap before anything else can fail
+   * (F2). Errors it throws are logged, never propagated: the money has moved.
+   */
+  onBroadcast?: (r: IntentsBroadcastInfo) => void | Promise<void>;
   onPhase?: (s: SwapExecutionStatus) => void;
+  /** Clock, for tests (F4). */
+  nowMs?: () => number;
 }
+
+export interface IntentsBroadcastInfo {
+  sourceTxHash: string;
+  depositAddress: string;
+  /** The network accepted it; the wallet has not seen it confirmed. */
+  pending: boolean;
+}
+
+/**
+ * Source chain kinds whose deposit can be a TOKEN transfer. For every other
+ * kind the executor only knows how to move the native coin, so a catalog
+ * asset with a contract on one of them is refused (F1).
+ */
+const TOKEN_DEPOSIT_KINDS: ReadonlySet<SwapChainKind> = new Set<SwapChainKind>([
+  "EVM",
+  "SOLANA",
+  "TRON",
+]);
 
 /**
  * Execute a NEAR Intents quote: build → sign → broadcast a source-chain
@@ -517,23 +579,36 @@ export interface ExecuteIntentsInput {
  * the solver-relay perform the cross-chain settlement.
  *
  * Source-chain coverage:
- *   - EVM (ETH / AVAX / POL / FLR / MON / BNB): inline below — query
- *     nonce/gasPrice from RPC, sign via `swap_sign_evm`.
- *   - SOL: `executeSolanaTransfer` — System.transfer + `swap_sign_solana`.
- *   - NEAR: `executeNearNativeTransfer` — borsh-encoded Transfer +
- *     `swap_sign_near_tx`. User must have ≥0.1 NEAR for fees.
- *   - BTC / LTC / DOGE / BCH: `executeUtxoTransfer` — UTXO fetch +
- *     bitcoinjs-lib PSBT build + `swap_sign_psbt`.
- *   - ADA: `executeCardanoTransfer` — the one TS-signed source. Builds +
- *     signs (BIP-32-Ed25519) + submits via Koios in `cardano-tx.ts`; no
- *     Rust signer. Needs `input.cardanoMnemonic`.
- *   - DASH / STELLAR / SUI: routed through their dedicated helpers in
- *     swap-sources.ts (not this generic dispatcher).
+ *   - EVM (ETH / AVAX / POL / MON / BNB, and the stablecoin legs): inline
+ *     below — gas estimate, balance gates, `swap_sign_evm`, verified
+ *     broadcast. Native coin or ERC-20 `transfer` per the 1Click catalog.
+ *   - SOL: `executeSolanaTransfer`; SPL legs: `executeSplTransfer`.
+ *   - NEAR: `executeNearNativeTransfer`.
+ *   - BTC / LTC / DOGE / BCH / DASH: `executeAccountUtxoTransfer` — the
+ *     adapter's account-wide send (F10). The single-address Rust PSBT path
+ *     (`executeUtxoTransfer`) is the fallback for BTC/LTC/DOGE/BCH when the
+ *     adapter's account scan does not cover the wallet.
+ *   - ADA: `executeCardanoTransfer` (TS-signed).
+ *   - XRP / TRX / USDT-TRON: `executeAdapterTransfer` (TS-signed).
+ *
+ * Before anything is built (2026-09-29 send-safety audit):
+ *   - F1: the source asset is checked against the 1Click catalog entry the
+ *     quote names — native or token, which contract, which decimals;
+ *   - F3: the quote must have been made for THIS asset, amount, recipient
+ *     and refund address;
+ *   - F4: its deposit window must leave the origin chain time to land;
+ *   - F2: the deposit address is claimed, and a second attempt for it is
+ *     refused — one quote, one signature.
+ *
+ * After the broadcast: `onBroadcast` first, then a best-effort notify that
+ * can no longer fail the call (F2). A broadcast whose outcome is unknown
+ * throws `SendOutcomeUnknownError` with the hash.
  */
 export async function executeIntentsTrade(
   input: ExecuteIntentsInput
-): Promise<{ sourceTxHash: string; depositAddress: string }> {
+): Promise<{ sourceTxHash: string; depositAddress: string; pending: boolean }> {
   const phase = (s: SwapExecutionStatus) => input.onPhase?.(s);
+  const now = input.nowMs ?? (() => Date.now());
   // Effective source-chain metadata — when `fromBlockchain` is set, we
   // route through `getSwapCoinMeta(symbol, blockchain)` for synthetic
   // per-(symbol, blockchain) routing (USDC on Base, ETH on Arbitrum).
@@ -554,14 +629,67 @@ export async function executeIntentsTrade(
   if (!amountIn) {
     throw new Error("NEAR Intents quote missing amountIn");
   }
+  const ctx = (stage: string) => ({ stage, ticker: fromMeta.ticker, depositAddress });
 
-  // CARDANO signs + submits via the TS Koios path (no chain RPC); every
-  // other source needs an RPC URL. Default to "" so the type stays
-  // `string` for the existing branches while exempting CARDANO.
-  const rpcUrl = input.rpcUrlOverride ?? fromMeta.defaultRpcUrl ?? "";
-  if (!rpcUrl && fromMeta.chainKind !== "CARDANO") {
-    throw new Error(`No RPC URL configured for ${input.fromAsset}`);
+  // ─── F1 ─ the asset, per the 1Click catalog ───────────────────────
+  // The contract (or its absence) the deposit must carry comes from the
+  // CATALOG, and the registry must agree with it. Until 2026-09-29 the
+  // registry had no contract for any stablecoin leg, and every check below
+  // compared the built tx with that same registry — so 100 USDC-BSC was
+  // built, checked and signed as a 100 BNB transfer.
+  const { contract: catalogContract } = await runInvariant(
+    () =>
+      assertSourceMetaMatchesCatalog({
+        ticker: fromMeta.ticker,
+        nearIntentsAsset: fromMeta.nearIntentsAsset,
+        decimals: fromMeta.decimals,
+        tokenContract: fromMeta.tokenContract,
+        catalogAsset: fromMeta.nearIntentsAsset
+          ? lookupByAssetId(fromMeta.nearIntentsAsset)
+          : null,
+      }),
+    ctx("pre-build"),
+  );
+  if (catalogContract && !TOKEN_DEPOSIT_KINDS.has(fromMeta.chainKind)) {
+    await runInvariant(() => {
+      throw new SafetyInvariantError({
+        invariant: "SOURCE_ASSET_CATALOG_MISMATCH",
+        message:
+          `${fromMeta.ticker} is a token (${catalogContract}) on a ${fromMeta.chainKind} ` +
+          `chain, and the wallet can only deposit that chain's native coin. Refusing to build it.`,
+        context: { ticker: fromMeta.ticker, chainKind: fromMeta.chainKind, catalogContract },
+      });
+    }, ctx("pre-build"));
   }
+
+  // ─── F3 ─ the quote answers THIS swap ─────────────────────────────
+  assertQuoteBinding(input.quoteRequest, {
+    originAsset: fromMeta.nearIntentsAsset,
+    destinationAsset: input.destinationAsset,
+    amountAtomic: input.userIntendedAtomic,
+    recipient: input.destinationAddress,
+    refundTo: input.sourceAddress,
+  });
+  const echoDiff = echoMismatches(input.quoteRequest, input.quoteEcho);
+  if (echoDiff.length > 0) {
+    await runInvariant(() => {
+      throw new SafetyInvariantError({
+        invariant: "QUOTE_ECHO_MISMATCH",
+        message:
+          `1Click says this quote answers a different request than the one the wallet ` +
+          `sent (${echoDiff.join("; ")}). Refusing to sign.`,
+        context: { ticker: fromMeta.ticker, differences: echoDiff.join(" | ") },
+      });
+    }, ctx("post-quote"));
+  }
+
+  // ─── F4 ─ the deposit window is still open for this chain ────────
+  assertDepositWindowOpen({
+    deadline: input.intentsQuote.deadline ?? input.quoteRequest.deadline,
+    chainKind: fromMeta.chainKind,
+    nowMs: now(),
+    ticker: fromMeta.ticker,
+  });
 
   // ─── INVARIANT #1 ─ post-quote, pre-build ─────────────────────────
   // `quote.amountIn` is what 1Click told us we'll spend. It must match
@@ -578,525 +706,787 @@ export async function executeIntentsTrade(
         ticker: fromMeta.ticker,
         decimals: fromMeta.decimals,
       }),
-    {
-      stage: "post-quote",
-      ticker: fromMeta.ticker,
-      depositAddress,
-    }
+    ctx("post-quote"),
   );
+
+  // ─── F2 ─ one quote, one signature ────────────────────────────────
+  // Claimed synchronously, after every check that can refuse the quote and
+  // before anything is built: two overlapping submits cannot both pass, and
+  // a Retry, a re-opened modal or a second click on the same quote is
+  // refused here instead of signing a second deposit to the same address.
+  claimIntentsDeposit(depositAddress, now());
 
   phase({ phase: "building" });
 
   let sourceTxHash: string;
-
-  switch (fromMeta.chainKind) {
-    case "EVM": {
-      if (typeof fromMeta.evmChainId !== "number") {
-        throw new Error(`No chain id configured for ${input.fromAsset}`);
-      }
-      // Resolve the RPC fallback list for this chain. If the user pinned
-      // an `rpcUrlOverride` we honor it absolutely; otherwise we use the
-      // chain's full audited fallback list (env-overridable via
-      // VITE_<CHAIN>_RPC_URL — see wallets/chain-rpcs.ts).
-      const rpcUrls: string[] = input.rpcUrlOverride
-        ? [input.rpcUrlOverride]
-        : (fromMeta.rpcFallbacks && fromMeta.rpcFallbacks.length > 0
-            ? fromMeta.rpcFallbacks
-            : [rpcUrl]);
-
-      // ─── 1Click's `quote.amountIn` is atomic units (wei / 1e6 token / etc.) ──
-      // Documented contract: do NOT re-convert via decimalToBaseUnits.
-      // See post-mortem-amount-units for the 5-sextillion-ETH bug story.
-      const transferAmountAtomic = quoteAmountAtomic;
-
-      // ERC-20 source flow branches on `tokenContract`. For native gas
-      // (ETH, MATIC, BNB, AVAX, MON, etc.) the `value` field carries the
-      // amount and `data` is empty. For ERC-20 transfers, `to` is the
-      // token contract, `value` is 0, and `data` is the encoded
-      // transfer(recipient, amount) calldata.
-      const isErc20 = !!fromMeta.tokenContract;
-
-      // Fetch gas price first; nonce is fetched as the LAST step
-      // before signing so it's as fresh as possible.
-      const gasPriceHex = await jsonRpcCall(
-        rpcUrls,
-        "eth_gasPrice",
-        [],
-        { ticker: fromMeta.ticker },
-      );
-
-      // ─── pre-sign balance + value gates ───────────────────────────
-      // Native gas balance is always required (every EVM tx pays in gas).
-      const nativeBalanceHex = await jsonRpcCall(
-        rpcUrls,
-        "eth_getBalance",
-        [input.sourceAddress, "latest"],
-        { ticker: fromMeta.ticker },
-      );
-      const nativeBalanceWei = BigInt(nativeBalanceHex);
-      const gasPriceWei = BigInt(gasPriceHex);
-      // Native: 21000. ERC-20: ~50-65k for USDT/USDC, ~50k for DAI; pad
-      // to 100k for safety (the user pays only what's actually consumed).
-      const gasLimit = isErc20 ? 100_000n : 21_000n;
-      const gasCostWei = gasLimit * gasPriceWei;
-
-      // Token balance fetch (ERC-20 only) via balanceOf(address) eth_call.
-      let tokenBalanceAtomic: bigint = 0n;
-      if (isErc20 && fromMeta.tokenContract) {
-        const { buildErc20BalanceOfCalldata } = await import("./erc20-calldata");
-        const balanceOfData = buildErc20BalanceOfCalldata(input.sourceAddress);
-        const tokenBalanceHex = await jsonRpcCall(
-          rpcUrls,
-          "eth_call",
-          [{ to: fromMeta.tokenContract, data: balanceOfData }, "latest"],
-          { ticker: fromMeta.ticker },
-        );
-        tokenBalanceAtomic = BigInt(tokenBalanceHex);
-      }
-
-      // Three layered guards on the moving asset's balance:
-      //   #3 funded (native side): gas <= native balance (always)
-      //   #3 funded (transfer): for native, value + gas <= native;
-      //                         for ERC-20, transferAmount <= token balance
-      //   #4 not overspend: transferAmount <= 2× moving-asset balance
-      const movingAssetBalance = isErc20 ? tokenBalanceAtomic : nativeBalanceWei;
-      await runInvariant(
-        () =>
-          assertTxNotPlausibleOverspend({
-            valueAtomic: transferAmountAtomic,
-            balanceAtomic: movingAssetBalance,
-            ticker: fromMeta.ticker,
-          }),
-        { stage: "pre-sign", ticker: fromMeta.ticker, depositAddress }
-      );
-      if (isErc20) {
-        // ERC-20: native pays only gas; token covers the transfer.
-        await runInvariant(
-          () =>
-            assertTxFundable({
-              valueAtomic: gasCostWei,
-              gasCostAtomic: 0n, // already folded in
-              balanceAtomic: nativeBalanceWei,
-              ticker: fromMeta.ticker,
-            }),
-          { stage: "pre-sign", ticker: fromMeta.ticker, depositAddress }
-        );
-        await runInvariant(
-          () =>
-            assertTxFundable({
-              valueAtomic: transferAmountAtomic,
-              gasCostAtomic: 0n,
-              balanceAtomic: tokenBalanceAtomic,
-              ticker: fromMeta.ticker,
-            }),
-          { stage: "pre-sign", ticker: fromMeta.ticker, depositAddress }
-        );
-      } else {
-        // Native: value + gas <= native balance (the historic check).
-        await runInvariant(
-          () =>
-            assertTxFundable({
-              valueAtomic: transferAmountAtomic,
-              gasCostAtomic: gasCostWei,
-              balanceAtomic: nativeBalanceWei,
-              ticker: fromMeta.ticker,
-            }),
-          { stage: "pre-sign", ticker: fromMeta.ticker, depositAddress }
-        );
-      }
-
-      // ─── Nonce: fetched LAST, immediately before signing ───────
-      const nonceHex = await jsonRpcCall(
-        rpcUrls,
-        "eth_getTransactionCount",
-        [input.sourceAddress, "pending"],
-        { ticker: fromMeta.ticker },
-      );
-
-      // Build the unsigned tx — branches on isErc20.
-      let unsignedTx: {
-        chainId: number;
-        to: string;
-        value: string;
-        data: string;
-        gas: number;
-        gasPrice: string;
-        nonce: string;
-      };
-      if (isErc20 && fromMeta.tokenContract) {
-        const { buildErc20TransferCalldata } = await import("./erc20-calldata");
-        unsignedTx = {
-          chainId: fromMeta.evmChainId,
-          to: fromMeta.tokenContract,
-          value: "0x0",
-          data: buildErc20TransferCalldata(depositAddress, transferAmountAtomic),
-          gas: Number(gasLimit),
-          gasPrice: gasPriceHex,
-          nonce: nonceHex,
-        };
-      } else {
-        const valueHex = "0x" + transferAmountAtomic.toString(16);
-        unsignedTx = {
-          chainId: fromMeta.evmChainId,
-          to: depositAddress,
-          value: valueHex,
-          data: "0x",
-          gas: Number(gasLimit),
-          gasPrice: gasPriceHex,
-          nonce: nonceHex,
-        };
-      }
-
-      // ─── INVARIANT #2 ─ built tx value/calldata === quote.amountIn ─
-      // Native: value field === quote atomic. ERC-20: value=0 AND
-      // calldata's parsed amount === quote atomic. Both layers prevent a
-      // future bug from quietly putting the value somewhere it wouldn't
-      // get spent.
-      if (isErc20) {
-        const { parseErc20TransferCalldata } = await import("./erc20-calldata");
-        if (BigInt(unsignedTx.value) !== 0n) {
-          throw new SafetyInvariantError({
-            invariant: "ERC20_SOURCE_VALUE_DRIFT",
-            message: `ERC-20 source tx must have value=0 but got ${unsignedTx.value}`,
-            context: {
-              value: unsignedTx.value,
-              ticker: fromMeta.ticker,
-              stage: "post-build",
-            },
-          });
-        }
-        const parsed = parseErc20TransferCalldata(unsignedTx.data);
-        if (!parsed) {
-          throw new SafetyInvariantError({
-            invariant: "ERC20_SOURCE_CALLDATA_DRIFT",
-            message: `ERC-20 source tx calldata is not transfer(address,uint256)`,
-            context: {
-              dataHead: unsignedTx.data.slice(0, 12),
-              ticker: fromMeta.ticker,
-              stage: "post-build",
-            },
-          });
-        }
-        await runInvariant(
-          () =>
-            assertTxValueMatchesQuote({
-              txValueAtomic: parsed.amount,
-              quoteAmountAtomic,
-              ticker: fromMeta.ticker,
-            }),
-          { stage: "post-build", ticker: fromMeta.ticker, depositAddress }
-        );
-      } else {
-        await runInvariant(
-          () =>
-            assertTxValueMatchesQuote({
-              txValueAtomic: BigInt(unsignedTx.value),
-              quoteAmountAtomic,
-              ticker: fromMeta.ticker,
-            }),
-          { stage: "post-build", ticker: fromMeta.ticker, depositAddress }
-        );
-      }
-
-      phase({ phase: "signing" });
-      const signed = await signEvm(
-        input.sessionId,
-        unsignedTx,
-        input.account ?? 0,
-        input.index ?? 0
-      );
-
-      // ─── INVARIANT #5 ─ signed tx value + recipient unchanged ───
-      // For native EVM the assertion compares value+to directly. For
-      // ERC-20 the on-chain `to` is the token contract and `value=0`;
-      // the *transfer recipient* lives in calldata. The existing
-      // assertSignedTxValueMatches helper inspects the RLP `to`/`value`
-      // fields, so for ERC-20 we adapt:
-      //   - expectedRecipient = tokenContract (where the tx is sent)
-      //   - expectedValueAtomic = 0
-      // The transfer recipient is verified against calldata above.
-      const expectedSignedRecipient = isErc20 && fromMeta.tokenContract
-        ? fromMeta.tokenContract
-        : depositAddress;
-      const expectedSignedValue = isErc20 ? 0n : transferAmountAtomic;
-      await runInvariant(
-        () =>
-          assertSignedTxValueMatches({
-            rawSignedTxHex: signed.rawTx,
-            expectedValueAtomic: expectedSignedValue,
-            expectedRecipient: expectedSignedRecipient,
-            ticker: fromMeta.ticker,
-          }),
-        { stage: "post-sign", ticker: fromMeta.ticker, depositAddress }
-      );
-
-      phase({ phase: "broadcasting" });
-      const r = await broadcastEvmVerified(rpcUrls, signed.rawTx);
-
-      // ─── INVARIANT #6 ─ verified hash === keccak256(signedTx) ──
-      // The Rust verified-broadcast layer should have returned the same
-      // hash a local keccak256 of the signed tx produces. If they
-      // differ, an RPC misbehaved — surface the discrepancy rather
-      // than blindly trusting the network's response.
-      await runInvariant(
-        () =>
-          assertVerifiedHashMatches({
-            rawSignedTxHex: signed.rawTx,
-            verifiedHash: r.txHash,
-          }),
-        { stage: "post-broadcast", ticker: fromMeta.ticker, depositAddress }
-      );
-
-      sourceTxHash = r.txHash;
-      break;
-    }
-
-    case "SOLANA": {
-      // Source address must come from our derivation, not be passed in,
-      // because the form may pre-fill `sourceAddress` from a non-SOL
-      // wallet adapter when SOL has no first-party adapter.
-      const fromAddress =
-        input.sourceAddress && input.sourceAddress.length > 0
-          ? input.sourceAddress
-          : await getSolanaAddress(input.sessionId);
-      phase({ phase: "signing" });
-      // SPL token branch: when the source asset has a `tokenContract`
-      // (= SPL mint address), route through executeSplTransfer which
-      // builds a Token Program transfer instruction against the
-      // source/destination ATAs. Otherwise route through the native
-      // SOL helper.
-      let r: { txHash: string };
-      if (fromMeta.tokenContract) {
-        r = await executeSplTransfer({
-          sessionId: input.sessionId,
-          fromAddress,
+  let pending = false;
+  try {
+    switch (fromMeta.chainKind) {
+      case "EVM": {
+        sourceTxHash = await depositEvm({
+          input,
+          fromMeta,
           depositAddress,
-          mint: fromMeta.tokenContract,
-          amountAtomic: amountIn,
-          rpcUrl,
+          quoteAmountAtomic,
+          contract: catalogContract,
+          phase,
+          ctx,
         });
-      } else {
-        // amountIn from 1Click is already in lamports (atomic) — pass
-        // through the atomic-units field, NOT the now-removed amountSol.
-        r = await executeSolanaTransfer({
-          sessionId: input.sessionId,
-          fromAddress,
-          depositAddress,
-          amountAtomic: amountIn,
-          rpcUrl,
-        });
+        break;
       }
-      phase({ phase: "broadcasting" });
-      sourceTxHash = r.txHash;
-      break;
-    }
 
-    case "NEAR": {
-      const near = await getNearAddress(input.sessionId);
-      phase({ phase: "signing" });
-      // amountIn = yoctoNEAR (atomic) per 1Click's response shape.
-      const r = await executeNearNativeTransfer({
-        sessionId: input.sessionId,
-        fromAccountId:
+      case "SOLANA": {
+        const rpcUrl = input.rpcUrlOverride ?? fromMeta.defaultRpcUrl;
+        if (!rpcUrl) throw new Error(`No RPC URL configured for ${input.fromAsset}`);
+        // Source address must come from our derivation, not be passed in,
+        // because the form may pre-fill `sourceAddress` from a non-SOL
+        // wallet adapter when SOL has no first-party adapter.
+        const fromAddress =
           input.sourceAddress && input.sourceAddress.length > 0
             ? input.sourceAddress
-            : near.accountId,
-        fromPublicKey: near.publicKey,
-        depositAddress,
-        amountAtomic: amountIn,
-        rpcUrl,
-      });
-      phase({ phase: "broadcasting" });
-      sourceTxHash = r.txHash;
-      break;
-    }
-
-    case "BTC":
-    case "LTC":
-    case "DOGE":
-    case "BCH": {
-      const chainMap: Record<string, "btc" | "ltc" | "doge" | "bch"> = {
-        BTC: "btc",
-        LTC: "ltc",
-        DOGE: "doge",
-        BCH: "bch",
-      };
-      const chain = chainMap[fromMeta.chainKind];
-      const fromAddress =
-        input.sourceAddress && input.sourceAddress.length > 0
-          ? input.sourceAddress
-          : await getUtxoAddress(input.sessionId, chain);
-      phase({ phase: "signing" });
-      // amountIn = atomic units (satoshi-equivalent: 1e8 atomic per coin
-      // for BTC/LTC/DOGE/BCH) per 1Click's response shape.
-      const r = await executeUtxoTransfer({
-        sessionId: input.sessionId,
-        chain,
-        fromAddress,
-        depositAddress,
-        amountAtomic: amountIn,
-        rpcUrl,
-      });
-      phase({ phase: "broadcasting" });
-      sourceTxHash = r.txHash;
-      break;
-    }
-
-    case "DASH":
-    case "STELLAR":
-    case "SUI":
-      // Phase 5 / 6 / 7 routing is wired through the dedicated source
-      // helpers in `swap-sources.ts`. Each chain has its own multi-step
-      // build → fetch → sign → broadcast flow that doesn't fit the
-      // generic EVM/SOL/NEAR/UTXO patterns above.
-      throw new Error(
-        `${fromMeta.ticker} source-tx routing is wired through executeDash/executeStellar/executeSui in swap-sources.ts — call those directly, not this generic dispatcher.`
-      );
-
-    case "CARDANO": {
-      // ADA source — signed in the TS Cardano stack, NOT the Rust core.
-      // See executeCardanoTransfer for the rationale. The mnemonic is
-      // threaded in from walletsByChain.cardano (same as ADA Send); the
-      // Rust swap session isn't used for this chain.
-      if (input.sourceSecret?.kind !== "mnemonic" || !input.sourceSecret.value) {
-        throw new Error(
-          "ADA source swap requires the Cardano mnemonic. Open the Cardano " +
-            "chain in the dashboard so the wallet is derived, then retry."
-        );
+            : await getSolanaAddress(input.sessionId);
+        phase({ phase: "signing" });
+        // Token or native per the CATALOG (F1). The mint is the catalog's,
+        // which `assertSourceMetaMatchesCatalog` has checked is the wallet's.
+        const r = catalogContract
+          ? await executeSplTransfer({
+              sessionId: input.sessionId,
+              fromAddress,
+              depositAddress,
+              mint: catalogContract,
+              amountAtomic: amountIn,
+              rpcUrl,
+            })
+          : await executeSolanaTransfer({
+              sessionId: input.sessionId,
+              fromAddress,
+              depositAddress,
+              amountAtomic: amountIn,
+              rpcUrl,
+            });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        break;
       }
-      phase({ phase: "signing" });
-      // amountIn = lovelace (6dp atomic) per 1Click's response shape.
-      const r = await executeCardanoTransfer({
-        mnemonic: input.sourceSecret.value,
-        fromAddress: input.sourceAddress,
-        depositAddress,
-        amountAtomic: amountIn,
-      });
-      phase({ phase: "broadcasting" });
-      sourceTxHash = r.txHash;
-      break;
-    }
 
-    case "XRP":
-    case "TRON": {
-      // XRP, native TRX and TRC-20 USDT — the other TS-signed sources
-      // (2026-09-09). All three go through the wallet's own chain adapter,
-      // which is the same call the dashboard Send button makes, so a swap
-      // deposit and a manual send cannot drift apart.
-      //
-      // `walletsByChainKey` is what picks the adapter, and it is the ONLY
-      // thing separating native TRX from TRC-20 USDT: same chainKind, same
-      // key, same signature, different transaction builder. Branching on
-      // chainKind alone would send USDT as if it were TRX.
-      if (
-        input.sourceSecret?.kind !== "privateKey" ||
-        !input.sourceSecret.value
-      ) {
-        throw new Error(
-          `${fromMeta.ticker} source swap requires the ${fromMeta.ticker} ` +
-            `private key. Open the ${fromMeta.ticker} chain in the dashboard ` +
-            `so the wallet is derived, then retry.`
-        );
+      case "NEAR": {
+        const rpcUrl = input.rpcUrlOverride ?? fromMeta.defaultRpcUrl;
+        if (!rpcUrl) throw new Error(`No RPC URL configured for ${input.fromAsset}`);
+        const near = await getNearAddress(input.sessionId);
+        phase({ phase: "signing" });
+        // amountIn = yoctoNEAR (atomic) per 1Click's response shape.
+        const r = await executeNearNativeTransfer({
+          sessionId: input.sessionId,
+          fromAccountId:
+            input.sourceAddress && input.sourceAddress.length > 0
+              ? input.sourceAddress
+              : near.accountId,
+          fromPublicKey: near.publicKey,
+          depositAddress,
+          amountAtomic: amountIn,
+          rpcUrl,
+        });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        break;
       }
-      // Resolved through swap-data rather than the registry directly: it is
-      // the same answer (`tickerToChain` falls back to the registry's own
-      // `walletsByChainKey`), and it keeps this module off a direct import of
-      // `asset-capabilities`, whose entries evaluate RPC lists at module load.
-      const chainKey = tickerToChain(input.fromAsset);
-      if (!chainKey) {
-        throw new Error(
-          `${input.fromAsset} has no wallet chain key, so the swap cannot ` +
-            `pick a signer for it. This is a registry bug — please report it.`
-        );
-      }
-      phase({ phase: "signing" });
-      // amountIn is ATOMIC (drops / sun). executeAdapterTransfer converts to
-      // the display units every adapter takes, with exact string math.
-      const r = await executeAdapterTransfer({
-        chainKey,
-        privateKey: input.sourceSecret.value,
-        depositAddress,
-        amountAtomic: amountIn,
-        decimals: fromMeta.decimals,
-        ticker: fromMeta.ticker,
-      });
-      phase({ phase: "broadcasting" });
-      sourceTxHash = r.txHash;
-      break;
-    }
 
-    case "XMR":
-    case "ZEPH":
-    case "ZANO":
-      // XMR routes through the atomic-swap modal; ZEPH through the Zephyr
-      // ecosystem card; ZANO has no swap route at all yet (no atomicDesk,
-      // no SwapKit/Intents entry — see asset-capabilities.ts). None of the
-      // three is a NEAR Intents source. The exhaustive-switch guard matters
-      // for type-soundness: without this branch, TS can't prove
-      // `sourceTxHash` is always assigned post-switch.
-      throw new Error(
-        `${fromMeta.ticker} cannot be a NEAR Intents source — out of scope.`
-      );
+      case "BTC":
+      case "LTC":
+      case "DOGE":
+      case "BCH":
+      case "DASH": {
+        // ACCOUNT-WIDE first (2026-09-29, F10) — the same send the wallet's
+        // Send button makes. The single-address Rust path read only the
+        // primary address, which a UTXO wallet empties on its first spend:
+        // the operator's LTC swap failed with "No UTXOs found at ltc1qty7…"
+        // over a wallet showing 4.03 LTC.
+        const chainKey =
+          fromMeta.walletsByChainKey ?? (tickerToChain(input.fromAsset) as ChainType | null);
+        const mnemonic =
+          input.sourceSecret?.kind === "mnemonic" ? input.sourceSecret.value : undefined;
+        if (
+          fromMeta.tsSourceSigner === "utxo-account" &&
+          chainKey &&
+          (await accountSendAvailable({
+            chainKey,
+            mnemonic,
+            fromAddress: input.sourceAddress,
+          }))
+        ) {
+          phase({ phase: "signing" });
+          const r = await executeAccountUtxoTransfer({
+            chainKey,
+            mnemonic: mnemonic!,
+            fromAddress: input.sourceAddress,
+            depositAddress,
+            amountAtomic: amountIn,
+            decimals: fromMeta.decimals,
+            ticker: fromMeta.ticker,
+          });
+          phase({ phase: "broadcasting" });
+          sourceTxHash = r.txHash;
+          pending = r.pending === true;
+          break;
+        }
+        // Fallback: the pre-F10 single-address path, ONLY when account send is
+        // unavailable — never after it was tried (a failed account send must
+        // not become a second attempt through another path).
+        if (fromMeta.chainKind === "DASH") {
+          throw new Error(
+            `DASH swaps deposit from the whole wallet account, and this wallet's ` +
+              `DASH address is not on the account the wallet can spend from ` +
+              `(or its recovery phrase is not loaded). Nothing was sent.`,
+          );
+        }
+        const rpcUrl = input.rpcUrlOverride ?? fromMeta.defaultRpcUrl;
+        if (!rpcUrl) throw new Error(`No RPC URL configured for ${input.fromAsset}`);
+        const chainMap: Record<string, "btc" | "ltc" | "doge" | "bch"> = {
+          BTC: "btc",
+          LTC: "ltc",
+          DOGE: "doge",
+          BCH: "bch",
+        };
+        const chain = chainMap[fromMeta.chainKind];
+        const fromAddress =
+          input.sourceAddress && input.sourceAddress.length > 0
+            ? input.sourceAddress
+            : await getUtxoAddress(input.sessionId, chain);
+        phase({ phase: "signing" });
+        // amountIn = atomic units (satoshi-equivalent: 1e8 atomic per coin
+        // for BTC/LTC/DOGE/BCH) per 1Click's response shape.
+        const r = await executeUtxoTransfer({
+          sessionId: input.sessionId,
+          chain,
+          fromAddress,
+          depositAddress,
+          amountAtomic: amountIn,
+          rpcUrl,
+        });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        break;
+      }
+
+      case "STELLAR":
+      case "SUI":
+        // No executor branch (F7). `isIntentsRoutableFromRegistry` no longer
+        // quotes these as sources; this is the backstop.
+        throw new Error(
+          `${fromMeta.ticker} cannot be a NEAR Intents source in this build — ` +
+            `the wallet has no deposit path for it. Nothing was sent.`,
+        );
+
+      case "CARDANO": {
+        // ADA source — signed in the TS Cardano stack, NOT the Rust core.
+        // See executeCardanoTransfer for the rationale. The mnemonic is
+        // threaded in from walletsByChain.cardano (same as ADA Send); the
+        // Rust swap session isn't used for this chain.
+        if (input.sourceSecret?.kind !== "mnemonic" || !input.sourceSecret.value) {
+          throw new Error(
+            "ADA source swap requires the Cardano mnemonic. Open the Cardano " +
+              "chain in the dashboard so the wallet is derived, then retry."
+          );
+        }
+        phase({ phase: "signing" });
+        // amountIn = lovelace (6dp atomic) per 1Click's response shape.
+        const r = await executeCardanoTransfer({
+          mnemonic: input.sourceSecret.value,
+          fromAddress: input.sourceAddress,
+          depositAddress,
+          amountAtomic: amountIn,
+        });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        break;
+      }
+
+      case "XRP":
+      case "TRON": {
+        // XRP, native TRX and TRC-20 USDT — TS-signed sources (2026-09-09).
+        // All three go through the wallet's own chain adapter, which is the
+        // same call the dashboard Send button makes, so a swap deposit and a
+        // manual send cannot drift apart. No RPC URL: these adapters reach
+        // their networks themselves, which is why the generic "No RPC URL"
+        // refusal that used to sit above this switch stopped XRP, TRX and
+        // USDT-TRON before signing on every attempt (F6, 2026-09-29).
+        //
+        // `walletsByChainKey` is what picks the adapter, and it is the ONLY
+        // thing separating native TRX from TRC-20 USDT: same chainKind, same
+        // key, same signature, different transaction builder. Branching on
+        // chainKind alone would send USDT as if it were TRX.
+        if (
+          input.sourceSecret?.kind !== "privateKey" ||
+          !input.sourceSecret.value
+        ) {
+          throw new Error(
+            `${fromMeta.ticker} source swap requires the ${fromMeta.ticker} ` +
+              `private key. Open the ${fromMeta.ticker} chain in the dashboard ` +
+              `so the wallet is derived, then retry.`
+          );
+        }
+        const chainKey =
+          fromMeta.walletsByChainKey ?? (tickerToChain(input.fromAsset) as ChainType | null);
+        if (!chainKey) {
+          throw new Error(
+            `${input.fromAsset} has no wallet chain key, so the swap cannot ` +
+              `pick a signer for it. This is a registry bug — please report it.`
+          );
+        }
+        // F1 for the adapter-built chains: the adapter chosen must be the
+        // token adapter for exactly the catalog's contract, or a native one.
+        const leg = stablecoinNetworkFor(chainKey);
+        if (catalogContract ? leg?.contract !== catalogContract : !!leg) {
+          await runInvariant(() => {
+            throw new SafetyInvariantError({
+              invariant: "SOURCE_ASSET_CATALOG_MISMATCH",
+              message:
+                `${fromMeta.ticker}: the ${chainKey} wallet sends ` +
+                `${leg ? `token ${leg.contract}` : "the native coin"}, but 1Click lists ` +
+                `${catalogContract ? `token ${catalogContract}` : "the native coin"}. ` +
+                `Refusing to build the deposit.`,
+              context: {
+                ticker: fromMeta.ticker,
+                chainKey,
+                walletContract: leg?.contract ?? "(native)",
+                catalogContract: catalogContract ?? "(native)",
+              },
+            });
+          }, ctx("pre-build"));
+        }
+        phase({ phase: "signing" });
+        // amountIn is ATOMIC (drops / sun). executeAdapterTransfer converts to
+        // the display units every adapter takes, with exact string math.
+        const r = await executeAdapterTransfer({
+          chainKey,
+          privateKey: input.sourceSecret.value,
+          depositAddress,
+          amountAtomic: amountIn,
+          decimals: fromMeta.decimals,
+          ticker: fromMeta.ticker,
+        });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        pending = r.pending === true;
+        break;
+      }
+
+      case "XMR":
+      case "ZEPH":
+      case "ZANO":
+        // XMR routes through the atomic-swap modal; ZEPH through the Zephyr
+        // ecosystem card; ZANO has no swap route at all yet (no atomicDesk,
+        // no SwapKit/Intents entry — see asset-capabilities.ts). None of the
+        // three is a NEAR Intents source. The exhaustive-switch guard matters
+        // for type-soundness: without this branch, TS can't prove
+        // `sourceTxHash` is always assigned post-switch.
+        throw new Error(
+          `${fromMeta.ticker} cannot be a NEAR Intents source — out of scope.`
+        );
+    }
+  } catch (e) {
+    if (isSendOutcomeUnknown(e)) {
+      recordIntentsDeposit(depositAddress, { state: "unknown", txHash: e.hash });
+    }
+    throw e;
+  }
+
+  recordIntentsDeposit(depositAddress, { state: "broadcast", txHash: sourceTxHash });
+
+  // Persist first (F2). The deposit is on its way; nothing after this line
+  // may turn that into a rejection the UI would read as "failed".
+  if (input.onBroadcast) {
+    try {
+      await input.onBroadcast({ sourceTxHash, depositAddress, pending });
+    } catch (e) {
+      console.warn("[swap] onBroadcast handler failed after the deposit went out:", e);
+    }
   }
 
   // Tell 1Click the deposit txhash so the solver-relay starts processing
-  // immediately rather than waiting for the chain scanner to spot it.
-  await notifyIntentsDeposit({
-    depositAddress,
-    txHash: sourceTxHash,
-  });
+  // immediately rather than waiting for its chain scanner to spot it. BEST
+  // EFFORT (2026-09-29, F2): this used to be awaited bare, so a relay 503
+  // AFTER the broadcast rejected the whole call — no hash, no history row,
+  // and a Retry button that signed a second deposit to the same address.
+  // The scanner finds the deposit without it.
+  try {
+    await withTimeout(
+      notifyIntentsDeposit({ depositAddress, txHash: sourceTxHash }),
+      15_000,
+      "notifyIntentsDeposit",
+    );
+  } catch (e) {
+    console.warn(
+      "[swap] notifyIntentsDeposit failed; 1Click will find the deposit on chain:",
+      errorText(e),
+    );
+  }
 
   phase({ phase: "pending", sourceTxHash });
-  return { sourceTxHash, depositAddress };
+  return { sourceTxHash, depositAddress, pending };
 }
 
+/**
+ * The EVM deposit: gas estimate, balance gates, build per the catalog's
+ * shape, sign once, broadcast once. Returns the source tx hash.
+ */
+async function depositEvm(args: {
+  input: ExecuteIntentsInput;
+  fromMeta: SwapCoinMeta;
+  depositAddress: string;
+  quoteAmountAtomic: bigint;
+  /** From the catalog (F1): token contract, or null for the native coin. */
+  contract: string | null;
+  phase: (s: SwapExecutionStatus) => void;
+  ctx: (stage: string) => Record<string, string>;
+}): Promise<string> {
+  const { input, fromMeta, depositAddress, quoteAmountAtomic, contract, phase, ctx } = args;
+  if (typeof fromMeta.evmChainId !== "number") {
+    throw new Error(`No chain id configured for ${input.fromAsset}`);
+  }
+  // Resolve the RPC fallback list for this chain. If the user pinned
+  // an `rpcUrlOverride` we honor it absolutely; otherwise we use the
+  // chain's full audited fallback list (env-overridable via
+  // VITE_<CHAIN>_RPC_URL — see wallets/chain-rpcs.ts).
+  const rpcUrls: string[] = input.rpcUrlOverride
+    ? [input.rpcUrlOverride]
+    : fromMeta.rpcFallbacks && fromMeta.rpcFallbacks.length > 0
+      ? fromMeta.rpcFallbacks
+      : fromMeta.defaultRpcUrl
+        ? [fromMeta.defaultRpcUrl]
+        : [];
+  if (rpcUrls.length === 0) {
+    throw new Error(`No RPC URL configured for ${input.fromAsset}`);
+  }
+  const ticker = fromMeta.ticker;
+
+  // ─── 1Click's `quote.amountIn` is atomic units (wei / 1e6 token / etc.) ──
+  // Documented contract: do NOT re-convert via decimalToBaseUnits.
+  // See post-mortem-amount-units for the 5-sextillion-ETH bug story.
+  const transferAmountAtomic = quoteAmountAtomic;
+
+  // Token or native per the CATALOG (F1). For native gas (ETH, BNB, AVAX,
+  // POL, MON) the `value` field carries the amount and `data` is empty. For
+  // an ERC-20, `to` is the token contract, `value` is 0, and `data` is the
+  // encoded transfer(depositAddress, amount).
+  const isErc20 = contract !== null;
+  const txTo = isErc20 ? contract : depositAddress;
+  const txValueHex = "0x" + (isErc20 ? 0n : transferAmountAtomic).toString(16);
+  const txData = isErc20
+    ? buildErc20TransferCalldata(depositAddress, transferAmountAtomic)
+    : "0x";
+
+  // Fetch gas price first; nonce is fetched as the LAST step
+  // before signing so it's as fresh as possible.
+  const gasPriceHex = await jsonRpcCall(rpcUrls, "eth_gasPrice", [], { ticker });
+
+  // ─── pre-sign balance + value gates ───────────────────────────
+  // Native gas balance is always required (every EVM tx pays in gas).
+  const nativeBalanceHex = await jsonRpcCall(
+    rpcUrls,
+    "eth_getBalance",
+    [input.sourceAddress, "latest"],
+    { ticker },
+  );
+  const nativeBalanceWei = BigInt(nativeBalanceHex);
+  const gasPriceWei = BigInt(gasPriceHex);
+  // Gas limit from `eth_estimateGas` on the exact transaction plus a margin
+  // (2026-09-29, EXTRA). It was a flat 21 000 / 100 000: Arbitrum's native
+  // transfer alone estimates 21 595, and an L2 token transfer's L1 data
+  // component can exceed 100 000 when L1 is busy — out of gas on chain.
+  const gasLimit = await estimateDepositGasLimit({
+    rpcUrls,
+    from: input.sourceAddress,
+    to: txTo,
+    valueHex: txValueHex,
+    data: txData,
+    isErc20,
+    ticker,
+  });
+  const gasCostWei = gasLimit * gasPriceWei;
+
+  // Token balance fetch (ERC-20 only) via balanceOf(address) eth_call.
+  let tokenBalanceAtomic: bigint = 0n;
+  if (isErc20) {
+    const tokenBalanceHex = await jsonRpcCall(
+      rpcUrls,
+      "eth_call",
+      [{ to: contract, data: buildErc20BalanceOfCalldata(input.sourceAddress) }, "latest"],
+      { ticker },
+    );
+    tokenBalanceAtomic = BigInt(tokenBalanceHex);
+  }
+
+  // Three layered guards on the moving asset's balance:
+  //   #3 funded (native side): gas <= native balance (always)
+  //   #3 funded (transfer): for native, value + gas <= native;
+  //                         for ERC-20, transferAmount <= token balance
+  //   #4 not overspend: transferAmount <= 2× moving-asset balance
+  const movingAssetBalance = isErc20 ? tokenBalanceAtomic : nativeBalanceWei;
+  await runInvariant(
+    () =>
+      assertTxNotPlausibleOverspend({
+        valueAtomic: transferAmountAtomic,
+        balanceAtomic: movingAssetBalance,
+        ticker,
+      }),
+    ctx("pre-sign"),
+  );
+  if (isErc20) {
+    // ERC-20: native pays only gas; token covers the transfer.
+    await runInvariant(
+      () =>
+        assertTxFundable({
+          valueAtomic: gasCostWei,
+          gasCostAtomic: 0n, // already folded in
+          balanceAtomic: nativeBalanceWei,
+          ticker,
+        }),
+      ctx("pre-sign"),
+    );
+    await runInvariant(
+      () =>
+        assertTxFundable({
+          valueAtomic: transferAmountAtomic,
+          gasCostAtomic: 0n,
+          balanceAtomic: tokenBalanceAtomic,
+          ticker,
+        }),
+      ctx("pre-sign"),
+    );
+  } else {
+    // Native: value + gas <= native balance (the historic check).
+    await runInvariant(
+      () =>
+        assertTxFundable({
+          valueAtomic: transferAmountAtomic,
+          gasCostAtomic: gasCostWei,
+          balanceAtomic: nativeBalanceWei,
+          ticker,
+        }),
+      ctx("pre-sign"),
+    );
+  }
+
+  // ─── Nonce: fetched LAST, immediately before signing ───────
+  const nonceHex = await jsonRpcCall(
+    rpcUrls,
+    "eth_getTransactionCount",
+    [input.sourceAddress, "pending"],
+    { ticker },
+  );
+
+  const unsignedTx = {
+    chainId: fromMeta.evmChainId,
+    to: txTo,
+    value: txValueHex,
+    data: txData,
+    gas: Number(gasLimit),
+    gasPrice: gasPriceHex,
+    nonce: nonceHex,
+  };
+
+  // ─── INVARIANT #2 ─ built tx moves exactly quote.amountIn ─────
+  await runInvariant(
+    () =>
+      assertTxValueMatchesQuote({
+        txValueAtomic: isErc20
+          ? (parseErc20TransferCalldata(unsignedTx.data)?.amount ?? -1n)
+          : BigInt(unsignedTx.value),
+        quoteAmountAtomic,
+        ticker,
+      }),
+    ctx("post-build"),
+  );
+  // ─── F1 ─ built tx has the catalog's shape ────────────────────
+  await runInvariant(
+    () =>
+      assertEvmDepositShape({
+        to: unsignedTx.to,
+        value: BigInt(unsignedTx.value),
+        data: unsignedTx.data,
+        depositAddress,
+        amountAtomic: transferAmountAtomic,
+        contract,
+        ticker,
+        stage: "post-build",
+      }),
+    ctx("post-build"),
+  );
+
+  phase({ phase: "signing" });
+  const signed = await signEvm(
+    input.sessionId,
+    unsignedTx,
+    input.account ?? 0,
+    input.index ?? 0
+  );
+
+  // ─── INVARIANT #5 + F1 on the SIGNED bytes ────────────────────
+  // To, value AND calldata, decoded from the RLP the signer produced —
+  // so a signer that changed the recipient inside the calldata is caught
+  // too (the pre-2026-09-29 check read `to` and `value` only).
+  await runInvariant(
+    () =>
+      assertSignedTxValueMatches({
+        rawSignedTxHex: signed.rawTx,
+        expectedValueAtomic: isErc20 ? 0n : transferAmountAtomic,
+        expectedRecipient: txTo,
+        ticker,
+      }),
+    ctx("post-sign"),
+  );
+  const decoded = await runInvariant(() => decodeEvmSignedTx(signed.rawTx), ctx("post-sign"));
+  await runInvariant(
+    () =>
+      assertEvmDepositShape({
+        to: decoded.to,
+        value: decoded.value,
+        data: decoded.data,
+        depositAddress,
+        amountAtomic: transferAmountAtomic,
+        contract,
+        ticker,
+        stage: "post-sign",
+      }),
+    ctx("post-sign"),
+  );
+
+  phase({ phase: "broadcasting" });
+  return broadcastEvmDepositOnce({
+    rpcUrls,
+    rawTx: signed.rawTx,
+    ticker,
+    depositAddress,
+  });
+}
+
+/**
+ * Gas limit for the deposit: `eth_estimateGas` on the exact transaction plus
+ * 25 %, or the historic fixed limits (21 000 native / 100 000 ERC-20) when
+ * estimation is unavailable or returns an implausible reading
+ * (2026-09-29, EXTRA). The user pays only for gas used; the limit only has to
+ * be enough.
+ */
+export async function estimateDepositGasLimit(args: {
+  rpcUrls: string[];
+  from: string;
+  to: string;
+  valueHex: string;
+  data: string;
+  isErc20: boolean;
+  ticker: string;
+}): Promise<bigint> {
+  const fallback = args.isErc20 ? 100_000n : 21_000n;
+  const call: Record<string, string> = {
+    from: args.from,
+    to: args.to,
+    value: args.valueHex,
+  };
+  if (args.data && args.data !== "0x") call.data = args.data;
+  try {
+    const hex = await jsonRpcCall(args.rpcUrls, "eth_estimateGas", [call], {
+      ticker: args.ticker,
+    });
+    const est = BigInt(hex);
+    if (est < 21_000n || est > 10_000_000n) return fallback;
+    return (est * 125n + 99n) / 100n;
+  } catch (e) {
+    console.warn(
+      `[swap] eth_estimateGas unavailable for the ${args.ticker} deposit; using ${fallback}:`,
+      errorText(e),
+    );
+    return fallback;
+  }
+}
+
+/** keccak-256 of signed EVM bytes — the hash the network will give the tx. */
+function evmTxHash(rawTxHex: string): string {
+  const c = rawTxHex.startsWith("0x") ? rawTxHex.slice(2) : rawTxHex;
+  const bytes = new Uint8Array(c.length / 2);
+  for (let i = 0; i < bytes.length; i++) {
+    bytes[i] = parseInt(c.slice(i * 2, i * 2 + 2), 16);
+  }
+  return (
+    "0x" +
+    Array.from(keccak_256(bytes))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+  );
+}
+
+/** Does any of `rpcUrls` know `hash` (mempool or chain)? False on failure. */
+async function evmTransactionKnown(rpcUrls: string[], hash: string): Promise<boolean> {
+  for (const url of rpcUrls) {
+    try {
+      const resp = await withTimeout(
+        fetch(url, {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_getTransactionByHash",
+            params: [hash],
+          }),
+        }),
+        6_000,
+        "eth_getTransactionByHash",
+      );
+      if (!resp.ok) continue;
+      const json = (await resp.json()) as { result?: unknown };
+      if (json && json.result) return true;
+    } catch {
+      /* next URL */
+    }
+  }
+  return false;
+}
+
+/**
+ * Broadcast signed EVM bytes ONCE (2026-09-29 send-safety audit, F2).
+ *
+ * The Rust verified broadcast re-sends the SAME bytes to each RPC in turn and
+ * gives up when none can show the transaction afterwards. That can happen to
+ * a transaction that is in a mempool — a node answered with its hash and a
+ * lagging read replica returned null — and the modal used to call it
+ * "Broadcast failed. Retry", whose retry signed a NEW transaction.
+ *
+ * Now: the hash of the signed bytes is computed locally; on a rejection it is
+ * looked up; a transaction nobody refused outright is reported as UNKNOWN
+ * with that hash (`SendOutcomeUnknownError`), and only a submission every RPC
+ * refused at the broadcast stage is an ordinary failure. A verified hash that
+ * disagrees with the local one (INVARIANT #6) is likewise an unknown outcome,
+ * not a "safety check failed before broadcasting".
+ */
+async function broadcastEvmDepositOnce(args: {
+  rpcUrls: string[];
+  rawTx: string;
+  ticker: string;
+  depositAddress: string;
+}): Promise<string> {
+  const localHash = evmTxHash(args.rawTx);
+  let verifiedHash: string;
+  try {
+    verifiedHash = (await broadcastEvmVerified(args.rpcUrls, args.rawTx)).txHash;
+  } catch (e) {
+    const msg = errorText(e);
+    if (await evmTransactionKnown(args.rpcUrls, localHash)) return localHash;
+    if (evmBroadcastRefusedEverywhere(msg)) {
+      throw new Error(`Every RPC refused the ${args.ticker} deposit, so it was not sent. ${msg}`);
+    }
+    throw new SendOutcomeUnknownError(
+      `The ${args.ticker} deposit may have been sent: an RPC accepted it or did not ` +
+        `answer, and none can show it yet. Check ${localHash} on a block explorer ` +
+        `before trying again.\n${msg}`,
+      localHash,
+    );
+  }
+  // ─── INVARIANT #6 ─ verified hash === keccak256(signedTx) ──
+  try {
+    assertVerifiedHashMatches({ rawSignedTxHex: args.rawTx, verifiedHash });
+  } catch (e) {
+    if (e instanceof SafetyInvariantError) {
+      void logSafetyIncident(e, {
+        stage: "post-broadcast",
+        ticker: args.ticker,
+        depositAddress: args.depositAddress,
+      });
+      throw new SendOutcomeUnknownError(
+        `The ${args.ticker} deposit was broadcast, but the network answered with hash ` +
+          `${verifiedHash} while the transaction the wallet signed is ${localHash} ` +
+          `(safety check ${e.invariant}). It may or may not be on chain — check ` +
+          `${localHash} on a block explorer before doing anything else.`,
+        localHash,
+      );
+    }
+    throw e;
+  }
+  return verifiedHash;
+}
+
+/**
+ * Statuses after which 1Click will not change a swap again.
+ *
+ * `INCOMPLETE_DEPOSIT` was in this set until 2026-09-29 (send-safety audit,
+ * F5) and was recorded as "failed". It is not terminal: it means the deposit
+ * arrived short of the quote, and 1Click refunds it by the deadline (or
+ * completes the swap if the rest arrives), so the swap still ends REFUNDED
+ * or SUCCESS. Calling it "failed" stopped the tracking at the one moment the
+ * user's funds were in flight back to them.
+ */
 const INTENTS_TERMINAL: ReadonlySet<string> = new Set([
   "SUCCESS",
   "REFUNDED",
   "FAILED",
-  "INCOMPLETE_DEPOSIT",
 ] as const);
+
+/** Deposit addresses a poller in this session is already watching. */
+const activeIntentsPolls = new Set<string>();
+
+/** True while `pollIntentsToTerminal` is watching `depositAddress`. */
+export function isIntentsPollActive(depositAddress: string): boolean {
+  return activeIntentsPolls.has(depositAddress);
+}
 
 /**
  * Poll `/api/intents/status?depositAddress=...` every `intervalMs` (default
- * 10 s) until terminal or `timeoutMs` (default 30 min). Calls `onUpdate` on
- * every tick.
+ * 10 s) until terminal or timeout. Calls `onUpdate` on every tick.
+ *
+ * The timeout is sized from the quote's `deadline` when one is given: the
+ * swap cannot be decided before the deadline (a short or late deposit is
+ * refunded BY it), so a flat 30 minutes gave up on every BTC swap and on
+ * every refund (F5). Default: whichever is later of 30 minutes and the
+ * deadline plus an hour.
  */
 export async function pollIntentsToTerminal(args: {
   depositAddress: string;
+  deadline?: string;
   intervalMs?: number;
   timeoutMs?: number;
   onUpdate?: (s: IntentsStatusResponse) => void;
 }): Promise<IntentsStatusResponse> {
   const interval = args.intervalMs ?? 10_000;
-  const timeout = args.timeoutMs ?? 30 * 60_000;
+  const deadlineMs = args.deadline ? Date.parse(args.deadline) : NaN;
+  const timeout =
+    args.timeoutMs ??
+    Math.max(
+      30 * 60_000,
+      Number.isFinite(deadlineMs) ? deadlineMs - Date.now() + 60 * 60_000 : 0,
+    );
   const start = Date.now();
-  while (true) {
-    if (Date.now() - start > timeout) {
-      throw new Error("Intents status polling timed out");
-    }
-    let resp: IntentsStatusResponse;
-    try {
-      resp = await getIntentsStatus(args.depositAddress);
-    } catch {
+  activeIntentsPolls.add(args.depositAddress);
+  try {
+    while (true) {
+      if (Date.now() - start > timeout) {
+        throw new Error("Intents status polling timed out");
+      }
+      let resp: IntentsStatusResponse;
+      try {
+        resp = await getIntentsStatus(args.depositAddress);
+      } catch {
+        await sleep(interval);
+        continue;
+      }
+      args.onUpdate?.(resp);
+      if (typeof resp.status === "string" && INTENTS_TERMINAL.has(resp.status)) {
+        return resp;
+      }
       await sleep(interval);
-      continue;
     }
-    args.onUpdate?.(resp);
-    if (typeof resp.status === "string" && INTENTS_TERMINAL.has(resp.status)) {
-      return resp;
-    }
-    await sleep(interval);
+  } finally {
+    activeIntentsPolls.delete(args.depositAddress);
   }
 }
 
-/** Map an Intents status to the local history enum. */
+/** Map an Intents status to the local history enum. `INCOMPLETE_DEPOSIT`
+ *  is pending, not failed (F5). */
 export function intentsStatusToHistory(
   s: string | undefined
 ): "pending" | "success" | "refunded" | "failed" {
   if (s === "SUCCESS") return "success";
   if (s === "REFUNDED") return "refunded";
-  if (s === "FAILED" || s === "INCOMPLETE_DEPOSIT") return "failed";
+  if (s === "FAILED") return "failed";
   return "pending";
 }
 
@@ -1108,4 +1498,3 @@ export function intentsStatusToHistory(
 // uses `atomicStringToBigInt` exclusively for source-tx values; if a
 // caller ever needs display→atomic, import `decimalToBaseUnitsBigInt`
 // from `swap-sources.ts`.
-

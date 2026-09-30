@@ -47,6 +47,7 @@ import {
   deskPairLabel,
   isDeskRoutableFromRegistry,
   isIntentsRoutableFromRegistry,
+  isIntentsSourceExecutable,
   isSwapKitRoutableFromRegistry,
   type WalletsByChain,
 } from "./asset-capabilities";
@@ -237,15 +238,26 @@ describe("ASSET_CAPABILITIES registry — agreement with public predicates", () 
   });
 
   it("isIntentsRoutable agrees with the registry's nearIntentsAsset fields", () => {
+    // Updated deliberately on 2026-09-29 (send-safety audit, F7): the
+    // predicate is `f.nearIntentsAsset && t.nearIntentsAsset` AND the source
+    // must be one the executor can deposit from. XLM and SUI carry asset ids
+    // but have no executor branch, so a quoted XLM/SUI swap threw at Confirm,
+    // after the password. They stay routable as DESTINATIONS.
     const tickers = Object.keys(ASSET_CAPABILITIES);
     for (const from of tickers) {
       for (const to of tickers) {
         const f = ASSET_CAPABILITIES[from];
         const t = ASSET_CAPABILITIES[to];
-        const expected = !!(f?.nearIntentsAsset && t?.nearIntentsAsset);
+        const expected =
+          !!(f?.nearIntentsAsset && t?.nearIntentsAsset) &&
+          isIntentsSourceExecutable(from);
         expect(isIntentsRoutable(from, to)).toBe(expected);
       }
     }
+    expect(isIntentsRoutable("XLM", "BTC")).toBe(false);
+    expect(isIntentsRoutable("SUI", "BTC")).toBe(false);
+    expect(isIntentsRoutable("BTC", "XLM")).toBe(true);
+    expect(isIntentsRoutable("BTC", "SUI")).toBe(true);
   });
 });
 

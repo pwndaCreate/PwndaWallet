@@ -216,15 +216,17 @@ describe("buildIntentsRequestSafely — body shape (1Click /api/intents/quote)",
     expect(typeof body.refundTo).toBe("string");
 
     // Deadline is timestamp-dependent; assert ISO 8601 prefix and a
-    // future point in time (within the allowed 10-min window).
+    // future point in time. Its LENGTH is per origin chain since 2026-09-29
+    // (send-safety audit, F4): a flat 10 minutes was shorter than BTC's own
+    // time estimate. ETH is an account chain: 30 minutes.
     expect(typeof body.deadline).toBe("string");
     expect(body.deadline).toMatch(
       /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/,
     );
     const deadlineMs = new Date(body.deadline).getTime();
     expect(Number.isFinite(deadlineMs)).toBe(true);
-    expect(deadlineMs).toBeGreaterThan(Date.now());
-    expect(deadlineMs).toBeLessThan(Date.now() + 11 * 60 * 1000);
+    expect(deadlineMs).toBeGreaterThan(Date.now() + 29 * 60 * 1000);
+    expect(deadlineMs).toBeLessThan(Date.now() + 31 * 60 * 1000);
 
     expect(body.quoteWaitingTimeMs).toBe(5000);
     expect(typeof body.quoteWaitingTimeMs).toBe("number");
