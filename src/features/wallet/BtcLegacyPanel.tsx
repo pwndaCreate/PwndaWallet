@@ -7,6 +7,7 @@ import {
   sweepLegacyBtcToAddress,
 } from "../../wallets/btc-wallet";
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
+import { openExternal } from "../../utils/openExternal";
 
 type SweepState =
   | { kind: "idle" }
@@ -156,6 +157,15 @@ export function BtcLegacyPanel(props: {
               href={`https://mempool.space/tx/${state.txid}`}
               target="_blank"
               rel="noreferrer"
+              onClick={(e) => {
+                // The Tauri opener, not the webview: a `target="_blank"` link
+                // opens only if its click reaches the opener's window listener
+                // (swap/TxHashField.tsx, 2026-09-30).
+                e.preventDefault();
+                void openExternal(`https://mempool.space/tx/${state.txid}`).catch((err) =>
+                  console.warn("[wallet] could not open the link", err),
+                );
+              }}
               style={{ fontSize: 10, color: "var(--text-dim)", marginTop: 4, display: "inline-block" }}
             >
               View on mempool.space →

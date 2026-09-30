@@ -3,6 +3,7 @@ import { Card } from "../../components/PrimitivesV2";
 import type { useMiner } from "./useMiner";
 import { DeviceProfilePanel } from "./DeviceProfilePanel";
 import { needsLinuxPerfSetup, supportsDefenderExclusion } from "../../platform/os";
+import { openExternal } from "../../utils/openExternal";
 
 type MinerApi = ReturnType<typeof useMiner>;
 
@@ -81,6 +82,15 @@ export function MinerSetupView({
             href="https://xmrig.com/docs/miner/randomx-optimization-guide/msr"
             target="_blank"
             rel="noreferrer"
+            onClick={(e) => {
+              // The Tauri opener, not the webview: a `target="_blank"` link
+              // opens only if its click reaches the opener's window listener
+              // (swap/TxHashField.tsx, 2026-09-30).
+              e.preventDefault();
+              void openExternal("https://xmrig.com/docs/miner/randomx-optimization-guide/msr").catch((err) =>
+                console.warn("[mining] could not open the link", err),
+              );
+            }}
           >
             Setup guide
           </a>

@@ -1,4 +1,5 @@
 import { Card } from "../../components/PrimitivesV2";
+import { openExternal } from "../../utils/openExternal";
 
 interface BinaryDownloadProgress {
   stage: string;
@@ -86,6 +87,15 @@ export function ZanoSyncCard({
                 href="https://aka.ms/vs/17/release/vc_redist.x64.exe"
                 target="_blank"
                 rel="noreferrer"
+                onClick={(e) => {
+                  // The Tauri opener, not the webview: a `target="_blank"` link
+                  // opens only if its click reaches the opener's window listener
+                  // (swap/TxHashField.tsx, 2026-09-30).
+                  e.preventDefault();
+                  void openExternal("https://aka.ms/vs/17/release/vc_redist.x64.exe").catch((err) =>
+                    console.warn("[zano] could not open the link", err),
+                  );
+                }}
               >
                 Microsoft Visual C++ Redistributable (x64)
               </a>{" "}
@@ -99,7 +109,20 @@ export function ZanoSyncCard({
               erroring at the server — this has been observed as a
               network-level block on some connections. Try a different
               network, or download the ZIP manually from{" "}
-              <a href="https://zano.org" target="_blank" rel="noreferrer">
+              <a
+                href="https://zano.org"
+                target="_blank"
+                rel="noreferrer"
+                onClick={(e) => {
+                  // The Tauri opener, not the webview: a `target="_blank"` link
+                  // opens only if its click reaches the opener's window listener
+                  // (swap/TxHashField.tsx, 2026-09-30).
+                  e.preventDefault();
+                  void openExternal("https://zano.org").catch((err) =>
+                    console.warn("[zano] could not open the link", err),
+                  );
+                }}
+              >
                 zano.org
               </a>
               , verify its checksum, and place it as instructed above.
