@@ -18,6 +18,7 @@ import {
   withGasMargin,
 } from "./evm-gas";
 import { sendEvmTransfer } from "./evm-send";
+import { fetchEvmHistory, type EvmExplorer } from "./evm-history";
 import { proxyGetJson } from "./_proxy";
 import { withFallback as withUrlFallback } from "./_fallback";
 
@@ -52,11 +53,12 @@ export interface EvmChainConfig {
   /** Decimal places for the ERC-20 token (e.g. 6 for USDT, 18 for most tokens) */
   tokenDecimals?: number;
   /**
-   * Blockscout-style explorer API base URLs (e.g. `https://eth.blockscout.com/api`),
-   * tried in order. Endpoints must be on the http_proxy allowlist. Empty
-   * list disables history fetching for this chain.
+   * History sources, tried in order (`evm-history.ts`). Hosts must be on the
+   * http_proxy allowlist. An EMPTY list means the chain has no history source:
+   * `getTransactionHistory` then says "history not available", which until
+   * 2026-09-30 it did not — it returned no rows, read as "no transactions".
    */
-  explorerApis?: string[];
+  explorerApis?: EvmExplorer[];
 }
 
 export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
@@ -246,91 +248,27 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
       }
     },
 
+    /**
+     * Which explorer, how its answer is read, and why it changed (operator
+     * report 2026-09-30: 17 EVM rows in error, BSC silently empty):
+     * `evm-history.ts`.
+     */
     async getTransactionHistory(
       address: string,
       opts?: { limit?: number; cursor?: string }
     ): Promise<TxHistoryPage> {
-      const limit = opts?.limit ?? 25;
-      if (explorerApis.length === 0) return { items: [] };
-
-      // Blockscout exposes the Etherscan-V1 module=account interface, so the
-      // same querystring works against every instance. For ERC-20 tokens we
-      // hit `action=tokentx&contractaddress=...`; native coin uses `txlist`.
-      const action = tokenContract ? "tokentx" : "txlist";
-      const ctParam = tokenContract ? `&contractaddress=${tokenContract}` : "";
-      const cursor = opts?.cursor ? Number(opts.cursor) : 0;
-      const startBlock = Number.isFinite(cursor) && cursor > 0 ? cursor : 0;
-
-      const data = await withUrlFallback(
-        explorerApis,
-        async (base) =>
-          await proxyGetJson<{ status: string; message: string; result: any[] | string }>(
-            `${base}?module=account&action=${action}` +
-              `&address=${address}` +
-              `&startblock=${startBlock}` +
-              `&endblock=99999999` +
-              `&page=1&offset=${limit}&sort=desc` +
-              ctParam
-          )
-      );
-
-      // Blockscout returns `status: "0"` and `message: "No transactions found"`
-      // for empty results — that's a successful zero-row answer, not an error.
-      const rows = Array.isArray(data.result) ? data.result : [];
-      const lower = address.toLowerCase();
-      const items: ChainTx[] = rows.map((r) => {
-        const from = String(r.from ?? "").toLowerCase();
-        const to = String(r.to ?? "").toLowerCase();
-        const direction: ChainTx["direction"] =
-          from === lower && to === lower
-            ? "self"
-            : from === lower
-              ? "out"
-              : "in";
-        const value = BigInt(r.value ?? "0");
-        const fee = (() => {
-          if (r.gasUsed && r.gasPrice) {
-            try {
-              return ethers.formatEther(BigInt(r.gasUsed) * BigInt(r.gasPrice));
-            } catch {
-              return undefined;
-            }
-          }
-          return undefined;
-        })();
-        const amount = tokenContract
-          ? ethers.formatUnits(value, tokenDecimals)
-          : ethers.formatEther(value);
-        const timestamp = r.timeStamp ? Number(r.timeStamp) : undefined;
-        const confirmations = r.confirmations ? Number(r.confirmations) : undefined;
-        const height = r.blockNumber ? Number(r.blockNumber) : undefined;
-        return {
+      return fetchEvmHistory(
+        {
           chain,
-          hash: String(r.hash),
-          direction,
-          amount,
-          fee: direction === "out" ? fee : undefined,
-          timestamp,
-          confirmations,
-          height,
-          counterparty: direction === "out" ? r.to : r.from,
-          meta: {
-            input: r.input,
-            method: r.functionName ?? r.methodId,
-            tokenSymbol: r.tokenSymbol,
-            contractAddress: r.contractAddress,
-          },
-        };
-      });
-
-      // Cursor: oldest blockNumber returned, used as `endblock` for the next
-      // page. Blockscout's pagination via `page=N` is implementation-specific
-      // and unreliable across instances; block-window cursors are portable.
-      const cursorOut =
-        items.length === limit
-          ? String(Math.min(...items.map((i) => i.height ?? Number.MAX_SAFE_INTEGER)) - 1)
-          : undefined;
-      return { items, cursor: cursorOut };
+          displayName,
+          explorers: explorerApis,
+          tokenContract,
+          decimals: tokenContract ? tokenDecimals : 18,
+        },
+        address,
+        opts,
+        (url) => proxyGetJson(url),
+      );
     },
 
     /**

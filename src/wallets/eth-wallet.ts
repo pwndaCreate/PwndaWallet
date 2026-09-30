@@ -1,4 +1,5 @@
 import { createEvmAdapter } from "./evm-factory";
+import { blockscoutV2, etherscanCompatible, type EvmExplorer } from "./evm-history";
 import {
   ETH_RPCS,
   AVAX_RPCS,
@@ -11,43 +12,50 @@ import {
   MONAD_RPCS,
 } from "./chain-rpcs";
 
-// Blockscout instances for each EVM chain we support. All keyless. The
-// `/api` suffix is intentional — those endpoints expose the Etherscan-V1
-// `module=account&action=txlist|tokentx` interface used by evm-factory's
-// `getTransactionHistory`. Hosts here must also live in `http_proxy.rs`'s
-// `ALLOWED_HOST_SUFFIXES` (`blockscout.com`, `routescan.io`, `flare-explorer.flare.network`).
-const ETH_EXPLORERS = [
-  "https://eth.blockscout.com/api",
+// History sources per EVM chain, tried in order (`evm-history.ts`). All
+// keyless, and every host must be on `http_proxy.rs`'s ALLOWED_HOST_SUFFIXES
+// (`blockscout.com`, `routescan.io`, `flare-explorer.flare.network`).
+//
+// Re-checked 2026-09-30 (operator report: 17 EVM rows in error) with the
+// world-public test address, one read-only request each:
+//  - Blockscout's Etherscan-style `/api?module=account…` now allows a keyless
+//    client 10 requests per ~20 minutes across ALL *.blockscout.com instances
+//    (HTTP 429 "Too many requests. Increase limits now at
+//    https://dev.blockscout.com"). Its v2 REST API allows 180 a minute per
+//    instance (Base 150), so every Blockscout entry is read through v2.
+//  - Routescan's Etherscan-style route answers for chain 1 and 43114 only;
+//    10, 56, 137, 143, 8453 and 42161 are "chain not supported".
+//  - avalanche.blockscout.com is gone ("default backend - 404").
+//  - optimism.blockscout.com 301s to explorer.optimism.io; the proxy follows
+//    it (the allowlist is checked on the first host only).
+const ETH_EXPLORERS: EvmExplorer[] = [
+  blockscoutV2("https://eth.blockscout.com"),
+  etherscanCompatible("https://api.routescan.io/v2/network/mainnet/evm/1/etherscan/api"),
 ];
-const AVAX_EXPLORERS = [
-  "https://avalanche.blockscout.com/api",
-  // Routescan exposes the same Etherscan-style API on a chain-id route.
-  "https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api",
+const AVAX_EXPLORERS: EvmExplorer[] = [
+  etherscanCompatible("https://api.routescan.io/v2/network/mainnet/evm/43114/etherscan/api"),
 ];
-const POLYGON_EXPLORERS = [
-  "https://polygon.blockscout.com/api",
+const POLYGON_EXPLORERS: EvmExplorer[] = [blockscoutV2("https://polygon.blockscout.com")];
+const FLARE_EXPLORERS: EvmExplorer[] = [
+  // Flare's official explorer is a Blockscout fork on its own host, with no
+  // rate limit on either route (`x-ratelimit-limit: -1`, 2026-09-30). v2
+  // first for the richer rows; the Etherscan-style route as the fallback.
+  blockscoutV2("https://flare-explorer.flare.network"),
+  etherscanCompatible("https://flare-explorer.flare.network/api"),
 ];
-const FLARE_EXPLORERS = [
-  // Flare's official explorer is a Blockscout fork on its own host.
-  "https://flare-explorer.flare.network/api",
-];
-const ARB_EXPLORERS = [
-  "https://arbitrum.blockscout.com/api",
-];
-const BASE_EXPLORERS = [
-  "https://base.blockscout.com/api",
-];
-const OP_EXPLORERS = [
-  "https://optimism.blockscout.com/api",
-];
-const BSC_EXPLORERS = [
-  // Blockscout has a BSC mirror; Routescan also covers it via chain-id 56.
-  "https://api.routescan.io/v2/network/mainnet/evm/56/etherscan/api",
-];
-const MONAD_EXPLORERS = [
-  // Monad's primary explorer (Phase 3). Blockscout-fork shape.
-  "https://explorer.monad.xyz/api",
-];
+const ARB_EXPLORERS: EvmExplorer[] = [blockscoutV2("https://arbitrum.blockscout.com")];
+const BASE_EXPLORERS: EvmExplorer[] = [blockscoutV2("https://base.blockscout.com")];
+const OP_EXPLORERS: EvmExplorer[] = [blockscoutV2("https://optimism.blockscout.com")];
+// No keyless BSC history source (2026-09-30): Routescan answers "chain not
+// supported" (which the old reader turned into an empty list), BscScan's v1
+// API is retired, Etherscan v2's free tier excludes BSC, Blockscout runs no
+// BSC instance. Empty = "history not available for … yet".
+const BSC_EXPLORERS: EvmExplorer[] = [];
+// No keyless Monad history source (2026-09-30): the configured
+// explorer.monad.xyz does not resolve (and was never on the proxy
+// allowlist); Routescan: "chain not supported"; Etherscan v2 and BlockVision
+// need a key; MonadVision / monadexplorer.com answer a bot challenge.
+const MONAD_EXPLORERS: EvmExplorer[] = [];
 
 // RPC URL lists — pulled from `chain-rpcs.ts` so the dashboard adapter +
 // the swap broadcast path + the Settings → Network test panel all read

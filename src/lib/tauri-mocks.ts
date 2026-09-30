@@ -1321,6 +1321,24 @@ function etherscanTxList(): unknown {
   };
 }
 
+/** `etherscanTxList`'s rows in Blockscout v2's `/transactions` shape. */
+function blockscoutV2TxList(): unknown[] {
+  const rows = (etherscanTxList() as { result: Record<string, string>[] }).result;
+  return rows.map((r) => ({
+    hash: r.hash,
+    from: { hash: r.from },
+    to: { hash: r.to },
+    value: r.value,
+    fee: { type: "actual", value: (BigInt(r.gasUsed) * BigInt(r.gasPrice)).toString() },
+    status: "ok",
+    result: "success",
+    timestamp: new Date(Number(r.timeStamp) * 1000).toISOString(),
+    block_number: Number(r.blockNumber),
+    confirmations: Number(r.confirmations),
+    method: null,
+  }));
+}
+
 /** Esplora address-txs payload (BTC) when funded. */
 function esploraTxs(addr: string): unknown[] {
   const now = Math.floor(Date.now() / 1000);
@@ -1759,7 +1777,13 @@ function dispatchUrl(
     return { status: 200, json: funded ? etherscanTxList() : { status: "0", message: "No transactions found", result: [] } };
   if (/[?&]action=tokentx/.test(url))
     return { status: 200, json: { status: "0", message: "No transactions found", result: [] } };
-  if (/blockscout\.com\/.*\/api\/v2\/addresses\/[^/]+\/transactions/.test(url))
+  // Blockscout v2 — EVM history's primary source since 2026-09-30
+  // (`wallets/evm-history.ts`). The old pattern here needed a path segment
+  // between the host and `/api/v2`, so it matched no real URL. Same two
+  // funded rows as `etherscanTxList`, in v2's shape; token transfers empty.
+  if (/\/api\/v2\/addresses\/[^/]+\/transactions/.test(url))
+    return { status: 200, json: { items: funded ? blockscoutV2TxList() : [], next_page_params: null } };
+  if (/\/api\/v2\/addresses\/[^/]+\/token-transfers/.test(url))
     return { status: 200, json: { items: [], next_page_params: null } };
   if (/[?&]action=balance/.test(url)) {
     const chainId = evmChainIdForUrl(url);
