@@ -35,11 +35,11 @@
  * already pulls in.
  *
  * Address format: CashAddr (`bitcoincash:q...` for P2PKH,
- * `bitcoincash:p...` for P2SH). Encoder + decoder + both type variants
- * implemented inline below; spec at
+ * `bitcoincash:p...` for P2SH and P2SH32). Encoder + decoder + both type
+ * variants implemented inline below; spec at
  * https://github.com/bitcoincashorg/bitcoincash.org/blob/master/spec/cashaddr.md.
- * Legacy base58check addresses (`1...`, `3...`) are also accepted as
- * recipients — the decoder transparently converts them via `bs58check`.
+ * CORRECTED 2026-09-29: legacy base58check recipients (`1...`, `3...`) were
+ * accepted here too; they are refused now — see `parseRecipient`.
  */
 
 import * as bitcoin from "bitcoinjs-lib";
@@ -59,14 +59,32 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendOptions,
 } from "./types";
-import { proxyGetJson, httpProxyCall } from "./_proxy";
+import { proxyGetJson } from "./_proxy";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
   accountShortfallMessage,
+  planAccountSpend,
   P2PKH_SIZING,
+  type AccountSpendCandidate,
 } from "./utxo-account";
+import {
+  assertFeeWithinCap,
+  assertNotDust,
+  broadcastSignedTx,
+  dustThresholdSat,
+  DUST_RELAY_FEE_PER_KB,
+  outputVBytes,
+  parseSendAmountSat,
+  proxyPushEndpoint,
+  proxyTxLookup,
+  trySources,
+  txidOfLegacyRawHex,
+  type BroadcastEndpoint,
+  type TxLookup,
+} from "./utxo-send";
 import {
   parseEsploraStats,
   blockchairProbe,
@@ -139,23 +157,10 @@ const SOFT_DUST_SAT = 546n; // BCH's standard dust threshold
 // Multi-source helper (mirrors `tryEach` in doge-wallet.ts)
 // =========================================================================
 
-async function tryEach<T>(
-  sources: Array<{ name: string; fn: () => Promise<T> }>
-): Promise<T> {
-  let lastError: unknown = null;
-  const tried: string[] = [];
-  for (const s of sources) {
-    tried.push(s.name);
-    try {
-      return await s.fn();
-    } catch (e) {
-      lastError = e;
-    }
-  }
-  const tail = lastError instanceof Error ? lastError.message : String(lastError);
-  throw new Error(
-    `All ${tried.length} BCH source(s) failed [${tried.join(", ")}]: ${tail}`
-  );
+/** READ sources in order; every source's error on exhaustion (`trySources`).
+ *  Never for broadcasting — see `broadcastBch`. */
+function tryEach<T>(sources: Array<{ name: string; fn: () => Promise<T> }>): Promise<T> {
+  return trySources<T>("BCH", sources);
 }
 
 // =========================================================================
@@ -324,14 +329,37 @@ export function decodeCashAddr(input: string): { type: AddressType; hash: Uint8A
       `CashAddr: hash length mismatch (got ${hash.length}, expected ${expectedSize})`
     );
   }
-  return { type: typeFromVersionByte(versionByte), hash };
+  const type = typeFromVersionByte(versionByte);
+  // Only the sizes a standard locking script exists for (2026-09-29 send-safety
+  // audit). CashAddr can carry a 24–64-byte hash under either type, and every
+  // caller built its script with a hard-coded 20-byte push — a P2SH32 address
+  // became `a9 14 <32 bytes> 87`, a script no one can ever satisfy. The swap
+  // path's `bchAddressToScript` builds P2PKH from this decoder too.
+  if (type === "p2pkh" && hash.length !== 20) {
+    throw new Error(
+      `CashAddr: a P2PKH address must carry a 20-byte key hash, not ${hash.length} bytes`
+    );
+  }
+  if (type === "p2sh" && hash.length !== 20 && hash.length !== 32) {
+    throw new Error(
+      `CashAddr: a P2SH address carries a 20- or 32-byte script hash, not ${hash.length} bytes`
+    );
+  }
+  return { type, hash };
 }
 
 /**
- * Parse a recipient address that the user may have pasted in any
- * supported format: CashAddr (preferred), or legacy base58check
- * (`1...` for P2PKH, `3...` for P2SH). Returns the script pubkey
- * type and 20-byte hash160 — enough to build the output script.
+ * Parse a recipient address that the user may have pasted: CashAddr, with or
+ * without its `bitcoincash:` prefix, in either case, or inside a payment URI.
+ * Returns the script type and hash — 20 bytes, or 32 for a P2SH32 address.
+ *
+ * Legacy base58check (`1…` / `3…`) is REFUSED since 2026-09-29 (send-safety
+ * audit). It used to be accepted "for backwards compat", but those strings are
+ * byte-for-byte Bitcoin addresses: a BTC address pasted into the BCH form was
+ * paid without a word, and for a BTC SegWit-wrapped `3…` deposit address the
+ * BCH output is spendable by anyone who learns the redeem script (BCH's
+ * SegWit-recovery rule — inference, not observed). Every BCH wallet has shown
+ * CashAddr since 2018, so asking for it costs a legitimate recipient nothing.
  */
 export function parseRecipient(addr: string): { type: AddressType; hash: Uint8Array } {
   // A payment URI (`bitcoincash:q…?amount=0.1&label=…`, what a QR code or a
@@ -349,20 +377,22 @@ export function parseRecipient(addr: string): { type: AddressType; hash: Uint8Ar
   if (lower.includes(":") || lower.startsWith("q") || lower.startsWith("p")) {
     return decodeCashAddr(trimmed);
   }
-  // Legacy base58check (BTC-style) — version 0x00 → P2PKH, 0x05 → P2SH.
-  // Many BCH services still display these for backwards compat.
-  let decoded: Uint8Array;
+  // Base58check is recognised only to say precisely why it is refused.
+  let decoded: Uint8Array | null = null;
   try {
     decoded = bs58check.decode(trimmed);
   } catch {
-    throw new Error(`Cannot parse address: ${trimmed}`);
+    /* not base58 either */
   }
-  if (decoded.length !== 21) throw new Error("Legacy address: bad length");
-  const version = decoded[0];
-  const hash = decoded.slice(1);
-  if (version === 0x00) return { type: "p2pkh", hash };
-  if (version === 0x05) return { type: "p2sh", hash };
-  throw new Error(`Legacy address: unsupported version byte 0x${version.toString(16)}`);
+  if (decoded && decoded.length === 21 && (decoded[0] === 0x00 || decoded[0] === 0x05)) {
+    throw new Error(
+      `${trimmed} is a legacy-format address (1… / 3…) — the same format Bitcoin (BTC) ` +
+        "uses, so a Bitcoin address pasted here would be paid. Bitcoin Cash needs a " +
+        "CashAddr address (bitcoincash:q… or bitcoincash:p…): ask the recipient for it. " +
+        "Nothing was sent.",
+    );
+  }
+  throw new Error(`Cannot parse address: ${trimmed}`);
 }
 
 // =========================================================================
@@ -481,8 +511,27 @@ function scriptP2SH(hash: Uint8Array): Uint8Array {
   return concatBytes(u8(0xa9), u8(0x14), hash, u8(0x87));
 }
 
+/**
+ * scriptPubKey for P2SH32 (BCH, May 2023): OP_HASH256 <32> hash OP_EQUAL.
+ * Same template as BasicSwap's `bch.py::getDestForScriptHash` for a 32-byte
+ * script hash — a second, independent implementation.
+ */
+function scriptP2SH32(hash: Uint8Array): Uint8Array {
+  return concatBytes(u8(0xaa), u8(0x20), hash, u8(0x87));
+}
+
+/**
+ * The output script for a parsed recipient, by type AND hash length. It used
+ * to pick by type alone and push 20 bytes whatever the hash was, so a P2SH32
+ * address produced `a9 14 <32 bytes> 87` — unspendable if mined (2026-09-29
+ * send-safety audit). An unknown combination throws; it never guesses.
+ */
 function outputScriptForRecipient(parsed: { type: AddressType; hash: Uint8Array }): Uint8Array {
-  return parsed.type === "p2pkh" ? scriptP2PKH(parsed.hash) : scriptP2SH(parsed.hash);
+  const n = parsed.hash.length;
+  if (parsed.type === "p2pkh" && n === 20) return scriptP2PKH(parsed.hash);
+  if (parsed.type === "p2sh" && n === 20) return scriptP2SH(parsed.hash);
+  if (parsed.type === "p2sh" && n === 32) return scriptP2SH32(parsed.hash);
+  throw new Error(`No standard output script for a ${n}-byte ${parsed.type} hash; nothing was sent.`);
 }
 
 // =========================================================================
@@ -686,25 +735,18 @@ async function fetchUtxosHaskoin(base: string, addr: string): Promise<Normalized
  * `POST /transactions` with the raw hex body → `{ txid }`.
  *
  * **Not verified against the live endpoint** — verifying a broadcast means
- * broadcasting, so it is proven by the first real send, like `broadcastBitcore`.
+ * broadcasting, so it is proven by the first real send, like the Bitcore push.
  * The body format (hex, or binary) is from haskoin-store's `Web.hs`
  * (`parseBody: bin b <> hex b`); the response shape is inferred from the
  * same file's `postTx` returning a `TxId`. A wrong guess fails loudly with
- * the endpoint's own status and body and rotates to the next source.
+ * the endpoint's own status and body and the ladder moves on.
  */
-async function broadcastHaskoin(base: string, rawHex: string): Promise<string> {
-  const r = await httpProxyCall({
-    method: "POST",
-    url: `${base}/transactions`,
-    body: rawHex,
-    headers: { "Content-Type": "text/plain" },
-  });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`haskoin push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as { txid?: string };
-  if (!parsed.txid) throw new Error(`haskoin push: no txid in ${r.body.slice(0, 200)}`);
-  return parsed.txid;
+function haskoinPush(name: string, base: string): BroadcastEndpoint {
+  return proxyPushEndpoint(
+    name,
+    (hex) => ({ url: `${base}/transactions`, body: hex, contentType: "text/plain" }),
+    (body) => JSON.parse(body)?.txid,
+  );
 }
 
 /** One row of `/address/{addr}/transactions/full`, as captured live. */
@@ -768,25 +810,16 @@ async function fetchUtxosFullstack(addr: string): Promise<NormalizedUtxo[]> {
 
 // Broadcast --------------------------------------------------------------
 
-async function broadcastBlockchair(rawHex: string): Promise<string> {
-  const r = await httpProxyCall({
-    method: "POST",
+/** Blockchair — form-urlencoded `data=<hex>` → `{ data: { transaction_hash } }`. */
+const BLOCKCHAIR_PUSH = proxyPushEndpoint(
+  "blockchair",
+  (hex) => ({
     url: `${BLOCKCHAIR_BASE}/push/transaction`,
-    body: `data=${encodeURIComponent(rawHex)}`,
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
-  });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`blockchair push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as {
-    data?: { transaction_hash?: string };
-    context?: { error?: string };
-  };
-  if (parsed.context?.error) throw new Error(`blockchair: ${parsed.context.error}`);
-  const hash = parsed.data?.transaction_hash;
-  if (!hash) throw new Error("blockchair push: no transaction_hash");
-  return hash;
-}
+    body: `data=${encodeURIComponent(hex)}`,
+    contentType: "application/x-www-form-urlencoded",
+  }),
+  (body) => JSON.parse(body)?.data?.transaction_hash,
+);
 
 /**
  * Bitpay Bitcore broadcast — `POST /tx/send` with `{ rawTx }`, returns `{ txid }`.
@@ -802,44 +835,49 @@ async function broadcastBlockchair(rawHex: string): Promise<string> {
  * is strictly better than the empty ladder it replaces — but treat the first
  * real BCH send as the thing that confirms it.
  */
-async function broadcastBitcore(rawHex: string): Promise<string> {
-  const r = await httpProxyCall({
-    method: "POST",
-    url: BITCORE_BCH_SEND,
-    body: JSON.stringify({ rawTx: rawHex }),
-    headers: { "Content-Type": "application/json" },
-  });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`bitcore push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as { txid?: string; txid$?: string };
-  const txid = parsed.txid ?? parsed.txid$;
-  if (!txid) throw new Error(`bitcore push: no txid in ${r.body.slice(0, 200)}`);
-  return txid;
-}
+const BITCORE_PUSH = proxyPushEndpoint(
+  "bitcore",
+  (hex) => ({ url: BITCORE_BCH_SEND, body: JSON.stringify({ rawTx: hex }), contentType: "application/json" }),
+  (body) => JSON.parse(body)?.txid,
+);
 
-async function broadcastFullstack(rawHex: string): Promise<string> {
-  // FullStack's bch-api accepts POST { txHex } at /tx/broadcast.
-  const r = await httpProxyCall({
-    method: "POST",
+/** FullStack's bch-api: POST `{ txHex }` at /tx/broadcast. DEAD — see
+ *  FULLSTACK_BASE; its HTML reply is classified as "not processed". */
+const FULLSTACK_PUSH = proxyPushEndpoint(
+  "fullstack",
+  (hex) => ({
     url: `${FULLSTACK_BASE}/tx/broadcast`,
-    body: JSON.stringify({ txHex: rawHex }),
-    headers: { "Content-Type": "application/json" },
-  });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`fullstack push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as {
-    success?: boolean;
-    txid?: string;
-    error?: string;
-  };
-  if (parsed.error) throw new Error(`fullstack push: ${parsed.error}`);
-  if (!parsed.txid) throw new Error("fullstack push: no txid");
-  return parsed.txid;
-}
+    body: JSON.stringify({ txHex: hex }),
+    contentType: "application/json",
+  }),
+  (body) => JSON.parse(body)?.txid,
+);
+
+/** Consulted only when every push errored: does any explorer know the txid? */
+const BCH_LOOKUPS: TxLookup[] = [
+  proxyTxLookup("haskoin", (t) => `${HASKOIN_BASES[0]}/transaction/${t}`, (j) => j?.txid),
+  proxyTxLookup("haskoin-2", (t) => `${HASKOIN_BASES[1]}/transaction/${t}`, (j) => j?.txid),
+  proxyTxLookup("bitcore", (t) => `https://api.bitcore.io/api/BCH/mainnet/tx/${t}`, (j) => j?.txid),
+  proxyTxLookup(
+    "blockchair",
+    (t) => `${BLOCKCHAIR_BASE}/dashboards/transaction/${t}`,
+    (j, t) => j?.data?.[t]?.transaction?.hash,
+  ),
+];
 
 // Fee oracle -------------------------------------------------------------
+
+/**
+ * The most a BCH send pays per byte — ten times the 1 sat/B every BCH backend
+ * quotes and every block clears at (2026-09-29 send-safety audit).
+ *
+ * BCH is serialized by hand, so bitcoinjs-lib's 5,000 sat/vB guard never ran
+ * on it and nothing bounded the fee: the send paid whatever Blockchair's
+ * `suggested_transaction_fee_per_byte_sat` said, and so did the modal. Oracle
+ * readings are clamped to this; an explicit rate above it is refused; and
+ * `assertFeeWithinCap` checks the signed transaction against it.
+ */
+export const BCH_MAX_FEE_RATE = 10;
 
 async function fetchFeeRateBlockchair(): Promise<number> {
   const r = await proxyGetJson<{
@@ -855,6 +893,35 @@ async function fetchFeeRateFullstack(): Promise<number> {
   // doesn't expose a per-byte fee. We treat 1 sat/B as the safe BCH
   // default (next-block in 2026 mempool conditions).
   return 1;
+}
+
+/**
+ * sat/B for a BCH send and for the modal's estimate: the caller's rate if
+ * given (refused above the cap), else the oracle clamped to [1, cap], else 1.
+ */
+async function bchSendFeeRate(override?: number): Promise<{ rate: number; isFallback: boolean }> {
+  if (override !== undefined) {
+    if (!Number.isFinite(override) || override <= 0) {
+      throw new Error(`Invalid BCH fee rate ${override}; nothing was sent.`);
+    }
+    const r = Math.max(Math.ceil(override), 1);
+    if (r > BCH_MAX_FEE_RATE) {
+      throw new Error(
+        `A fee rate of ${r} sat/B is above this wallet's ${BCH_MAX_FEE_RATE} sat/B cap for ` +
+          "Bitcoin Cash, where every block clears at 1 sat/B. Nothing was sent.",
+      );
+    }
+    return { rate: r, isFallback: false };
+  }
+  try {
+    const oracle = await tryEach([
+      { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
+      { name: "fullstack", fn: () => fetchFeeRateFullstack() },
+    ]);
+    return { rate: Math.min(Math.max(Math.ceil(oracle), 1), BCH_MAX_FEE_RATE), isFallback: false };
+  } catch {
+    return { rate: 1, isFallback: true };
+  }
 }
 
 // =========================================================================
@@ -1110,28 +1177,19 @@ export async function sendBchFromAccount(
     );
   }
 
-  const sendSatNum = Math.round(parseFloat(amount) * 1e8);
-  if (!Number.isFinite(sendSatNum) || sendSatNum <= 0) {
-    throw new Error("Amount must be greater than zero.");
-  }
+  // Amount and recipient are settled before anything touches the network
+  // (2026-09-29 send-safety audit): `parseFloat` sent "1,5" as 1, a legacy
+  // `1…`/`3…` address is refused, and a P2SH32 recipient's 44-byte output is
+  // priced as such.
+  const sendSatNum = parseSendAmountSat(amount, "BCH");
+  const recipientScript = outputScriptForRecipient(parseRecipient(to));
+  assertNotDust(sendSatNum, dustThresholdSat(recipientScript, DUST_RELAY_FEE_PER_KB["bitcoin-cash"]), "BCH");
 
   // BCH has no real fee market — every backend defaults to 1 sat/B and the
-  // mempool clears next block. Query anyway to honour an uptick. sat/B and
-  // sat/vB are the same number on a chain with no witness discount.
-  let feePerVB = opts?.feeRateOverride ?? 1;
-  if (opts?.feeRateOverride === undefined) {
-    try {
-      feePerVB = Math.max(
-        await tryEach([
-          { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
-          { name: "fullstack", fn: () => fetchFeeRateFullstack() },
-        ]),
-        1,
-      );
-    } catch {
-      /* keep 1 sat/B */
-    }
-  }
+  // mempool clears next block. Query anyway to honour an uptick, within
+  // BCH_MAX_FEE_RATE. sat/B and sat/vB are the same number on a chain with no
+  // witness discount.
+  const { rate: feePerVB } = await bchSendFeeRate(opts?.feeRateOverride);
 
   // Change goes to the internal chain's lowest unused index (2026-09-04) —
   // the BIP-44 rule every surveyed wallet and the swap engine follow — not
@@ -1143,6 +1201,7 @@ export async function sendBchFromAccount(
     feePerVB,
     sizing: P2PKH_SIZING,
     dustSat: Number(SOFT_DUST_SAT),
+    recipientOutputVB: outputVBytes(recipientScript.length),
     gapLimit: opts?.gapLimit,
     fetchUtxos: async (address) => {
       const utxos = await tryEach([
@@ -1190,9 +1249,7 @@ export async function sendBchFromAccount(
     vout: i.vout,
     value: BigInt(i.valueSat),
   }));
-  const outputs: BchOutput[] = [
-    { value: BigInt(sendSatNum), scriptPubKey: outputScriptForRecipient(parseRecipient(to)) },
-  ];
+  const outputs: BchOutput[] = [{ value: BigInt(sendSatNum), scriptPubKey: recipientScript }];
   if (plan.changeSat > 0) {
     outputs.push({
       value: BigInt(plan.changeSat),
@@ -1218,7 +1275,7 @@ export async function sendBchFromAccount(
   }
 
   const rawHex = serializeSignedTx(inputs, outputs, scriptSigs, VERSION, LOCKTIME);
-  return { hash: await broadcastBch(rawHex) };
+  return broadcastBch(rawHex, inputs, outputs);
 }
 
 /**
@@ -1226,19 +1283,43 @@ export async function sendBchFromAccount(
  *
  * Order: the two sources whose call shape is documented (Blockchair's is
  * verified, though its free tier 430-blacklists shared IPs; Bitcore's is
- * documented but unverified), then haskoin's two deployments (unverified, see
- * `broadcastHaskoin`), then FullStack — which is DEAD and, per the rule on
- * `FULLSTACK_BASE`, must never be the last entry, so Blockchair-via-form-post
- * is not repeated after it. A ladder that ends on a dead source is no ladder.
+ * documented but unverified), then FullStack — which is DEAD, and so must
+ * never be the last entry — then haskoin's two deployments (unverified, see
+ * `haskoinPush`). A ladder that ends on a dead source is no ladder.
+ *
+ * Since 2026-09-29 (send-safety audit) this is the only place a BCH
+ * transaction leaves the wallet, and it goes through `broadcastSignedTx`: the
+ * txid is computed here from the signed bytes, every endpoint gets those same
+ * bytes, and a lost reply is "may have been sent" — never "failed". BCH is
+ * serialized by hand, so no library checked its fee; `assertFeeWithinCap`
+ * does, before anything is sent.
  */
-async function broadcastBch(rawHex: string): Promise<string> {
-  return tryEach([
-    { name: "blockchair", fn: () => broadcastBlockchair(rawHex) },
-    { name: "bitcore", fn: () => broadcastBitcore(rawHex) },
-    { name: "fullstack", fn: () => broadcastFullstack(rawHex) },
-    { name: "haskoin", fn: () => broadcastHaskoin(HASKOIN_BASES[0], rawHex) },
-    { name: "haskoin-2", fn: () => broadcastHaskoin(HASKOIN_BASES[1], rawHex) },
-  ]);
+function broadcastBch(rawHex: string, inputs: BchInput[], outputs: BchOutput[]): Promise<TxResult> {
+  const inTotal = inputs.reduce((t, i) => t + Number(i.value), 0);
+  const outTotal = outputs.reduce((t, o) => t + Number(o.value), 0);
+  assertFeeWithinCap({
+    ticker: "BCH",
+    feeSat: inTotal - outTotal,
+    vbytes: rawHex.length / 2,
+    // Twice the policy ceiling: this guard is for a gross error (a unit
+    // mix-up), and a send priced AT the ceiling legitimately exceeds it per
+    // byte once a sub-dust change output is dropped from the estimate.
+    maxSatPerVByte: 2 * BCH_MAX_FEE_RATE,
+    foldAllowanceSat: Number(SOFT_DUST_SAT),
+  });
+  return broadcastSignedTx({
+    ticker: "BCH",
+    txid: txidOfLegacyRawHex(rawHex),
+    rawHex,
+    endpoints: [
+      BLOCKCHAIR_PUSH,
+      BITCORE_PUSH,
+      FULLSTACK_PUSH,
+      haskoinPush("haskoin", HASKOIN_BASES[0]),
+      haskoinPush("haskoin-2", HASKOIN_BASES[1]),
+    ],
+    lookups: BCH_LOOKUPS,
+  });
 }
 
 export const bchAdapter: ChainAdapter = {
@@ -1340,25 +1421,29 @@ export const bchAdapter: ChainAdapter = {
    *      ECDSA-sign with low-S DER; embed `<sig+0x41> <pubkey>` as the
    *      scriptSig.
    *   4. Serialize the legacy (pre-segwit) raw tx.
-   *   5. Broadcast across Blockchair → FullStack.
+   *   5. Broadcast once, through `broadcastBch`.
    *
    * Recipient parsing accepts CashAddr (`bitcoincash:q...` for P2PKH,
-   * `bitcoincash:p...` for P2SH) or legacy base58check (`1...` / `3...`)
-   * — see `parseRecipient`.
+   * `bitcoincash:p...` for P2SH / P2SH32); legacy base58check is refused
+   * since 2026-09-29 — see `parseRecipient`.
    */
   async sendTransaction(
     privateKey: string,
     to: string,
-    amount: string
+    amount: string,
+    _assetType?: string,
+    opts?: SendOptions,
   ): Promise<TxResult> {
+    // Settled before any request (2026-09-29 send-safety audit).
+    const sendSatNum = parseSendAmountSat(amount, "BCH");
+    const recipientScript = outputScriptForRecipient(parseRecipient(to));
+    assertNotDust(sendSatNum, dustThresholdSat(recipientScript, DUST_RELAY_FEE_PER_KB["bitcoin-cash"]), "BCH");
+
     const privKey = hexToBytes(privateKey);
     const pubKey = pubkeyFromPriv(privKey);
     const senderHash = hash160(pubKey);
     const senderAddr = encodeCashAddr(senderHash, "p2pkh");
     const senderScript = scriptP2PKH(senderHash);
-
-    const recipient = parseRecipient(to);
-    const recipientScript = outputScriptForRecipient(recipient);
 
     // 1) UTXOs (multi-source). Same ladder as the account-wide path.
     const utxos = await tryEach([
@@ -1372,60 +1457,46 @@ export const bchAdapter: ChainAdapter = {
       throw new Error("No spendable UTXOs available for this address.");
     }
 
-    // 2) Fee rate (sat/B). BCH has no real fee market in 2026 — every
-    //    backend defaults to 1 sat/B and the mempool clears in the next
-    //    block. We still query the oracle to honor any uptick.
-    let feeSatPerB = 1;
-    try {
-      feeSatPerB = Math.max(
-        await tryEach([
-          { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
-          { name: "fullstack", fn: () => fetchFeeRateFullstack() },
-        ]),
-        1
-      );
-    } catch {
-      /* keep 1 sat/B */
-    }
+    // 2) Fee rate (sat/B): the modal's tier when given, else the oracle —
+    //    both within BCH_MAX_FEE_RATE.
+    const { rate: feeSatPerB } = await bchSendFeeRate(opts?.feeRate);
 
-    const sendSat = BigInt(Math.round(parseFloat(amount) * 1e8));
-    if (sendSat <= 0n) throw new Error("Amount must be greater than zero.");
-
-    // 3) Input selection (largest-first), sized against actual byte count.
-    const sortedUtxos = [...utxos].sort((a, b) =>
-      a.value < b.value ? 1 : a.value > b.value ? -1 : 0
-    );
-    const selected: NormalizedUtxo[] = [];
-    let total = 0n;
-    let estimatedBytes = 192;
-    let feeSat = BigInt(estimatedBytes * feeSatPerB);
-    for (const u of sortedUtxos) {
-      selected.push(u);
-      total += u.value;
-      // 1 P2PKH input ≈ 148 bytes signed; overhead/output = 44; with
-      // change output = +34; total ≈ 10 + 148*N + 34*outputCount.
-      estimatedBytes = 10 + 148 * selected.length + 34 * 2;
-      feeSat = BigInt(estimatedBytes * feeSatPerB);
-      if (total >= sendSat + feeSat) break;
-    }
-    if (total < sendSat + feeSat) {
+    // 3) Largest-first selection with the shared planner, priced for the
+    //    recipient's real output (a P2SH32 output is 44 bytes, not 34).
+    const candidates: AccountSpendCandidate[] = utxos.map((u) => {
+      if (u.value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(
+          `Output ${u.txid}:${u.vout} exceeds 2^53 sats and cannot be selected safely. Nothing was sent.`,
+        );
+      }
+      return { path: DERIVATION_PATH, address: senderAddr, txid: u.txid, vout: u.vout, valueSat: Number(u.value) };
+    });
+    const plan = planAccountSpend({
+      candidates,
+      sendSat: sendSatNum,
+      feePerVB: feeSatPerB,
+      sizing: P2PKH_SIZING,
+      dustSat: Number(SOFT_DUST_SAT),
+      recipientOutputVB: outputVBytes(recipientScript.length),
+    });
+    if (!plan.covered) {
+      const have = candidates.reduce((t, c) => t + c.valueSat, 0);
       throw new Error(
-        `Insufficient funds. Have ${(Number(total) / 1e8).toFixed(8)} BCH, ` +
-          `need ${(Number(sendSat + feeSat) / 1e8).toFixed(8)} BCH ` +
-          `(incl. ~${(Number(feeSat) / 1e8).toFixed(8)} fee).`
+        `Insufficient funds. Have ${(have / 1e8).toFixed(8)} BCH, ` +
+          `need ${((have + plan.shortfallSat) / 1e8).toFixed(8)} BCH ` +
+          `(incl. ~${(plan.feeSat / 1e8).toFixed(8)} fee).`
       );
     }
 
     // 4) Build inputs + outputs.
-    const inputs: BchInput[] = selected.map((u) => ({
+    const inputs: BchInput[] = plan.inputs.map((u) => ({
       txid: u.txid,
       vout: u.vout,
-      value: u.value,
+      value: BigInt(u.valueSat),
     }));
-    const outputs: BchOutput[] = [{ value: sendSat, scriptPubKey: recipientScript }];
-    const change = total - sendSat - feeSat;
-    if (change >= SOFT_DUST_SAT) {
-      outputs.push({ value: change, scriptPubKey: senderScript });
+    const outputs: BchOutput[] = [{ value: BigInt(sendSatNum), scriptPubKey: recipientScript }];
+    if (plan.changeSat > 0) {
+      outputs.push({ value: BigInt(plan.changeSat), scriptPubKey: senderScript });
     }
 
     // 5) Sign each input with FORKID sighash. scriptCode for a single-key
@@ -1454,9 +1525,9 @@ export const bchAdapter: ChainAdapter = {
       scriptSigs.push(scriptSig);
     }
 
-    // 6) Serialize + broadcast.
+    // 6) Serialize, then the one broadcast (fee-checked; see `broadcastBch`).
     const rawHex = serializeSignedTx(inputs, outputs, scriptSigs, VERSION, LOCKTIME);
-    return { hash: await broadcastBch(rawHex) };
+    return broadcastBch(rawHex, inputs, outputs);
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -1582,17 +1653,10 @@ export const bchAdapter: ChainAdapter = {
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {
-    let perByte = 1;
-    let isFallback = false;
-    try {
-      perByte = await tryEach([
-        { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
-        { name: "fullstack", fn: () => fetchFeeRateFullstack() },
-      ]);
-    } catch {
-      /* keep 1 sat/B — and say it is the default, not a reading */
-      isFallback = true;
-    }
+    // The same rate a send uses, within BCH_MAX_FEE_RATE (2026-09-29) — the
+    // modal showed the raw oracle and the send paid it. `isFallback` when no
+    // source answered: 1 sat/B is then the default, not a reading.
+    const { rate: perByte, isFallback } = await bchSendFeeRate();
     return {
       normal: { value: String(Math.max(perByte, 1)) },
       unit: "sat/B",

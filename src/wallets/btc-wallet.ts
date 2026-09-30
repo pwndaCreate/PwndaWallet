@@ -11,6 +11,7 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendOptions,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
 import { withFallback } from "./_fallback";
@@ -18,8 +19,23 @@ import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
   accountShortfallMessage,
+  planAccountSpend,
   P2WPKH_SIZING,
 } from "./utxo-account";
+import {
+  acceptPushReply,
+  assertNotDust,
+  broadcastSignedTx,
+  dustThresholdSat,
+  DUST_RELAY_FEE_PER_KB,
+  fetchTxLookup,
+  outputVBytes,
+  parseSendAmountSat,
+  recipientOutput,
+  SEGWIT_CHAIN_OUTPUTS,
+  type BroadcastEndpoint,
+} from "./utxo-send";
+import { errorText } from "../lib/errorText";
 import {
   parseEsploraStats,
   blockchairProbe,
@@ -36,19 +52,89 @@ const BTC_API_URLS = [
   "https://mempool.space/api",
 ];
 
+/**
+ * GET from the Esplora hosts in order; the first 2xx (or 404, which Esplora
+ * uses for "unknown") wins. When every host fails, the error names each one
+ * with its status and reply — it used to keep only the last, as
+ * `HTTP 429 from https://mempool.space/api` with no body (2026-09-29
+ * send-safety audit). Reads only: broadcasting goes through
+ * `broadcastBtc`, which must never treat a lost reply as a failure.
+ */
 async function btcFetch(path: string, init?: RequestInit): Promise<Response> {
-  let lastError: any;
+  const failures: string[] = [];
   for (const base of BTC_API_URLS) {
+    const host = new URL(base).host;
     try {
       const resp = await fetch(`${base}${path}`, init);
       if (resp.ok || resp.status === 404) return resp;
-      lastError = new Error(`HTTP ${resp.status} from ${base}`);
+      let body = "";
+      try {
+        body = (await resp.text()).replace(/\s+/g, " ").trim().slice(0, 160);
+      } catch {
+        /* status alone */
+      }
+      failures.push(`${host}: HTTP ${resp.status}${body ? ` ${body}` : ""}`);
     } catch (e) {
-      lastError = e;
-      continue;
+      failures.push(`${host}: ${errorText(e, "request failed")}`);
     }
   }
-  throw lastError;
+  throw new Error(`Every BTC explorer failed for ${path} — ${failures.join("; ")}`);
+}
+
+/**
+ * The broadcast ladder: Esplora `POST /tx` on each host, the same signed bytes
+ * to each. See `broadcastSignedTx` (utxo-send.ts) for what a failure means.
+ */
+const BTC_BROADCAST: BroadcastEndpoint[] = BTC_API_URLS.map((base) => ({
+  name: new URL(base).host,
+  async send(rawHex: string) {
+    const resp = await fetch(`${base}/tx`, { method: "POST", body: rawHex });
+    return acceptPushReply(resp.status, await resp.text(), (b) => b.trim());
+  },
+}));
+
+/** Esplora `GET /tx/:txid` — used only when every push errored. */
+const BTC_LOOKUPS = BTC_API_URLS.map((base) =>
+  fetchTxLookup(new URL(base).host, (txid) => `${base}/tx/${txid}`, (j) => j?.txid),
+);
+
+/** Broadcast a signed BTC transaction: once, with an honest outcome. */
+function broadcastBtc(tx: bitcoin.Transaction): Promise<TxResult> {
+  return broadcastSignedTx({
+    ticker: "BTC",
+    txid: tx.getId(),
+    rawHex: tx.toHex(),
+    endpoints: BTC_BROADCAST,
+    lookups: BTC_LOOKUPS,
+  });
+}
+
+/** Decode a BTC recipient, trimmed and with a `bitcoin:` URI cut to the address. */
+function btcRecipient(to: string) {
+  return recipientOutput(to, {
+    network: bitcoin.networks.bitcoin,
+    ticker: "BTC",
+    uriSchemes: ["bitcoin"],
+    allowed: SEGWIT_CHAIN_OUTPUTS,
+  });
+}
+
+/**
+ * The rate a BTC send signs with: the Send modal's tier when given, else the
+ * Esplora 6-block estimate, else 10 sat/vB. Shared by both send paths — the
+ * single-key one ignored the modal's tier until 2026-09-29.
+ */
+async function btcSendFeeRate(override?: number): Promise<number> {
+  if (override !== undefined && Number.isFinite(override) && override > 0) {
+    return Math.max(Math.ceil(override), 1);
+  }
+  try {
+    const resp = await btcFetch(`/fee-estimates`);
+    const est = await resp.json();
+    return Math.max(Math.ceil(est["6"] ?? est["3"] ?? est["1"] ?? 10), 1);
+  } catch {
+    return 10;
+  }
 }
 
 const BLOCKSTREAM_API = BTC_API_URLS[0];
@@ -227,21 +313,14 @@ export async function sendBtcFromAccount(
     );
   }
 
-  const sendSat = Math.round(parseFloat(amount) * 1e8);
-  if (!Number.isFinite(sendSat) || sendSat <= 0) {
-    throw new Error("Amount must be greater than zero.");
-  }
+  // Amount and recipient are settled before anything touches the network
+  // (2026-09-29 send-safety audit): `parseFloat` sent "1,5" as 1, and the
+  // recipient output's real size feeds the fee.
+  const sendSat = parseSendAmountSat(amount, "BTC");
+  const recipient = btcRecipient(to);
+  assertNotDust(sendSat, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.bitcoin), "BTC");
 
-  let feePerVB = opts?.feeRateOverride;
-  if (feePerVB === undefined) {
-    try {
-      const resp = await btcFetch(`/fee-estimates`);
-      const est = await resp.json();
-      feePerVB = Math.max(Math.ceil(est["6"] ?? est["3"] ?? est["1"] ?? 10), 1);
-    } catch {
-      feePerVB = 10;
-    }
-  }
+  const feePerVB = await btcSendFeeRate(opts?.feeRateOverride);
 
   // Change goes to the internal chain's lowest unused index (2026-09-04) —
   // the BIP-44 rule every surveyed wallet and the swap engine follow — not
@@ -253,6 +332,7 @@ export async function sendBtcFromAccount(
     feePerVB,
     sizing: P2WPKH_SIZING,
     dustSat: BTC_DUST_SAT,
+    recipientOutputVB: outputVBytes(recipient.script.length),
     gapLimit: opts?.gapLimit,
     fetchUtxos: async (address) => {
       const resp = await btcFetch(`/address/${address}/utxo`);
@@ -291,7 +371,7 @@ export async function sendBtcFromAccount(
       },
     });
   }
-  psbt.addOutput({ address: to, value: BigInt(sendSat) });
+  psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
   if (plan.changeSat > 0) {
     psbt.addOutput({ address: change.address, value: BigInt(plan.changeSat) });
   }
@@ -303,13 +383,9 @@ export async function sendBtcFromAccount(
     });
   });
   psbt.finalizeAllInputs();
-  const rawTx = psbt.extractTransaction().toHex();
 
-  const resp = await btcFetch(`/tx`, { method: "POST", body: rawTx });
-  if (!resp.ok) {
-    throw new Error(`Broadcast failed: ${await resp.text()}`);
-  }
-  return { hash: (await resp.text()).trim() };
+  // Signed once; from here on only these bytes are ever sent.
+  return broadcastBtc(psbt.extractTransaction());
 }
 
 export const btcAdapter: ChainAdapter = {
@@ -384,87 +460,76 @@ export const btcAdapter: ChainAdapter = {
     return (satoshis / 1e8).toFixed(8);
   },
 
+  /**
+   * Single-key send — a private-key import, or any wallet `supportsAccountSend`
+   * does not cover. Since 2026-09-29 (send-safety audit) it prices the
+   * transaction it actually builds — the shared planner, the recipient's real
+   * output size — at the Send modal's tier (`opts.feeRate`), where it used to
+   * budget a fixed 140 vB at the oracle's rate whatever the tier and however
+   * many inputs it spent (0.5 sat/vB measured for three inputs).
+   */
   async sendTransaction(
     privateKey: string,
     to: string,
-    amount: string
+    amount: string,
+    _assetType?: string,
+    opts?: SendOptions,
   ): Promise<TxResult> {
+    const sendSat = parseSendAmountSat(amount, "BTC");
+    const recipient = btcRecipient(to);
+    assertNotDust(sendSat, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.bitcoin), "BTC");
+
     const privKeyBytes = hexToBytes(privateKey);
     const keyPair = ECPair.fromPrivateKey(Buffer.from(privKeyBytes));
     const senderAddress = getAddress(keyPair.publicKey);
 
-    // Fetch UTXOs
     const utxoResp = await btcFetch(`/address/${senderAddress}/utxo`);
     if (!utxoResp.ok) throw new Error("Failed to fetch UTXOs");
-    const utxos: any[] = await utxoResp.json();
-
+    const utxos: Array<{ txid: string; vout: number; value: number }> = await utxoResp.json();
     if (utxos.length === 0) throw new Error("No UTXOs available");
 
-    // Fetch fee rate
-    const feeResp = await btcFetch(`/fee-estimates`);
-    const feeEstimates = await feeResp.json();
-    const feeRate = Math.ceil(feeEstimates["6"] || 10); // sat/vB, target 6 blocks
-
-    const satoshisToSend = Math.round(parseFloat(amount) * 1e8);
-    const estimatedSize = 140; // rough estimate for 1-in 2-out segwit tx
-    const fee = feeRate * estimatedSize;
-
-    // Select UTXOs
-    let totalInput = 0;
-    const psbt = new bitcoin.Psbt({ network: bitcoin.networks.bitcoin });
-
-    for (const utxo of utxos) {
-      psbt.addInput({
-        hash: utxo.txid,
-        index: utxo.vout,
-        witnessUtxo: {
-          script: bitcoin.payments.p2wpkh({
-            pubkey: keyPair.publicKey,
-            network: bitcoin.networks.bitcoin,
-          }).output!,
-          value: BigInt(utxo.value),
-        },
-      });
-      totalInput += utxo.value;
-      if (totalInput >= satoshisToSend + fee) break;
-    }
-
-    if (totalInput < satoshisToSend + fee) {
+    const feePerVB = await btcSendFeeRate(opts?.feeRate);
+    const plan = planAccountSpend({
+      candidates: utxos.map((u) => ({
+        path: DERIVATION_PATH,
+        address: senderAddress,
+        txid: u.txid,
+        vout: u.vout,
+        valueSat: u.value,
+      })),
+      sendSat,
+      feePerVB,
+      sizing: P2WPKH_SIZING,
+      dustSat: BTC_DUST_SAT,
+      recipientOutputVB: outputVBytes(recipient.script.length),
+    });
+    if (!plan.covered) {
+      const have = utxos.reduce((t, u) => t + u.value, 0);
       throw new Error(
-        `Insufficient funds. Have ${(totalInput / 1e8).toFixed(8)} BTC, need ${((satoshisToSend + fee) / 1e8).toFixed(8)} BTC (includes fee)`
+        `Insufficient funds. Have ${(have / 1e8).toFixed(8)} BTC, need ` +
+          `${((have + plan.shortfallSat) / 1e8).toFixed(8)} BTC (includes fee)`,
       );
     }
 
-    // Output: recipient
-    psbt.addOutput({ address: to, value: BigInt(satoshisToSend) });
-
-    // Change output
-    const change = totalInput - satoshisToSend - fee;
-    if (change > 546) {
-      psbt.addOutput({ address: senderAddress, value: BigInt(change) });
+    const network = bitcoin.networks.bitcoin;
+    const psbt = new bitcoin.Psbt({ network });
+    const witnessScript = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network }).output!;
+    for (const input of plan.inputs) {
+      psbt.addInput({
+        hash: input.txid,
+        index: input.vout,
+        witnessUtxo: { script: witnessScript, value: BigInt(input.valueSat) },
+      });
     }
-
-    // Sign all inputs
+    psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
+    if (plan.changeSat > 0) {
+      psbt.addOutput({ address: senderAddress, value: BigInt(plan.changeSat) });
+    }
     for (let i = 0; i < psbt.inputCount; i++) {
       psbt.signInput(i, keyPair);
     }
-
     psbt.finalizeAllInputs();
-    const rawTx = psbt.extractTransaction().toHex();
-
-    // Broadcast
-    const broadcastResp = await btcFetch(`/tx`, {
-      method: "POST",
-      body: rawTx,
-    });
-
-    if (!broadcastResp.ok) {
-      const errText = await broadcastResp.text();
-      throw new Error(`Broadcast failed: ${errText}`);
-    }
-
-    const txid = await broadcastResp.text();
-    return { hash: txid };
+    return broadcastBtc(psbt.extractTransaction());
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -673,12 +738,7 @@ export async function sweepLegacyBtcToAddress(
     psbt.signInput(i, keyPair);
   }
   psbt.finalizeAllInputs();
-  const rawTx = psbt.extractTransaction().toHex();
-  const broadcastResp = await btcFetch(`/tx`, { method: "POST", body: rawTx });
-  if (!broadcastResp.ok) {
-    const errText = await broadcastResp.text();
-    throw new Error(`Sweep broadcast failed: ${errText}`);
-  }
-  const txid = await broadcastResp.text();
-  return { hash: txid };
+  // The same broadcast as a send (2026-09-29 send-safety audit): a lost reply
+  // is reported as "may have been sent", never as a failed sweep.
+  return broadcastBtc(psbt.extractTransaction());
 }

@@ -49,13 +49,30 @@ import type {
   TxHistoryPage,
   FeeEstimate,
 } from "./types";
-import { proxyGetJson, proxyPostJson, httpProxyCall } from "./_proxy";
+import { proxyGetJson } from "./_proxy";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
   accountShortfallMessage,
+  planAccountSpend,
   P2PKH_SIZING,
+  type AccountSpendCandidate,
 } from "./utxo-account";
+import {
+  assertFeeWithinCap,
+  assertNotDust,
+  broadcastSignedTx,
+  LEGACY_CHAIN_OUTPUTS,
+  NO_SEGWIT_BECH32,
+  outputVBytes,
+  parseSendAmountSat,
+  proxyPushEndpoint,
+  proxyTxLookup,
+  recipientOutput,
+  trySources,
+  type BroadcastEndpoint,
+  type TxLookup,
+} from "./utxo-send";
 import {
   parseEsploraStats,
   blockchairProbe,
@@ -70,13 +87,17 @@ const ECPair = ECPairFactory(tinysecp);
 // Network parameters (Dogecoin Core `chainparams.cpp`)
 // =========================================================================
 //
-// Dogecoin never activated segwit — `bech32` is intentionally a placeholder
-// string that will never match a real address. Any future call to
-// `bitcoin.payments.p2wpkh({ network: dogeNetwork })` would mint addresses
-// no Dogecoin node accepts.
+// Dogecoin never activated segwit, so `bech32` must match NO address.
+//
+// CORRECTED 2026-09-29 (send-safety audit): the comment here claimed "doge"
+// was "a placeholder string that will never match a real address". It matched
+// any checksum-valid `doge1…` string, which bitcoinjs-lib turned into a P2WPKH
+// output — a script Dogecoin nodes treat as anyone-can-spend. See
+// `NO_SEGWIT_BECH32`; `recipientOutput` also refuses every non-P2PKH/P2SH
+// template on this chain.
 const dogeNetwork: bitcoin.Network = {
   messagePrefix: "\x19Dogecoin Signed Message:\n",
-  bech32: "doge",
+  bech32: NO_SEGWIT_BECH32,
   bip32: { public: 0x02facafd, private: 0x02fac398 },
   pubKeyHash: 0x1e, // "D..." legacy P2PKH
   scriptHash: 0x16, // "9..." or "A..." P2SH
@@ -96,11 +117,44 @@ const BITCORE_DOGE_BALANCE = (addr: string) =>
   `https://api.bitcore.io/api/DOGE/mainnet/address/${addr}/balance`;
 const DERIVATION_PATH = "m/44'/3'/0'/0/0";
 
-// Standard 1-in 2-out P2PKH tx is ~226 bytes. We use 226 in fee math
-// throughout; oversized inputs (e.g. multi-input consolidations) round
-// up via the input count adder in `estimateTxBytes`.
+// Standard 1-in 2-out P2PKH tx is ~226 bytes — the size the modal's
+// estimate is quoted for. Sends are priced for what they actually build.
 const STANDARD_TX_BYTES = 226;
-const MIN_RECOMMENDED_RATE_PER_KB = 0.01; // DOGE/kB — see file header
+
+/**
+ * The fee band, in satoshi per kB (1 DOGE = 1e8 sat).
+ *
+ * Floor: Dogecoin Core 1.14.6's recommended 0.01 DOGE/kB — see file header.
+ *
+ * Ceiling: 0.04 DOGE/kB, four times the recommended rate (2026-09-29
+ * send-safety audit). The oracles had no upper bound, and on 2026-09-29 they
+ * read 0.58 DOGE/kB (BlockCypher `medium_fee_per_kb` 58,349,538) and 5 DOGE/kB
+ * (Blockchair 500,000 sat/B) — 58× and 500× the recommendation. Both are past
+ * bitcoinjs-lib's 5,000 sat/B guard, so EVERY DOGE send threw
+ * "Warning: You are paying around …"; without that guard they would have paid
+ * those rates. Our reading (inference, not measured): the oracles average what
+ * transactions pay, and a large share of DOGE traffic still pays the pre-1.14.4
+ * default of 1 DOGE/kB. 0.04 leaves room for a genuine uptick at under a cent
+ * per send, and stays below the 0.05 DOGE/kB that guard enforces.
+ */
+export const DOGE_MIN_SAT_PER_KB = 1_000_000;
+export const DOGE_MAX_SAT_PER_KB = 4_000_000;
+
+/**
+ * Hard sanity cap for a signed DOGE transaction, per vbyte, checked before
+ * broadcast (`assertFeeWithinCap`) — bitcoinjs-lib's own default. It replaces
+ * that library's generic check, which also counted change folded into the fee
+ * and refused a send with 0.009 DOGE of sub-dust change at the FLOOR rate.
+ */
+const DOGE_FEE_CAP_SAT_PER_VB = 5_000;
+
+/** Clamp any rate reading (sat/kB) into the band; non-numbers fall to the floor. */
+export function clampDogeSatPerKb(satPerKb: number | null | undefined): number {
+  if (typeof satPerKb !== "number" || !Number.isFinite(satPerKb) || satPerKb <= 0) {
+    return DOGE_MIN_SAT_PER_KB;
+  }
+  return Math.min(Math.max(Math.ceil(satPerKb), DOGE_MIN_SAT_PER_KB), DOGE_MAX_SAT_PER_KB);
+}
 
 // =========================================================================
 // Helpers
@@ -130,34 +184,12 @@ function getAddress(publicKey: Uint8Array): string {
 }
 
 /**
- * Try a sequence of async sources in declared order; return the first
- * value that resolves successfully. Throws on full exhaustion with the
- * last underlying error preserved. Used by every multi-source fetch in
- * this adapter so a single endpoint outage doesn't surface to the user.
+ * Try READ sources in declared order; the first answer wins. On full
+ * exhaustion the error names every source with what it said (`trySources`).
+ * Never used for broadcasting — see `broadcastDoge`.
  */
-async function tryEach<T>(
-  sources: Array<{ name: string; fn: () => Promise<T> }>
-): Promise<T> {
-  let lastError: unknown = null;
-  const tried: string[] = [];
-  for (const s of sources) {
-    tried.push(s.name);
-    try {
-      return await s.fn();
-    } catch (e) {
-      lastError = e;
-    }
-  }
-  const tail = lastError instanceof Error ? lastError.message : String(lastError);
-  throw new Error(
-    `All ${tried.length} DOGE source(s) failed [${tried.join(", ")}]: ${tail}`
-  );
-}
-
-function estimateTxBytes(inputCount: number, outputCount = 2): number {
-  // Empirically: 10 bytes overhead + 148 bytes/legacy P2PKH input + 34 bytes/P2PKH output.
-  // Matches Bitcoin Core's `GetVirtualTransactionSize` for legacy 1-of-1 inputs.
-  return 10 + 148 * inputCount + 34 * outputCount;
+function tryEach<T>(sources: Array<{ name: string; fn: () => Promise<T> }>): Promise<T> {
+  return trySources<T>("DOGE", sources);
 }
 
 // =========================================================================
@@ -278,54 +310,94 @@ async function fetchPrevTxHexBlockchair(txid: string): Promise<string> {
 }
 
 // -------------------------------------------------------------------------
-// Broadcast — multi-source
+// Broadcast — the same signed bytes to each endpoint; the outcome decided by
+// `broadcastSignedTx` (utxo-send.ts). DOGE has two live broadcast endpoints
+// (dogechain.info is behind a Cloudflare challenge), which made the 2026-09-29
+// audit's lost-reply double payment easy to hit here.
 // -------------------------------------------------------------------------
 
-async function broadcastBlockcypher(rawHex: string): Promise<string> {
-  const r = await proxyPostJson<{
-    tx?: { hash?: string };
-    error?: string;
-  }>(`${BLOCKCYPHER_BASE}/txs/push`, { tx: rawHex });
-  if (r.error) throw new Error(`blockcypher push: ${r.error}`);
-  if (!r.tx?.hash) throw new Error("blockcypher push: no hash");
-  return r.tx.hash;
-}
+const DOGE_BROADCAST: BroadcastEndpoint[] = [
+  proxyPushEndpoint(
+    "blockcypher",
+    (hex) => ({
+      url: `${BLOCKCYPHER_BASE}/txs/push`,
+      body: JSON.stringify({ tx: hex }),
+      contentType: "application/json",
+    }),
+    (body) => JSON.parse(body)?.tx?.hash,
+  ),
+  // Blockchair's broadcast endpoint expects form-urlencoded `data=<hex>`; a
+  // JSON content-type is rejected with HTTP 400.
+  proxyPushEndpoint(
+    "blockchair",
+    (hex) => ({
+      url: `${BLOCKCHAIR_BASE}/push/transaction`,
+      body: `data=${encodeURIComponent(hex)}`,
+      contentType: "application/x-www-form-urlencoded",
+    }),
+    (body) => JSON.parse(body)?.data?.transaction_hash,
+  ),
+  proxyPushEndpoint(
+    "dogechain",
+    (hex) => ({
+      url: `${DOGECHAIN_BASE}/pushtx`,
+      body: JSON.stringify({ tx: hex }),
+      contentType: "application/json",
+    }),
+    (body) => {
+      const j = JSON.parse(body);
+      return j?.success === 1 ? j.tx_hash : undefined;
+    },
+  ),
+];
 
-async function broadcastBlockchair(rawHex: string): Promise<string> {
-  // Blockchair's broadcast endpoint expects form-urlencoded `data=<hex>`.
-  // Going through `httpProxyCall` directly because `proxyPostJson` always
-  // sets JSON content-type, which blockchair rejects with HTTP 400.
-  const r = await httpProxyCall({
-    method: "POST",
-    url: `${BLOCKCHAIR_BASE}/push/transaction`,
-    body: `data=${encodeURIComponent(rawHex)}`,
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+const DOGE_LOOKUPS: TxLookup[] = [
+  proxyTxLookup("blockcypher", (t) => `${BLOCKCYPHER_BASE}/txs/${t}`, (j) => j?.hash),
+  proxyTxLookup(
+    "blockchair",
+    (t) => `${BLOCKCHAIR_BASE}/dashboards/transaction/${t}`,
+    (j, t) => j?.data?.[t]?.transaction?.hash,
+  ),
+];
+
+/**
+ * Check the fee, then broadcast. Extracted with bitcoinjs-lib's generic fee
+ * check OFF: it counts change folded into the fee as fee rate, so a send
+ * leaving up to 0.01 DOGE of sub-dust change tripped its 5,000 sat/B limit even
+ * at the floor rate. `assertFeeWithinCap` applies the same limit with that
+ * change allowed for.
+ */
+function broadcastDoge(psbt: bitcoin.Psbt, inputTotalSat: number): Promise<TxResult> {
+  const tx = psbt.extractTransaction(true);
+  const outTotal = tx.outs.reduce((t, o) => t + Number(o.value), 0);
+  assertFeeWithinCap({
+    ticker: "DOGE",
+    feeSat: inputTotalSat - outTotal,
+    vbytes: tx.virtualSize(),
+    maxSatPerVByte: DOGE_FEE_CAP_SAT_PER_VB,
+    foldAllowanceSat: DOGE_DUST_SAT,
   });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`blockchair push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as {
-    data?: { transaction_hash?: string };
-    context?: { error?: string };
-  };
-  if (parsed.context?.error) throw new Error(`blockchair: ${parsed.context.error}`);
-  const hash = parsed.data?.transaction_hash;
-  if (!hash) throw new Error("blockchair push: no transaction_hash");
-  return hash;
+  return broadcastSignedTx({
+    ticker: "DOGE",
+    txid: tx.getId(),
+    rawHex: tx.toHex(),
+    endpoints: DOGE_BROADCAST,
+    lookups: DOGE_LOOKUPS,
+  });
 }
 
-async function broadcastDogechain(rawHex: string): Promise<string> {
-  const r = await proxyPostJson<{ success?: number; tx_hash?: string; error?: string }>(
-    `${DOGECHAIN_BASE}/pushtx`,
-    { tx: rawHex }
-  );
-  if (r.error) throw new Error(`dogechain push: ${r.error}`);
-  if (!r.tx_hash) throw new Error("dogechain push: no tx_hash");
-  return r.tx_hash;
+/** Decode a DOGE recipient: P2PKH (D…) or P2SH (9…/A…) only. */
+function dogeRecipient(to: string) {
+  return recipientOutput(to, {
+    network: dogeNetwork,
+    ticker: "DOGE",
+    uriSchemes: ["dogecoin"],
+    allowed: LEGACY_CHAIN_OUTPUTS,
+  });
 }
 
 // -------------------------------------------------------------------------
-// Fee oracle — multi-source. Returns DOGE/kB.
+// Fee oracle — multi-source. Returns sat/kB; always clamped to the band.
 // -------------------------------------------------------------------------
 
 async function fetchFeeRateBlockcypher(): Promise<number> {
@@ -334,10 +406,10 @@ async function fetchFeeRateBlockcypher(): Promise<number> {
     medium_fee_per_kb?: number;
     low_fee_per_kb?: number;
   }>(BLOCKCYPHER_BASE);
-  // BlockCypher returns satoshi/kB; convert to DOGE/kB.
+  // BlockCypher quotes satoshi per kB.
   const med = r.medium_fee_per_kb;
   if (!med || med <= 0) throw new Error("blockcypher fee: invalid");
-  return med / 1e8;
+  return med;
 }
 
 async function fetchFeeRateBlockchair(): Promise<number> {
@@ -346,7 +418,26 @@ async function fetchFeeRateBlockchair(): Promise<number> {
   }>(`${BLOCKCHAIR_BASE}/stats`);
   const perByte = r.data?.suggested_transaction_fee_per_byte_sat;
   if (!perByte || perByte <= 0) throw new Error("blockchair fee: invalid");
-  return (perByte * 1000) / 1e8; // sat/B → DOGE/kB
+  return perByte * 1000; // sat/B → sat/kB
+}
+
+/**
+ * The rate every DOGE fee decision uses — both send paths and the modal's
+ * estimate, so what is shown is what is paid: the oracle's reading clamped to
+ * [DOGE_MIN_SAT_PER_KB, DOGE_MAX_SAT_PER_KB], or the floor when both oracles
+ * are down.
+ */
+async function dogeSatPerKb(): Promise<{ satPerKb: number; oracle: number | null }> {
+  let oracle: number | null = null;
+  try {
+    oracle = await tryEach<number>([
+      { name: "blockcypher", fn: fetchFeeRateBlockcypher },
+      { name: "blockchair", fn: fetchFeeRateBlockchair },
+    ]);
+  } catch {
+    /* keep the floor */
+  }
+  return { satPerKb: clampDogeSatPerKb(oracle), oracle };
 }
 
 // =========================================================================
@@ -393,8 +484,9 @@ export const DOGE_DUST_SAT = 1_000_000;
  * of how other wallets do this; the scan/derive/select half is shared
  * (`gatherAccountSpend`). What is Dogecoin-specific here:
  *
- *   - **Legacy P2PKH sizing** (10 / 148 / 34 vB) — `P2PKH_SIZING` matches this
- *     file's own `estimateTxBytes` exactly. Budgeting a DOGE send with SegWit
+ *   - **Legacy P2PKH sizing** (10 / 148 / 34 vB) — `P2PKH_SIZING`, which the
+ *     single-key `sendTransaction` now shares too (its own `estimateTxBytes`
+ *     copy was retired 2026-09-29). Budgeting a DOGE send with SegWit
  *     constants would underpay by ~80 vB per input.
  *   - **`nonWitnessUtxo`**, which means fetching the FULL previous transaction
  *     for every input. bitcoinjs-lib v7 requires it for legacy spends. This is
@@ -424,28 +516,20 @@ export async function sendDogeFromAccount(
     );
   }
 
-  const sendSat = Math.round(parseFloat(amount) * 1e8);
-  if (!Number.isFinite(sendSat) || sendSat <= 0) {
-    throw new Error("Amount must be greater than zero.");
-  }
+  // Amount and recipient are settled before anything touches the network
+  // (2026-09-29 send-safety audit). Below Dogecoin's 0.01 DOGE soft-dust line
+  // an output needs an extra 0.01 DOGE of fee, which this wallet does not add.
+  const sendSat = parseSendAmountSat(amount, "DOGE");
+  const recipient = dogeRecipient(to);
+  assertNotDust(sendSat, DOGE_DUST_SAT, "DOGE");
 
-  // Oracles quote DOGE/kB; the planner wants sat/vB. Never below the network's
-  // recommended floor — DOGE's relay minimum is high and a cheaper tx simply
-  // does not propagate.
-  let perKb = MIN_RECOMMENDED_RATE_PER_KB;
-  if (opts?.feeRateOverride === undefined) {
-    try {
-      const oracle = await tryEach<number>([
-        { name: "blockcypher", fn: fetchFeeRateBlockcypher },
-        { name: "blockchair", fn: fetchFeeRateBlockchair },
-      ]);
-      if (oracle > perKb) perKb = oracle;
-    } catch {
-      /* keep the floor */
-    }
-  }
-  const feePerVB =
-    opts?.feeRateOverride ?? Math.max(Math.ceil((perKb * 1e8) / 1000), 1);
+  // Always inside the band, whatever the source — an override included; the
+  // Send modal never passes one for DOGE (its estimate is a total).
+  const satPerKb =
+    opts?.feeRateOverride !== undefined
+      ? clampDogeSatPerKb(opts.feeRateOverride * 1000)
+      : (await dogeSatPerKb()).satPerKb;
+  const feePerVB = Math.ceil(satPerKb / 1000);
 
   // Change goes to the internal chain's lowest unused index (2026-09-04) —
   // the BIP-44 rule every surveyed wallet and the swap engine follow — not
@@ -457,6 +541,7 @@ export async function sendDogeFromAccount(
     feePerVB,
     sizing: P2PKH_SIZING,
     dustSat: DOGE_DUST_SAT,
+    recipientOutputVB: outputVBytes(recipient.script.length),
     gapLimit: opts?.gapLimit,
     fetchUtxos: async (address) => {
       const utxos = await tryEach<NormalizedUtxo[]>([
@@ -518,20 +603,15 @@ export async function sendDogeFromAccount(
       nonWitnessUtxo: Buffer.from(prevTx.get(input.txid)!, "hex"),
     });
   }
-  psbt.addOutput({ address: to, value: BigInt(sendSat) });
+  psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
   if (plan.changeSat > 0) {
     psbt.addOutput({ address: change.address, value: BigInt(plan.changeSat) });
   }
   plan.inputs.forEach((input, i) => psbt.signInput(i, keyPairs.get(input.address)!));
   psbt.finalizeAllInputs();
-  const rawHex = psbt.extractTransaction().toHex();
 
-  const hash = await tryEach<string>([
-    { name: "blockcypher", fn: () => broadcastBlockcypher(rawHex) },
-    { name: "blockchair", fn: () => broadcastBlockchair(rawHex) },
-    { name: "dogechain", fn: () => broadcastDogechain(rawHex) },
-  ]);
-  return { hash };
+  // Signed once; from here on only these bytes are ever sent.
+  return broadcastDoge(psbt, plan.inputs.reduce((t, i) => t + i.valueSat, 0));
 }
 
 export const dogeAdapter: ChainAdapter = {
@@ -632,6 +712,11 @@ export const dogeAdapter: ChainAdapter = {
     to: string,
     amount: string
   ): Promise<TxResult> {
+    // 0) Settled before any request (2026-09-29 send-safety audit).
+    const sendSat = parseSendAmountSat(amount, "DOGE");
+    const recipient = dogeRecipient(to);
+    assertNotDust(sendSat, DOGE_DUST_SAT, "DOGE");
+
     const privKeyBytes = hexToBytes(privateKey);
     const keyPair = ECPair.fromPrivateKey(Buffer.from(privKeyBytes), {
       network: dogeNetwork,
@@ -648,51 +733,41 @@ export const dogeAdapter: ChainAdapter = {
       throw new Error("No spendable UTXOs available for this address.");
     }
 
-    // 2) Fee rate. Floor at the recommended 0.01 DOGE/kB so we never
-    //    fall below modern wallet defaults even if every oracle is down.
-    let perKbRate = MIN_RECOMMENDED_RATE_PER_KB;
-    try {
-      const oracle = await tryEach([
-        { name: "blockcypher", fn: () => fetchFeeRateBlockcypher() },
-        { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
-      ]);
-      if (oracle > perKbRate) perKbRate = oracle;
-    } catch {
-      /* keep MIN_RECOMMENDED_RATE_PER_KB */
-    }
+    // 2) Fee rate, clamped to the band (see DOGE_MAX_SAT_PER_KB).
+    const { satPerKb } = await dogeSatPerKb();
 
-    // 3) Greedy input selection (largest-first). Re-estimate fee with the
-    //    actual selected input count once we've picked.
-    const sendSat = BigInt(Math.round(parseFloat(amount) * 1e8));
-    if (sendSat <= 0n) throw new Error("Amount must be greater than zero.");
-
-    const sortedUtxos = [...utxos].sort((a, b) =>
-      a.value < b.value ? 1 : a.value > b.value ? -1 : 0
-    );
-    const selected: NormalizedUtxo[] = [];
-    let total = 0n;
-    let feeSat = BigInt(
-      Math.ceil((perKbRate * 1e8 * estimateTxBytes(1)) / 1000)
-    );
-    for (const u of sortedUtxos) {
-      selected.push(u);
-      total += u.value;
-      const sizeBytes = estimateTxBytes(selected.length);
-      feeSat = BigInt(Math.ceil((perKbRate * 1e8 * sizeBytes) / 1000));
-      if (total >= sendSat + feeSat) break;
-    }
-    if (total < sendSat + feeSat) {
+    // 3) Largest-first selection with the shared planner — the same pricing
+    //    and 0.01 DOGE soft-dust fold as the account-wide path.
+    const candidates: AccountSpendCandidate[] = utxos.map((u) => {
+      if (u.value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(
+          `Output ${u.txid}:${u.vout} exceeds 2^53 base units and cannot be ` +
+            "selected safely. Nothing was sent.",
+        );
+      }
+      return { path: DERIVATION_PATH, address: senderAddress, txid: u.txid, vout: u.vout, valueSat: Number(u.value) };
+    });
+    const plan = planAccountSpend({
+      candidates,
+      sendSat,
+      feePerVB: Math.ceil(satPerKb / 1000),
+      sizing: P2PKH_SIZING,
+      dustSat: DOGE_DUST_SAT,
+      recipientOutputVB: outputVBytes(recipient.script.length),
+    });
+    if (!plan.covered) {
+      const have = candidates.reduce((t, c) => t + c.valueSat, 0);
       throw new Error(
-        `Insufficient funds. Have ${(Number(total) / 1e8).toFixed(8)} DOGE, ` +
-          `need ${(Number(sendSat + feeSat) / 1e8).toFixed(8)} DOGE ` +
-          `(incl. ~${(Number(feeSat) / 1e8).toFixed(8)} fee).`
+        `Insufficient funds. Have ${(have / 1e8).toFixed(8)} DOGE, ` +
+          `need ${((have + plan.shortfallSat) / 1e8).toFixed(8)} DOGE ` +
+          `(incl. ~${(plan.feeSat / 1e8).toFixed(8)} fee).`
       );
     }
 
     // 4) Resolve prev-tx hex for each selected input. nonWitnessUtxo is
     //    mandatory for legacy P2PKH spends in bitcoinjs-lib v7.
     const prevTxCache = new Map<string, string>();
-    for (const u of selected) {
+    for (const u of plan.inputs) {
       if (prevTxCache.has(u.txid)) continue;
       const hex = await tryEach([
         { name: "blockcypher", fn: () => fetchPrevTxHexBlockcypher(u.txid) },
@@ -703,22 +778,16 @@ export const dogeAdapter: ChainAdapter = {
 
     // 5) Build PSBT.
     const psbt = new bitcoin.Psbt({ network: dogeNetwork });
-    for (const u of selected) {
+    for (const u of plan.inputs) {
       psbt.addInput({
         hash: u.txid,
         index: u.vout,
         nonWitnessUtxo: Buffer.from(prevTxCache.get(u.txid)!, "hex"),
       });
     }
-    psbt.addOutput({ address: to, value: sendSat });
-    const change = total - sendSat - feeSat;
-    // Soft dust threshold per Dogecoin Core 1.14.6 fee policy:
-    // outputs below 0.01 DOGE (1_000_000 satoshi) are discouraged
-    // (extra +0.01 DOGE fee penalty). If our change is smaller than
-    // that, fold it into the fee rather than emitting a costly output.
-    const SOFT_DUST_SAT = 1_000_000n;
-    if (change >= SOFT_DUST_SAT) {
-      psbt.addOutput({ address: senderAddress, value: change });
+    psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
+    if (plan.changeSat > 0) {
+      psbt.addOutput({ address: senderAddress, value: BigInt(plan.changeSat) });
     }
 
     // 6) Sign + finalize. Standard SIGHASH_ALL; bitcoinjs-lib defaults to
@@ -727,16 +796,9 @@ export const dogeAdapter: ChainAdapter = {
       psbt.signInput(i, keyPair as any);
     }
     psbt.finalizeAllInputs();
-    const rawHex = psbt.extractTransaction().toHex();
 
-    // 7) Broadcast (multi-source).
-    return {
-      hash: await tryEach([
-        { name: "blockcypher", fn: () => broadcastBlockcypher(rawHex) },
-        { name: "blockchair", fn: () => broadcastBlockchair(rawHex) },
-        { name: "dogechain", fn: () => broadcastDogechain(rawHex) },
-      ]),
-    };
+    // 7) Fee check, then the one broadcast (see `broadcastDoge`).
+    return broadcastDoge(psbt, plan.inputs.reduce((t, i) => t + i.valueSat, 0));
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -855,26 +917,17 @@ export const dogeAdapter: ChainAdapter = {
     // the existing FeeEstimate UI can render "<N> DOGE" without per-tier
     // confusion. DOGE has no real fee market in 2026 — slow/normal/fast
     // tiers would all collapse to the same value, so we don't bother.
-    let perKb = MIN_RECOMMENDED_RATE_PER_KB;
-    let raw: unknown = { source: "static", perKb };
-    try {
-      const oracle = await tryEach([
-        { name: "blockcypher", fn: () => fetchFeeRateBlockcypher() },
-        { name: "blockchair", fn: () => fetchFeeRateBlockchair() },
-      ]);
-      if (oracle > perKb) {
-        perKb = oracle;
-        raw = { source: "oracle", perKb };
-      }
-    } catch {
-      /* keep MIN_RECOMMENDED_RATE_PER_KB */
-    }
-    const fee = (perKb * STANDARD_TX_BYTES) / 1000;
+    //
+    // The SAME clamped rate the sends use (2026-09-29): the modal showed the
+    // raw oracle — 0.13 DOGE at BlockCypher's 0.58 DOGE/kB — for sends that
+    // then failed at bitcoinjs-lib's fee guard.
+    const { satPerKb, oracle } = await dogeSatPerKb();
+    const feeSat = Math.ceil((satPerKb * STANDARD_TX_BYTES) / 1000);
     return {
-      normal: { value: fee.toFixed(8) },
+      normal: { value: (feeSat / 1e8).toFixed(8) },
       unit: "DOGE",
       fetchedAt: Date.now(),
-      raw,
+      raw: { source: oracle === null ? "static" : "oracle", satPerKb, oracleSatPerKb: oracle },
     };
   },
 };

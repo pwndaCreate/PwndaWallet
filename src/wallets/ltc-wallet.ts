@@ -35,8 +35,9 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendOptions,
 } from "./types";
-import { proxyGetJson, proxyPostJson, httpProxyCall } from "./_proxy";
+import { proxyGetJson, httpProxyCall } from "./_proxy";
 import { esploraTxToChainTx, type EsploraTx } from "./esplora-history";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
@@ -44,8 +45,25 @@ import {
   DEFAULT_GAP_LIMIT,
   gatherAccountSpend,
   accountShortfallMessage,
+  planAccountSpend,
   P2WPKH_SIZING,
+  P2PKH_SIZING,
 } from "./utxo-account";
+import {
+  assertNotDust,
+  broadcastSignedTx,
+  dustThresholdSat,
+  DUST_RELAY_FEE_PER_KB,
+  outputVBytes,
+  parseSendAmountSat,
+  proxyPushEndpoint,
+  proxyTxLookup,
+  recipientOutput,
+  SEGWIT_CHAIN_OUTPUTS,
+  trySources,
+  type BroadcastEndpoint,
+  type TxLookup,
+} from "./utxo-send";
 // Re-exported so the account-send tests and any future caller have one
 // import site per concept; the DEFINITION lives in `utxo-account.ts`
 // (moved there 2026-08-25 when BTC/DOGE/DASH/BCH adopted it).
@@ -59,8 +77,17 @@ export type {
   AccountSpendPlan,
   TxSizing,
 } from "./utxo-account";
-/** LTC/BTC standard relay dust. */
-export const LTC_DUST_SAT = 546;
+/**
+ * Litecoin's dust threshold for a P2WPKH output — the change output every LTC
+ * send makes: Litecoin Core's `DUST_RELAY_TX_FEE` of 30,000 lit/kB × (31 B
+ * output + 67 B to spend it) = 2,940 lits.
+ *
+ * CORRECTED 2026-09-29 (send-safety audit): this was Bitcoin's 546. Litecoin's
+ * dust relay fee is ten times Bitcoin's, so change of 547–2,939 lits was
+ * emitted as an output and every node refused to relay the transaction. Other
+ * output types have their own thresholds (`dustThresholdSat`, utxo-send.ts).
+ */
+export const LTC_DUST_SAT = 2_940;
 import {
   parseEsploraStats,
   blockchairProbe,
@@ -98,27 +125,15 @@ const BLOCKCHAIR_BASE = "https://api.blockchair.com/litecoin";
 // (src-tauri/src/http_proxy.rs). See [[remote-connections-inventory]].
 const LITECOINSPACE_BASE = "https://litecoinspace.org/api";
 
-// Multi-source try-each — same pattern as doge/bch/dash. A signed tx must
-// have more than one way to broadcast, and reads must survive one provider
-// rate-limiting. Returns the first source that succeeds; throws only if ALL
-// fail, naming each tried source.
-async function tryEach<T>(
-  sources: Array<{ name: string; fn: () => Promise<T> }>
-): Promise<T> {
-  let lastError: unknown = null;
-  const tried: string[] = [];
-  for (const s of sources) {
-    tried.push(s.name);
-    try {
-      return await s.fn();
-    } catch (e) {
-      lastError = e;
-    }
-  }
-  const tail = lastError instanceof Error ? lastError.message : String(lastError);
-  throw new Error(
-    `All ${tried.length} LTC source(s) failed [${tried.join(", ")}]: ${tail}`
-  );
+// Multi-source try-each for READS — same pattern as doge/bch/dash, so one
+// provider rate-limiting cannot blank a balance. Throws only if ALL fail,
+// naming each source with what it said (`trySources`, utxo-send.ts).
+//
+// Never for broadcasting (2026-09-29 send-safety audit): a push that errors
+// may still have been relayed, so "every source failed" is not a failure
+// there. Broadcasts go through `broadcastLtc`.
+function tryEach<T>(sources: Array<{ name: string; fn: () => Promise<T> }>): Promise<T> {
+  return trySources<T>("LTC", sources);
 }
 
 // ── Fee rates ─────────────────────────────────────────────────────────────
@@ -294,55 +309,69 @@ async function fetchUtxosLitecoinspace(addr: string): Promise<NormalizedLtcUtxo[
   }));
 }
 
-async function broadcastBlockcypher(rawHex: string): Promise<string> {
-  const r = await proxyPostJson<{ tx?: { hash?: string }; error?: string }>(
-    `${BLOCKCYPHER_BASE}/txs/push`,
-    { tx: rawHex }
-  );
-  if (r.error) throw new Error(`blockcypher push: ${r.error}`);
-  const hash = r.tx?.hash;
-  if (!hash) throw new Error("blockcypher push: no txid");
-  return hash;
+// ── Broadcast ─────────────────────────────────────────────────────────────
+// The same three providers, the same signed bytes to each, and the outcome
+// decided by `broadcastSignedTx` (utxo-send.ts): a lost reply is "may have
+// been sent", never "failed" — the 2026-09-29 send-safety audit reproduced a
+// double payment on LTC from exactly that.
+
+const LTC_BROADCAST: BroadcastEndpoint[] = [
+  proxyPushEndpoint(
+    "blockcypher",
+    (hex) => ({
+      url: `${BLOCKCYPHER_BASE}/txs/push`,
+      body: JSON.stringify({ tx: hex }),
+      contentType: "application/json",
+    }),
+    (body) => JSON.parse(body)?.tx?.hash,
+  ),
+  // Blockchair wants form-urlencoded `data=<hex>`, not JSON.
+  proxyPushEndpoint(
+    "blockchair",
+    (hex) => ({
+      url: `${BLOCKCHAIR_BASE}/push/transaction`,
+      body: `data=${encodeURIComponent(hex)}`,
+      contentType: "application/x-www-form-urlencoded",
+    }),
+    (body) => JSON.parse(body)?.data?.transaction_hash,
+  ),
+  // Esplora POST /tx — raw hex body, the txid back as plain text.
+  proxyPushEndpoint(
+    "litecoinspace",
+    (hex) => ({ url: `${LITECOINSPACE_BASE}/tx`, body: hex, contentType: "text/plain" }),
+    (body) => body.trim(),
+  ),
+];
+
+/** Consulted only when every push errored: does any explorer know the txid? */
+const LTC_LOOKUPS: TxLookup[] = [
+  proxyTxLookup("litecoinspace", (t) => `${LITECOINSPACE_BASE}/tx/${t}`, (j) => j?.txid),
+  proxyTxLookup("blockcypher", (t) => `${BLOCKCYPHER_BASE}/txs/${t}`, (j) => j?.hash),
+  proxyTxLookup(
+    "blockchair",
+    (t) => `${BLOCKCHAIR_BASE}/dashboards/transaction/${t}`,
+    (j, t) => j?.data?.[t]?.transaction?.hash,
+  ),
+];
+
+function broadcastLtc(tx: bitcoin.Transaction): Promise<TxResult> {
+  return broadcastSignedTx({
+    ticker: "LTC",
+    txid: tx.getId(),
+    rawHex: tx.toHex(),
+    endpoints: LTC_BROADCAST,
+    lookups: LTC_LOOKUPS,
+  });
 }
 
-async function broadcastBlockchair(rawHex: string): Promise<string> {
-  // Blockchair wants form-urlencoded `data=<hex>`; proxyPostJson forces a
-  // JSON content-type that blockchair rejects, so go through httpProxyCall.
-  const r = await httpProxyCall({
-    method: "POST",
-    url: `${BLOCKCHAIR_BASE}/push/transaction`,
-    body: `data=${encodeURIComponent(rawHex)}`,
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+/** Decode an LTC recipient, trimmed and with a `litecoin:` URI cut to the address. */
+function ltcRecipient(to: string) {
+  return recipientOutput(to, {
+    network: ltcNetwork,
+    ticker: "LTC",
+    uriSchemes: ["litecoin"],
+    allowed: SEGWIT_CHAIN_OUTPUTS,
   });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`blockchair push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as {
-    data?: { transaction_hash?: string };
-    context?: { error?: string };
-  };
-  if (parsed.context?.error) throw new Error(`blockchair: ${parsed.context.error}`);
-  const hash = parsed.data?.transaction_hash;
-  if (!hash) throw new Error("blockchair push: no transaction_hash");
-  return hash;
-}
-
-async function broadcastLitecoinspace(rawHex: string): Promise<string> {
-  // Esplora POST /tx — raw hex body, returns the txid as PLAIN TEXT.
-  const r = await httpProxyCall({
-    method: "POST",
-    url: `${LITECOINSPACE_BASE}/tx`,
-    body: rawHex,
-    headers: { "Content-Type": "text/plain" },
-  });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`litecoinspace push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const txid = r.body.trim();
-  if (!/^[0-9a-fA-F]{64}$/.test(txid)) {
-    throw new Error(`litecoinspace push: unexpected response ${txid.slice(0, 80)}`);
-  }
-  return txid;
 }
 
 /** Multi-source UTXO fetch for one address (BlockCypher → Blockchair →
@@ -517,8 +546,12 @@ export interface LegacySweepPlan {
 
 /** P2PKH input ≈148 vB (scriptSig carries sig+pubkey, no witness discount);
  *  one P2WPKH output ≈31 vB; ~10 vB overhead. +20 cushions estimate error the
- *  same way the BTC sweep does. */
-const LEGACY_SWEEP_DUST_LITS = 546;
+ *  same way the BTC sweep does.
+ *
+ *  The sweep's one output is P2WPKH, so its floor is `LTC_DUST_SAT` — 546
+ *  until 2026-09-29, which let a 547–2,939-lit sweep be built that no node
+ *  would relay (send-safety audit). */
+const LEGACY_SWEEP_DUST_LITS = LTC_DUST_SAT;
 
 /**
  * Pure sweep planner — exported for tests, because the two failure modes here
@@ -619,14 +652,9 @@ export async function sweepLegacyLtcToModern(
     });
   }
   psbt.finalizeAllInputs();
-  const rawTx = psbt.extractTransaction().toHex();
 
-  const hash = await tryEach<string>([
-    { name: "blockcypher", fn: () => broadcastBlockcypher(rawTx) },
-    { name: "blockchair", fn: () => broadcastBlockchair(rawTx) },
-    { name: "litecoinspace", fn: () => broadcastLitecoinspace(rawTx) },
-  ]);
-  return { hash, destination, sweptLits: plan.sendValue };
+  const sent = await broadcastLtc(psbt.extractTransaction());
+  return { ...sent, destination, sweptLits: plan.sendValue };
 }
 
 // -------------------------------------------------------------------------
@@ -943,7 +971,9 @@ export function planLtcConsolidation(args: {
   /** Below this, sweeping costs more than it moves. */
   dustSat?: number;
 }): ConsolidationPlan {
-  const dust = args.dustSat ?? 546;
+  // The consolidated output is P2WPKH: Litecoin's floor is 2,940, not 546
+  // (2026-09-29 send-safety audit — see LTC_DUST_SAT).
+  const dust = args.dustSat ?? LTC_DUST_SAT;
   // The destination's own output is already where we want it; including it
   // would spend and re-create it for nothing but a fee.
   const sources = args.entries
@@ -1109,7 +1139,7 @@ export async function consolidateLtcAccount(
     feePerVB * estimateConsolidationVBytes(signers.length),
   );
   const sendValue = totalInput - feeSat;
-  if (sendValue <= 546) {
+  if (sendValue < LTC_DUST_SAT) {
     throw new Error(
       `The network fee (${(feeSat / 1e8).toFixed(8)} LTC) would consume the ` +
         `whole amount. Nothing was sent.`,
@@ -1125,14 +1155,9 @@ export async function consolidateLtcAccount(
     });
   }
   psbt.finalizeAllInputs();
-  const rawTx = psbt.extractTransaction().toHex();
 
-  const hash = await tryEach<string>([
-    { name: "blockcypher", fn: () => broadcastBlockcypher(rawTx) },
-    { name: "blockchair", fn: () => broadcastBlockchair(rawTx) },
-    { name: "litecoinspace", fn: () => broadcastLitecoinspace(rawTx) },
-  ]);
-  return { hash, destination, movedLits: sendValue, inputs: signers.length };
+  const sent = await broadcastLtc(psbt.extractTransaction());
+  return { ...sent, destination, movedLits: sendValue, inputs: signers.length };
 }
 /**
  * Spend from the whole LTC account — the way every other wallet does.
@@ -1201,10 +1226,12 @@ export async function sendLtcFromAccount(
     );
   }
 
-  const sendSat = Math.round(parseFloat(amount) * 1e8);
-  if (!Number.isFinite(sendSat) || sendSat <= 0) {
-    throw new Error("Amount must be greater than zero.");
-  }
+  // Amount and recipient are settled before anything touches the network
+  // (2026-09-29 send-safety audit): `parseFloat` sent "1,5" as 1, and the
+  // recipient output's real size feeds the fee.
+  const sendSat = parseSendAmountSat(amount, "LTC");
+  const recipient = ltcRecipient(to);
+  assertNotDust(sendSat, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.litecoin), "LTC");
 
   // The modal's selected tier when given (`opts.feeRateOverride`), else the
   // live normal tier, else the default — `ltcSendFeeRate`.
@@ -1217,6 +1244,7 @@ export async function sendLtcFromAccount(
     feePerVB,
     sizing: P2WPKH_SIZING,
     dustSat: LTC_DUST_SAT,
+    recipientOutputVB: outputVBytes(recipient.script.length),
     gapLimit: opts?.gapLimit,
     fetchUtxos: async (address) =>
       (await fetchUtxos(address)).map((u) => ({
@@ -1255,7 +1283,7 @@ export async function sendLtcFromAccount(
       },
     });
   }
-  psbt.addOutput({ address: to, value: BigInt(sendSat) });
+  psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
   if (plan.changeSat > 0) {
     psbt.addOutput({ address: change.address, value: BigInt(plan.changeSat) });
   }
@@ -1267,14 +1295,9 @@ export async function sendLtcFromAccount(
     });
   });
   psbt.finalizeAllInputs();
-  const rawTx = psbt.extractTransaction().toHex();
 
-  const hash = await tryEach<string>([
-    { name: "blockcypher", fn: () => broadcastBlockcypher(rawTx) },
-    { name: "blockchair", fn: () => broadcastBlockchair(rawTx) },
-    { name: "litecoinspace", fn: () => broadcastLitecoinspace(rawTx) },
-  ]);
-  return { hash };
+  // Signed once; from here on only these bytes are ever sent.
+  return broadcastLtc(psbt.extractTransaction());
 }
 
 export const ltcAdapter: ChainAdapter = {
@@ -1411,8 +1434,15 @@ export const ltcAdapter: ChainAdapter = {
   async sendTransaction(
     privateKey: string,
     to: string,
-    amount: string
+    amount: string,
+    _assetType?: string,
+    opts?: SendOptions,
   ): Promise<TxResult> {
+    // Settled before any request (2026-09-29 send-safety audit).
+    const sendSat = parseSendAmountSat(amount, "LTC");
+    const recipient = ltcRecipient(to);
+    assertNotDust(sendSat, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.litecoin), "LTC");
+
     const privKeyBytes = hexToBytes(privateKey);
     const keyPair = ECPair.fromPrivateKey(Buffer.from(privKeyBytes), {
       network: ltcNetwork,
@@ -1439,69 +1469,71 @@ export const ltcAdapter: ChainAdapter = {
       throw new Error("No spendable UTXOs available for this address.");
     }
 
-    // 2) Fee rate: live tiers (litecoinspace → BlockCypher), else the default.
-    const feePerVB = await ltcSendFeeRate();
-    // P2PKH inputs are ~3× the size of a P2WPKH input's witness, so a legacy
-    // 1-in/2-out tx is ~226 vB vs ~140 vB for segwit. Estimate before input
-    // selection (the fee determines how many inputs to pull); LTC fees are
-    // tiny so a small miss is harmless.
-    const estimatedSizeVB = isLegacy ? 226 : 140;
-    const feeSat = feePerVB * estimatedSizeVB;
+    // 2) Fee rate: the Send modal's tier when given (`opts.feeRate`, passed
+    //    here since 2026-09-29), else the live normal tier, else the default.
+    const feePerVB = await ltcSendFeeRate(opts?.feeRate);
 
-    const sendSat = Math.round(parseFloat(amount) * 1e8);
-    if (sendSat <= 0) throw new Error("Amount must be greater than zero.");
-
-    // 3) Greedy input selection — decide the set BEFORE building the PSBT. A
-    //    legacy build fetches a full raw tx per selected input, so we must not
-    //    fetch for inputs we won't use.
-    const selected: NormalizedLtcUtxo[] = [];
-    let totalInput = 0;
-    for (const u of utxos) {
-      selected.push(u);
-      totalInput += u.value;
-      if (totalInput >= sendSat + feeSat) break;
-    }
-    if (totalInput < sendSat + feeSat) {
+    // 3) Select and price with the shared planner, sized for what is really
+    //    built: legacy P2PKH inputs are 148 vB against P2WPKH's 68, and the
+    //    recipient's output is sized from its script. This used to budget a
+    //    fixed 226 / 140 vB whatever the input count — three legacy inputs at
+    //    1 lit/vB paid 0.44 lit/vB, under the relay floor (send-safety audit).
+    //    Change below the change script's dust line is folded into the fee.
+    const changeScript = isLegacy
+      ? bitcoin.payments.p2pkh({ pubkey: keyPair.publicKey, network: ltcNetwork }).output!
+      : bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network: ltcNetwork }).output!;
+    const plan = planAccountSpend({
+      candidates: utxos.map((u) => ({
+        path: isLegacy ? LEGACY_BIP44_PATH : DERIVATION_PATH,
+        address: senderAddress,
+        txid: u.tx_hash,
+        vout: u.tx_output_n,
+        valueSat: u.value,
+      })),
+      sendSat,
+      feePerVB,
+      sizing: isLegacy ? P2PKH_SIZING : P2WPKH_SIZING,
+      dustSat: dustThresholdSat(changeScript, DUST_RELAY_FEE_PER_KB.litecoin),
+      recipientOutputVB: outputVBytes(recipient.script.length),
+    });
+    if (!plan.covered) {
+      const have = utxos.reduce((t, u) => t + u.value, 0);
       throw new Error(
-        `Insufficient funds. Have ${(totalInput / 1e8).toFixed(8)} LTC, need ${(
-          (sendSat + feeSat) /
+        `Insufficient funds. Have ${(have / 1e8).toFixed(8)} LTC, need ${(
+          (have + plan.shortfallSat) /
           1e8
-        ).toFixed(8)} LTC (incl. ~${(feeSat / 1e8).toFixed(8)} fee).`
+        ).toFixed(8)} LTC (incl. ~${(plan.feeSat / 1e8).toFixed(8)} fee).`
       );
     }
 
-    // 4) Build PSBT inputs per address type.
+    // 4) Build PSBT inputs per address type — only for the selected inputs:
+    //    a legacy build fetches a full raw tx per input.
     const psbt = new bitcoin.Psbt({ network: ltcNetwork });
     if (isLegacy) {
       // P2PKH: each input needs the FULL previous transaction (nonWitnessUtxo).
-      for (const u of selected) {
-        const rawHex = await fetchRawTxHex(u.tx_hash);
+      for (const u of plan.inputs) {
+        const rawHex = await fetchRawTxHex(u.txid);
         psbt.addInput({
-          hash: u.tx_hash,
-          index: u.tx_output_n,
+          hash: u.txid,
+          index: u.vout,
           nonWitnessUtxo: Buffer.from(rawHex, "hex"),
         });
       }
     } else {
-      const witnessScript = bitcoin.payments.p2wpkh({
-        pubkey: keyPair.publicKey,
-        network: ltcNetwork,
-      }).output!;
-      for (const u of selected) {
+      for (const u of plan.inputs) {
         psbt.addInput({
-          hash: u.tx_hash,
-          index: u.tx_output_n,
-          witnessUtxo: { script: witnessScript, value: BigInt(u.value) },
+          hash: u.txid,
+          index: u.vout,
+          witnessUtxo: { script: changeScript, value: BigInt(u.valueSat) },
         });
       }
     }
 
-    // 5) Outputs: recipient + change (above 546 sat dust) back to whichever
-    //    address (segwit or legacy) we're spending from.
-    psbt.addOutput({ address: to, value: BigInt(sendSat) });
-    const change = totalInput - sendSat - feeSat;
-    if (change > 546) {
-      psbt.addOutput({ address: senderAddress, value: BigInt(change) });
+    // 5) Outputs: recipient + change back to whichever address (segwit or
+    //    legacy) we're spending from.
+    psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
+    if (plan.changeSat > 0) {
+      psbt.addOutput({ address: senderAddress, value: BigInt(plan.changeSat) });
     }
 
     // 6) Sign + finalize — signInput handles both P2PKH and P2WPKH inputs;
@@ -1510,17 +1542,9 @@ export const ltcAdapter: ChainAdapter = {
       psbt.signInput(i, keyPair as any);
     }
     psbt.finalizeAllInputs();
-    const rawTx = psbt.extractTransaction().toHex();
 
-    // 7) Broadcast — multi-source. A signed tx must have more than one way
-    //    out: if BlockCypher 429s/rejects, try Blockchair then litecoinspace
-    //    before giving up.
-    const hash = await tryEach<string>([
-      { name: "blockcypher", fn: () => broadcastBlockcypher(rawTx) },
-      { name: "blockchair", fn: () => broadcastBlockchair(rawTx) },
-      { name: "litecoinspace", fn: () => broadcastLitecoinspace(rawTx) },
-    ]);
-    return { hash };
+    // 7) Broadcast the one signed transaction; see `broadcastLtc`.
+    return broadcastLtc(psbt.extractTransaction());
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {

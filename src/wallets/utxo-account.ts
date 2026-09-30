@@ -758,7 +758,14 @@ export const P2PKH_SIZING: TxSizing = { overheadVB: 10, inputVB: 148, outputVB: 
  * A change output below the chain's dust threshold costs more to spend later
  * than it holds and bloats the UTXO set; Bitcoin Core, Electrum and every
  * wallet surveyed do the same. `dustSat` is required and varies by an order of
- * magnitude between chains (DOGE 1_000_000, BCH/BTC/LTC 546).
+ * magnitude between chains (DOGE 1_000_000, LTC 2_940, BCH/BTC/DASH 546).
+ *
+ * **The recipient output is sized from its script** (`recipientOutputVB`,
+ * 2026-09-29 send-safety audit). `sizing.outputVB` is the CHANGE output's size;
+ * the recipient's used to be assumed equal to it, so a P2TR, P2WSH, P2PKH or
+ * P2SH recipient of a BTC/LTC send paid 0.92–0.99× the chosen rate — below
+ * the 1 sat/vB relay floor at LTC's 1 lit/vB tier. Absent, it defaults to
+ * `sizing.outputVB`, which is exact for a recipient of the change's type.
  */
 export function planAccountSpend(args: {
   candidates: AccountSpendCandidate[];
@@ -766,13 +773,20 @@ export function planAccountSpend(args: {
   feePerVB: number;
   sizing: TxSizing;
   dustSat: number;
+  /** vbytes of the recipient's output: `outputVBytes(script.length)` in `utxo-send.ts`. */
+  recipientOutputVB?: number;
 }): AccountSpendPlan {
   const { candidates, sendSat, feePerVB, sizing, dustSat } = args;
+  const recipientVB = args.recipientOutputVB ?? sizing.outputVB;
 
+  // `outputs` is 1 (recipient only) or 2 (recipient + change).
   const feeFor = (inputs: number, outputs: number) =>
     Math.ceil(
       feePerVB *
-        (sizing.overheadVB + inputs * sizing.inputVB + outputs * sizing.outputVB),
+        (sizing.overheadVB +
+          inputs * sizing.inputVB +
+          recipientVB +
+          (outputs - 1) * sizing.outputVB),
     );
 
   const pool = [...candidates].sort((a, b) => b.valueSat - a.valueSat);
@@ -845,6 +859,8 @@ export async function gatherAccountSpend(args: {
   feePerVB: number;
   sizing: TxSizing;
   dustSat: number;
+  /** See `planAccountSpend` — the recipient output's real size. */
+  recipientOutputVB?: number;
   gapLimit?: number;
   /** Chain-specific UTXO fetch for one address. MUST throw on failure. */
   fetchUtxos: (
@@ -894,6 +910,7 @@ export async function gatherAccountSpend(args: {
       feePerVB: args.feePerVB,
       sizing: args.sizing,
       dustSat: args.dustSat,
+      recipientOutputVB: args.recipientOutputVB,
     });
   let plan = plan0();
 

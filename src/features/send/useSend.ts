@@ -228,8 +228,15 @@ export function useSend(args: {
         ? parseDestinationTag(getSendDestinationTag())
         : {};
       if (tagInput.error) throw new Error(tagInput.error);
+      // The fee tier reaches the single-key path too (2026-09-29 send-safety
+      // audit); it only ever went to `sendFromAccount`.
       const sendOpts =
-        tagInput.tag !== undefined ? { destinationTag: tagInput.tag } : undefined;
+        tagInput.tag !== undefined || feeRate !== undefined
+          ? {
+              ...(tagInput.tag !== undefined ? { destinationTag: tagInput.tag } : {}),
+              ...(feeRate !== undefined ? { feeRate } : {}),
+            }
+          : undefined;
 
       const result = sendOverride
         ? await sendOverride(sendTo, sendAmount)

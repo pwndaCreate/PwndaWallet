@@ -11,9 +11,11 @@
  *     Budget a DOGE send with SegWit constants and it underpays by ~80 vB per
  *     input, producing a transaction that is valid, broadcastable, and sits
  *     unconfirmed. Nothing throws.
- *   - **dustSat** — 546 on BTC/LTC/DASH/BCH, 1_000_000 on DOGE. Use the low
- *     value on DOGE and you emit change Dogecoin Core penalises; use DOGE's on
- *     DASH and you silently donate up to 0.01 DASH of change to the miner.
+ *   - **dustSat** — 546 on BTC/DASH/BCH, 2,940 on LTC, 1_000_000 on DOGE. Use
+ *     the low value on DOGE and you emit change Dogecoin Core penalises; use
+ *     DOGE's on DASH and you silently donate up to 0.01 DASH of change to the
+ *     miner. (CORRECTED 2026-09-29: LTC was listed at 546 here, which was the
+ *     bug — Litecoin's dust relay fee is ten times Bitcoin's. See LTC_DUST_SAT.)
  *
  * Both are wrong-but-plausible failures, which is why they are required
  * arguments rather than defaults, and why they are pinned here.

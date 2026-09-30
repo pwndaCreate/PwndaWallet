@@ -26,14 +26,33 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendOptions,
 } from "./types";
-import { proxyGetJson, proxyPostJson, httpProxyCall } from "./_proxy";
+import { proxyGetJson } from "./_proxy";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
   accountShortfallMessage,
+  planAccountSpend,
   P2PKH_SIZING,
+  type AccountSpendCandidate,
 } from "./utxo-account";
+import {
+  assertNotDust,
+  broadcastSignedTx,
+  dustThresholdSat,
+  DUST_RELAY_FEE_PER_KB,
+  LEGACY_CHAIN_OUTPUTS,
+  NO_SEGWIT_BECH32,
+  outputVBytes,
+  parseSendAmountSat,
+  proxyPushEndpoint,
+  proxyTxLookup,
+  recipientOutput,
+  trySources,
+  type BroadcastEndpoint,
+  type TxLookup,
+} from "./utxo-send";
 import {
   parseEsploraStats,
   blockchairProbe,
@@ -50,7 +69,10 @@ const ECPair = ECPairFactory(tinysecp);
 
 const dashNetwork: bitcoin.Network = {
   messagePrefix: "\x19DarkCoin Signed Message:\n",
-  bech32: "dash", // placeholder — Dash never activated segwit
+  // Dash never activated segwit. This was "dash" — a matchable prefix, so a
+  // checksum-valid `dash1…` string decoded to a P2WPKH output Dash nodes treat
+  // as anyone-can-spend (2026-09-29 send-safety audit). See NO_SEGWIT_BECH32.
+  bech32: NO_SEGWIT_BECH32,
   bip32: { public: 0x0488b21e, private: 0x0488ade4 }, // standard BIP-32
   pubKeyHash: 0x4c, // "X..." legacy P2PKH
   scriptHash: 0x10, // "7..." P2SH
@@ -121,27 +143,10 @@ export function deriveDashAtPath(mnemonic: string, path: string): WalletInfo {
   };
 }
 
-async function tryEach<T>(
-  sources: Array<{ name: string; fn: () => Promise<T> }>
-): Promise<T> {
-  let lastError: unknown = null;
-  const tried: string[] = [];
-  for (const s of sources) {
-    tried.push(s.name);
-    try {
-      return await s.fn();
-    } catch (e) {
-      lastError = e;
-    }
-  }
-  const tail = lastError instanceof Error ? lastError.message : String(lastError);
-  throw new Error(
-    `All ${tried.length} DASH source(s) failed [${tried.join(", ")}]: ${tail}`
-  );
-}
-
-function estimateTxBytes(inputCount: number, outputCount = 2): number {
-  return 10 + 148 * inputCount + 34 * outputCount;
+/** READ sources in order; every source's error on exhaustion (`trySources`).
+ *  Never for broadcasting — see `broadcastDash`. */
+function tryEach<T>(sources: Array<{ name: string; fn: () => Promise<T> }>): Promise<T> {
+  return trySources<T>("DASH", sources);
 }
 
 interface NormalizedUtxo {
@@ -238,34 +243,71 @@ async function fetchPrevTxHexBlockchair(txid: string): Promise<string> {
 // Broadcast
 // =========================================================================
 
-async function broadcastBlockcypher(rawHex: string): Promise<string> {
-  const r = await proxyPostJson<{ tx?: { hash?: string }; error?: string }>(
-    `${BLOCKCYPHER_BASE}/txs/push`,
-    { tx: rawHex }
-  );
-  if (r.error) throw new Error(`blockcypher push: ${r.error}`);
-  if (!r.tx?.hash) throw new Error("blockcypher push: no hash");
-  return r.tx.hash;
+// The same signed bytes to each endpoint; the outcome decided by
+// `broadcastSignedTx` (utxo-send.ts). DASH has only these two, which made the
+// 2026-09-29 audit's lost-reply double payment easy to hit here.
+const DASH_BROADCAST: BroadcastEndpoint[] = [
+  proxyPushEndpoint(
+    "blockcypher",
+    (hex) => ({
+      url: `${BLOCKCYPHER_BASE}/txs/push`,
+      body: JSON.stringify({ tx: hex }),
+      contentType: "application/json",
+    }),
+    (body) => JSON.parse(body)?.tx?.hash,
+  ),
+  proxyPushEndpoint(
+    "blockchair",
+    (hex) => ({
+      url: `${BLOCKCHAIR_BASE}/push/transaction`,
+      body: `data=${encodeURIComponent(hex)}`,
+      contentType: "application/x-www-form-urlencoded",
+    }),
+    (body) => JSON.parse(body)?.data?.transaction_hash,
+  ),
+];
+
+const DASH_LOOKUPS: TxLookup[] = [
+  proxyTxLookup("blockcypher", (t) => `${BLOCKCYPHER_BASE}/txs/${t}`, (j) => j?.hash),
+  proxyTxLookup(
+    "blockchair",
+    (t) => `${BLOCKCHAIR_BASE}/dashboards/transaction/${t}`,
+    (j, t) => j?.data?.[t]?.transaction?.hash,
+  ),
+  proxyTxLookup("insight", (t) => `${INSIGHT_BASE}/tx/${t}`, (j) => j?.txid),
+];
+
+function broadcastDash(tx: bitcoin.Transaction): Promise<TxResult> {
+  return broadcastSignedTx({
+    ticker: "DASH",
+    txid: tx.getId(),
+    rawHex: tx.toHex(),
+    endpoints: DASH_BROADCAST,
+    lookups: DASH_LOOKUPS,
+  });
 }
 
-async function broadcastBlockchair(rawHex: string): Promise<string> {
-  const r = await httpProxyCall({
-    method: "POST",
-    url: `${BLOCKCHAIR_BASE}/push/transaction`,
-    body: `data=${encodeURIComponent(rawHex)}`,
-    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+/** Decode a DASH recipient: P2PKH (X…) or P2SH (7…) only. */
+function dashRecipient(to: string) {
+  return recipientOutput(to, {
+    network: dashNetwork,
+    ticker: "DASH",
+    uriSchemes: ["dash"],
+    allowed: LEGACY_CHAIN_OUTPUTS,
   });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`blockchair push HTTP ${r.status}: ${r.body.slice(0, 200)}`);
+}
+
+/** Duffs per vbyte to sign with: the modal's tier when given, else the
+ *  oracle (never below the floor). */
+async function dashSendFeeRate(override?: number): Promise<number> {
+  if (override !== undefined && Number.isFinite(override) && override > 0) {
+    return Math.max(Math.ceil(override), 1);
   }
-  const parsed = JSON.parse(r.body) as {
-    data?: { transaction_hash?: string };
-    context?: { error?: string };
-  };
-  if (parsed.context?.error) throw new Error(`blockchair: ${parsed.context.error}`);
-  const hash = parsed.data?.transaction_hash;
-  if (!hash) throw new Error("blockchair push: no transaction_hash");
-  return hash;
+  const ratePerKb = Math.max(
+    await fetchFeeRateBlockcypher().catch(() => MIN_RECOMMENDED_RATE_PER_KB),
+    MIN_RECOMMENDED_RATE_PER_KB,
+  );
+  return Math.max(Math.ceil((ratePerKb * 1e8) / 1000), 1);
 }
 
 // =========================================================================
@@ -382,18 +424,14 @@ export async function sendDashFromAccount(
     );
   }
 
-  const sendSat = Math.round(parseFloat(amount) * 1e8);
-  if (!Number.isFinite(sendSat) || sendSat <= 0) {
-    throw new Error("Amount must be greater than zero.");
-  }
+  // Amount and recipient are settled before anything touches the network
+  // (2026-09-29 send-safety audit): `parseFloat` sent "1,5" as 1.
+  const sendSat = parseSendAmountSat(amount, "DASH");
+  const recipient = dashRecipient(to);
+  assertNotDust(sendSat, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.dash), "DASH");
 
   // The oracle quotes DASH/kB; the planner wants duffs/vB.
-  const ratePerKb = Math.max(
-    await fetchFeeRateBlockcypher().catch(() => MIN_RECOMMENDED_RATE_PER_KB),
-    MIN_RECOMMENDED_RATE_PER_KB,
-  );
-  const feePerVB =
-    opts?.feeRateOverride ?? Math.max(Math.ceil((ratePerKb * 1e8) / 1000), 1);
+  const feePerVB = await dashSendFeeRate(opts?.feeRateOverride);
 
   // Change goes to the internal chain's lowest unused index (2026-09-04) —
   // the BIP-44 rule every surveyed wallet and the swap engine follow — not
@@ -405,6 +443,7 @@ export async function sendDashFromAccount(
     feePerVB,
     sizing: P2PKH_SIZING,
     dustSat: DASH_DUST_SAT,
+    recipientOutputVB: outputVBytes(recipient.script.length),
     gapLimit: opts?.gapLimit,
     fetchUtxos: async (address) => {
       const utxos = await tryEach([
@@ -461,19 +500,15 @@ export async function sendDashFromAccount(
       nonWitnessUtxo: Buffer.from(hexToBytes(prevTx.get(input.txid)!)),
     });
   }
-  psbt.addOutput({ address: to, value: BigInt(sendSat) });
+  psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
   if (plan.changeSat > 0) {
     psbt.addOutput({ address: change.address, value: BigInt(plan.changeSat) });
   }
   plan.inputs.forEach((input, i) => psbt.signInput(i, keyPairs.get(input.address)!));
   psbt.finalizeAllInputs();
-  const rawHex = psbt.extractTransaction().toHex();
 
-  const hash = await tryEach([
-    { name: "blockcypher", fn: () => broadcastBlockcypher(rawHex) },
-    { name: "blockchair", fn: () => broadcastBlockchair(rawHex) },
-  ]);
-  return { hash };
+  // Signed once; from here on only these bytes are ever sent.
+  return broadcastDash(psbt.extractTransaction());
 }
 
 export const dashAdapter: ChainAdapter = {
@@ -561,14 +596,20 @@ export const dashAdapter: ChainAdapter = {
   async sendTransaction(
     privateKey: string,
     to: string,
-    amount: string
+    amount: string,
+    _assetType?: string,
+    opts?: SendOptions,
   ): Promise<TxResult> {
+    // Settled before any request (2026-09-29 send-safety audit).
+    const amountDuffs = parseSendAmountSat(amount, "DASH");
+    const recipient = dashRecipient(to);
+    assertNotDust(amountDuffs, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.dash), "DASH");
+
     const cleaned = privateKey.startsWith("0x") ? privateKey.slice(2) : privateKey;
     const keyPair = ECPair.fromPrivateKey(Buffer.from(hexToBytes(cleaned)), {
       network: dashNetwork,
     });
     const fromAddress = getAddress(keyPair.publicKey);
-    const amountDuffs = BigInt(Math.round(parseFloat(amount) * 1e8));
 
     const utxos = await tryEach([
       { name: "blockcypher", fn: () => fetchUtxosBlockcypher(fromAddress) },
@@ -576,30 +617,32 @@ export const dashAdapter: ChainAdapter = {
     ]);
     if (utxos.length === 0) throw new Error("No DASH UTXOs available");
 
-    const feeRatePerKb = await fetchFeeRateBlockcypher().catch(
-      () => MIN_RECOMMENDED_RATE_PER_KB
-    );
-    const ratePerKb = Math.max(feeRatePerKb, MIN_RECOMMENDED_RATE_PER_KB);
-
-    // Sort UTXOs largest-first; pick until we cover amount + fee.
-    const sorted = [...utxos].sort((a, b) => Number(b.value - a.value));
-    const picked: NormalizedUtxo[] = [];
-    let inSum = 0n;
-    let feeDuffs = 0n;
-    for (const u of sorted) {
-      picked.push(u);
-      inSum += u.value;
-      const bytes = estimateTxBytes(picked.length, 2);
-      feeDuffs = BigInt(Math.ceil(((bytes / 1000) * ratePerKb) * 1e8));
-      if (inSum >= amountDuffs + feeDuffs) break;
-    }
-    if (inSum < amountDuffs + feeDuffs) {
+    // Largest-first selection with the shared planner. Change of 1–546 duffs
+    // is folded into the fee: this path used to emit ANY positive change as an
+    // output (`change > 0n`), and Dash nodes refuse a transaction carrying a
+    // 100-duff output as dust (2026-09-29 send-safety audit).
+    const candidates: AccountSpendCandidate[] = utxos.map((u) => {
+      if (u.value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(
+          `Output ${u.txid}:${u.vout} exceeds 2^53 duffs and cannot be selected safely. Nothing was sent.`,
+        );
+      }
+      return { path: DERIVATION_PATH, address: fromAddress, txid: u.txid, vout: u.vout, valueSat: Number(u.value) };
+    });
+    const plan = planAccountSpend({
+      candidates,
+      sendSat: amountDuffs,
+      feePerVB: await dashSendFeeRate(opts?.feeRate),
+      sizing: P2PKH_SIZING,
+      dustSat: DASH_DUST_SAT,
+      recipientOutputVB: outputVBytes(recipient.script.length),
+    });
+    if (!plan.covered) {
       throw new Error("Insufficient DASH balance for amount + fee");
     }
-    const change = inSum - amountDuffs - feeDuffs;
 
     const psbt = new bitcoin.Psbt({ network: dashNetwork });
-    for (const u of picked) {
+    for (const u of plan.inputs) {
       const prevHex = await tryEach([
         { name: "blockcypher", fn: () => fetchPrevTxHexBlockcypher(u.txid) },
         { name: "blockchair", fn: () => fetchPrevTxHexBlockchair(u.txid) },
@@ -610,20 +653,14 @@ export const dashAdapter: ChainAdapter = {
         nonWitnessUtxo: Buffer.from(hexToBytes(prevHex)),
       });
     }
-    psbt.addOutput({ address: to, value: amountDuffs });
-    if (change > 0n) {
-      psbt.addOutput({ address: fromAddress, value: change });
+    psbt.addOutput({ script: recipient.script, value: BigInt(amountDuffs) });
+    if (plan.changeSat > 0) {
+      psbt.addOutput({ address: fromAddress, value: BigInt(plan.changeSat) });
     }
 
     psbt.signAllInputs(keyPair);
     psbt.finalizeAllInputs();
-    const rawHex = psbt.extractTransaction().toHex();
-
-    const hash = await tryEach([
-      { name: "blockcypher", fn: () => broadcastBlockcypher(rawHex) },
-      { name: "blockchair", fn: () => broadcastBlockchair(rawHex) },
-    ]);
-    return { hash };
+    return broadcastDash(psbt.extractTransaction());
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {

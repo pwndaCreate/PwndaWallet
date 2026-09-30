@@ -63,13 +63,18 @@ describe("planLegacyLtcSweep", () => {
   });
 
   it("refuses a balance that dust+fee would consume", () => {
-    // 2500 lits minus the ~2090-lit fee leaves 410 — under the 546 dust
-    // floor. Sweeping would burn 84% of the balance as fees. Refusal, not a
-    // silent tiny send.
+    // 2500 lits minus the ~2090-lit fee leaves 410 — under the dust floor.
+    // Sweeping would burn 84% of the balance as fees. Refusal, not a silent
+    // tiny send.
     expect(() => planLegacyLtcSweep([utxo(2_500)], 10)).toThrow(/dust/i);
-    // And just ABOVE the line it goes through — pinning the boundary, not
-    // merely one side of it.
-    expect(planLegacyLtcSweep([utxo(2_700)], 10).sendValue).toBe(610);
+    // CORRECTED 2026-09-29 (send-safety audit): this boundary was pinned at
+    // Bitcoin's 546 — `utxo(2_700)` swept 610 lits. The sweep's output is
+    // P2WPKH, whose Litecoin dust threshold is 2,940 lits (30,000 lit/kB ×
+    // 98 B), so that transaction was one no node would relay. 610 is refused
+    // now, and the boundary sits at 2,940: fee 2,090 + 2,940 = 5,030.
+    expect(() => planLegacyLtcSweep([utxo(2_700)], 10)).toThrow(/dust/i);
+    expect(() => planLegacyLtcSweep([utxo(5_029)], 10)).toThrow(/dust/i);
+    expect(planLegacyLtcSweep([utxo(5_030)], 10).sendValue).toBe(2_940);
   });
 
   it("refuses an empty input set and a nonsense fee rate", () => {

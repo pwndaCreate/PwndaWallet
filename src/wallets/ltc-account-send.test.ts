@@ -28,8 +28,9 @@ import {
   type AccountSpendCandidate,
 } from "./ltc-wallet";
 
-/** LTC is native SegWit at the standard 546-lit dust threshold. Spread into
- *  every call so the sizing under test is stated once, not twelve times. */
+/** LTC is native SegWit at Litecoin's P2WPKH dust threshold — 2,940 lits since
+ *  2026-09-29 (it was Bitcoin's 546; see LTC_DUST_SAT). Spread into every call
+ *  so the sizing under test is stated once, not twelve times. */
 const LTC = { sizing: P2WPKH_SIZING, dustSat: LTC_DUST_SAT } as const;
 
 /** A UTXO at a given account path. `chain` 1 = change, the indices Send missed. */

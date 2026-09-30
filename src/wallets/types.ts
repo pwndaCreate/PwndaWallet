@@ -258,6 +258,14 @@ export interface GasBudget {
  */
 export interface SendOptions {
   destinationTag?: number;
+  /**
+   * The Send modal's selected fee tier, in the adapter's base units per
+   * (v)byte — the same value `sendFromAccount`'s `opts.feeRate` carries, and
+   * only ever set for per-byte-rate estimates (`feeRateForSend`). Added
+   * 2026-09-29 (send-safety audit): the single-key UTXO paths — private-key
+   * imports, LTC's legacy account — ignored the tier and budgeted a fixed size.
+   */
+  feeRate?: number;
 }
 
 /**

@@ -35,9 +35,25 @@ import type {
   TxHistoryPage,
   FeeEstimate,
 } from "./types";
-import { proxyGetJson, proxyPostJson } from "./_proxy";
+import { proxyGetJson } from "./_proxy";
 import type { UtxoAccountSpec } from "./utxo-account";
+import { planAccountSpend, P2PKH_SIZING } from "./utxo-account";
 import type { UtxoProbeResult } from "./_utxo-probes";
+import {
+  assertNotDust,
+  broadcastSignedTx,
+  dustThresholdSat,
+  DUST_RELAY_FEE_PER_KB,
+  LEGACY_CHAIN_OUTPUTS,
+  outputVBytes,
+  parseSendAmountSat,
+  proxyPushEndpoint,
+  proxyTxLookup,
+  recipientOutput,
+  type BroadcastEndpoint,
+  type TxLookup,
+} from "./utxo-send";
+import { decimalToAtomic } from "./decimal-amount";
 
 bitcoin.initEccLib(tinysecp);
 const ECPair = ECPairFactory(tinysecp);
@@ -197,6 +213,43 @@ async function insightGet<T>(path: string): Promise<T> {
     ? lastError
     : new Error("All Insight-API mirrors failed");
 }
+
+// -------------------------------------------------------------------------
+// Broadcast
+// -------------------------------------------------------------------------
+//
+// CORRECTED 2026-09-29 (send-safety audit): every RVN send failed. The
+// BlockBook push went to `/api/v2/sendtx` — no trailing slash — with the hex
+// JSON-QUOTED (`proxyPostJson` stringifies its body). The host answers the
+// slash-less path with a 301, and the proxy's HTTP client re-sends a redirected
+// POST as a bodiless GET, so the node never saw the transaction; the two
+// Insight fallbacks are dead (404). BlockBook's documented form is
+// `POST /api/v2/sendtx/` with the raw hex as the body.
+
+const RVN_BROADCAST: BroadcastEndpoint[] = [
+  proxyPushEndpoint(
+    "blockbook",
+    (hex) => ({ url: `${BLOCKBOOK_URL}/api/v2/sendtx/`, body: hex, contentType: "text/plain" }),
+    (body) => JSON.parse(body)?.result,
+  ),
+  ...INSIGHT_URLS.map((base) =>
+    proxyPushEndpoint(
+      `insight:${new URL(base).host}`,
+      (hex) => ({ url: `${base}/tx/send`, body: JSON.stringify({ rawtx: hex }), contentType: "application/json" }),
+      (body) => JSON.parse(body)?.txid,
+    ),
+  ),
+];
+
+const RVN_LOOKUPS: TxLookup[] = [
+  proxyTxLookup("blockbook", (t) => `${BLOCKBOOK_URL}/api/v2/tx/${t}`, (j) => j?.txid),
+  ...INSIGHT_URLS.map((base) =>
+    proxyTxLookup(`insight:${new URL(base).host}`, (t) => `${base}/tx/${t}`, (j) => j?.txid),
+  ),
+];
+
+/** RVN relay dust for this app's P2PKH outputs (Ravencoin keeps Bitcoin's 3,000/kB). */
+const RVN_DUST_SAT = 546;
 
 // =========================================================================
 // Adapter
@@ -373,14 +426,29 @@ export const rvnAdapter: ChainAdapter = {
    * after the P2PKH prefix and so always exceed 25 bytes.
    *
    * Fees: estimated against the live RVN-network fee oracle via
-   * `getFeeEstimate()`; capped at the consensus floor of 0.01 RVN/kB.
-   * Standard 1-in / 2-out segwit-less tx is ≈ 226 vbytes.
+   * `getFeeEstimate()`, never below the consensus floor of 0.01 RVN/kB, and
+   * applied to the size of the transaction actually built (the shared
+   * planner, since 2026-09-29) rather than a fixed 226 bytes.
+   *
+   * Broadcast: once, through `broadcastSignedTx` — see RVN_BROADCAST.
    */
   async sendTransaction(
     privateKey: string,
     to: string,
     amount: string
   ): Promise<TxResult> {
+    // 0) Settled before any request (2026-09-29 send-safety audit): the amount
+    //    was `parseFloat`ed ("1,5" sent 1), and the recipient's real output
+    //    size now feeds the fee.
+    const sendSat = parseSendAmountSat(amount, "RVN");
+    const recipient = recipientOutput(to, {
+      network: rvnNetwork,
+      ticker: "RVN",
+      uriSchemes: ["raven", "ravencoin"],
+      allowed: LEGACY_CHAIN_OUTPUTS,
+    });
+    assertNotDust(sendSat, dustThresholdSat(recipient.script, DUST_RELAY_FEE_PER_KB.ravencoin), "RVN");
+
     const privKeyBytes = hexToBytes(privateKey);
     const keyPair = ECPair.fromPrivateKey(Buffer.from(privKeyBytes), {
       network: rvnNetwork,
@@ -473,57 +541,71 @@ export const rvnAdapter: ChainAdapter = {
     }
 
     // 3) Pick a fee rate. Try the live oracle, fall back to the consensus
-    //    floor of 0.01 RVN/kB.
-    let feePerKbRvn = 0.01;
+    //    floor of 0.01 RVN/kB. Converted to whole sat/kB by string (no float).
+    let satPerKb = 1_000_000; // 0.01 RVN/kB
     try {
       const fee = await this.getFeeEstimate();
       const v = Number(fee.normal.value);
-      if (Number.isFinite(v) && v > 0) feePerKbRvn = Math.max(v, 0.01);
+      if (Number.isFinite(v) && v > 0) {
+        satPerKb = Math.max(Number(decimalToAtomic(v.toFixed(8), 8)), 1_000_000);
+      }
     } catch {
       /* keep default */
     }
-    const estimatedSizeBytes = 226n; // 1-in 2-out P2PKH
-    const feeSat = BigInt(Math.ceil((feePerKbRvn * 1e8 * Number(estimatedSizeBytes)) / 1000));
 
-    const sendSat = BigInt(Math.round(parseFloat(amount) * 1e8));
-    if (sendSat <= 0n) throw new Error("Amount must be greater than zero.");
-
-    // 4) Greedy input selection (largest first) until we cover sendSat + fee.
-    spendable.sort((a, b) => (a.sats < b.sats ? 1 : a.sats > b.sats ? -1 : 0));
-    const selected: typeof spendable = [];
-    let total = 0n;
-    for (const s of spendable) {
-      selected.push(s);
-      total += s.sats;
-      if (total >= sendSat + feeSat) break;
-    }
-    if (total < sendSat + feeSat) {
-      const have = (Number(total) / 1e8).toFixed(8);
-      const need = (Number(sendSat + feeSat) / 1e8).toFixed(8);
+    // 4) Largest-first selection with the shared planner, priced for what is
+    //    actually built. This used to budget a fixed 226 bytes whatever the
+    //    input count: three inputs paid 0.0043 RVN/kB, under the relay floor
+    //    (2026-09-29 send-safety audit).
+    const plan = planAccountSpend({
+      candidates: spendable.map((s) => {
+        // bigint here, number in the shared planner: check BEFORE narrowing.
+        if (s.sats > BigInt(Number.MAX_SAFE_INTEGER)) {
+          throw new Error(
+            `Output ${s.utxo.txid}:${s.utxo.vout} exceeds 2^53 base units and cannot be ` +
+              "selected safely. Nothing was sent.",
+          );
+        }
+        return {
+          path: DERIVATION_PATH,
+          address: senderAddress,
+          txid: s.utxo.txid,
+          vout: s.utxo.vout,
+          valueSat: Number(s.sats),
+        };
+      }),
+      sendSat,
+      feePerVB: Math.ceil(satPerKb / 1000),
+      sizing: P2PKH_SIZING,
+      dustSat: RVN_DUST_SAT,
+      recipientOutputVB: outputVBytes(recipient.script.length),
+    });
+    if (!plan.covered) {
+      const haveSat = spendable.reduce((t, s) => t + Number(s.sats), 0);
       throw new Error(
-        `Insufficient funds. Have ${have} RVN, need ${need} RVN (incl. ~${(
-          Number(feeSat) / 1e8
-        ).toFixed(8)} fee).`
+        `Insufficient funds. Have ${(haveSat / 1e8).toFixed(8)} RVN, need ` +
+          `${((haveSat + plan.shortfallSat) / 1e8).toFixed(8)} RVN (incl. ~` +
+          `${(plan.feeSat / 1e8).toFixed(8)} fee).`
       );
     }
+    const rawByOutpoint = new Map(spendable.map((s) => [`${s.utxo.txid}:${s.utxo.vout}`, s.rawTxHex]));
 
     // 5) Build PSBT.
     const psbt = new bitcoin.Psbt({ network: rvnNetwork });
-    for (const s of selected) {
+    for (const input of plan.inputs) {
       psbt.addInput({
-        hash: s.utxo.txid,
-        index: s.utxo.vout,
+        hash: input.txid,
+        index: input.vout,
         // Legacy P2PKH input — RVN is pre-segwit, must use nonWitnessUtxo.
-        nonWitnessUtxo: Buffer.from(s.rawTxHex, "hex"),
+        nonWitnessUtxo: Buffer.from(rawByOutpoint.get(`${input.txid}:${input.vout}`)!, "hex"),
       });
     }
-    psbt.addOutput({ address: to, value: sendSat });
-    const change = total - sendSat - feeSat;
-    if (change >= 546n) {
+    psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
+    if (plan.changeSat > 0) {
       // Above dust — add a change output back to ourselves. Index reuse
       // (sender == change addr) matches the rest of this app today; xpub
       // discovery would split this out.
-      psbt.addOutput({ address: senderAddress, value: change });
+      psbt.addOutput({ address: senderAddress, value: BigInt(plan.changeSat) });
     }
 
     // 6) Sign every input with the same key (single-key wallet today).
@@ -531,45 +613,17 @@ export const rvnAdapter: ChainAdapter = {
       psbt.signInput(i, keyPair as any);
     }
     psbt.finalizeAllInputs();
-    const rawTxHex = psbt.extractTransaction().toHex();
+    const tx = psbt.extractTransaction();
 
-    // 7) Broadcast — BlockBook first, Insight fallback. BlockBook's
-    //    `/api/v2/sendtx/{hex}` accepts a GET with the tx hex in the path;
-    //    POST `/api/v2/sendtx` with the hex body works too. Insight uses
-    //    `POST /tx/send` with `{ rawtx }`.
-    let txid: string | null = null;
-    try {
-      const r = await proxyPostJson<{ result?: string; error?: { message?: string } }>(
-        `${BLOCKBOOK_URL}/api/v2/sendtx`,
-        rawTxHex,
-        { "Content-Type": "text/plain" }
-      );
-      if (r.error?.message) throw new Error(r.error.message);
-      if (r.result) txid = r.result;
-    } catch (e) {
-      // Insight fallback.
-      try {
-        for (const base of INSIGHT_URLS) {
-          try {
-            const r = await proxyPostJson<{ txid?: string }>(
-              `${base}/tx/send`,
-              { rawtx: rawTxHex }
-            );
-            if (r.txid) {
-              txid = r.txid;
-              break;
-            }
-          } catch {
-            /* try next mirror */
-          }
-        }
-      } catch {
-        /* fallthrough */
-      }
-      if (!txid) throw e;
-    }
-    if (!txid) throw new Error("Broadcast returned no txid.");
-    return { hash: txid };
+    // 7) Broadcast once — BlockBook, then the Insight mirrors, the same bytes
+    //    to each; a lost reply is "may have been sent" (see RVN_BROADCAST).
+    return broadcastSignedTx({
+      ticker: "RVN",
+      txid: tx.getId(),
+      rawHex: tx.toHex(),
+      endpoints: RVN_BROADCAST,
+      lookups: RVN_LOOKUPS,
+    });
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
