@@ -12,6 +12,7 @@ import {
 import {
   planLtcConsolidation,
   consolidateLtcAccount,
+  ltcUtxoAccounts,
 } from "../../wallets/ltc-wallet";
 import {
   resolveUtxoAccountBalance,
@@ -310,12 +311,15 @@ export function UtxoAccountCard(props: {
                 <div style={{ border: "1px solid var(--border)" }}>
                   {summary.entries.map((e, i) => {
                     const funded = e.balanceSat > 0;
+                    // Path AND address: two BTC accounts share m/44'/0'/0'
+                    // (2026-09-29), so one path can name two addresses when
+                    // "Scan all derivations" lists both.
                     const stranded = summary.strandedEntries.some(
-                      (s) => s.path === e.path,
+                      (s) => s.path === e.path && s.address === e.address,
                     );
                     return (
                       <div
-                        key={e.path}
+                        key={`${e.path} ${e.address}`}
                         style={{
                           padding: "6px 8px",
                           background: stranded
@@ -453,7 +457,17 @@ function ConsolidatePanel({
   // fund-moving path is worse than not offering it yet.
   if (chain !== "litecoin") return null;
 
-  const funded = summary.entries.filter((e) => e.balanceSat > 0);
+  // Only over the account `consolidateLtcAccount` spends: BIP-84. Since the
+  // scan follows the DISPLAYED account (2026-09-29 send-safety audit), a
+  // legacy-LTC wallet's summary lists its BIP-44 addresses — previewing those
+  // and then moving BIP-84 coins would sign something the user never saw.
+  // Entries are kept to the BIP-84 paths too: "Scan all derivations" adds the
+  // other account's to the same list.
+  const bip84 = ltcUtxoAccounts[0].accountPath;
+  if (summary.account?.accountPath !== bip84) return null;
+  const funded = summary.entries.filter(
+    (e) => e.balanceSat > 0 && e.path.startsWith(`${bip84}/`),
+  );
   if (funded.length < 2) return null;
 
   // Preview only. The executor re-plans against freshly fetched UTXOs and

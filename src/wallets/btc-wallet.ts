@@ -15,12 +15,15 @@ import type {
 } from "./types";
 import { proxyGetJson } from "./_proxy";
 import { withFallback } from "./_fallback";
-import type { UtxoAccountSpec } from "./utxo-account";
+import type { TxSizing, UtxoAccountSpec } from "./utxo-account";
 import {
   gatherAccountSpend,
   accountShortfallMessage,
   planAccountSpend,
+  utxoAccountSpecFor,
   P2WPKH_SIZING,
+  P2SH_P2WPKH_SIZING,
+  P2PKH_SIZING,
 } from "./utxo-account";
 import {
   acceptPushReply,
@@ -29,6 +32,7 @@ import {
   dustThresholdSat,
   DUST_RELAY_FEE_PER_KB,
   fetchTxLookup,
+  outputKind,
   outputVBytes,
   parseSendAmountSat,
   recipientOutput,
@@ -166,12 +170,213 @@ function deriveLegacyKeyFromMnemonic(mnemonic: string) {
   return deriveAtPath(mnemonic, LEGACY_DERIVATION_PATH);
 }
 
+/**
+ * The single-key script types a Bitcoin wallet here can hold coins under — one
+ * per derivation the import picker (`derivation-detector.ts`) can select:
+ * BIP-84 `bc1q…` (and the pre-2026-05-06 BIP-44-path quirk, also P2WPKH),
+ * BIP-49 `3…` and BIP-44 `1…`.
+ */
+export type BtcScriptType = "p2wpkh" | "p2sh-p2wpkh" | "p2pkh";
+
+/**
+ * A public key as a BTC address of `scriptType`: the one encoder the account
+ * specs and the single-key send share, building the same three payments as the
+ * picker's `btcAddressForSpec`. `network` exists for the BIP-49 test vector,
+ * which is published for testnet only.
+ */
+export function btcAddressFor(
+  pubkey: Uint8Array,
+  scriptType: BtcScriptType,
+  network: bitcoin.Network = bitcoin.networks.bitcoin,
+): string {
+  const pk = Buffer.from(pubkey);
+  if (scriptType === "p2wpkh") return bitcoin.payments.p2wpkh({ pubkey: pk, network }).address!;
+  if (scriptType === "p2sh-p2wpkh") {
+    return bitcoin.payments.p2sh({ redeem: bitcoin.payments.p2wpkh({ pubkey: pk, network }), network })
+      .address!;
+  }
+  return bitcoin.payments.p2pkh({ pubkey: pk, network }).address!;
+}
+
 function getAddress(publicKey: Uint8Array): string {
-  const { address } = bitcoin.payments.p2wpkh({
-    pubkey: Buffer.from(publicKey),
-    network: bitcoin.networks.bitcoin,
-  });
-  return address!;
+  return btcAddressFor(publicKey, "p2wpkh");
+}
+
+/**
+ * Transaction sizing per script type (`TxSizing`, utxo-account.ts). The planner
+ * prices inputs and the change output with these, so a BIP-49 send is priced
+ * at 91 vB an input and a BIP-44 one at 148 — not at native SegWit's 68, which
+ * would underpay a legacy send by more than half.
+ */
+const BTC_SIZING: Record<BtcScriptType, TxSizing> = {
+  p2wpkh: P2WPKH_SIZING,
+  "p2sh-p2wpkh": P2SH_P2WPKH_SIZING,
+  p2pkh: P2PKH_SIZING,
+};
+
+/** Unspent outputs at one address, from Esplora. Throws when no host answers. */
+async function fetchBtcUtxos(
+  address: string,
+): Promise<Array<{ txid: string; vout: number; valueSat: number }>> {
+  const resp = await btcFetch(`/address/${address}/utxo`);
+  if (!resp.ok) throw new Error(`BTC utxo fetch HTTP ${resp.status}`);
+  const list: Array<{ txid: string; vout: number; value: number }> = await resp.json();
+  return list.map((u) => ({ txid: u.txid, vout: u.vout, valueSat: u.value }));
+}
+
+/**
+ * The whole previous transaction a P2PKH input spends — its `nonWitnessUtxo`.
+ *
+ * Each Esplora host in turn; the first whose bytes hash to `txid` wins. A host
+ * that serves anything else is passed over like one that is down: bitcoinjs
+ * would refuse to sign against it anyway, and a legacy signature does not
+ * commit to the amount, so the transaction the value is read from has to be
+ * the right one. Every failure is named when all hosts fail.
+ */
+async function fetchBtcPrevTx(txid: string): Promise<bitcoin.Transaction> {
+  const failures: string[] = [];
+  for (const base of BTC_API_URLS) {
+    const host = new URL(base).host;
+    try {
+      const resp = await fetch(`${base}/tx/${txid}/hex`);
+      const body = (await resp.text()).trim();
+      if (!resp.ok) {
+        failures.push(`${host}: HTTP ${resp.status}`);
+        continue;
+      }
+      const tx = bitcoin.Transaction.fromHex(body);
+      if (tx.getId() !== txid.toLowerCase()) {
+        failures.push(`${host}: served a different transaction`);
+        continue;
+      }
+      return tx;
+    } catch (e) {
+      failures.push(`${host}: ${errorText(e, "request failed")}`);
+    }
+  }
+  throw new Error(
+    `Could not fetch transaction ${txid}, which a legacy (P2PKH) input spends — ` +
+      `${failures.join("; ")}. Nothing was sent.`,
+  );
+}
+
+/** One coin to spend: an outpoint, its value, and the address that holds it. */
+type BtcCoin = { txid: string; vout: number; valueSat: number; address: string };
+
+/** The previous transaction of every P2PKH coin in `coins`, one fetch per txid. */
+async function prevTxsForLegacy(
+  coins: ReadonlyArray<BtcCoin>,
+): Promise<Map<string, bitcoin.Transaction>> {
+  const out = new Map<string, bitcoin.Transaction>();
+  for (const c of coins) {
+    if (out.has(c.txid)) continue;
+    const script = bitcoin.address.toOutputScript(c.address, bitcoin.networks.bitcoin);
+    if (outputKind(script) !== "p2pkh") continue;
+    out.set(c.txid, await fetchBtcPrevTx(c.txid));
+  }
+  return out;
+}
+
+/**
+ * Add one coin to `psbt` with what ITS script type needs to be signed
+ * (2026-09-29 send-safety audit):
+ *
+ *  - P2WPKH: `witnessUtxo`.
+ *  - P2SH-P2WPKH: `witnessUtxo` (the P2SH output) and `redeemScript` (the
+ *    P2WPKH program it wraps). Without the redeem script there is nothing to
+ *    sign against — and the send path this replaces never produced one: it
+ *    re-encoded every key as P2WPKH.
+ *  - P2PKH: `nonWitnessUtxo`, the whole previous transaction, whose output must
+ *    be this key's and carry exactly the value the explorer listed.
+ *
+ * The type is read from the address being spent, not assumed from the
+ * account, so one transaction can mix types, and the key is checked against
+ * the script before anything is signed.
+ */
+function addBtcInput(
+  psbt: bitcoin.Psbt,
+  coin: BtcCoin,
+  pubkey: Uint8Array,
+  prevTxs: ReadonlyMap<string, bitcoin.Transaction>,
+): void {
+  const network = bitcoin.networks.bitcoin;
+  const pk = Buffer.from(pubkey);
+  const script = bitcoin.address.toOutputScript(coin.address, network);
+  const kind = outputKind(script);
+  const same = (a: Uint8Array, b: Uint8Array) => Buffer.from(a).equals(Buffer.from(b));
+  const refuse = (why: string) =>
+    new Error(`Cannot spend ${coin.txid}:${coin.vout} at ${coin.address}: ${why}. Nothing was sent.`);
+
+  if (kind === "p2wpkh") {
+    const own = bitcoin.payments.p2wpkh({ pubkey: pk, network }).output!;
+    if (!same(own, script)) throw refuse("the signing key does not own it");
+    psbt.addInput({
+      hash: coin.txid,
+      index: coin.vout,
+      witnessUtxo: { script: own, value: BigInt(coin.valueSat) },
+    });
+    return;
+  }
+  if (kind === "p2sh") {
+    const redeem = bitcoin.payments.p2wpkh({ pubkey: pk, network });
+    const own = bitcoin.payments.p2sh({ redeem, network }).output!;
+    if (!same(own, script)) throw refuse("it is not the signing key's wrapped-SegWit (P2SH-P2WPKH) output");
+    psbt.addInput({
+      hash: coin.txid,
+      index: coin.vout,
+      witnessUtxo: { script: own, value: BigInt(coin.valueSat) },
+      redeemScript: redeem.output!,
+    });
+    return;
+  }
+  if (kind === "p2pkh") {
+    const own = bitcoin.payments.p2pkh({ pubkey: pk, network }).output!;
+    if (!same(own, script)) throw refuse("the signing key does not own it");
+    const prev = prevTxs.get(coin.txid);
+    const out = prev?.outs[coin.vout];
+    if (!prev || !out) throw refuse("the transaction that created it could not be read");
+    if (!same(out.script, own)) throw refuse("the transaction that created it pays a different script");
+    if (out.value !== BigInt(coin.valueSat)) {
+      throw refuse(
+        `the explorer listed ${coin.valueSat} sat, the transaction that created it says ${out.value}`,
+      );
+    }
+    psbt.addInput({ hash: coin.txid, index: coin.vout, nonWitnessUtxo: prev.toBuffer() });
+    return;
+  }
+  throw refuse(`${kind ?? "a non-standard"} output is not a type this wallet signs`);
+}
+
+/**
+ * Where a lone private key's coins are, for the single-key send.
+ *
+ * A key alone does not say which script type it was used with, and the path
+ * this replaces assumed native SegWit: a BIP-49 or BIP-44 key was re-encoded as
+ * P2WPKH, found nothing, and the send failed "No UTXOs available" over a funded
+ * wallet (2026-09-29 send-safety audit). The three encodings are asked in turn
+ * — native SegWit first, the only one a private-key import displays, so that
+ * case still costs one request — and the FIRST that holds coins is spent,
+ * with the change returning to that same address. Encodings are not mixed: the
+ * change needs one home, and it is the address the coins came from.
+ */
+const SINGLE_KEY_ORDER: readonly BtcScriptType[] = ["p2wpkh", "p2sh-p2wpkh", "p2pkh"];
+
+async function btcKeyCoins(
+  pubkey: Uint8Array,
+): Promise<{ scriptType: BtcScriptType; address: string; coins: BtcCoin[] }> {
+  const looked: string[] = [];
+  for (const scriptType of SINGLE_KEY_ORDER) {
+    const address = btcAddressFor(pubkey, scriptType);
+    const utxos = await fetchBtcUtxos(address);
+    if (utxos.length > 0) {
+      return { scriptType, address, coins: utxos.map((u) => ({ ...u, address })) };
+    }
+    looked.push(address);
+  }
+  throw new Error(
+    `No UTXOs available at this key's native SegWit, wrapped SegWit or legacy address ` +
+      `(${looked.join(", ")}). Nothing was sent.`,
+  );
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -225,36 +430,51 @@ async function probeBtcAddresses(addresses: string[]): Promise<UtxoProbeResult[]
   throw lastErr instanceof Error ? lastErr : new Error(String(lastErr));
 }
 
+/** A BTC account spec, with the script type its addresses (and change) use. */
+export type BtcUtxoAccountSpec = UtxoAccountSpec & { scriptType: BtcScriptType };
+
+function btcAccount(accountPath: string, label: string, scriptType: BtcScriptType): BtcUtxoAccountSpec {
+  return {
+    chain: "bitcoin",
+    accountPath,
+    label,
+    scriptType,
+    deriveAddress: (node) => btcAddressFor(node.publicKey!, scriptType),
+    probe: probeBtcAddress,
+    probeMany: probeBtcAddresses,
+    batchSize: 50,
+  };
+}
+
 /**
- * BTC has not yet been spent from by the swap engine, so its change chain is
- * still untouched — but it shares the identical C8 arrangement with LTC, so
- * the first BTC swap will put change on the internal chain exactly as LTC's
- * did. Listing the account now means that day is a non-event.
+ * Every account a Bitcoin wallet here can be — one per derivation the import
+ * picker (`derivation-detector.ts` `BTC_SPECS`) can select. The one the
+ * dashboard scans and the Send button spends is whichever derives the
+ * DISPLAYED address (`utxoAccountSpecFor`).
  *
- * The second entry mirrors this adapter's own `deriveLegacyKeyFromMnemonic`,
- * which derives at the BIP-44 PATH but still encodes P2WPKH — a quirk of this
- * codebase, reproduced here deliberately so the scan looks where the app can
- * actually put funds rather than where the path name suggests.
+ *  - BIP-84 native SegWit, the default. BTC has not been spent from by the
+ *    swap engine yet, but it shares LTC's C8 arrangement, so the first BTC
+ *    swap will put change on the internal chain exactly as LTC's did.
+ *  - The BIP-44 PATH with SegWit ENCODING: `deriveLegacyKeyFromMnemonic`'s
+ *    quirk from builds before 2026-05-06, kept so the scan looks where the app
+ *    could actually have put funds rather than where the path name suggests.
+ *  - BIP-49 wrapped SegWit (`3…`) and BIP-44 legacy (`1…`), added 2026-09-29
+ *    (send-safety audit). Import auto-selects them when that is where a seed's
+ *    coins are — older Electrum/BlueWallet, Bitcoin Core legacy, Atomic — and
+ *    until these specs existed such a wallet read 0 on the dashboard (only the
+ *    BIP-84 account was scanned) and could not send: the fallback re-encoded
+ *    its key as P2WPKH and found no coins.
+ *
+ * Order matters in one respect: index 0 is the BIP-84 default — what a send
+ * with no `fromAddress` spends, what the sandbox mocks fund, and the only
+ * account whose pre-2026-09-29 scan records are still trusted (`recordIsFor`,
+ * utxo-account-balance.ts). Keep it first.
  */
-export const btcUtxoAccounts: UtxoAccountSpec[] = [
-  {
-    chain: "bitcoin",
-    accountPath: "m/84'/0'/0'",
-    label: "BIP-84 native SegWit",
-    deriveAddress: (node) => getAddress(node.publicKey!),
-    probe: probeBtcAddress,
-    probeMany: probeBtcAddresses,
-    batchSize: 50,
-  },
-  {
-    chain: "bitcoin",
-    accountPath: "m/44'/0'/0'",
-    label: "BIP-44 path, SegWit encoding",
-    deriveAddress: (node) => getAddress(node.publicKey!),
-    probe: probeBtcAddress,
-    probeMany: probeBtcAddresses,
-    batchSize: 50,
-  },
+export const btcUtxoAccounts: BtcUtxoAccountSpec[] = [
+  btcAccount("m/84'/0'/0'", "BIP-84 native SegWit", "p2wpkh"),
+  btcAccount("m/44'/0'/0'", "BIP-44 path, SegWit encoding", "p2wpkh"),
+  btcAccount("m/49'/0'/0'", "BIP-49 wrapped SegWit", "p2sh-p2wpkh"),
+  btcAccount("m/44'/0'/0'", "BIP-44 legacy", "p2pkh"),
 ];
 
 /** BTC standard relay dust, in sats. */
@@ -263,22 +483,14 @@ export const BTC_DUST_SAT = 546;
 /**
  * Which of `btcUtxoAccounts` derives `address` at its index-0 receive slot?
  *
- * BTC differs from LTC here: **both** its accounts encode as native SegWit
- * (`getAddress` is p2wpkh for both specs — the BIP-44 entry is a non-standard
- * path with SegWit encoding, not a legacy P2PKH account). So unlike LTC, where
- * account-wide sending has to refuse the legacy account outright, BTC can serve
- * either — it only has to spend the RIGHT one. Picking the wrong account would
- * report a false shortfall over a funded wallet, which is the same failure
- * account-wide spending exists to remove.
+ * All four are spendable account-wide, each with its own script type, so this
+ * only has to name the RIGHT one: spending the wrong account reports a false
+ * shortfall over a funded wallet, the failure account-wide spending exists to
+ * remove. Two share the path `m/44'/0'/0'` and differ only in encoding, which
+ * is why the match is on the derived address and not on a path or a label.
  */
-function btcAccountFor(mnemonic: string, address: string): UtxoAccountSpec | null {
-  const seed = mnemonicToSeedSync(mnemonic.trim(), "");
-  const root = HDKey.fromMasterSeed(seed);
-  for (const spec of btcUtxoAccounts) {
-    const node = root.derive(spec.accountPath).deriveChild(0).deriveChild(0);
-    if (node.publicKey && spec.deriveAddress(node) === address) return spec;
-  }
-  return null;
+function btcAccountFor(mnemonic: string, address: string): BtcUtxoAccountSpec | null {
+  return utxoAccountSpecFor(mnemonic, btcUtxoAccounts, address);
 }
 
 /**
@@ -286,9 +498,12 @@ function btcAccountFor(mnemonic: string, address: string): UtxoAccountSpec | nul
  *
  * See `sendLtcFromAccount` in `ltc-wallet.ts` for the full rationale and the
  * survey of how other wallets do this; the scan/derive/select half is shared
- * (`gatherAccountSpend`). What is Bitcoin-specific here: two candidate
- * accounts to choose between, P2WPKH `witnessUtxo` inputs, and Esplora
- * broadcast.
+ * (`gatherAccountSpend`). What is Bitcoin-specific here: four candidate
+ * accounts to choose between, three script types — each priced at its real
+ * input size (`BTC_SIZING`) and signed with what its type needs (`addBtcInput`:
+ * `redeemScript` for BIP-49, the previous transaction for BIP-44) — with the
+ * change on the SAME account's internal chain, so it is the same type; and
+ * Esplora broadcast.
  *
  * **BTC is not a hypothetical.** It is one of exactly two coins BasicSwap can
  * adopt via C8 account-key sharing (`ELECTRUM_CAPABLE` = bitcoin, litecoin) and
@@ -303,15 +518,14 @@ export async function sendBtcFromAccount(
   amount: string,
   opts?: { feeRateOverride?: number; gapLimit?: number; fromAddress?: string },
 ): Promise<TxResult> {
-  const spec =
-    (opts?.fromAddress ? btcAccountFor(mnemonic, opts.fromAddress) : null) ??
-    btcUtxoAccounts[0];
-  if (opts?.fromAddress && !btcAccountFor(mnemonic, opts.fromAddress)) {
+  const matched = opts?.fromAddress ? btcAccountFor(mnemonic, opts.fromAddress) : null;
+  if (opts?.fromAddress && !matched) {
     throw new Error(
       `${opts.fromAddress} is not an index-0 address of any account this seed ` +
         "derives. Nothing was sent.",
     );
   }
+  const spec = matched ?? btcUtxoAccounts[0];
 
   // Amount and recipient are settled before anything touches the network
   // (2026-09-29 send-safety audit): `parseFloat` sent "1,5" as 1, and the
@@ -325,28 +539,27 @@ export async function sendBtcFromAccount(
   // Change goes to the internal chain's lowest unused index (2026-09-04) —
   // the BIP-44 rule every surveyed wallet and the swap engine follow — not
   // back to the displayed address. See `nextChangeIndex` in utxo-account.ts.
+  // It is derived by `spec`, so it has the account's own script type.
   const { plan, sources, change } = await gatherAccountSpend({
     mnemonic,
     spec,
     sendSat,
     feePerVB,
-    sizing: P2WPKH_SIZING,
+    sizing: BTC_SIZING[spec.scriptType],
     dustSat: BTC_DUST_SAT,
     recipientOutputVB: outputVBytes(recipient.script.length),
     gapLimit: opts?.gapLimit,
-    fetchUtxos: async (address) => {
-      const resp = await btcFetch(`/address/${address}/utxo`);
-      if (!resp.ok) throw new Error(`BTC utxo fetch HTTP ${resp.status}`);
-      const list: Array<{ txid: string; vout: number; value: number }> =
-        await resp.json();
-      return list.map((u) => ({ txid: u.txid, vout: u.vout, valueSat: u.value }));
-    },
+    fetchUtxos: fetchBtcUtxos,
   });
 
   if (!plan.covered) {
     const held = plan.inputs.reduce((t, i) => t + i.valueSat, 0);
     throw new Error(accountShortfallMessage(plan, held, plan.inputs.length, "BTC"));
   }
+
+  // Everything the inputs need is fetched BEFORE anything is signed: a legacy
+  // input's previous transaction that cannot be read stops the send here.
+  const prevTxs = await prevTxsForLegacy(plan.inputs);
 
   const network = bitcoin.networks.bitcoin;
   const psbt = new bitcoin.Psbt({ network });
@@ -359,17 +572,7 @@ export async function sendBtcFromAccount(
       keyPair = ECPair.fromPrivateKey(Buffer.from(src.node.privateKey!), { network });
       keyPairs.set(input.address, keyPair);
     }
-    psbt.addInput({
-      hash: input.txid,
-      index: input.vout,
-      witnessUtxo: {
-        script: bitcoin.payments.p2wpkh({
-          pubkey: Buffer.from(keyPair.publicKey),
-          network,
-        }).output!,
-        value: BigInt(input.valueSat),
-      },
-    });
+    addBtcInput(psbt, input, keyPair.publicKey, prevTxs);
   }
   psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
   if (plan.changeSat > 0) {
@@ -390,9 +593,11 @@ export async function sendBtcFromAccount(
 
 export const btcAdapter: ChainAdapter = {
   /**
-   * Both BTC accounts encode as native SegWit, so either can be spent
-   * account-wide —  picks the matching one. Returns
-   * false only for an address this seed does not derive at index 0.
+   * Every BTC account can be spent account-wide — `sendBtcFromAccount` picks
+   * the one that derives the displayed address. False only for an address this
+   * seed does not derive at index 0 of any of them. It used to be false for a
+   * BIP-49 or BIP-44 wallet, which then fell to the single-key path and could
+   * not send at all (2026-09-29 send-safety audit).
    */
   supportsAccountSend(mnemonic: string, address: string) {
     return btcAccountFor(mnemonic, address) !== null;
@@ -467,6 +672,11 @@ export const btcAdapter: ChainAdapter = {
    * output size — at the Send modal's tier (`opts.feeRate`), where it used to
    * budget a fixed 140 vB at the oracle's rate whatever the tier and however
    * many inputs it spent (0.5 sat/vB measured for three inputs).
+   *
+   * And it spends the key's coins under the script type they are actually
+   * held in (`btcKeyCoins`), priced and signed as that type. It used to
+   * re-encode every key as native SegWit, so a BIP-49 or BIP-44 key found no
+   * coins: "No UTXOs available" over a funded wallet, the same audit.
    */
   async sendTransaction(
     privateKey: string,
@@ -481,49 +691,33 @@ export const btcAdapter: ChainAdapter = {
 
     const privKeyBytes = hexToBytes(privateKey);
     const keyPair = ECPair.fromPrivateKey(Buffer.from(privKeyBytes));
-    const senderAddress = getAddress(keyPair.publicKey);
-
-    const utxoResp = await btcFetch(`/address/${senderAddress}/utxo`);
-    if (!utxoResp.ok) throw new Error("Failed to fetch UTXOs");
-    const utxos: Array<{ txid: string; vout: number; value: number }> = await utxoResp.json();
-    if (utxos.length === 0) throw new Error("No UTXOs available");
+    const held = await btcKeyCoins(keyPair.publicKey);
 
     const feePerVB = await btcSendFeeRate(opts?.feeRate);
     const plan = planAccountSpend({
-      candidates: utxos.map((u) => ({
-        path: DERIVATION_PATH,
-        address: senderAddress,
-        txid: u.txid,
-        vout: u.vout,
-        valueSat: u.value,
-      })),
+      candidates: held.coins.map((c) => ({ ...c, path: `single key (${held.scriptType})` })),
       sendSat,
       feePerVB,
-      sizing: P2WPKH_SIZING,
+      sizing: BTC_SIZING[held.scriptType],
       dustSat: BTC_DUST_SAT,
       recipientOutputVB: outputVBytes(recipient.script.length),
     });
     if (!plan.covered) {
-      const have = utxos.reduce((t, u) => t + u.value, 0);
+      const have = held.coins.reduce((t, c) => t + c.valueSat, 0);
       throw new Error(
         `Insufficient funds. Have ${(have / 1e8).toFixed(8)} BTC, need ` +
           `${((have + plan.shortfallSat) / 1e8).toFixed(8)} BTC (includes fee)`,
       );
     }
 
+    const prevTxs = await prevTxsForLegacy(plan.inputs);
     const network = bitcoin.networks.bitcoin;
     const psbt = new bitcoin.Psbt({ network });
-    const witnessScript = bitcoin.payments.p2wpkh({ pubkey: keyPair.publicKey, network }).output!;
-    for (const input of plan.inputs) {
-      psbt.addInput({
-        hash: input.txid,
-        index: input.vout,
-        witnessUtxo: { script: witnessScript, value: BigInt(input.valueSat) },
-      });
-    }
+    for (const input of plan.inputs) addBtcInput(psbt, input, keyPair.publicKey, prevTxs);
     psbt.addOutput({ script: recipient.script, value: BigInt(sendSat) });
     if (plan.changeSat > 0) {
-      psbt.addOutput({ address: senderAddress, value: BigInt(plan.changeSat) });
+      // Back to the address the coins came from: the same script type.
+      psbt.addOutput({ address: held.address, value: BigInt(plan.changeSat) });
     }
     for (let i = 0; i < psbt.inputCount; i++) {
       psbt.signInput(i, keyPair);

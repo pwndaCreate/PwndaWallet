@@ -597,6 +597,7 @@ export function WalletLandscapeView({
   const utxoReceiveAddress = useUtxoReceiveAddress(
     activeChain,
     activeWallet?.mnemonic,
+    activeWallet?.address,
   );
 
   // Same rotation portrait uses, from the SAME hook and the same helper -- an

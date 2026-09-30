@@ -159,6 +159,51 @@ export function childPath(
 }
 
 /**
+ * The account the wallet DISPLAYS: the spec whose first receive address
+ * (`<accountPath>/0/0`) is `displayedAddress` — or `null` when no spec's is.
+ *
+ * # Why this replaced `utxoAccounts[0]` (2026-09-29 send-safety audit)
+ *
+ * The balance sweep, the account card's rescan and the receive rotation all
+ * took an adapter's FIRST spec — BIP-84 for BTC and LTC, the standard BIP-44
+ * account elsewhere — whatever address the wallet showed. Import selects the
+ * FUNDED derivation (`derivation-detector.ts`), so a seed from a BIP-49 or
+ * BIP-44 Bitcoin wallet displayed its `3…` / `1…` address while the dashboard
+ * summed the BIP-84 account: 0, over a funded wallet. LTC's BIP-44 legacy
+ * account, and DASH/RVN wallets on Atomic/Exodus paths, read 0 the same way.
+ * The audit reproduced it offline.
+ *
+ * Matching on the displayed ADDRESS rather than on a derivation id means the
+ * account that is scanned can never differ from the one on screen: if the
+ * addresses are equal, it is the same account.
+ *
+ * `null` is an answer, not an error. A path outside the receive/change account
+ * model — Atomic's three-step `m/44'/5'/0'` for DASH, Exodus's fully hardened
+ * `m/44'/175'/0'/0'/0'` for RVN — has no account to scan, and the caller reads
+ * that one address instead. No spec is invented for such paths: a spec is a
+ * claim about where a wallet puts its change, and nothing here knows that for
+ * them.
+ */
+export function utxoAccountSpecFor<S extends UtxoAccountSpec>(
+  mnemonic: string,
+  specs: ReadonlyArray<S>,
+  displayedAddress: string,
+): S | null {
+  const want = String(displayedAddress ?? "").trim();
+  if (!mnemonic || !want || specs.length === 0) return null;
+  const root = HDKey.fromMasterSeed(mnemonicToSeedSync(mnemonic.trim(), ""));
+  for (const spec of specs) {
+    try {
+      const node = root.derive(spec.accountPath).deriveChild(0).deriveChild(0);
+      if (node.publicKey && spec.deriveAddress(node) === want) return spec;
+    } catch {
+      /* a spec that cannot derive here is not the displayed account */
+    }
+  }
+  return null;
+}
+
+/**
  * Derive `count` addresses on one chain of one account, starting at `from`.
  * Pure and offline — no network. Exposed separately so the recovery/export
  * surface can list paths without probing anything.
@@ -206,6 +251,15 @@ export function firstUnusedReceiveAddress(
   let highestTouched = -1;
   for (const e of summary.entries) {
     if (e.chainIndex !== 0) continue;
+    // Only THIS account's receive chain counts (2026-09-29 send-safety
+    // audit). A summary can hold another account's entries — "Scan all
+    // derivations" sums every spec, and after a derivation switch the old
+    // account's summary stays until the next scan — and an index used there
+    // says nothing about this account. By path, so two encodings of one path
+    // (BTC's m/44'/0'/0' P2WPKH quirk and its BIP-44 P2PKH account) still
+    // share: that can only skip an index, never hand out another account's
+    // address, which comes from `spec` alone.
+    if (e.path !== childPath(spec.accountPath, 0, e.index)) continue;
     if (e.used || e.balanceSat > 0) {
       if (e.index > highestTouched) highestTouched = e.index;
     }
@@ -734,6 +788,16 @@ export type TxSizing = {
 
 /** BIP-84 native SegWit (BTC, LTC). Witness discount applies. */
 export const P2WPKH_SIZING: TxSizing = { overheadVB: 11, inputVB: 68, outputVB: 31 };
+
+/**
+ * BIP-49 wrapped SegWit, P2SH-P2WPKH (BTC). 91 vB per input: the 23-byte
+ * scriptSig that pushes the P2WPKH program is NOT witness data, so it costs
+ * full weight — 64 bytes outside the witness (256 WU) plus the same 108 WU
+ * witness as native SegWit. A P2SH output is 32 bytes. Added 2026-09-29 (send-
+ * safety audit) with the BIP-49 account; sized as P2WPKH, a three-input send
+ * would underpay by ~70 vB.
+ */
+export const P2SH_P2WPKH_SIZING: TxSizing = { overheadVB: 11, inputVB: 91, outputVB: 32 };
 
 /** Legacy P2PKH (DOGE, DASH, BCH, RVN). No witness discount — 148 vB per input. */
 export const P2PKH_SIZING: TxSizing = { overheadVB: 10, inputVB: 148, outputVB: 34 };

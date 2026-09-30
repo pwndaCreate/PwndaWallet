@@ -1,5 +1,5 @@
 import { getAdapter } from "../wallets";
-import { firstUnusedReceiveAddress } from "../wallets/utxo-account";
+import { firstUnusedReceiveAddress, utxoAccountSpecFor } from "../wallets/utxo-account";
 /**
  * Where the UTXO account-scan results live between the sweep and the views.
  *
@@ -47,6 +47,21 @@ export function setUtxoAccountSummary(
   emit();
 }
 
+/**
+ * Drop one chain's summary — when the wallet displayed on that chain has no
+ * account to scan (2026-09-29 send-safety audit: a path outside the
+ * receive/change model, read as a single address). A summary left behind by a
+ * previous wallet there would otherwise list another account's addresses as
+ * this wallet's, and feed their history into Activity. No-op when absent.
+ */
+export function clearUtxoAccountSummary(chain: ChainType): void {
+  if (!(chain in summaries)) return;
+  const next = { ...summaries };
+  delete next[chain];
+  summaries = next;
+  emit();
+}
+
 /** Drop everything — call on logout/wallet switch so one wallet's scan can
  *  never describe another's. */
 export function clearUtxoAccountSummaries(): void {
@@ -86,37 +101,63 @@ export function totalStrandedSat(all: UtxoAccountSummaries): number {
  * Returns `null` for non-UTXO chains, before a scan has run, and after an
  * incomplete one; every caller then falls back to the primary address with its
  * own honest label.
+ *
+ * `displayedAddress` picks the account (2026-09-29 send-safety audit): the
+ * fresh address comes from the account whose first receive address is the one
+ * on screen. This used `utxoAccounts[0]`, so a BIP-49 or BIP-44 Bitcoin wallet
+ * (or a legacy LTC one) was handed a BIP-84 address — a deposit to it lands in
+ * an account the dashboard, now scanning the displayed one, does not add up.
  */
 export function useUtxoReceiveAddress(
   chain: ChainType,
   mnemonic: string | undefined | null,
+  displayedAddress: string | undefined | null,
 ): string | null {
   const summary = useUtxoAccountSummary(chain);
-  return useMemo(() => {
-    // Fail CLOSED, and never throw.
-    //
-    // This is a display-only privacy nicety. It renders inside the wallet's
-    // main view on both layouts, so anything it throws unmounts the entire
-    // tree and the user gets a blank window with no message -- the wallet
-    // becomes unusable to protect an address from being reused. That trade is
-    // never worth making, so every failure here degrades to "show the primary
-    // address" instead.
-    //
-    // Two concrete ways it could throw, both cheap to rule out:
-    //   - `getAdapter` returns `adapters[chain]` and does NOT throw on an
-    //     unmapped chain -- it returns `undefined`, so `.utxoAccounts` on it is
-    //     a TypeError. The type says ChainAdapter; the runtime disagrees.
-    //   - `firstUnusedReceiveAddress` runs `mnemonicToSeedSync`, which throws on
-    //     a malformed phrase. Chains with their own seed (XMR/ZEPH/ZANO) carry a
-    //     NON-bip39 phrase in `wallet.mnemonic`; they are excluded by the `spec`
-    //     check today, and this catch is what keeps that from being load-bearing.
-    try {
-      const spec = getAdapter(chain)?.utxoAccounts?.[0];
-      if (!spec || !mnemonic) return null;
-      return firstUnusedReceiveAddress(mnemonic, spec, summary)?.address ?? null;
-    } catch (e) {
-      console.warn("[utxo-receive] falling back to the primary address:", e);
-      return null;
-    }
-  }, [chain, mnemonic, summary]);
+  return useMemo(
+    () => utxoReceiveAddressFor(chain, mnemonic, displayedAddress, summary),
+    [chain, mnemonic, displayedAddress, summary],
+  );
+}
+
+/**
+ * The pure half of {@link useUtxoReceiveAddress}, exported for tests.
+ *
+ * Fail CLOSED, and never throw.
+ *
+ * This is a display-only privacy nicety. It renders inside the wallet's main
+ * view on both layouts, so anything it throws unmounts the entire tree and the
+ * user gets a blank window with no message -- the wallet becomes unusable to
+ * protect an address from being reused. That trade is never worth making, so
+ * every failure here degrades to "show the primary address" instead.
+ *
+ * Concrete ways it could throw, all cheap to rule out:
+ *   - `getAdapter` returns `adapters[chain]` and does NOT throw on an unmapped
+ *     chain -- it returns `undefined`, so `.utxoAccounts` on it is a TypeError.
+ *     The type says ChainAdapter; the runtime disagrees.
+ *   - `utxoAccountSpecFor` and `firstUnusedReceiveAddress` run
+ *     `mnemonicToSeedSync`, which throws on a malformed phrase. Chains with
+ *     their own seed (XMR/ZEPH/ZANO) carry a NON-bip39 phrase in
+ *     `wallet.mnemonic`; they are excluded by the `utxoAccounts` check today,
+ *     and this catch is what keeps that from being load-bearing.
+ *
+ * No account derives the displayed address (a single-address path): `null`,
+ * because there is no account to rotate through.
+ */
+export function utxoReceiveAddressFor(
+  chain: ChainType,
+  mnemonic: string | undefined | null,
+  displayedAddress: string | undefined | null,
+  summary: UtxoAccountSummary | undefined,
+): string | null {
+  try {
+    const specs = getAdapter(chain)?.utxoAccounts;
+    if (!specs || !mnemonic || !displayedAddress) return null;
+    const spec = utxoAccountSpecFor(mnemonic, specs, displayedAddress);
+    if (!spec) return null;
+    return firstUnusedReceiveAddress(mnemonic, spec, summary)?.address ?? null;
+  } catch (e) {
+    console.warn("[utxo-receive] falling back to the primary address:", e);
+    return null;
+  }
 }

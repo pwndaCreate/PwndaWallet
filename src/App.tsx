@@ -136,8 +136,10 @@ import {
 import {
   resolveUtxoAccountBalance,
 } from "./wallets/utxo-account-balance";
+import { utxoAccountSpecFor } from "./wallets/utxo-account";
 import {
   setUtxoAccountSummary,
+  clearUtxoAccountSummary,
   clearUtxoAccountSummaries,
   useUtxoAccountSummaries,
 } from "./lib/utxoAccountRegistry";
@@ -851,8 +853,21 @@ function App() {
       // paths disagreed, the hero number and the asset row would show different
       // balances for the same coin. An incomplete scan throws into the catch
       // below rather than reporting a lower bound as a balance.
-      const [bal, info] = await Promise.all([
+      //
+      // The account scanned is the one DISPLAYED (2026-09-29 send-safety
+      // audit): the spec whose first receive address is `wallet.address`. It
+      // was always `utxoAccounts[0]`, so a BIP-49/BIP-44 BTC, legacy LTC,
+      // Atomic-path DASH or Exodus-path RVN wallet had another account summed
+      // under its address — 0 while funded. No matching spec (a path outside
+      // the receive/change model) reads the displayed address alone, and drops
+      // any summary a previous wallet on this chain left behind.
+      const utxoAccount =
         adapter.utxoAccounts && wallet.mnemonic
+          ? utxoAccountSpecFor(wallet.mnemonic, adapter.utxoAccounts, wallet.address)
+          : null;
+      if (adapter.utxoAccounts && !utxoAccount) clearUtxoAccountSummary(reqChain);
+      const [bal, info] = await Promise.all([
+        utxoAccount && adapter.utxoAccounts && wallet.mnemonic
           ? resolveUtxoAccountBalance(
               reqChain,
               adapter.utxoAccounts,
@@ -992,8 +1007,16 @@ function App() {
             // costs one probe for an untouched account and only escalates to a
             // gap walk when there is history to explain. See
             // `wallets/utxo-account-balance.ts`.
-            const bal = await withTimeout(
+            //
+            // The DISPLAYED account, not `utxoAccounts[0]` — see the same
+            // choice in `refreshBalance` above (2026-09-29 send-safety audit).
+            const utxoAccount =
               a.utxoAccounts && w.mnemonic
+                ? utxoAccountSpecFor(w.mnemonic, a.utxoAccounts, w.address)
+                : null;
+            if (a.utxoAccounts && !utxoAccount) clearUtxoAccountSummary(chain);
+            const bal = await withTimeout(
+              utxoAccount && a.utxoAccounts && w.mnemonic
                 ? resolveUtxoAccountBalance(
                     chain,
                     a.utxoAccounts,

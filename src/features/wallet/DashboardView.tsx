@@ -380,7 +380,7 @@ export function DashboardView(props: {
    * output, the balance-cache fingerprint and what the swap engine watches.
    */
   const [utxoShowPrimary, setUtxoShowPrimary] = useState(false);
-  const utxoReceiveAddress = useUtxoReceiveAddress(activeChain, wallet?.mnemonic);
+  const utxoReceiveAddress = useUtxoReceiveAddress(activeChain, wallet?.mnemonic, wallet?.address);
 
   // What Receive copies: the address AccountCard is DISPLAYING, by the same
   // rule landscape uses (`displayedReceiveAddress`), and the copy-feedback key

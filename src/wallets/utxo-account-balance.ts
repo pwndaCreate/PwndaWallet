@@ -42,6 +42,7 @@ import {
   deriveUtxoAddresses,
   analyzeRecoveryRisk,
   satsToDecimal,
+  utxoAccountSpecFor,
   DEFAULT_GAP_LIMIT,
   type UtxoAccountSpec,
   type UtxoAddressEntry,
@@ -115,11 +116,27 @@ export interface UtxoAccountSummary {
   strandedEntries: UtxoAddressEntry[];
   /** Minimum gap limit a third-party wallet needs to see everything. */
   requiredGapLimit: number;
+  /**
+   * The account this summary describes: the one whose first receive address
+   * is the displayed address (`utxoAccountSpecFor`, 2026-09-29 send-safety
+   * audit). `null` only for a "Scan all derivations" run over an address no
+   * account derives. With `allAccounts`, `entries` and `totalSat` also cover
+   * the adapter's OTHER accounts; everything else about the summary is this
+   * account's.
+   */
+  account: { accountPath: string; label: string } | null;
 }
 
 interface StoredAccountState {
   /** The displayed address, so a wallet switch invalidates the record. */
   fingerprint: string;
+  /**
+   * `accountKey` of the account `entries` came from (2026-09-29 send-safety
+   * audit). Absent on records written before then, when the scanned account
+   * was always the adapter's first spec whatever the fingerprint — see
+   * `recordIsFor`.
+   */
+  account?: string;
   entries: Array<{
     path: string;
     address: string;
@@ -138,6 +155,18 @@ interface StoredAccountState {
  * as well as its BIP-84 default); it is off by default because it doubles the
  * request count and only matters when hunting for funds under another
  * derivation.
+ *
+ * # Which account (2026-09-29 send-safety audit)
+ *
+ * The one the wallet DISPLAYS: the spec whose first receive address is
+ * `displayedAddress` (`utxoAccountSpecFor`). This used to be `specs[0]`
+ * whatever the address, so a Bitcoin wallet imported on its funded BIP-49 or
+ * BIP-44 derivation — and LTC's legacy account, DASH on Atomic's path, RVN on
+ * Exodus's — had a DIFFERENT account summed under its address, and read 0
+ * while funded. An address no spec derives has no account: that throws (with
+ * `allAccounts` it still scans every spec, as a search, and persists nothing).
+ * Callers that show a balance check `utxoAccountSpecFor` first and read such
+ * an address alone.
  */
 export async function resolveUtxoAccountBalance(
   chain: ChainType,
@@ -146,15 +175,35 @@ export async function resolveUtxoAccountBalance(
   displayedAddress: string,
   opts?: { force?: boolean; allAccounts?: boolean; gapLimit?: number },
 ): Promise<UtxoAccountSummary> {
-  const primary = specs[0];
-  if (!primary) throw new Error(`${chain}: no UTXO account spec`);
+  if (specs.length === 0) throw new Error(`${chain}: no UTXO account spec`);
   const gapLimit = opts?.gapLimit ?? DEFAULT_GAP_LIMIT;
-  const useSpecs = opts?.allAccounts ? specs : [primary];
+  const primary = utxoAccountSpecFor(mnemonic, specs, displayedAddress);
+
+  if (!primary) {
+    if (!opts?.allAccounts) throw new Error(noAccountMessage(displayedAddress));
+    // A search across every account, for an address none of them derives.
+    // Nothing is persisted: there is no displayed account to cache.
+    const scans = [];
+    for (const spec of specs) scans.push(await scanUtxoAccount(mnemonic, spec, { gapLimit }));
+    return summarize(
+      chain,
+      scans.flatMap((s) => s.entries),
+      scans.every((s) => s.complete),
+      scans.reduce((n, s) => n + s.scanned, 0),
+      true,
+      null,
+    );
+  }
+  const account = { accountPath: primary.accountPath, label: primary.label };
+  const useSpecs = opts?.allAccounts
+    ? [primary, ...specs.filter((s) => s !== primary)]
+    : [primary];
 
   const stored = await readAccountState(chain);
   const fresh =
     stored &&
     stored.fingerprint === displayedAddress &&
+    recordIsFor(stored, primary, specs) &&
     Date.now() - stored.deepScannedAt < DEEP_SCAN_TTL_MS;
 
   // ── Cheap path: what a previous deep scan found, plus a lookahead ──────
@@ -162,7 +211,7 @@ export async function resolveUtxoAccountBalance(
     const candidates = cheapCandidates(mnemonic, primary, stored.entries);
     const probed = await probeAddresses(primary, candidates);
     if (!probed.complete) {
-      return summarize(chain, touchedOnly(probed.entries), false, candidates.length, false);
+      return summarize(chain, touchedOnly(probed.entries), false, candidates.length, false, account);
     }
     // NEW activity on an address the last deep scan did not know about means
     // the persisted picture is stale — something (the swap engine, another
@@ -176,7 +225,7 @@ export async function resolveUtxoAccountBalance(
       (e) => !knownAddrs.has(e.address) && (e.used || e.balanceSat > 0),
     );
     if (!surprise) {
-      return summarize(chain, touchedOnly(probed.entries), true, candidates.length, false);
+      return summarize(chain, touchedOnly(probed.entries), true, candidates.length, false, account);
     }
     // fall through to the deep walk
   }
@@ -190,10 +239,11 @@ export async function resolveUtxoAccountBalance(
       // Untouched account: no history anywhere means no change anywhere.
       await writeAccountState(chain, {
         fingerprint: displayedAddress,
+        account: accountKey(primary),
         entries: [],
         deepScannedAt: Date.now(),
       });
-      return summarize(chain, [], true, 1, false);
+      return summarize(chain, [], true, 1, false, account);
     }
   }
 
@@ -206,10 +256,19 @@ export async function resolveUtxoAccountBalance(
   const complete = scans.every((s) => s.complete);
   const scanned = scans.reduce((n, s) => n + s.scanned, 0);
 
-  if (complete) {
+  // Only the displayed account is persisted — `scans[0]`, since `useSpecs`
+  // puts it first (2026-09-29 send-safety audit). The cheap path re-probes
+  // stored addresses with THIS account's probe and sums them into THIS
+  // account's total (every stored address, for a spec without a batch probe),
+  // so another account's addresses in the record — they used to be stored
+  // after "Scan all derivations" — were added to the dashboard's number until
+  // the next deep scan.
+  const own = scans[0];
+  if (own.complete) {
     await writeAccountState(chain, {
       fingerprint: displayedAddress,
-      entries: entries.map((e) => ({
+      account: accountKey(primary),
+      entries: own.entries.map((e) => ({
         path: e.path,
         address: e.address,
         chainIndex: e.chainIndex,
@@ -218,7 +277,41 @@ export async function resolveUtxoAccountBalance(
       deepScannedAt: Date.now(),
     });
   }
-  return summarize(chain, entries, complete, scanned, true);
+  return summarize(chain, entries, complete, scanned, true, account);
+}
+
+/** Identity of an account spec within one chain. Two BTC specs share
+ *  `m/44'/0'/0'`, so the path alone is not enough. */
+function accountKey(spec: UtxoAccountSpec): string {
+  return `${spec.accountPath} ${spec.label}`;
+}
+
+/**
+ * Did this persisted record come from a scan of `primary`?
+ *
+ * Records written before 2026-09-29 carry no `account`: they were always a scan
+ * of `specs[0]`, whatever address was displayed. They are trusted only where
+ * that was the displayed account — for every default wallet, so the upgrade
+ * costs them nothing — and otherwise re-scanned: a BIP-49 wallet's old record
+ * lists BIP-84 addresses.
+ */
+function recordIsFor(
+  stored: StoredAccountState,
+  primary: UtxoAccountSpec,
+  specs: ReadonlyArray<UtxoAccountSpec>,
+): boolean {
+  if (stored.account !== undefined) return stored.account === accountKey(primary);
+  return primary === specs[0];
+}
+
+/** The refusal for an address no account derives. Shown by the account card. */
+function noAccountMessage(displayedAddress: string): string {
+  return (
+    `${displayedAddress} is not the first address of any account this wallet ` +
+    "scans (it sits on a single-address derivation path), so there is no account " +
+    "to add up: its balance is read from that address alone. “Scan all " +
+    "derivations” still searches every account this seed has on this chain."
+  );
 }
 
 /** Only addresses with history or a balance — the empty tail is not "where
@@ -307,6 +400,7 @@ function summarize(
   complete: boolean,
   scanned: number,
   deep: boolean,
+  account: UtxoAccountSummary["account"],
 ): UtxoAccountSummary {
   const totalSat = entries.reduce((s, e) => s + e.balanceSat, 0);
   const risk = analyzeRecoveryRisk({ entries });
@@ -321,6 +415,7 @@ function summarize(
     strandedSat: risk.strandedSat,
     strandedEntries: risk.strandedEntries,
     requiredGapLimit: risk.requiredGapLimit,
+    account,
   };
 }
 
