@@ -13,8 +13,14 @@
  *  - no reserve, no unfunded-recipient check, no destination tags;
  *  - Activity read `tx.Amount`, which rippled API v2 (xrpl.js 4.x's default)
  *    renames `DeliverMax`, so every amount read 0.
+ *
+ * The 2026-09-29 send-safety audit added: a payment submitted to one server,
+ * after which no server answered, came back as an ordinary failure (the form
+ * stayed filled; the next press signed a new Sequence and paid again), and
+ * the Send modal's "at most" disagreed with the send's own limit.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { isSendOutcomeUnknown } from "./send-outcome";
 
 const ABANDON =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -29,13 +35,24 @@ interface FakeServer {
   final?: string | null;
   /** Throw a connection error on the Nth `tx` lookup (1-based). */
   dropOnLookup?: number;
+  /** The connection drops while `submit` is in flight: no answer, maybe arrived. */
+  dropOnSubmit?: boolean;
+  /** `connect()` fails from this connection on (1-based); earlier ones succeed. */
+  failConnectFrom?: number;
+  /** `searched_all` on a ranged `tx` lookup that finds nothing (default true). */
+  searchedAll?: boolean;
+  /** `server_info.load_factor` (default 1). */
+  loadFactor?: number;
   ledgerIndex?: number;
   accountTx?: unknown[];
   requests: Array<{ command: string; tx_blob?: string }>;
+  connects?: number;
 }
 
 let servers: Record<string, FakeServer>;
 let nextSequence = 6;
+/** Every payment handed to `autofill`, as the wallet built it. */
+let autofilled: any[] = [];
 
 function server(partial: Partial<FakeServer>): FakeServer {
   return { accounts: {}, requests: [], ...partial };
@@ -50,7 +67,11 @@ vi.mock("xrpl", async (importOriginal) => {
       this.s = servers[url] ?? server({});
     }
     async connect() {
+      this.s.connects = (this.s.connects ?? 0) + 1;
       if ((this.s as any).down) throw new Error("connect failed");
+      if (this.s.failConnectFrom !== undefined && this.s.connects >= this.s.failConnectFrom) {
+        throw new Error("connect failed");
+      }
     }
     async disconnect() {}
     async getLedgerIndex() {
@@ -64,7 +85,10 @@ vi.mock("xrpl", async (importOriginal) => {
       // Each prepare takes the next Sequence, as the ledger's would once the
       // previous payment had been applied: a re-prepared payment is a NEW one.
       nextSequence++;
-      return { ...tx, Fee: "12", Sequence: nextSequence, LastLedgerSequence: 100, SigningPubKey: "" };
+      autofilled.push(tx);
+      // Like xrpl.js: a Fee that is set is kept; an unset one is computed
+      // (base 10 drops × the 1.2 cushion at load 1).
+      return { ...tx, Fee: tx.Fee ?? "12", Sequence: nextSequence, LastLedgerSequence: 100, SigningPubKey: "" };
     }
     async request(req: any) {
       this.s.requests.push({ command: req.command, tx_blob: req.tx_blob });
@@ -74,7 +98,7 @@ vi.mock("xrpl", async (importOriginal) => {
           return {
             result: {
               info: {
-                load_factor: 1,
+                load_factor: this.s.loadFactor ?? 1,
                 validated_ledger: { base_fee_xrp: 0.00001, reserve_base_xrp: r.base, reserve_inc_xrp: r.inc },
               },
             },
@@ -86,12 +110,16 @@ vi.mock("xrpl", async (importOriginal) => {
           return { result: { account_data: { OwnerCount: 0, Flags: 0, ...a } } };
         }
         case "submit":
+          if (this.s.dropOnSubmit) throw new Error("websocket closed");
           return { result: { engine_result: this.s.prelim ?? "tesSUCCESS", engine_result_message: "" } };
         case "tx": {
           this.lookups++;
           if (this.s.dropOnLookup === this.lookups) throw new Error("websocket closed");
           if (this.s.final === null || this.s.final === undefined) {
-            throw Object.assign(new Error("txnNotFound"), { data: { error: "txnNotFound" } });
+            // rippled adds `searched_all` when the lookup names a ledger range.
+            const data: Record<string, unknown> = { error: "txnNotFound" };
+            if (req.min_ledger !== undefined) data.searched_all = this.s.searchedAll ?? true;
+            throw Object.assign(new Error("txnNotFound"), { data });
           }
           return { result: { validated: true, meta: { TransactionResult: this.s.final } } };
         }
@@ -118,6 +146,8 @@ const [S1, S2, S3] = ["wss://xrplcluster.com", "wss://s1.ripple.com", "wss://s2.
 
 beforeEach(() => {
   nextSequence = 6;
+  autofilled = [];
+  vi.restoreAllMocks();
   // Guarded so this file can also be pointed at the pre-2026-09-29 adapter,
   // which is how its assertions were shown to fail there.
   if (XRP_CONFIRM_POLL_MS) XRP_CONFIRM_POLL_MS.value = 1;
@@ -246,8 +276,11 @@ describe("the Send modal's budget", () => {
   it("names the reserve, not the fee, as what the balance must cover", async () => {
     const b = await xrpAdapter.getGasBudget!(me.address, { amount: "24.5" });
     expect(b).toMatchObject({ ticker: "XRP", includesAmount: true, available: "25", sufficient: false });
+    // 23.999988, the send's own limit (2026-09-29 send-safety audit). This
+    // said 23.99999: the note left out the 1.2 fee cushion autofill adds, so
+    // a send of the amount it named was refused.
     expect(b.note).toBe(
-      "The XRP Ledger keeps 1 XRP of this balance locked as the account reserve, so at most 23.99999 XRP can be sent.",
+      "The XRP Ledger keeps 1 XRP of this balance locked as the account reserve, so at most 23.999988 XRP can be sent.",
     );
   });
 
@@ -300,5 +333,88 @@ describe("Activity amounts", () => {
     ];
     const page = await xrpAdapter.getTransactionHistory(me.address);
     expect(page.items[0].amount).toBe("0.000001");
+  });
+});
+
+/** The error a promise rejects with (for assertions `toThrow` cannot make). */
+async function rejection(p: Promise<unknown>): Promise<any> {
+  try {
+    await p;
+  } catch (e) {
+    return e;
+  }
+  throw new Error("expected the send to be rejected");
+}
+
+describe("a submitted payment is never reported as an ordinary failure (2026-09-29 send-safety audit)", () => {
+  it("server 1 takes it and drops, no other server answers: unknown, with the hash", async () => {
+    // The existing retry test covers "server 2 answers"; this is the case the
+    // audit found: withClient threw the last connection error as a failure.
+    servers[S1].dropOnLookup = 1;
+    (servers[S2] as any).down = true;
+    (servers[S3] as any).down = true;
+    const e = await rejection(xrpAdapter.sendTransaction(me.privateKey, other, "2"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    const blob = submits()[0].tx_blob!;
+    expect(e.hash).toBe(xrpl.hashes.hashSignedTx(blob));
+    expect(submits()).toHaveLength(1);
+    expect(nextSequence).toBe(7); // signed once
+  });
+
+  it("the connection drops while the submit is in flight: it may have arrived, so unknown", async () => {
+    servers[S1].dropOnSubmit = true;
+    (servers[S2] as any).down = true;
+    (servers[S3] as any).down = true;
+    const e = await rejection(xrpAdapter.sendTransaction(me.privateKey, other, "2"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toMatch(/^[0-9A-F]{64}$/);
+  });
+
+  it("no final word within the wait is unknown, not a failure, and not resubmitted elsewhere", async () => {
+    servers[S1].final = null; // never found; the ledger stays short of LastLedgerSequence
+    let t = Date.now();
+    vi.spyOn(Date, "now").mockImplementation(() => (t += 30_000));
+    const e = await rejection(xrpAdapter.sendTransaction(me.privateKey, other, "2"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toMatch(/^[0-9A-F]{64}$/);
+    expect(submits()).toHaveLength(1);
+  });
+
+  it("'expired, nothing was sent' only when the server vouches it searched the whole window", async () => {
+    servers[S1].final = null;
+    servers[S1].ledgerIndex = 150; // past LastLedgerSequence 100
+    servers[S1].searchedAll = false; // but missing some of those ledgers
+    const e = await rejection(xrpAdapter.sendTransaction(me.privateKey, other, "2"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(String(e.message)).not.toMatch(/Nothing was sent/);
+  });
+
+  it("stays an ordinary failure when no submit was ever sent (regression pin)", async () => {
+    servers[S1].failConnectFrom = 2; // the signing phase connects; the submit phase cannot
+    (servers[S2] as any).down = true;
+    (servers[S3] as any).down = true;
+    const e = await rejection(xrpAdapter.sendTransaction(me.privateKey, other, "2"));
+    expect(isSendOutcomeUnknown(e)).toBe(false);
+    expect(String(e.message)).toMatch(/connect failed/);
+    expect(submits()).toHaveLength(0);
+  });
+});
+
+describe("one fee for the note, the limit and the payment (2026-09-29 send-safety audit)", () => {
+  it("agrees under load too, and the signed payment pays exactly that fee", async () => {
+    // A payer of its own, so no earlier test's cached budget is read.
+    const payer = (await import("./xrp-wallet")).deriveXrpAtPath(ABANDON, "m/44'/144'/0'/0/3");
+    servers[S1].accounts[payer.address] = { Balance: "25000000" };
+    for (const s of Object.values(servers)) s.loadFactor = 1.5;
+    const b = await xrpAdapter.getGasBudget!(payer.address, {});
+    const noteMax = /at most ([\d.]+) XRP can be sent/.exec(b.note ?? "")?.[1];
+    const refused = await rejection(xrpAdapter.sendTransaction(payer.privateKey, other, "24"));
+    const sendMax = /You can send at most ([\d.]+) XRP/.exec(String(refused.message))?.[1];
+    expect(noteMax).toBe(sendMax);
+    // 10 drops × load 1.5 × autofill's 1.2 cushion = 18 drops.
+    expect(sendMax).toBe("23.999982");
+    await xrpAdapter.sendTransaction(payer.privateKey, other, sendMax!);
+    expect(xrpl.decode(submits().at(-1)!.tx_blob!).Fee).toBe("18");
+    expect(autofilled.at(-1).Fee).toBe("18");
   });
 });

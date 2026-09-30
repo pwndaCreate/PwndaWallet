@@ -21,6 +21,7 @@ import type {
   GasBudget,
   SendOptions,
 } from "./types";
+import { SendOutcomeUnknownError, isSendOutcomeUnknown } from "./send-outcome";
 
 const XRP_RPC_URLS = [
   "wss://xrplcluster.com",
@@ -129,8 +130,33 @@ interface XrpLedgerCosts {
   reserveBaseDrops: bigint;
   /** Locked per object the account owns (trust line, offer, …). */
   reserveIncDrops: bigint;
-  /** Open-ledger cost of a plain payment, at current load. */
+  /** The fee a payment from this wallet pays — see `paymentFeeDrops`. */
   feeDrops: bigint;
+}
+
+/** xrpl.js `Client` defaults: fee cushion 1.2, fee cap 2 XRP. */
+const FEE_CUSHION_TENTHS = 12n;
+const MAX_FEE_DROPS = 2_000_000n;
+
+/**
+ * The fee a payment from this wallet pays, in drops: the open-ledger cost at
+ * the current load, times xrpl.js's 1.2 cushion (so a rise in load between
+ * pricing and submitting does not strand it), rounded to a drop, capped at
+ * 2 XRP — the formula `client.autofill` uses.
+ *
+ * ONE function, and the send passes its result as the payment's `Fee`
+ * (2026-09-29 send-safety audit). The Send modal's note computed the fee
+ * without the cushion while autofill added it, so a 25 XRP account was told
+ * "at most 23.99999 XRP can be sent" and then refused at 23.99999 with "you
+ * can send at most 23.999988".
+ */
+function paymentFeeDrops(info: any): bigint {
+  const base = BigInt(xrpToDrops(String(info?.validated_ledger?.base_fee_xrp ?? 0.00001)));
+  const loadMilli = BigInt(Math.max(1000, Math.round(Number(info?.load_factor ?? 1) * 1000)));
+  // base × (loadMilli / 1000) × (12 / 10), rounded half up to a whole drop.
+  const denom = 1000n * 10n;
+  const fee = (base * loadMilli * FEE_CUSHION_TENTHS + denom / 2n) / denom;
+  return fee < MAX_FEE_DROPS ? fee : MAX_FEE_DROPS;
 }
 
 async function readLedgerCosts(client: Client): Promise<XrpLedgerCosts> {
@@ -140,12 +166,10 @@ async function readLedgerCosts(client: Client): Promise<XrpLedgerCosts> {
   if (v?.reserve_base_xrp == null || v?.reserve_inc_xrp == null) {
     throw new Error("The XRP Ledger reserve is unavailable right now");
   }
-  const baseFee = BigInt(xrpToDrops(String(v.base_fee_xrp ?? 0.00001)));
-  const load = BigInt(Math.max(1, Math.ceil(Number(info.load_factor ?? 1))));
   return {
     reserveBaseDrops: BigInt(xrpToDrops(String(v.reserve_base_xrp))),
     reserveIncDrops: BigInt(xrpToDrops(String(v.reserve_inc_xrp))),
-    feeDrops: baseFee * load,
+    feeDrops: paymentFeeDrops(info),
   };
 }
 
@@ -169,9 +193,39 @@ const budgetCache = new Map<
  * late reconnect reads a validated payment as a lost one.
  *
  * Resolves with the final `TransactionResult` (`tesSUCCESS`, `tec…`).
+ *
+ * Once a `submit` has been SENT to any server, the payment may be on the
+ * ledger, so no later failure is reported as an ordinary one (2026-09-29
+ * send-safety audit). Server 1 could accept the payment and every server then
+ * drop: `withClient` threw the last connection error, the wallet said
+ * "Transaction failed" with the form still filled, and one more press
+ * autofilled a NEW Sequence and paid again. Such an ending is now
+ * `SendOutcomeUnknownError` with the hash, as is the 120 s wait running out.
+ * A failure before any submit was sent stays ordinary: nothing left the
+ * wallet, and trying again is safe.
  */
-async function submitAndConfirm(blob: string, hash: string, lastLedger: number): Promise<string> {
-  return withClient(async (client) => {
+async function submitAndConfirm(
+  blob: string,
+  hash: string,
+  /** Validated ledger seen just before signing: no ledger before it can hold the payment. */
+  firstLedger: number,
+  lastLedger: number,
+): Promise<string> {
+  // Set as a submit request is SENT: one that errors may still have arrived.
+  let submitted = false;
+  try {
+    return await withClient((client) => confirmOn(client));
+  } catch (e) {
+    if (e instanceof XrpFinalError || isSendOutcomeUnknown(e) || !submitted) throw e;
+    throw new SendOutcomeUnknownError(
+      `The payment was submitted, then no XRP Ledger server could be asked how it ended ` +
+        `(${e instanceof Error ? e.message : String(e)}).`,
+      hash,
+    );
+  }
+
+  async function confirmOn(client: Client): Promise<string> {
+    submitted = true;
     const sub: any = await client.request({ command: "submit", tx_blob: blob });
     const prelim: string = sub?.result?.engine_result ?? "";
     // `tem`: malformed, never applies anywhere. Everything else — including
@@ -191,6 +245,27 @@ async function submitAndConfirm(blob: string, hash: string, lastLedger: number):
         throw e;
       }
     };
+    /**
+     * The lookup that may conclude "never included": over the payment's whole
+     * window, so the server can say whether it holds every ledger in it.
+     * "Not found" from a server missing some of them proves nothing.
+     */
+    const windowLookup = async (): Promise<{ found: any | null; searchedAll: boolean }> => {
+      try {
+        const r: any = await client.request({
+          command: "tx",
+          transaction: hash,
+          min_ledger: firstLedger,
+          max_ledger: lastLedger,
+        } as any);
+        return { found: r.result ?? null, searchedAll: true };
+      } catch (e: any) {
+        if (e?.data?.error === "txnNotFound") {
+          return { found: null, searchedAll: e?.data?.searched_all === true };
+        }
+        throw e;
+      }
+    };
     const deadline = Date.now() + 120_000;
     for (;;) {
       await new Promise((r) => setTimeout(r, XRP_CONFIRM_POLL_MS.value));
@@ -198,20 +273,28 @@ async function submitAndConfirm(blob: string, hash: string, lastLedger: number):
       if (found?.validated) return String(found.meta?.TransactionResult ?? "");
       const latest = await client.getLedgerIndex();
       if (latest > lastLedger) {
-        const last = await lookup();
-        if (last?.validated) return String(last.meta?.TransactionResult ?? "");
+        const last = await windowLookup();
+        if (last.found?.validated) return String(last.found.meta?.TransactionResult ?? "");
+        // Say "nothing was sent" only when the server vouches that it
+        // searched every ledger the payment could be in (2026-09-29).
+        if (!last.searchedAll) {
+          throw new SendOutcomeUnknownError(
+            `The XRP Ledger server could not confirm it holds every ledger this payment could be in.`,
+            hash,
+          );
+        }
         throw new XrpFinalError(
           `The payment expired before any ledger included it (last allowed ledger ${lastLedger}). ` +
             `Nothing was sent. Preliminary result: ${prelim}.`,
         );
       }
       if (Date.now() > deadline) {
-        throw new XrpFinalError(
-          `No final result for ${hash} yet. Check it on an explorer before sending again.`,
-        );
+        // Not a failure: the payment can still be validated until its last
+        // ledger. Unknown, with the hash, and the form closed.
+        throw new SendOutcomeUnknownError(`No final result from the XRP Ledger yet.`, hash);
       }
     }
-  });
+  }
 }
 
 /** Poll interval for `submitAndConfirm`. Mutable for tests only. */
@@ -312,8 +395,9 @@ async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
         await client.disconnect();
       }
     } catch (e) {
-      // A final answer is the same from any server; say it once.
-      if (e instanceof XrpFinalError) throw e;
+      // A final answer is the same from any server; say it once. So is an
+      // unknown outcome: another server would only resubmit and wait again.
+      if (e instanceof XrpFinalError || isSendOutcomeUnknown(e)) throw e;
       lastError = e;
       continue;
     }
@@ -442,8 +526,14 @@ export const xrpAdapter: ChainAdapter = {
         Account: wallet.classicAddress,
         Destination: destination,
         Amount: drops.toString(),
+        // The same fee the Send modal's note subtracts (`paymentFeeDrops`).
+        // autofill keeps a Fee that is set; left unset, it computed its own.
+        Fee: costs.feeDrops.toString(),
         ...(tag !== undefined ? { DestinationTag: tag } : {}),
       };
+      // No ledger before this one can hold the payment: the lower end of the
+      // window `submitAndConfirm` searches before it says "nothing was sent".
+      const firstLedger = await client.getLedgerIndex();
       const prepared = await client.autofill(payment);
       const fee = BigInt(prepared.Fee ?? "0");
       const locked = costs.reserveBaseDrops + costs.reserveIncDrops * BigInt(sender.ownerCount);
@@ -473,11 +563,16 @@ export const xrpAdapter: ChainAdapter = {
         throw new XrpFinalError("Could not set the payment's expiry ledger; nothing was sent.");
       }
       const s = wallet.sign(prepared);
-      return { blob: s.tx_blob, hash: s.hash, lastLedger };
+      return { blob: s.tx_blob, hash: s.hash, firstLedger, lastLedger };
     });
 
     // 2. Submit those bytes and wait for the verdict.
-    const result = await submitAndConfirm(signed.blob, signed.hash, signed.lastLedger);
+    const result = await submitAndConfirm(
+      signed.blob,
+      signed.hash,
+      signed.firstLedger,
+      signed.lastLedger,
+    );
     budgetCache.delete(wallet.classicAddress);
     if (result !== "tesSUCCESS") {
       const meaning = TEC_MEANING[result];
@@ -670,13 +765,16 @@ export const xrpAdapter: ChainAdapter = {
       const info = r.result.info as any;
       const baseXrp = Number(info.validated_ledger?.base_fee_xrp ?? 0.00001);
       const load = Number(info.load_factor ?? 1);
-      const normal = baseXrp * load;
-      // No `fast` tier officially exposed; bumping by 20% / 50% is the
-      // common pattern XRPL clients use to clear loaded ledgers.
+      // `normal` is the fee a send pays (2026-09-29): the same
+      // `paymentFeeDrops` the budget note and the send's limit use, so the
+      // modal shows one fee, not 0.00001 beside a refusal quoting 0.000012.
+      const normalDrops = paymentFeeDrops(info);
+      // No `fast` tier officially exposed; bumping by 50% is the common
+      // pattern XRPL clients use to clear loaded ledgers.
       return {
         slow: { value: baseXrp.toFixed(6) },
-        normal: { value: normal.toFixed(6) },
-        fast: { value: (normal * 1.5).toFixed(6) },
+        normal: { value: xrpFixed6(normalDrops) },
+        fast: { value: xrpFixed6((normalDrops * 3n) / 2n) },
         unit: "XRP",
         fetchedAt: Date.now(),
         raw: { base_fee_xrp: baseXrp, load_factor: load },
