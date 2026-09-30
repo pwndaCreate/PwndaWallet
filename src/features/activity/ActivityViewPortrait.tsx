@@ -85,8 +85,8 @@ export function ActivityViewPortrait({
 
   // One status per DISTINCT chain, merged across its address keys — the
   // same data path as landscape (`historyStatus.ts`, operator report
-  // 2026-09-30: `chainsOwned` repeats a UTXO chain per account address, so
-  // this listed those rows once per address).
+  // 2026-09-30: `chainsOwned` then repeated a UTXO chain per account
+  // address, so this listed those rows once per address).
   const statuses = useMemo(
     () => chainHistoryStatuses(chainsOwned, { txByChain, loading, errors }),
     [chainsOwned, txByChain, loading, errors]

@@ -80,10 +80,12 @@ export interface ChainHistoryStatus {
 }
 
 /**
- * One status per DISTINCT chain. `chainsOwned` repeats a UTXO chain once per
- * account address (App.tsx builds it from every `chain:address` pair), which
- * is why the Activity lists showed each LTC row once per address; each chain
- * is merged across all of its address keys exactly once here.
+ * One status per DISTINCT chain, each merged across all of its address keys
+ * exactly once. `chainsOwned` used to repeat a UTXO chain once per account
+ * address (App.tsx built it from every `chain:address` pair), which is why
+ * the Activity lists showed each LTC row once per address. App passes each
+ * chain once since 2026-09-30 (`ownedChainsOf`); the dedupe here stays so a
+ * caller that repeats a chain still cannot list its rows twice.
  */
 export function chainHistoryStatuses(
   chainsOwned: ChainType[],

@@ -16,8 +16,10 @@
  *  - The window has no OS title bar (`decorations: false`). It is dragged by
  *    the app's own title bar, a `data-tauri-drag-region` 34 px (portrait) or
  *    36 px (landscape) tall at the top of the window.
- *  - A backdrop is `position: fixed; inset: 0; z-index: 60`, so it covers
- *    that title bar. Tauri's drag script (tauri 2.11.5,
+ *  - A backdrop was `position: fixed; inset: 0; z-index: 60` inside `.app`,
+ *    and in portrait it covered that title bar, which has no layer of its
+ *    own (see `MODAL_BACKDROP_Z` below for the order now). Tauri's drag
+ *    script (tauri 2.11.5,
  *    `src/window/scripts/drag.js`) starts a drag only when the pressed element
  *    itself carries the attribute. A press on the title bar landed on the
  *    backdrop instead: the window did not move, and the release was a `click`

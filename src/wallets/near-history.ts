@@ -19,9 +19,11 @@
  * Gas-refund receipts (`system → <account>`) are dropped; they are not
  * payments.
  *
- * NearBlocks is fetched directly, like TronGrid: `nearblocks.io` is not on
- * the backend proxy's allowlist (`http_proxy.rs`), and adding it there is a
- * Rust change. The request carries only the public account ID.
+ * NearBlocks is fetched directly from the webview: `nearblocks.io` is not
+ * on the backend proxy's allowlist (`http_proxy.rs`), and adding it there is
+ * a Rust change. (TRON history, once fetched the same way, goes through the
+ * proxy now — `trx-wallet.ts`.) The request carries only the public
+ * account ID.
  *
  * Amounts: NearBlocks serialises `deposit` as a JSON NUMBER (`8.4768049e+23`
  * yoctoNEAR), so precision past ~16 significant digits is already gone when

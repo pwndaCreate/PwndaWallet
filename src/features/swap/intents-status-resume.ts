@@ -16,11 +16,12 @@
  *
  * # When it runs
  *
- * Once per session, the first time the swap form mounts (both layouts mount
- * `SwapForm`). Not at app start: this branch does not touch `App.tsx` (the
- * lead's file). Wiring `resumePendingIntentsSwapsOnce()` into app start is a
- * one-line follow-up; until then a pending swap resumes when the Swap screen
- * is first opened.
+ * Once per session, as soon as a wallet is open: `App.tsx` calls
+ * `resumePendingIntentsSwapsOnce()` when `walletsByChain` fills (2026-09-30).
+ * The first mount of `SwapForm` still calls it too; the `Once` makes the
+ * second call a no-op. Before that App wiring, a pending swap resumed only
+ * when the Swap screen was first opened, so after a restart a finished swap
+ * read "pending" in Activity until then.
  */
 import {
   intentsStatusToHistory,

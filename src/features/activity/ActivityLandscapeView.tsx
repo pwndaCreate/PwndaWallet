@@ -87,7 +87,7 @@ export function ActivityLandscapeView({
 
   // One status per DISTINCT chain, its rows merged across every address key
   // (`historyStatus.ts`, operator report 2026-09-30). This read one key per
-  // entry of `chainsOwned`, which repeats a UTXO chain once per account
+  // entry of `chainsOwned`, which then repeated a UTXO chain once per account
   // address — so each of those rows was listed once per address — and it only
   // ever read the LAST address `addressByChain` held for the chain.
   const statuses = useMemo(
