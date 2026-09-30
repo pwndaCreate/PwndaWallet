@@ -44,8 +44,15 @@ import { sourceSecretFor } from "./asset-capabilities";
 import { SwapConfirmModal } from "./SwapConfirmModal";
 import {
   loadSwapHistory,
+  onSwapHistoryChange,
   type SwapHistoryEntry,
 } from "./swap-history-store";
+import {
+  SWAP_ROW_OPEN_STYLE,
+  SwapDetailsModal,
+  swapRowOpenProps,
+} from "./SwapDetailsModal";
+import { openExplorer } from "./TxHashField";
 import { useSwapSettings } from "../settings/useSwapSettings";
 import { deriveWalletAddresses } from "./asset-address-resolver";
 import { defaultBlockchainFor } from "./intents-dedup";
@@ -216,6 +223,11 @@ export function SwapView({
   const [deskConfirmOpen, setDeskConfirmOpen] = useState(false);
   const [sidecarConfirmOpen, setSidecarConfirmOpen] = useState(false);
   const [history, setHistory] = useState<SwapHistoryEntry[]>([]);
+  // Same as landscape (2026-09-30): the swap whose details are open, and a
+  // tick bumped by every committed history write so the list stays current.
+  const [detailsId, setDetailsId] = useState<string | null>(null);
+  const [historyTick, setHistoryTick] = useState(0);
+  useEffect(() => onSwapHistoryChange(() => setHistoryTick((n) => n + 1)), []);
 
   // Fresh-install contract: NOTHING invokes a `swap_sidecar_*` command before
   // the user has opted in. `optedIn === null` means the read is still in
@@ -322,7 +334,7 @@ export function SwapView({
     return () => {
       cancel = true;
     };
-  }, [subTab, confirmOpen, deskConfirmOpen, sidecarConfirmOpen]);
+  }, [subTab, confirmOpen, deskConfirmOpen, sidecarConfirmOpen, historyTick]);
 
   // True when we have a quote (SwapKit OR NEAR Intents) and both wallets.
   // Pre-2026-05-25 the predicate only checked `isSwapKitRoutable`, which
@@ -695,7 +707,9 @@ export function SwapView({
         </>
       )}
 
-      {subTab === "history" && <HistoryList history={history} />}
+      {subTab === "history" && (
+        <HistoryList history={history} onOpen={(id) => setDetailsId(id)} />
+      )}
 
       {/* Option C 2026-05-25 — ZephyrEcosystemSwapCard is now mounted
           inside the swap-mode conditional above (embedded as the Zephyr
@@ -723,6 +737,13 @@ export function SwapView({
           onClose={() => setConfirmOpen(false)}
         />
       )}
+
+      {/* One swap's details, opened from the history list. The same component
+          landscape and both Activity layouts mount. */}
+      <SwapDetailsModal
+        entry={detailsId ? history.find((h) => h.id === detailsId) ?? null : null}
+        onClose={() => setDetailsId(null)}
+      />
 
       {/* Desk confirm modal. Gated on `deskReady` (which asserts the quote's
           source is pwnda-desk) rather than the shared predicate, so an
@@ -1025,7 +1046,14 @@ const STRIP_NOTE: React.CSSProperties = {
   color: "var(--text-muted)",
 };
 
-function HistoryList({ history }: { history: SwapHistoryEntry[] }) {
+function HistoryList({
+  history,
+  onOpen,
+}: {
+  history: SwapHistoryEntry[];
+  /** Opens the swap's details (2026-09-30). */
+  onOpen: (id: string) => void;
+}) {
   if (history.length === 0) {
     return (
       <div
@@ -1054,6 +1082,7 @@ function HistoryList({ history }: { history: SwapHistoryEntry[] }) {
       {history.map((h, i) => (
         <div
           key={h.id}
+          {...swapRowOpenProps(() => onOpen(h.id))}
           style={{
             display: "flex",
             alignItems: "center",
@@ -1064,6 +1093,7 @@ function HistoryList({ history }: { history: SwapHistoryEntry[] }) {
                 ? "1px solid var(--border-soft)"
                 : "none",
             fontFamily: "var(--font-mono)",
+            ...SWAP_ROW_OPEN_STYLE,
           }}
         >
           <div style={{ display: "flex", alignItems: "center" }}>
@@ -1096,25 +1126,15 @@ function HistoryList({ history }: { history: SwapHistoryEntry[] }) {
               }}
             >
               <span>{prettyAgo(h.createdAt)}</span>
+              {/* Buttons, not <a target="_blank">: the row is clickable now,
+                  and a link that stopped its click from opening the row
+                  would also stop the opener plugin from ever seeing it
+                  (see TxHashField.tsx). */}
               {h.sourceExplorerUrl && (
-                <a
-                  href={h.sourceExplorerUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{ color: "var(--accent)" }}
-                >
-                  source ↗
-                </a>
+                <HistoryLink label="source ↗" url={h.sourceExplorerUrl} />
               )}
               {h.destExplorerUrl && (
-                <a
-                  href={h.destExplorerUrl}
-                  target="_blank"
-                  rel="noreferrer"
-                  style={{ color: "var(--accent)" }}
-                >
-                  dest ↗
-                </a>
+                <HistoryLink label="dest ↗" url={h.destExplorerUrl} />
               )}
             </div>
           </div>
@@ -1138,6 +1158,32 @@ function HistoryList({ history }: { history: SwapHistoryEntry[] }) {
         </div>
       ))}
     </div>
+  );
+}
+
+/** An explorer shortcut inside a clickable history row: opens the explorer
+ *  and keeps the click from also opening the row's details. */
+function HistoryLink({ label, url }: { label: string; url: string }) {
+  return (
+    <button
+      type="button"
+      title={url}
+      onClick={(e) => {
+        e.stopPropagation();
+        void openExplorer(url);
+      }}
+      style={{
+        background: "transparent",
+        border: "none",
+        padding: 0,
+        color: "var(--accent)",
+        fontFamily: "inherit",
+        fontSize: "inherit",
+        cursor: "pointer",
+      }}
+    >
+      {label}
+    </button>
   );
 }
 

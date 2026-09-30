@@ -14,6 +14,9 @@ import {
   driftTone,
   formatActualReceived,
   formatDriftPercent,
+  SWAP_ROW_OPEN_STYLE,
+  SwapDetailsModal,
+  swapRowOpenProps,
   type SwapHistoryEntry,
 } from "../swap";
 import {
@@ -74,8 +77,10 @@ export function ActivityLandscapeView({
 
   // Cross-chain swap history — drives both the dedup of `all`-mode
   // chain-tx rows and the `swaps` filter's rendering.
-  const [swapHistory] = useSwapHistory();
+  const [swapHistory, reloadSwapHistory] = useSwapHistory();
   const swapHashes = useMemo(() => swapHashSet(swapHistory), [swapHistory]);
+  // A swap row opens the shared swap details modal (2026-09-30).
+  const [openSwapId, setOpenSwapId] = useState<string | null>(null);
 
   // Flatten + dedup against swap hashes + sort newest-first.
   const allTxs = useMemo(() => {
@@ -350,7 +355,9 @@ export function ActivityLandscapeView({
             ) : (
               sortedSwapHistory
                 .slice(0, 100)
-                .map((s) => <LandscapeSwapRow key={s.id} swap={s} />)
+                .map((s) => (
+                  <LandscapeSwapRow key={s.id} swap={s} onOpen={() => setOpenSwapId(s.id)} />
+                ))
             )
           ) : filtered.length === 0 ? (
             <div
@@ -516,6 +523,13 @@ export function ActivityLandscapeView({
           </div>
         )}
       </div>
+
+      {/* The shared swap details modal (2026-09-30), opened by a SWAPS row. */}
+      <SwapDetailsModal
+        entry={openSwapId ? swapHistory.find((s) => s.id === openSwapId) ?? null : null}
+        onClose={() => setOpenSwapId(null)}
+        onHistoryChanged={reloadSwapHistory}
+      />
     </div>
   );
 }
@@ -768,7 +782,14 @@ function DetailRow({
  * cleanly into the landscape's per-tx column layout. Two-line layout
  * matches the portrait `SwapRow`.
  */
-function LandscapeSwapRow({ swap }: { swap: SwapHistoryEntry }) {
+function LandscapeSwapRow({
+  swap,
+  onOpen,
+}: {
+  swap: SwapHistoryEntry;
+  /** Opens the swap's details (2026-09-30). */
+  onOpen: () => void;
+}) {
   const ts = swapEntryTimestamp(swap);
   const actualDisplay = formatActualReceived(swap.actualReceived, swap.toAsset);
   const drift = computeDriftFraction(swap.toAmount, actualDisplay ?? undefined);
@@ -792,10 +813,12 @@ function LandscapeSwapRow({ swap }: { swap: SwapHistoryEntry }) {
     h.length > 16 ? `${h.slice(0, 8)}…${h.slice(-6)}` : h;
   return (
     <div
+      {...swapRowOpenProps(onOpen, "rgba(0,204,102,0.02)")}
       style={{
         padding: "10px 14px",
         borderBottom: "1px solid var(--border)",
         background: "rgba(0,204,102,0.02)",
+        ...SWAP_ROW_OPEN_STYLE,
       }}
     >
       <div
@@ -886,6 +909,7 @@ function LandscapeSwapRow({ swap }: { swap: SwapHistoryEntry }) {
             style={{ cursor: "pointer" }}
             title={`${swap.sourceTxHash}\n(click: open in explorer · shift-click: copy)`}
             onClick={(e) => {
+              e.stopPropagation(); // the row behind opens the details
               if (e.shiftKey) {
                 void navigator.clipboard.writeText(swap.sourceTxHash);
                 return;
@@ -904,6 +928,7 @@ function LandscapeSwapRow({ swap }: { swap: SwapHistoryEntry }) {
               style={{ cursor: "pointer" }}
               title={`${swap.destTxHash}\n(click: open in explorer · shift-click: copy)`}
               onClick={(e) => {
+                e.stopPropagation(); // the row behind opens the details
                 if (e.shiftKey) {
                   void navigator.clipboard.writeText(swap.destTxHash ?? "");
                   return;

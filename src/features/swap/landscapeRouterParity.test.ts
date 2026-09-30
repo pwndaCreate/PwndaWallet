@@ -407,3 +407,87 @@ describe("tab switch → pair reconciliation is wired in both layouts", () => {
     }
   });
 });
+
+/**
+ * 2026-09-30, the operator's report: the confirm modal of a running swap
+ * "disappeared", and there was no way back to it: "click on the recent swaps
+ * and have the swap screen re-appear", "click on current and past swaps and
+ * see the data on them".
+ *
+ * Every list that shows swaps now opens ONE details modal: RECENT SWAPS in
+ * both Swap layouts, and the SWAPS filter in both Activity layouts. The same
+ * lesson as the strips above, for a fifth component: a list that renders rows
+ * but not the modal is a row that looks clickable and opens nothing. Sources
+ * are read with comments stripped (as `wallet/layout-parity.test.ts` does), so
+ * a comment naming the modal can never stand in for a mount.
+ */
+describe("every swap list opens the shared SwapDetailsModal, in both layouts", () => {
+  const strip = (s: string) =>
+    s
+      .replace(/\r\n/g, "\n")
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/(^|[^:"'`])\/\/.*$/gm, "$1");
+  const code = (rel: string) => strip(readFileSync(resolve(process.cwd(), rel), "utf8"));
+  const SWAP_LISTS = [
+    ["swap landscape (RECENT SWAPS)", "src/features/swap/SwapLandscapeView.tsx"],
+    ["swap portrait (history)", "src/features/swap/SwapView.tsx"],
+    ["activity landscape (SWAPS)", "src/features/activity/ActivityLandscapeView.tsx"],
+    ["activity portrait (SWAPS)", "src/features/activity/ActivityViewPortrait.tsx"],
+  ] as const;
+
+  it("control: the reader cannot be satisfied by prose", () => {
+    expect(strip("/* <SwapDetailsModal /> */ x")).not.toMatch(/<SwapDetailsModal/);
+    expect(strip("{/* <SwapDetailsModal /> */}")).not.toMatch(/<SwapDetailsModal/);
+    expect(strip("// {...swapRowOpenProps(\n")).not.toMatch(/swapRowOpenProps\(/);
+  });
+
+  for (const [label, rel] of SWAP_LISTS) {
+    it(`${label} mounts <SwapDetailsModal> and its swap rows open it`, () => {
+      const src = code(rel);
+      expect(src, `${label} never renders the details modal`).toMatch(/<SwapDetailsModal[\s/>]/);
+      expect(src, `${label}: the swap rows are not clickable`).toMatch(/\{\.\.\.swapRowOpenProps\(/);
+    });
+  }
+
+  it("one implementation: the Swap views import it from its file, Activity from the swap barrel", () => {
+    for (const rel of ["src/features/swap/SwapLandscapeView.tsx", "src/features/swap/SwapView.tsx"]) {
+      expect(code(rel), rel).toMatch(
+        /import\s*\{[^}]*\bSwapDetailsModal\b[^}]*\}\s*from\s*"\.\/SwapDetailsModal"/s,
+      );
+    }
+    for (const rel of [
+      "src/features/activity/ActivityLandscapeView.tsx",
+      "src/features/activity/ActivityViewPortrait.tsx",
+    ]) {
+      const src = code(rel);
+      expect(src, rel).toMatch(/import\s*\{[^}]*\bSwapDetailsModal\b[^}]*\}\s*from\s*"\.\.\/swap"/s);
+      expect(src, rel).not.toMatch(/function SwapDetailsModal/);
+    }
+    expect(code("src/features/swap/index.ts")).toMatch(/\bSwapDetailsModal\b[^}]*\}\s*from\s*"\.\/SwapDetailsModal"/s);
+  });
+
+  it("a hash chip inside an Activity swap row stops its click, so it does not also open the row", () => {
+    for (const [rel, fn] of [
+      ["src/features/activity/ActivityLandscapeView.tsx", "function LandscapeSwapRow("],
+      ["src/features/activity/ActivityViewPortrait.tsx", "function SwapRow("],
+    ] as const) {
+      const src = code(rel);
+      const row = src.slice(src.indexOf(fn));
+      const opens = row.match(/openExternal\(swap\./g)?.length ?? 0;
+      const stops = row.match(/e\.stopPropagation\(\)/g)?.length ?? 0;
+      expect(opens, rel).toBeGreaterThan(0);
+      expect(stops, `${rel}: a chip that opens the explorer must stop its click`).toBeGreaterThanOrEqual(opens);
+    }
+  });
+
+  it("the confirm modal shows hashes through TxHashField, keeps no anchors, and gates its backdrop", () => {
+    const src = code("src/features/swap/SwapConfirmModal.tsx");
+    // Every <a target="_blank"> in it was dead (the card stopped the click
+    // before tauri-plugin-opener's window listener could see it).
+    expect(src).not.toMatch(/<a\s/);
+    expect(src).toMatch(/<TxHashField label="source tx" value=\{exec\.sourceTxHash\}/);
+    expect(src).toMatch(
+      /<Backdrop onClick=\{!busy && swapModalBackdropCloses\(stage\) \? requestClose : undefined\}>/,
+    );
+  });
+});

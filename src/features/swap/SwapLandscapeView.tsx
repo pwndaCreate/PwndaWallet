@@ -48,8 +48,14 @@ import {
 } from "../swap-sidecar";
 import {
   loadSwapHistory,
+  onSwapHistoryChange,
   type SwapHistoryEntry,
 } from "./swap-history-store";
+import {
+  SWAP_ROW_OPEN_STYLE,
+  SwapDetailsModal,
+  swapRowOpenProps,
+} from "./SwapDetailsModal";
 import { useSwapSettings } from "../settings/useSwapSettings";
 import { deriveWalletAddresses } from "./asset-address-resolver";
 import {
@@ -185,6 +191,12 @@ export function SwapLandscapeView({
   const [deskConfirmOpen, setDeskConfirmOpen] = useState(false);
   const [sidecarConfirmOpen, setSidecarConfirmOpen] = useState(false);
   const [history, setHistory] = useState<SwapHistoryEntry[]>([]);
+  // The swap whose details are open (2026-09-30: a row under RECENT SWAPS
+  // opens `SwapDetailsModal`), and a tick bumped by every committed history
+  // write so this list shows what the background pollers record.
+  const [detailsId, setDetailsId] = useState<string | null>(null);
+  const [historyTick, setHistoryTick] = useState(0);
+  useEffect(() => onSwapHistoryChange(() => setHistoryTick((n) => n + 1)), []);
 
   const sourceAddress = useMemo(
     () => addressForTicker(fromCoin, walletsByChain),
@@ -286,7 +298,7 @@ export function SwapLandscapeView({
     return () => {
       cancel = true;
     };
-  }, [confirmOpen, deskConfirmOpen]);
+  }, [confirmOpen, deskConfirmOpen, historyTick]);
 
   // BasicSwap — the ONLY route carrying XMR against a bitcoin-family coin,
   // and the only peer-to-peer route for a bitcoin-family pair. Mirrors
@@ -607,6 +619,9 @@ export function SwapLandscapeView({
               return (
                 <div
                   key={h.id}
+                  // A row opens the swap's details (2026-09-30 report: "click
+                  // on the recent swaps and have the swap screen re-appear").
+                  {...swapRowOpenProps(() => setDetailsId(h.id))}
                   style={{
                     display: "flex",
                     alignItems: "center",
@@ -614,6 +629,7 @@ export function SwapLandscapeView({
                     padding: "10px 0",
                     borderBottom: "1px solid var(--border-soft)",
                     fontFamily: "var(--font-mono)",
+                    ...SWAP_ROW_OPEN_STYLE,
                   }}
                 >
                   <div
@@ -711,6 +727,13 @@ export function SwapLandscapeView({
           onClose={() => setConfirmOpen(false)}
         />
       )}
+
+      {/* One swap's details, opened from RECENT SWAPS. The same component
+          portrait and both Activity layouts mount. */}
+      <SwapDetailsModal
+        entry={detailsId ? history.find((h) => h.id === detailsId) ?? null : null}
+        onClose={() => setDetailsId(null)}
+      />
 
       {/* Desk confirm modal. Gated on `deskReady` (which asserts the quote's
           source is pwnda-desk) rather than the shared predicate, so an

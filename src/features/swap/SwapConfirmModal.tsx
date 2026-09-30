@@ -49,6 +49,7 @@ import {
 import { depositMemoToAttach, quoteHasDepositMemo } from "./intents-deposit-memo";
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 import { withTimeout } from "./broadcast-outcome";
+import { TxHashField } from "./TxHashField";
 
 /**
  * Confirm modal for a SwapKit-routable swap. Renders the locked-in quote,
@@ -86,6 +87,12 @@ import { withTimeout } from "./broadcast-outcome";
  * unlocked, and carried into the attempt record, the history row and every
  * status query — the Stellar deposit address is shared, and the memo is what
  * names this swap's deposit.
+ *
+ * 2026-09-30 (the operator's report: moving the window made this "disappear",
+ * and the source tx looked like a link but did nothing): a backdrop click
+ * closes it only in review and password (`swapModalBackdropCloses`), and the
+ * hashes are shown whole with a working explorer button (`TxHashField`). A
+ * closed swap reopens from Recent swaps or Activity (`SwapDetailsModal`).
  */
 export function SwapConfirmModal({
   open,
@@ -765,9 +772,13 @@ export function SwapConfirmModal({
   };
 
   return (
-    <Backdrop onClick={busy ? undefined : requestClose}>
+    // The backdrop closes this only before anything is signed; after that only
+    // the × (or a footer's Close) does (2026-09-30, see
+    // `swapModalBackdropCloses`). The card no longer stops click propagation:
+    // `Backdrop` ignores clicks that did not start and end on itself, and the
+    // stop was what kept the old explorer links from ever opening.
+    <Backdrop onClick={!busy && swapModalBackdropCloses(stage) ? requestClose : undefined}>
       <div
-        onClick={(e) => e.stopPropagation()}
         style={{
           width: "min(560px, 92vw)",
           maxHeight: "90vh",
@@ -1131,6 +1142,21 @@ export function modalIsBusy(stage: string, phase: SwapExecutionStatus["phase"]):
   );
 }
 
+/**
+ * Whether a click on the dimmed backdrop may close this modal (2026-09-30,
+ * the operator's report: "When I try to move the app the swap screen
+ * unfocuses and disappears").
+ *
+ * Only in review and password, before anything is signed. From Unlock & Sign
+ * on, the deposit may be on its way and this screen is where its hash and
+ * status are, so only the × (or a footer's Close button) closes it. The
+ * history row keeps the hash either way, and the swap reopens from Recent
+ * swaps or Activity.
+ */
+export function swapModalBackdropCloses(stage: string): boolean {
+  return stage === "review" || stage === "password";
+}
+
 /** "14:32 (in 23 min)" — or why the window is shut (F4). */
 function formatDepositWindow(deadline: string | undefined, minutesLeft: number | null): string {
   if (!deadline || minutesLeft === null) return "unknown — get a new quote";
@@ -1338,7 +1364,7 @@ function PasswordFooter({
   );
 }
 
-function ExecutingFooter({
+export function ExecutingFooter({
   exec,
   sourceExplorer,
 }: {
@@ -1406,22 +1432,11 @@ function ExecutingFooter({
           );
         })}
       </div>
+      {/* The whole hash, Copy, and an explorer button that works. It was
+          `truncate(hash)` in an <a target="_blank"> that the card's
+          stopPropagation kept from ever opening (2026-09-30 report). */}
       {exec.sourceTxHash && (
-        <div style={{ fontSize: 10, color: "var(--text-dim)" }}>
-          source tx:{" "}
-          {sourceExplorer ? (
-            <a
-              href={sourceExplorer}
-              target="_blank"
-              rel="noreferrer"
-              style={{ color: "var(--accent)" }}
-            >
-              {truncate(exec.sourceTxHash)}
-            </a>
-          ) : (
-            <span className="tnum">{truncate(exec.sourceTxHash)}</span>
-          )}
-        </div>
+        <TxHashField label="source tx" value={exec.sourceTxHash} explorerUrl={sourceExplorer} />
       )}
       {exec.trackStatus && (
         <div style={{ fontSize: 10, color: "var(--text-dim)" }}>
@@ -1429,11 +1444,18 @@ function ExecutingFooter({
           <span style={{ color: "var(--text)" }}>{exec.trackStatus}</span>
         </div>
       )}
+      {exec.phase === "pending" && (
+        <div data-close-hint style={{ fontSize: 10, color: "var(--text-dim)", lineHeight: 1.5 }}>
+          Closing this window does not stop the swap: the wallet keeps following
+          it, and you can open it again from Recent swaps, or from Activity under
+          Swaps.
+        </div>
+      )}
     </div>
   );
 }
 
-function DoneFooter({
+export function DoneFooter({
   exec,
   sourceExplorer,
   destExplorer,
@@ -1463,15 +1485,12 @@ function DoneFooter({
       >
         {exec.trackStatus ?? "done"}
       </div>
-      {sourceExplorer && (
-        <a href={sourceExplorer} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", fontSize: 11 }}>
-          View source tx ↗
-        </a>
+      {/* Were "View source tx ↗" anchors that never opened (2026-09-30). */}
+      {exec.sourceTxHash && (
+        <TxHashField label="source tx" value={exec.sourceTxHash} explorerUrl={sourceExplorer} />
       )}
-      {destExplorer && (
-        <a href={destExplorer} target="_blank" rel="noreferrer" style={{ color: "var(--accent)", fontSize: 11 }}>
-          View destination tx ↗
-        </a>
+      {exec.destTxHash && (
+        <TxHashField label="destination tx" value={exec.destTxHash} explorerUrl={destExplorer} />
       )}
       <Btn variant="ghost" full onClick={onClose}>Close</Btn>
     </div>
@@ -1735,16 +1754,7 @@ function UnknownOutcomeFooter({
           being followed by its deposit address and History will update.
         </div>
         {hash ? (
-          <div style={{ marginTop: 8, fontSize: 10, wordBreak: "break-all" }}>
-            tx:{" "}
-            {explorerUrl ? (
-              <a href={explorerUrl} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
-                {hash}
-              </a>
-            ) : (
-              <span className="tnum" style={{ color: "var(--text)" }}>{hash}</span>
-            )}
-          </div>
+          <TxHashField label="deposit tx" value={hash} explorerUrl={explorerUrl} />
         ) : (
           <div style={{ marginTop: 8, fontSize: 10, color: "var(--text)" }}>
             No transaction id came back. Check this wallet's recent activity on the
@@ -1796,17 +1806,7 @@ function UsedQuoteFooter({
       >
         This quote has already been used{hash ? " for the deposit below" : ""}. Nothing
         new was signed. Close this window — the form fetches a fresh quote for a new swap.
-        {hash && (
-          <div style={{ marginTop: 6, fontSize: 10, wordBreak: "break-all" }}>
-            {explorerUrl ? (
-              <a href={explorerUrl} target="_blank" rel="noreferrer" style={{ color: "var(--accent)" }}>
-                {hash}
-              </a>
-            ) : (
-              <span className="tnum">{hash}</span>
-            )}
-          </div>
-        )}
+        {hash && <TxHashField label="deposit tx" value={hash} explorerUrl={explorerUrl} />}
       </div>
       <Btn variant="ghost" full caret={false} onClick={onClose}>
         Close

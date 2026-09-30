@@ -221,10 +221,45 @@ export function deskStateToHistoryStatus(state: string): SwapHistoryStatus {
  */
 let writeQueue: Promise<void> = Promise.resolve();
 function enqueueWrite(fn: () => Promise<void>): Promise<void> {
-  const next = writeQueue.then(fn, fn);
+  // Listeners hear about a write only once it is committed; a write that
+  // rejects changes nothing, so it notifies nobody.
+  const next = writeQueue.then(fn, fn).then(notifySwapHistoryChange);
   // Keep the chain alive even if one write rejects.
   writeQueue = next.catch(() => undefined);
   return next;
+}
+
+/**
+ * Told after every committed history write (2026-09-30, the operator's
+ * report: "I don't know what is happening with the swap now that it
+ * disappeared").
+ *
+ * The lists that show swaps read this store when they mount (and when a
+ * confirm modal closes) and never again. The status of a running swap is
+ * written later, from a poll: the confirm modal's own (which outlives the
+ * modal), the resume pass (`intents-status-resume.ts`), the details modal.
+ * Each of those writes reached the store and not the screen, so a list kept
+ * saying "pending" about a swap that had finished. A list subscribes here and
+ * re-reads.
+ */
+const historyListeners = new Set<() => void>();
+
+/** Subscribe to committed history writes. Returns the unsubscribe. */
+export function onSwapHistoryChange(listener: () => void): () => void {
+  historyListeners.add(listener);
+  return () => {
+    historyListeners.delete(listener);
+  };
+}
+
+function notifySwapHistoryChange(): void {
+  for (const listener of [...historyListeners]) {
+    try {
+      listener();
+    } catch {
+      // One listener's failure is its own; the write already succeeded.
+    }
+  }
 }
 
 /**

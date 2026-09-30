@@ -28,6 +28,15 @@ export {
 } from "./swap-history-store";
 export { formatActualReceived } from "./swap-actual-received";
 
+// The swap details modal and the row props that open it (2026-09-30). The
+// Activity SWAPS lists open the same modal as the Swap tab's RECENT SWAPS: one
+// component for all four lists, never an Activity copy of it.
+export {
+  SwapDetailsModal,
+  SWAP_ROW_OPEN_STYLE,
+  swapRowOpenProps,
+} from "./SwapDetailsModal";
+
 // Desk tracker: owns in-flight desk swaps + their history projection. Routed
 // through the barrel so the App shell (and, later, the activity feature) can
 // read it without a BOUNDARIES.md amendment.

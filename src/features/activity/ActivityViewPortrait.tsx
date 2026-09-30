@@ -13,6 +13,9 @@ import {
   driftTone,
   formatActualReceived,
   formatDriftPercent,
+  SWAP_ROW_OPEN_STYLE,
+  SwapDetailsModal,
+  swapRowOpenProps,
   type SwapHistoryEntry,
 } from "../swap";
 import {
@@ -65,8 +68,10 @@ export function ActivityViewPortrait({
   // dedup of `all`-mode chain-tx rows (suppress hashes that already
   // appear as a swap source/dest) and the rendering when
   // `filter === "swaps"`.
-  const [swapHistory] = useSwapHistory();
+  const [swapHistory, reloadSwapHistory] = useSwapHistory();
   const swapHashes = useMemo(() => swapHashSet(swapHistory), [swapHistory]);
+  // A swap row opens the shared swap details modal (2026-09-30).
+  const [openSwapId, setOpenSwapId] = useState<string | null>(null);
 
   const allTxs = useMemo(() => {
     const out: ChainTx[] = [];
@@ -306,7 +311,12 @@ export function ActivityViewPortrait({
               .sort((a, b) => swapEntryTimestamp(b) - swapEntryTimestamp(a))
               .slice(0, 100)
               .map((s, i, arr) => (
-                <SwapRow key={s.id} swap={s} last={i === arr.length - 1} />
+                <SwapRow
+                  key={s.id}
+                  swap={s}
+                  last={i === arr.length - 1}
+                  onOpen={() => setOpenSwapId(s.id)}
+                />
               ))
           )
         ) : filteredTxs.length === 0 ? (
@@ -334,6 +344,13 @@ export function ActivityViewPortrait({
           })
         )}
       </div>
+
+      {/* The shared swap details modal (2026-09-30), opened by a SWAPS row. */}
+      <SwapDetailsModal
+        entry={openSwapId ? swapHistory.find((s) => s.id === openSwapId) ?? null : null}
+        onClose={() => setOpenSwapId(null)}
+        onHistoryChanged={reloadSwapHistory}
+      />
     </div>
   );
 }
@@ -470,7 +487,16 @@ function EmptyRow({ msg }: { msg: string }) {
  * entries / in-flight swaps / SwapKit responses without a settled-
  * amount field).
  */
-function SwapRow({ swap, last }: { swap: SwapHistoryEntry; last: boolean }) {
+function SwapRow({
+  swap,
+  last,
+  onOpen,
+}: {
+  swap: SwapHistoryEntry;
+  last: boolean;
+  /** Opens the swap's details (2026-09-30). */
+  onOpen: () => void;
+}) {
   const ts = swapEntryTimestamp(swap);
   const actualDisplay = formatActualReceived(swap.actualReceived, swap.toAsset);
   const drift = computeDriftFraction(swap.toAmount, actualDisplay ?? undefined);
@@ -494,10 +520,12 @@ function SwapRow({ swap, last }: { swap: SwapHistoryEntry; last: boolean }) {
     h.length > 14 ? `${h.slice(0, 6)}…${h.slice(-4)}` : h;
   return (
     <div
+      {...swapRowOpenProps(onOpen, "rgba(0,204,102,0.02)")}
       style={{
         padding: "12px 14px",
         borderBottom: last ? "none" : "1px solid var(--border)",
         background: "rgba(0,204,102,0.02)",
+        ...SWAP_ROW_OPEN_STYLE,
       }}
     >
       <div
@@ -588,6 +616,7 @@ function SwapRow({ swap, last }: { swap: SwapHistoryEntry; last: boolean }) {
             style={{ cursor: "pointer" }}
             title={`${swap.sourceTxHash}\n(click: open in explorer · shift-click: copy)`}
             onClick={(e) => {
+              e.stopPropagation(); // the row behind opens the details
               if (e.shiftKey) {
                 void navigator.clipboard.writeText(swap.sourceTxHash);
                 return;
@@ -606,6 +635,7 @@ function SwapRow({ swap, last }: { swap: SwapHistoryEntry; last: boolean }) {
               style={{ cursor: "pointer" }}
               title={`${swap.destTxHash}\n(click: open in explorer · shift-click: copy)`}
               onClick={(e) => {
+                e.stopPropagation(); // the row behind opens the details
                 if (e.shiftKey) {
                   void navigator.clipboard.writeText(swap.destTxHash ?? "");
                   return;
