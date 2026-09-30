@@ -96,6 +96,15 @@ export interface SwapHistoryEntry {
    * is gone; older rows have none and fall back to 1Click's echo.
    */
   minReceived?: string;
+  /**
+   * The addresses the quote was bound to (2026-09-30): where the swap pays
+   * out (`recipient`, on the `toAsset` chain) and where a refund goes
+   * (`refundTo`, on the `fromAsset` chain). Both are this wallet's. Older
+   * NEAR Intents rows have neither; the details read them from 1Click's
+   * echo of the request.
+   */
+  recipient?: string;
+  refundTo?: string;
 }
 
 // ─── Drift helpers ────────────────────────────────────────────────────

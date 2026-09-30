@@ -417,6 +417,10 @@ export function SwapConfirmModal({
         depositDeadline,
         ...(r.outcomeUnknown ? { outcomeUnknown: true } : {}),
         ...(q.minReceived ? { minReceived: q.minReceived } : {}),
+        // Where it pays out and where a refund goes (2026-09-30), so the
+        // details can show both after the quote is gone.
+        ...(q.intentsRequest?.recipient ? { recipient: q.intentsRequest.recipient } : {}),
+        ...(q.intentsRequest?.refundTo ? { refundTo: q.intentsRequest.refundTo } : {}),
       };
       if (historyWritten) {
         await updateSwapHistoryEntry(id, entry);

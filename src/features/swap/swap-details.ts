@@ -49,6 +49,9 @@ import {
 import { SWAP_COIN_META, getSwapCoinMeta } from "./swap-data";
 import { defaultBlockchainFor } from "./intents-dedup";
 import { ROUTER_MODES } from "./router-modes";
+import { ASSET_CAPABILITIES } from "./asset-capabilities";
+import { ALL_CHAINS } from "../../wallets";
+import type { ChainType } from "../../wallets";
 
 /** How often the open details modal asks 1Click (the ask was ~10-15 s). */
 export const DETAILS_POLL_MS = 12_000;
@@ -256,6 +259,11 @@ export interface IntentsLiveDetails {
   refundedAmountFormatted: string | null;
   /** The quote's minimum output in atomic units, when the status echoes it. */
   minAmountOutAtomic: string | null;
+  /** The payout and refund addresses, from 1Click's echo of the request
+   *  (`quoteResponse.quoteRequest`). For rows written before they were
+   *  stored (2026-09-30). */
+  recipient: string | null;
+  refundTo: string | null;
 }
 
 /** A hash worth showing and linking: no spaces, slashes or markup. */
@@ -286,6 +294,7 @@ export function readIntentsLiveDetails(resp: unknown): IntentsLiveDetails {
   const r = asRecord(resp);
   const d = asRecord(r?.swapDetails) ?? asRecord(r?.swap);
   const quote = asRecord(asRecord(r?.quoteResponse)?.quote);
+  const request = asRecord(asRecord(r?.quoteResponse)?.quoteRequest);
   return {
     status: text(r?.status),
     originTxHashes: hashesOf(d?.originChainTxHashes),
@@ -294,6 +303,8 @@ export function readIntentsLiveDetails(resp: unknown): IntentsLiveDetails {
     amountOutFormatted: text(d?.amountOutFormatted),
     refundedAmountFormatted: text(d?.refundedAmountFormatted),
     minAmountOutAtomic: text(quote?.minAmountOut),
+    recipient: text(request?.recipient),
+    refundTo: text(request?.refundTo),
   };
 }
 
@@ -469,6 +480,34 @@ export function destinationExplorerUrl(toAsset: string, hash: string): string | 
     getSwapCoinMeta(toAsset, defaultBlockchainFor(toAsset) ?? undefined) ??
     SWAP_COIN_META[toAsset.toUpperCase()];
   const url = meta ? meta.explorerTxUrl(hash) : null;
+  return isHttpUrl(url) ? url : null;
+}
+
+/**
+ * The wallet chain whose adapter reads one leg of a swap (2026-09-30): a
+ * token leg by its own name (`USDC-POL` -> `usdc-pol`, whose adapter reads
+ * that token's transfers), a coin by the wallet that holds it (`LTC` ->
+ * `litecoin`).
+ */
+export function swapLegChain(asset: string): ChainType | null {
+  const lower = asset.toLowerCase();
+  const leg = ALL_CHAINS.find((c) => c === lower);
+  if (leg) return leg;
+  return ASSET_CAPABILITIES[asset.toUpperCase()]?.walletsByChainKey ?? null;
+}
+
+/** The network a swap asset lives on, as the swap screens name it. */
+export function swapNetworkName(asset: string): string {
+  return ASSET_CAPABILITIES[asset.toUpperCase()]?.network ?? asset;
+}
+
+/** An explorer page for an address on a swap asset's chain, or null. */
+export function swapAddressExplorerUrl(asset: string, address: string): string | null {
+  if (!SAFE_HASH.test(address)) return null;
+  const meta =
+    getSwapCoinMeta(asset, defaultBlockchainFor(asset) ?? undefined) ??
+    SWAP_COIN_META[asset.toUpperCase()];
+  const url = meta ? meta.explorerAddressUrl(address) : null;
   return isHttpUrl(url) ? url : null;
 }
 

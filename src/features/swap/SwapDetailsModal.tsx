@@ -33,6 +33,9 @@ import { Backdrop, Stat } from "./modal-parts";
 import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { TxHashField } from "./TxHashField";
+import { useTxParties, type TxPartiesState } from "../../lib/txParties";
+import { useUtxoAccountSummaries } from "../../lib/utxoAccountRegistry";
+import type { ChainType } from "../../wallets";
 import {
   loadSwapHistory,
   onSwapHistoryChange,
@@ -46,6 +49,9 @@ import {
   formatSwapTime,
   isLiveTrackable,
   minReceivedOf,
+  swapAddressExplorerUrl,
+  swapLegChain,
+  swapNetworkName,
   swapRouteOf,
   swapStatusView,
   watchIntentsSwap,
@@ -194,8 +200,44 @@ export function SwapDetailsModal({
   }, [id]);
 
   // `row` lags `entry` by one render when the host switches swaps.
-  const shown = row && entry && row.id === entry.id ? row : entry;
+  const current = row && entry && row.id === entry.id ? row : entry;
+
+  // Addresses (2026-09-30, operator request: "which address each
+  // transaction was sent and received from"). The payout and refund
+  // addresses are on rows written since then; older NEAR Intents rows get
+  // them from 1Click's echo of the request. Each leg's actual sender and
+  // recipient are read from its chain by hash, once, while this is open.
+  // Hooks: before the early return below.
+  const echo = live?.details ?? null;
+  const fromChain = current ? swapLegChain(current.fromAsset) : null;
+  const toChain = current ? swapLegChain(current.toAsset) : null;
+  const refundTo = current?.refundTo ?? echo?.refundTo ?? null;
+  const recipient = current?.recipient ?? echo?.recipient ?? null;
+  const sourceParties = useTxParties(
+    fromChain,
+    current?.sourceTxHash || null,
+    refundTo ?? undefined,
+    !!current?.sourceTxHash,
+  );
+  const payoutHash =
+    current?.status === "refunded"
+      ? null
+      : current?.destTxHash ?? echo?.destinationTxHashes[0] ?? null;
+  const payoutParties = useTxParties(toChain, payoutHash, recipient ?? undefined, !!payoutHash);
+  const utxoSummaries = useUtxoAccountSummaries();
+
+  const shown = current;
   if (!shown) return null;
+
+  /** This wallet's addresses on a leg's chain: the quote's own address
+   *  there, and every address a UTXO account scan found. */
+  const ownOn = (chain: ChainType | null, known: string | null) => {
+    const list = [
+      ...(known ? [known] : []),
+      ...(chain ? (utxoSummaries[chain]?.entries ?? []).map((e) => e.address) : []),
+    ];
+    return (a: string) => list.some((o) => sameAddress(a, o));
+  };
 
   const route = swapRouteOf(shown);
   const trackable = isLiveTrackable(shown);
@@ -442,11 +484,19 @@ export function SwapDetailsModal({
         )}
 
         {shown.sourceTxHash ? (
-          <TxHashField
-            label="source tx"
-            value={shown.sourceTxHash}
-            explorerUrl={shown.sourceExplorerUrl}
-          />
+          <>
+            <TxHashField
+              label="source tx"
+              value={shown.sourceTxHash}
+              explorerUrl={shown.sourceExplorerUrl}
+            />
+            <LegParties
+              state={sourceParties}
+              network={swapNetworkName(shown.fromAsset)}
+              isOwn={ownOn(fromChain, refundTo)}
+              depositAddress={shown.depositAddress ?? null}
+            />
+          </>
         ) : reportedDeposit ? (
           <TxHashField
             label="deposit tx (reported by NEAR Intents)"
@@ -465,7 +515,15 @@ export function SwapDetailsModal({
         )}
 
         {destHash ? (
-          <TxHashField label="destination tx" value={destHash} explorerUrl={destUrl} />
+          <>
+            <TxHashField label="destination tx" value={destHash} explorerUrl={destUrl} />
+            <LegParties
+              state={payoutParties}
+              network={swapNetworkName(shown.toAsset)}
+              isOwn={ownOn(toChain, recipient)}
+              depositAddress={null}
+            />
+          </>
         ) : (
           <EmptyHash
             label="destination tx"
@@ -479,6 +537,23 @@ export function SwapDetailsModal({
           />
         )}
 
+        {recipient && (
+          <TxHashField
+            label={`payout address · yours on ${swapNetworkName(shown.toAsset)}`}
+            value={recipient}
+            explorerUrl={swapAddressExplorerUrl(shown.toAsset, recipient)}
+            hint={`Where this swap pays out the ${shown.toAsset}.`}
+          />
+        )}
+        {refundTo && (
+          <TxHashField
+            label={`refund address · yours on ${swapNetworkName(shown.fromAsset)}`}
+            value={refundTo}
+            explorerUrl={swapAddressExplorerUrl(shown.fromAsset, refundTo)}
+            hint={`Where the ${shown.fromAsset} goes back if the swap cannot complete.`}
+          />
+        )}
+
         <div style={{ marginTop: 16 }}>
           <Btn variant="ghost" full onClick={onClose}>
             Close
@@ -486,6 +561,85 @@ export function SwapDetailsModal({
         </div>
       </div>
     </Backdrop>
+  );
+}
+
+function sameAddress(a: string, b: string): boolean {
+  // Hex addresses (EVM) compare case-insensitively; everything else exactly.
+  return /^0x[0-9a-f]+$/i.test(a) ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/**
+ * Who sent one leg and who received it, as its chain says, under that
+ * leg's hash (2026-09-30). The wallet's own addresses are marked; on the
+ * deposit leg, the deposit address is named, and the wallet's own output
+ * beside it is change.
+ */
+function LegParties({
+  state,
+  network,
+  isOwn,
+  depositAddress,
+}: {
+  state: TxPartiesState;
+  network: string;
+  isOwn: (a: string) => boolean;
+  depositAddress: string | null;
+}) {
+  if (state.status === "idle") return null;
+  const box: CSSProperties = {
+    padding: "6px 12px 8px",
+    background: "var(--surface)",
+    border: "1px solid var(--border)",
+    borderTop: "none",
+    fontSize: 10,
+    lineHeight: 1.5,
+  };
+  if (state.status !== "done" || !state.parties) {
+    const text =
+      state.status === "loading"
+        ? `Reading who sent it and who received it from ${network}…`
+        : state.status === "error"
+          ? `Could not read who sent it and who received it: ${state.message}`
+          : `${network} does not show this transaction yet.`;
+    return (
+      <div data-leg-parties style={{ ...box, color: "var(--text-dim)" }}>
+        {text}
+      </div>
+    );
+  }
+  const p = state.parties;
+  const paidOthers = p.to.some((a) => !isOwn(a));
+  const tag = (a: string, side: "from" | "to"): string | null => {
+    if (depositAddress && sameAddress(a, depositAddress)) return "NEAR Intents deposit";
+    if (!isOwn(a)) return null;
+    return side === "to" && paidOthers && depositAddress ? "you (change)" : "you";
+  };
+  const line = (side: "from" | "to", list: string[], empty: string) => (
+    <div style={{ display: "flex", gap: 8, marginTop: 4 }}>
+      <span style={{ ...SMALL_CAPS, width: 34, flexShrink: 0, paddingTop: 1 }}>{side}</span>
+      <span style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+        {list.length === 0 ? (
+          <span style={{ color: "var(--text-dim)" }}>{empty}</span>
+        ) : (
+          list.map((a) => {
+            const t = tag(a, side);
+            return (
+              <span key={a} className="tnum" style={{ wordBreak: "break-all", color: "var(--text)" }}>
+                {a}
+                {t ? <span style={{ color: "var(--accent)", marginLeft: 6 }}>{`· ${t}`}</span> : null}
+              </span>
+            );
+          })
+        )}
+      </span>
+    </div>
+  );
+  return (
+    <div data-leg-parties style={box}>
+      {line("from", p.from, p.senderHidden ? `Hidden: ${network} does not reveal senders.` : "Not given.")}
+      {line("to", p.to, "Not given.")}
+    </div>
   );
 }
 
