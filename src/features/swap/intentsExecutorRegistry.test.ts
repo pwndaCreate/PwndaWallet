@@ -208,7 +208,10 @@ function bound(args: {
   const meta =
     (args.fromBlockchain ? getSwapCoinMeta(args.fromAsset, args.fromBlockchain) : null) ??
     SWAP_COIN_META[args.fromAsset.toUpperCase()];
-  const deadline = args.deadline ?? inMinutes(30);
+  // Well past every origin chain's landing margin (BTC's is the longest), so
+  // only the tests about deadlines meet the deposit-window check. A default of
+  // 30 minutes sat exactly on LTC's 30-minute margin and flaked on timing.
+  const deadline = args.deadline ?? inMinutes(180);
   return {
     sessionId: "s",
     fromAsset: args.fromAsset,
