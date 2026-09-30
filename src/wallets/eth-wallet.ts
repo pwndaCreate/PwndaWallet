@@ -243,7 +243,9 @@ export const usdtOpAdapter = createEvmAdapter({
   rpcFallbacks: opRpcs.slice(1),
   tokenContract: "0x94b008aA00579c1307B0EF2c499aD98a8ce58e58",
   tokenDecimals: 6,
-  explorerApis: ETH_EXPLORERS,
+  // Was ETH_EXPLORERS until 2026-09-29 (send-safety audit): history came from
+  // Ethereum's Blockscout, so no Optimism transfer ever showed in Activity.
+  explorerApis: OP_EXPLORERS,
 });
 
 export const usdtBscAdapter = createEvmAdapter({
@@ -282,7 +284,8 @@ export const usdcArbAdapter = createEvmAdapter({
   rpcFallbacks: arbRpcs.slice(1),
   tokenContract: "0xaf88d065e77c8cC2239327C5EDb3A432268e5831",
   tokenDecimals: 6,
-  explorerApis: ETH_EXPLORERS,
+  // Was ETH_EXPLORERS until 2026-09-29 (send-safety audit), as for usdt-op.
+  explorerApis: ARB_EXPLORERS,
 });
 
 export const usdcBaseAdapter = createEvmAdapter({
@@ -308,7 +311,8 @@ export const usdcOpAdapter = createEvmAdapter({
   rpcFallbacks: opRpcs.slice(1),
   tokenContract: "0x0b2C639c533813f4Aa9D7837CAf62653d097Ff85",
   tokenDecimals: 6,
-  explorerApis: ETH_EXPLORERS,
+  // Was ETH_EXPLORERS until 2026-09-29 (send-safety audit), as for usdt-op.
+  explorerApis: OP_EXPLORERS,
 });
 
 export const usdcPolAdapter = createEvmAdapter({
@@ -360,7 +364,8 @@ export const usdt0ArbAdapter = createEvmAdapter({
   rpcFallbacks: arbRpcs.slice(1),
   tokenContract: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
   tokenDecimals: 6,
-  explorerApis: ETH_EXPLORERS,
+  // Was ETH_EXPLORERS until 2026-09-29 (send-safety audit), as for usdt-op.
+  explorerApis: ARB_EXPLORERS,
 });
 
 export const usdt0PolAdapter = createEvmAdapter({
