@@ -1,4 +1,5 @@
 import { mnemonicToSeedSync } from "@scure/bip39";
+import { HDKey } from "@scure/bip32";
 import { blake2b } from "@noble/hashes/blake2.js";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { bech32 } from "@scure/base";
@@ -12,8 +13,20 @@ import type {
   FeeEstimate,
 } from "./types";
 import { proxyPostJson, proxyGetJson } from "./_proxy";
-import { deriveCardanoKeySet } from "./cardano-cip1852";
-import { sendAda } from "./cardano-tx";
+import {
+  deriveCardanoKeySet,
+  deriveCardanoKeySetFromMaster,
+  deriveExodusCardanoKeySetFromRoot,
+  deriveExodusCardanoKeySetSplitStakeFromRoot,
+  icarusMasterKey,
+  type CardanoKeySet,
+} from "./cardano-cip1852";
+import {
+  sendAda,
+  ed25519SeedSigner,
+  extendedKeySigner,
+  type CardanoSigner,
+} from "./cardano-tx";
 import { getAddressBalance } from "./cardano-koios";
 
 // Koios is a community-run, keyless Cardano API. Used for everything
@@ -90,6 +103,82 @@ function legacyPublicKeyToAddress(publicKey: Uint8Array): string {
   addressBytes[0] = 0x61;
   addressBytes.set(keyHash, 1);
   return bech32.encode("addr", bech32.toWords(addressBytes), 1023);
+}
+
+/**
+ * The key that controls `address`, among every Cardano derivation this
+ * wallet can show for `mnemonic` — or null (2026-09-29 send-safety audit).
+ *
+ * # Why
+ *
+ * The dashboard shows the address of the derivation the user chose on import
+ * (`derivePerChoice` → `deriveAdaAtChoice`), but `sendTransaction` receives
+ * only the mnemonic, and re-derived CIP-1852 account 0 / index 0 to sign and
+ * to pick inputs. For a wallet on any other choice the send spent a
+ * DIFFERENT address than the one on screen — checked for the abandon seed on
+ * `cip1852-a1-i0`, `exodus-cardano`, `exodus-cardano-split` and
+ * `pwnda-legacy`. The balance shown did not move, so nothing said the money
+ * had gone, and a second press sent it again.
+ *
+ * `WalletInfo` does not carry the choice, so it is found by address: the
+ * same space `derivation-detector.ts` offers (the default and its
+ * brute-force finder) — CIP-1852 accounts 0–5 × indexes 0–10, Exodus
+ * same-key and split-stake accounts 0–5 × indexes 0–5, and Pwnda's
+ * pre-2026-05-06 legacy key. A choice outside that space finds nothing, and
+ * the send is refused rather than spending something else.
+ */
+export function cardanoSignerFor(mnemonic: string, address: string): CardanoSigner | null {
+  const target = address.trim().toLowerCase();
+  const matches = (ks: CardanoKeySet) => ks.address.toLowerCase() === target;
+  const signerOf = (ks: CardanoKeySet) => extendedKeySigner(hexToBytes(ks.paymentPrivateKey));
+
+  // The default first: nearly every wallet is on it.
+  const master = icarusMasterKey(mnemonic);
+  const standard = deriveCardanoKeySetFromMaster(master, 0, 0);
+  if (matches(standard)) return signerOf(standard);
+
+  const legacy = deriveLegacyKeysFromMnemonic(mnemonic);
+  if (legacyPublicKeyToAddress(legacy.publicKey).toLowerCase() === target) {
+    return ed25519SeedSigner(legacy.privateKey);
+  }
+
+  for (let account = 0; account <= 5; account++) {
+    for (let index = 0; index <= 10; index++) {
+      const ks = deriveCardanoKeySetFromMaster(master, account, index);
+      if (matches(ks)) return signerOf(ks);
+    }
+  }
+
+  const root = HDKey.fromMasterSeed(mnemonicToSeedSync(mnemonic.trim()));
+  for (const derive of [deriveExodusCardanoKeySetFromRoot, deriveExodusCardanoKeySetSplitStakeFromRoot]) {
+    for (let account = 0; account <= 5; account++) {
+      for (let index = 0; index <= 5; index++) {
+        let ks: CardanoKeySet;
+        try {
+          ks = derive(root, account, index);
+        } catch {
+          continue; // a secp256k1 walk with no key: that candidate does not exist
+        }
+        if (matches(ks)) return signerOf(ks);
+      }
+    }
+  }
+  return null;
+}
+
+/** A Cardano send needs the mnemonic: see `sendTransaction`. */
+function requireMnemonic(keyMaterial: string): void {
+  const looksLikeMnemonic =
+    /\s/.test(keyMaterial.trim()) &&
+    keyMaterial.trim().split(/\s+/).length >= 12;
+  if (!looksLikeMnemonic) {
+    throw new Error(
+      "Cardano send requires the wallet's BIP-39 mnemonic — BIP-32-Ed25519 " +
+        "signing needs the chain code, which a raw payment private key " +
+        "doesn't carry. Use the dashboard's Send button (which reads the " +
+        "mnemonic from the unlocked vault)."
+    );
+  }
 }
 
 export const adaAdapter: ChainAdapter = {
@@ -195,27 +284,57 @@ export const adaAdapter: ChainAdapter = {
     // with `keyMaterial = wallet.mnemonic` rather than the private key.
     // If a caller bypasses that and passes raw hex, surface the mismatch
     // explicitly rather than silently mis-signing.
-    const looksLikeMnemonic =
-      /\s/.test(keyMaterial.trim()) &&
-      keyMaterial.trim().split(/\s+/).length >= 12;
-    if (!looksLikeMnemonic) {
-      throw new Error(
-        "Cardano send requires the wallet's BIP-39 mnemonic — BIP-32-Ed25519 " +
-          "signing needs the chain code, which a raw payment private key " +
-          "doesn't carry. Use the dashboard's Send button (which reads the " +
-          "mnemonic from the unlocked vault)."
-      );
-    }
-    // Re-derive the source address from the mnemonic so callers don't
-    // have to thread the wallet's display address through; this also
-    // protects against caller mismatch where the address and mnemonic
-    // are out of sync.
+    requireMnemonic(keyMaterial);
+    // No displayed address reaches this method, so it spends the standard
+    // CIP-1852 account-0 / index-0 address. The dashboard's Send goes through
+    // `sendFromAccount` instead, which spends the address the wallet SHOWS
+    // (2026-09-29 send-safety audit).
     const ks = deriveCardanoKeySet(keyMaterial);
     const result = await sendAda({
       mnemonic: keyMaterial,
       fromAddress: ks.address,
       toAddress: to,
       amountAda: amount,
+    });
+    return { hash: result.txHash };
+  },
+
+  /**
+   * Cardano implements the account-send pair for one reason (2026-09-29
+   * send-safety audit): `sendFromAccount` is the only send path that carries
+   * the wallet's DISPLAYED address, and a Cardano wallet may show the
+   * address of a non-default derivation (see `cardanoSignerFor`). So every
+   * Send with a mnemonic goes there — `true` here for any address, because
+   * the fallback, `sendTransaction`, would spend the default address instead
+   * of the shown one. `sendFromAccount` refuses, with the reason, when it
+   * cannot find the shown address's key.
+   */
+  supportsAccountSend(): boolean {
+    return true;
+  },
+
+  async sendFromAccount(
+    mnemonic: string,
+    to: string,
+    amount: string,
+    fromAddress?: string,
+  ): Promise<TxResult> {
+    requireMnemonic(mnemonic);
+    const from = fromAddress?.trim() || deriveCardanoKeySet(mnemonic).address;
+    const signer = cardanoSignerFor(mnemonic, from);
+    if (!signer) {
+      throw new Error(
+        `This wallet shows the Cardano address ${from.slice(0, 24)}…, and it is not one this ` +
+          `recovery phrase derives on any path Pwnda can sign for. Nothing was sent — send it from ` +
+          `the wallet that created that address.`,
+      );
+    }
+    const result = await sendAda({
+      mnemonic,
+      fromAddress: from,
+      toAddress: to,
+      amountAda: amount,
+      signer,
     });
     return { hash: result.txHash };
   },

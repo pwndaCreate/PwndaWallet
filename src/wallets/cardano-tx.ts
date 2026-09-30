@@ -2,7 +2,8 @@
  * Cardano transaction construction + signing for ADA-only sends.
  *
  * What this implements:
- *   - UTXO selection (largest-first, single-output coverage with change).
+ *   - UTXO selection (largest-first, adding inputs until the payment, the
+ *     exact fee and a change output fit — see `planTransfer`).
  *   - Tx body CBOR encoding (Conway/Babbage era, Mary-compatible: no
  *     scripts, no native assets).
  *   - Fee calculation: `min_fee_a * tx_size + min_fee_b` from Koios
@@ -10,14 +11,15 @@
  *     the fee field's encoded length, which depends on the fee value).
  *   - BIP-32-Ed25519 signing of the tx body hash (blake2b-256).
  *   - Final tx assembly: `[body, witnessSet, true, null]`.
- *   - Address bytes decoded from bech32 (`addr1…`).
+ *   - Address bytes decoded from bech32 (`addr1…`), and a recipient check
+ *     that refuses what an ADA payment must not go to (`recipientAddressBytes`).
  *
  * What this does NOT implement (out of scope — would 5x the surface):
  *   - Native-asset / NFT sends (multi-asset value).
  *   - Plutus / native-script witnesses.
  *   - Stake-key registration / delegation.
  *   - Pool registration.
- *   - Multi-input multi-output coin selection beyond the simple case.
+ *   - Multi-output payments.
  *
  * Spec references:
  *   - CIP-1852 (key derivation)
@@ -31,6 +33,7 @@
  */
 
 import { blake2b } from "@noble/hashes/blake2.js";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { bech32 } from "@scure/base";
 import {
   arrayCbor,
@@ -46,7 +49,6 @@ import {
 import {
   signBip32Ed25519,
   paymentExtendedKey,
-  paymentPublicKey,
 } from "./cardano-cip1852";
 import {
   getAddressUtxos,
@@ -55,6 +57,7 @@ import {
   submitTx,
   type KoiosUtxo,
 } from "./cardano-koios";
+import { decimalToAtomic } from "./decimal-amount";
 
 /** Min lovelace per UTXO under the current `coins_per_utxo_size` rules.
  *  Babbage-era effective minimum for a simple ADA-only output is ~1 ADA
@@ -67,14 +70,182 @@ const MIN_UTXO_VALUE = 1_000_000n;
  *  funds during a network stall. Cardano slot is 1 second. */
 const TTL_OFFSET_SLOTS = 7200;
 
+/** Lovelace as ADA with all six decimals, e.g. "1.500000" — exact, pasteable. */
+function adaText(lovelace: bigint): string {
+  const sign = lovelace < 0n ? "-" : "";
+  const l = lovelace < 0n ? -lovelace : lovelace;
+  return `${sign}${l / 1_000_000n}.${(l % 1_000_000n).toString().padStart(6, "0")}`;
+}
+
 // ---------------------------------------------------------------------------
 // Address decoding
 // ---------------------------------------------------------------------------
 
-/** Decode a `addr1…` bech32 address back to its raw bytes. */
+/** Decode a `addr1…` bech32 address back to its raw bytes. No policy: see
+ *  `recipientAddressBytes` for what a payment may be sent to. */
 export function decodeAddressBytes(address: string): Uint8Array {
   const decoded = bech32.decode(address as `${string}1${string}`, 1023);
   return new Uint8Array(bech32.fromWords(decoded.words));
+}
+
+/** CIP-19 header types whose payment part is a KEY hash: base (0, 2), pointer (4), enterprise (6). */
+const KEY_PAYMENT_TYPES: ReadonlySet<number> = new Set([0, 2, 4, 6]);
+/** CIP-19 header types whose payment part is a SCRIPT hash: base (1, 3), pointer (5), enterprise (7). */
+const SCRIPT_PAYMENT_TYPES: ReadonlySet<number> = new Set([1, 3, 5, 7]);
+const NETWORK_MAINNET = 1;
+
+/** A pointer address's tail: three variable-length naturals, nothing after. */
+function isPointerTail(b: Uint8Array): boolean {
+  let pos = 0;
+  for (let n = 0; n < 3; n++) {
+    let len = 0;
+    for (;;) {
+      if (pos >= b.length || ++len > 10) return false;
+      if ((b[pos++] & 0x80) === 0) break;
+    }
+  }
+  return pos === b.length;
+}
+
+/**
+ * The raw bytes of an address this wallet may pay ADA to, or an Error saying
+ * why not (2026-09-29 send-safety audit).
+ *
+ * This decoded bech32 and checked nothing else: a testnet `addr_test1…`, a
+ * `stake1…` reward address and an `addr1…` whose payment part is a SCRIPT
+ * all decoded, and the builder put them in an output. Accepted now: mainnet
+ * (`addr`, network id 1) addresses whose payment part is a key hash — base
+ * (types 0 and 2), pointer (4) and enterprise (6) — of the right length.
+ *
+ * Script payment addresses are refused. Plain ADA sent to a Plutus V1/V2
+ * script without a datum cannot be spent by that script again (inference
+ * from the ledger rule that spending a Plutus V1/V2 output needs a datum; a
+ * native multisig script would not need one, but the address does not say
+ * which kind it is). The contract's own app sends with the datum it expects.
+ *
+ * Byron addresses (base58, `Ae2…` / `DdzFF…`) are refused with the reason.
+ * Decision, not an oversight: supporting them means a second decoder —
+ * base58, CBOR, a CRC and a network-magic attribute — whose mistakes would
+ * send to outputs nobody can spend, for a format every current wallet
+ * replaced with `addr1…` years ago. They failed the bech32 decode before this
+ * too, with an unreadable error.
+ */
+export function recipientAddressBytes(address: string): Uint8Array {
+  const a = address.trim();
+  if (/^(Ae2|DdzFF)[1-9A-HJ-NP-Za-km-z]+$/.test(a)) {
+    throw new Error(
+      `"${a}" is a Byron-era Cardano address. This wallet sends only to Shelley addresses ` +
+        `(addr1…) — ask the recipient for one; every current Cardano wallet shows it.`,
+    );
+  }
+  let decoded: { prefix: string; words: number[] };
+  try {
+    decoded = bech32.decode(a as `${string}1${string}`, 1023);
+  } catch {
+    throw new Error(`"${a}" is not a Cardano address (expected addr1…).`);
+  }
+  if (decoded.prefix === "addr_test") {
+    throw new Error(`"${a}" is a Cardano TESTNET address. This wallet sends on mainnet only.`);
+  }
+  if (decoded.prefix === "stake" || decoded.prefix === "stake_test") {
+    throw new Error(
+      `"${a}" is a stake (reward) address. It cannot receive a payment — use the recipient's addr1… address.`,
+    );
+  }
+  if (decoded.prefix !== "addr") {
+    throw new Error(`"${a}" is not a Cardano address (expected addr1…).`);
+  }
+  const bytes = new Uint8Array(bech32.fromWords(decoded.words));
+  const type = bytes.length > 0 ? bytes[0] >> 4 : -1;
+  const network = bytes.length > 0 ? bytes[0] & 0x0f : -1;
+  if (SCRIPT_PAYMENT_TYPES.has(type)) {
+    throw new Error(
+      `"${a}" is a Cardano script address — a smart contract or a multi-signature wallet. ADA ` +
+        `sent to one without the datum its contract expects can be locked there for good, so this ` +
+        `wallet does not send to script addresses. Send from the app that uses the contract.`,
+    );
+  }
+  const lengthOk =
+    type === 0 || type === 2
+      ? bytes.length === 57
+      : type === 6
+        ? bytes.length === 29
+        : type === 4
+          ? bytes.length > 29 && isPointerTail(bytes.subarray(29))
+          : false;
+  if (!KEY_PAYMENT_TYPES.has(type) || network !== NETWORK_MAINNET || !lengthOk) {
+    throw new Error(`"${a}" is not a valid Cardano payment address.`);
+  }
+  return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// Signers
+// ---------------------------------------------------------------------------
+
+/**
+ * A key that can witness spending from one Cardano address: the witness's
+ * verification key (32 bytes; its blake2b-224 is the address's payment
+ * credential) and a signature over a 32-byte transaction-body hash.
+ */
+export interface CardanoSigner {
+  publicKey: Uint8Array;
+  sign(message: Uint8Array): Uint8Array;
+}
+
+const ED25519_N = 7237005577332262213973186563042994240857116359379907606001950938285454250989n;
+
+function bigIntLE(bytes: Uint8Array): bigint {
+  let v = 0n;
+  for (let i = bytes.length - 1; i >= 0; i--) v = (v << 8n) | BigInt(bytes[i]);
+  return v;
+}
+
+/**
+ * A signer for a BIP-32-Ed25519 extended secret, kL ‖ kR (64 bytes): what
+ * CIP-1852 and Exodus key sets store as `paymentPrivateKey`. The chain code
+ * is only needed to derive children, never to sign, so none is held.
+ */
+export function extendedKeySigner(secret: Uint8Array): CardanoSigner {
+  if (secret.length !== 64) throw new Error("A Cardano extended key is 64 bytes.");
+  const ext = { secret: Uint8Array.from(secret), chainCode: new Uint8Array(32) };
+  // A = kL·B, exactly as `cardano-cip1852.ts` computes the key it hashes.
+  const publicKey = ed25519.Point.BASE.multiply(bigIntLE(secret.slice(0, 32)) % ED25519_N).toBytes();
+  return { publicKey, sign: (m) => signBip32Ed25519(m, ext) };
+}
+
+/** A signer for a standard RFC-8032 Ed25519 seed (Pwnda's pre-2026-05-06 legacy key). */
+export function ed25519SeedSigner(seed: Uint8Array): CardanoSigner {
+  const key = Uint8Array.from(seed);
+  return { publicKey: ed25519.getPublicKey(key), sign: (m) => ed25519.sign(m, key) };
+}
+
+/** The CIP-1852 account-0 / index-0 payment key of `mnemonic` — the default signer. */
+export function defaultCardanoSigner(mnemonic: string): CardanoSigner {
+  return extendedKeySigner(paymentExtendedKey(mnemonic).secret);
+}
+
+/**
+ * Throw unless `signer` holds the payment key of the address in `fromBytes`.
+ *
+ * Belt and braces for the adapter's own address resolution (2026-09-29
+ * send-safety audit): whatever a caller passes, no transaction is signed that
+ * spends an address the key does not control. The node would reject it — but
+ * the point is not to build it.
+ */
+function assertSignerControls(fromBytes: Uint8Array, fromAddress: string, signer: CardanoSigner): void {
+  const type = fromBytes.length > 0 ? fromBytes[0] >> 4 : -1;
+  const credential = blake2b(signer.publicKey, { dkLen: 28 });
+  const matches =
+    KEY_PAYMENT_TYPES.has(type) &&
+    fromBytes.length >= 29 &&
+    credential.every((b, i) => fromBytes[1 + i] === b);
+  if (!matches) {
+    throw new Error(
+      `Refusing to sign: this key does not control ${fromAddress.slice(0, 20)}…, the address ` +
+        `the transfer would spend from. Nothing was sent.`,
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -142,10 +313,24 @@ function buildWitnessSet(vkeys: Array<{ pubkey: Uint8Array; signature: Uint8Arra
  * UTXO that carries native assets — sending those would require
  * preserving the asset bundle, which is outside this implementation's
  * scope.
+ *
+ * Kept for its callers; `buildAndSignTx` selects with `planTransfer`, which
+ * knows the exact fee of each candidate transaction.
  */
 export interface SelectedInputs {
   selected: KoiosUtxo[];
   totalInLovelace: bigint;
+}
+
+/** ADA-only UTXOs (no native assets), largest first. */
+function spendableLargestFirst(utxos: KoiosUtxo[]): KoiosUtxo[] {
+  return utxos
+    .filter((u) => !u.asset_list || u.asset_list.length === 0)
+    .sort((a, b) => {
+      const va = BigInt(a.value);
+      const vb = BigInt(b.value);
+      return vb < va ? -1 : vb > va ? 1 : 0;
+    });
 }
 
 export function selectUtxosForAmount(
@@ -153,14 +338,7 @@ export function selectUtxosForAmount(
   amountLovelace: bigint,
   feeFloorLovelace: bigint
 ): SelectedInputs {
-  const adaOnly = utxos.filter(
-    (u) => !u.asset_list || u.asset_list.length === 0
-  );
-  const sorted = [...adaOnly].sort((a, b) => {
-    const va = BigInt(a.value);
-    const vb = BigInt(b.value);
-    return vb < va ? -1 : vb > va ? 1 : 0;
-  });
+  const sorted = spendableLargestFirst(utxos);
   const selected: KoiosUtxo[] = [];
   let total = 0n;
   // Need: amount + fee + change-min-utxo (in case we produce change).
@@ -173,6 +351,144 @@ export function selectUtxosForAmount(
   return { selected, totalInLovelace: total };
 }
 
+/** Bytes of a one-key witness set plus the outer `[body, ws, true, null]`
+ *  wrapper: 104 + 3, rounded up (a few bytes over only raises the fee by
+ *  44 lovelace each; a fee is a floor, never an exact price). */
+const WITNESS_BYTES = 110;
+
+type Outputs = TxBodyInputs["outputs"];
+
+interface Plan {
+  inputs: KoiosUtxo[];
+  outputs: Outputs;
+  fee: bigint;
+  body: Uint8Array;
+}
+
+/**
+ * Encode the body and settle its fee. The fee depends on the body's size,
+ * which depends on the fee (and on any change output derived from it), so
+ * iterate — upward only: the loop ends at the first fee that covers the body
+ * it is encoded in, which is the one condition the ledger checks.
+ */
+function settleFee(
+  inputs: KoiosUtxo[],
+  outputsFor: (fee: bigint) => Outputs,
+  ttl: bigint,
+  minA: bigint,
+  minB: bigint,
+): { fee: bigint; body: Uint8Array; outputs: Outputs } {
+  let fee = minB;
+  for (;;) {
+    const outputs = outputsFor(fee);
+    const body = encodeCbor(
+      buildTxBody({
+        inputs: inputs.map((u) => ({ txHash: hexToBytes(u.tx_hash), outputIndex: u.tx_index })),
+        outputs,
+        fee,
+        ttl,
+      }),
+    );
+    const required = BigInt(body.length + WITNESS_BYTES) * minA + minB;
+    if (required <= fee) return { fee, body, outputs };
+    fee = required;
+  }
+}
+
+/**
+ * Choose inputs and outputs for sending `amount` to `toBytes`, change back to
+ * `fromBytes`.
+ *
+ * Adds inputs, largest first, until the payment, its exact fee and a change
+ * output of at least `MIN_UTXO_VALUE` fit — or the inputs pay the amount and
+ * fee exactly, with nothing left. With every input in and something left
+ * that is too small to be an output, it REFUSES (2026-09-29 send-safety
+ * audit): that change used to be added to the fee without a word, so the
+ * user paid up to 1 ADA more than the fee they were shown. The refusal names
+ * the amount that would be lost and the amounts that avoid it.
+ */
+function planTransfer(
+  utxos: KoiosUtxo[],
+  amount: bigint,
+  toBytes: Uint8Array,
+  fromBytes: Uint8Array,
+  ttl: bigint,
+  minA: bigint,
+  minB: bigint,
+): Plan {
+  const sorted = spendableLargestFirst(utxos);
+  const settle = (inputs: KoiosUtxo[], outputsFor: (fee: bigint) => Outputs) =>
+    settleFee(inputs, outputsFor, ttl, minA, minB);
+  const exactFor = (inputs: KoiosUtxo[], send: bigint) =>
+    settle(inputs, () => [{ addressBytes: toBytes, coin: send }]);
+  const withChangeFor = (inputs: KoiosUtxo[], send: bigint, total: bigint) =>
+    settle(inputs, (fee) => {
+      const change = total - send - fee;
+      return [
+        { addressBytes: toBytes, coin: send },
+        { addressBytes: fromBytes, coin: change > 0n ? change : 0n },
+      ];
+    });
+
+  let total = 0n;
+  let rest = -1n;
+  let exactFee = 0n;
+  for (let n = 1; n <= sorted.length; n++) {
+    const inputs = sorted.slice(0, n);
+    total += BigInt(sorted[n - 1].value);
+    const withChange = withChangeFor(inputs, amount, total);
+    if (total - amount - withChange.fee >= MIN_UTXO_VALUE) {
+      return { inputs, outputs: withChange.outputs, fee: withChange.fee, body: withChange.body };
+    }
+    const exact = exactFor(inputs, amount);
+    rest = total - amount - exact.fee;
+    exactFee = exact.fee;
+    if (rest === 0n) return { inputs, outputs: exact.outputs, fee: exact.fee, body: exact.body };
+    // Short, or left with change too small to be an output: another input
+    // helps, if there is one.
+  }
+
+  if (sorted.length === 0) {
+    throw new Error(
+      "All of this address's ADA is held together with tokens, which this wallet cannot send yet. Nothing was sent.",
+    );
+  }
+  if (rest < 0n) {
+    const assetOnly = utxos.length > sorted.length;
+    throw new Error(
+      `Insufficient funds: this address can send ${adaText(total)} ADA, and this transfer needs ` +
+        `${adaText(amount + exactFee)} ADA including the ${adaText(exactFee)} ADA network fee.` +
+        (assetOnly ? ` (ADA held together with tokens cannot be sent from this wallet yet.)` : ""),
+    );
+  }
+
+  // Every input is in, and `rest` (0 < rest < MIN_UTXO_VALUE) cannot be an
+  // output. Refuse, with two amounts that leave nothing to lose.
+  //   - Everything: the amount that makes the no-change transaction exact.
+  //     The fee moves only when the amount's encoded size does, so settle.
+  let sendAll = total - exactFee;
+  for (let i = 0; i < 4; i++) {
+    const next = total - exactFor(sorted, sendAll).fee;
+    if (next === sendAll) break;
+    sendAll = next;
+  }
+  //   - Keep change: the most that still leaves a change output of the minimum.
+  let keep = total - withChangeFor(sorted, amount, total).fee - MIN_UTXO_VALUE;
+  for (let i = 0; i < 4 && keep > 0n; i++) {
+    const next = total - withChangeFor(sorted, keep, total).fee - MIN_UTXO_VALUE;
+    if (next === keep) break;
+    keep = next;
+  }
+  const allFee = total - sendAll;
+  throw new Error(
+    `Sending ${adaText(amount)} ADA would leave ${adaText(rest)} ADA of change. A Cardano output ` +
+      `must hold at least ${adaText(MIN_UTXO_VALUE)} ADA, so that change could only be added to the ` +
+      `network fee — and lost. Send ${adaText(sendAll)} ADA instead (all of it, after the ` +
+      `${adaText(allFee)} ADA fee)` +
+      (keep >= MIN_UTXO_VALUE ? `, or at most ${adaText(keep)} ADA to keep change.` : `.`),
+  );
+}
+
 // ---------------------------------------------------------------------------
 // Top-level builder
 // ---------------------------------------------------------------------------
@@ -180,9 +496,9 @@ export function selectUtxosForAmount(
 export interface BuildTxArgs {
   /** Mnemonic of the source wallet (for signing). */
   mnemonic: string;
-  /** Source `addr1q…` base address (as displayed in the wallet). */
+  /** Source address (as displayed in the wallet): inputs come from it, change goes back to it. */
   fromAddress: string;
-  /** Destination address (any valid Cardano bech32). */
+  /** Destination address — see `recipientAddressBytes` for what is accepted. */
   toAddress: string;
   /**
    * Amount to send, in ADA (decimal string from the user). Provide this
@@ -197,6 +513,13 @@ export interface BuildTxArgs {
    * there's no float round-trip. Exactly one of the two must be set.
    */
   amountLovelace?: bigint;
+  /**
+   * The key that controls `fromAddress`. Omitted: the CIP-1852 account-0 /
+   * index-0 payment key of `mnemonic` (what every caller used before
+   * 2026-09-29). Either way it must control `fromAddress`, or nothing is
+   * signed (`assertSignerControls`).
+   */
+  signer?: CardanoSigner;
 }
 
 export interface BuiltTxResult {
@@ -211,11 +534,8 @@ export interface BuiltTxResult {
 }
 
 /**
- * Build + sign a Cardano ADA transfer. Two-pass fee calculation: build a
- * candidate body with a max-bound fee guess, encode it to measure the
- * size, recompute the actual fee, then re-encode the body. The fee field
- * doesn't change tx-size meaningfully across the typical range so this
- * converges in two passes; we run a third pass as a safety net.
+ * Build + sign a Cardano ADA transfer: check the recipient and the key,
+ * choose inputs with the exact fee (`planTransfer`), sign the body hash.
  */
 export async function buildAndSignTx(args: BuildTxArgs): Promise<BuiltTxResult> {
   const { mnemonic, fromAddress, toAddress } = args;
@@ -226,7 +546,10 @@ export async function buildAndSignTx(args: BuildTxArgs): Promise<BuiltTxResult> 
   if (args.amountLovelace !== undefined) {
     amountLovelace = args.amountLovelace;
   } else if (args.amountAda !== undefined && args.amountAda !== "") {
-    amountLovelace = BigInt(Math.round(parseFloat(args.amountAda) * 1_000_000));
+    // Exact (2026-09-29 send-safety audit). This was
+    // `BigInt(Math.round(parseFloat(amountAda) * 1e6))`: "1,5" sent 1 ADA,
+    // "1e3" sent 1000, and "2 ADA" sent 2.
+    amountLovelace = decimalToAtomic(args.amountAda, 6, "ADA amount");
   } else {
     throw new Error(
       "Cardano amount missing — provide amountAda (decimal) or amountLovelace (atomic)."
@@ -237,6 +560,12 @@ export async function buildAndSignTx(args: BuildTxArgs): Promise<BuiltTxResult> 
       `Cardano output minimum is ${MIN_UTXO_VALUE} lovelace (${Number(MIN_UTXO_VALUE) / 1_000_000} ADA). Send at least that much.`
     );
   }
+  // Refused before any network call: who the payment can go to, and whether
+  // this key can spend from where it would come from.
+  const toBytes = recipientAddressBytes(toAddress);
+  const fromBytes = decodeAddressBytes(fromAddress);
+  const signer = args.signer ?? defaultCardanoSigner(mnemonic);
+  assertSignerControls(fromBytes, fromAddress, signer);
 
   const [params, tipSlot, utxos] = await Promise.all([
     getEpochParams(),
@@ -248,89 +577,20 @@ export async function buildAndSignTx(args: BuildTxArgs): Promise<BuiltTxResult> 
   }
   const minA = BigInt(params.min_fee_a);
   const minB = BigInt(params.min_fee_b);
-
-  // Initial fee floor: charge as if the tx were 300 bytes (typical 1-in
-  // 2-out simple ADA transfer is ~250–280 bytes; this is a generous upper
-  // bound for selection purposes).
-  let feeGuess = 300n * minA + minB;
-
-  const { selected, totalInLovelace } = selectUtxosForAmount(
-    utxos,
-    amountLovelace,
-    feeGuess
-  );
-  if (totalInLovelace < amountLovelace + feeGuess + MIN_UTXO_VALUE) {
-    // Either no change room OR not enough funds. Try without min-utxo
-    // padding (i.e. exact-coverage no-change tx).
-    if (totalInLovelace < amountLovelace + feeGuess) {
-      throw new Error(
-        `Insufficient funds: have ${(Number(totalInLovelace) / 1_000_000).toFixed(6)} ADA, ` +
-          `need ${(Number(amountLovelace + feeGuess) / 1_000_000).toFixed(6)} ADA (incl. fee guess)`
-      );
-    }
-  }
-
   const ttl = BigInt(tipSlot + TTL_OFFSET_SLOTS);
-  const toBytes = decodeAddressBytes(toAddress);
-  const fromBytes = decodeAddressBytes(fromAddress);
 
-  // Build the body skeleton and refine fee until size is stable.
-  let fee = feeGuess;
-  let bodyBytes: Uint8Array = new Uint8Array(0);
-  for (let pass = 0; pass < 4; pass++) {
-    const change = totalInLovelace - amountLovelace - fee;
-    const outputs: TxBodyInputs["outputs"] = [
-      { addressBytes: toBytes, coin: amountLovelace },
-    ];
-    if (change >= MIN_UTXO_VALUE) {
-      outputs.push({ addressBytes: fromBytes, coin: change });
-    } else if (change > 0n) {
-      // Change too small to be a separate output. Burn into fee.
-      fee += change;
-    } else if (change < 0n) {
-      throw new Error(
-        `Insufficient funds after fee: short by ${(Number(-change) / 1_000_000).toFixed(6)} ADA`
-      );
-    }
-
-    const body = buildTxBody({
-      inputs: selected.map((u) => ({
-        txHash: hexToBytes(u.tx_hash),
-        outputIndex: u.tx_index,
-      })),
-      outputs,
-      fee,
-      ttl,
-    });
-    bodyBytes = encodeCbor(body);
-
-    // We don't have the witness set's bytes yet, but its size for a
-    // 1-key tx is fixed: ~106 bytes (map header + one vkey witness with
-    // 32-byte pubkey + 64-byte signature + array headers). Plus 4 bytes
-    // for the outer `[body, ws, true, null]` wrapper. Use 110 as the
-    // per-witness padding (validated empirically below).
-    const witnessSetBytes = 110;
-    const totalEstimate = bodyBytes.length + witnessSetBytes;
-    const newFee = BigInt(totalEstimate) * minA + minB;
-    if (newFee === fee) break;
-    fee = newFee;
-  }
+  const plan = planTransfer(utxos, amountLovelace, toBytes, fromBytes, ttl, minA, minB);
 
   // Sign the body hash.
-  const bodyHash = blake2b(bodyBytes, { dkLen: 32 });
-  const ext = paymentExtendedKey(mnemonic);
-  const signature = signBip32Ed25519(bodyHash, ext);
-  const pubkey = paymentPublicKey(mnemonic);
-
-  // Re-encode body with the FINAL fee (we exited the loop with a stable
-  // value; bodyBytes already reflects it).
-  const witnessSet = buildWitnessSet([{ pubkey, signature }]);
+  const bodyHash = blake2b(plan.body, { dkLen: 32 });
+  const signature = signer.sign(bodyHash);
+  const witnessSet = buildWitnessSet([{ pubkey: signer.publicKey, signature }]);
   const tx = arrayCbor([
     // body — re-decode-and-encode would be wasteful; instead, splice
     // bodyBytes into the outer array by encoding as a tagged "raw cbor"
     // field. We build the outer wrapper from the parsed body via a
     // trick: encode a fresh CborValue tree with the same structure.
-    decodeBodyForReuse(bodyBytes),
+    decodeBodyForReuse(plan.body),
     witnessSet,
     boolCbor(true),
     nullCbor(),
@@ -340,7 +600,7 @@ export async function buildAndSignTx(args: BuildTxArgs): Promise<BuiltTxResult> 
     .map((b) => b.toString(16).padStart(2, "0"))
     .join("");
 
-  return { txCborBytes, txHashHex, feeLovelace: fee, ttl };
+  return { txCborBytes, txHashHex, feeLovelace: plan.fee, ttl };
 }
 
 /**
