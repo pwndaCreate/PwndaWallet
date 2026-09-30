@@ -28,9 +28,13 @@ export type TxPartiesState =
 const answered = new Map<string, TxParties>();
 const inflight = new Map<string, Promise<TxPartiesState>>();
 
-function keyOf(chain: ChainType, hash: string): string {
-  // Hex hashes compare case-insensitively; base58 ids (Solana) do not.
-  return `${chain}|${/^(0x)?[0-9a-f]+$/i.test(hash) ? hash.toLowerCase() : hash}`;
+function keyOf(chain: ChainType, hash: string, ownAddress: string): string {
+  // Hex values compare case-insensitively; base58 ids (Solana) do not.
+  const norm = (v: string) => (/^(0x)?[0-9a-f]+$/i.test(v) ? v.toLowerCase() : v);
+  // The asking address is part of the answer for some readers (an SPL
+  // row's direction, a token leg's transfers that involve the wallet), so
+  // two wallets opening the same transaction do not share one answer.
+  return `${chain}|${norm(hash)}|${norm(ownAddress)}`;
 }
 
 /** Whether this chain's adapter can read a transaction's parties by hash. */
@@ -44,7 +48,7 @@ export function readTxParties(
   hash: string,
   ownAddress: string,
 ): Promise<TxPartiesState> {
-  const key = keyOf(chain, hash);
+  const key = keyOf(chain, hash, ownAddress);
   const known = answered.get(key);
   if (known) return Promise.resolve({ status: "done", parties: known });
   const running = inflight.get(key);
@@ -87,7 +91,7 @@ export function useTxParties(
   const ask = !!(enabled && chain && hash && txPartiesSupported(chain));
   const [state, setState] = useState<TxPartiesState>(() => {
     if (!ask) return { status: "idle" };
-    const known = answered.get(keyOf(chain!, hash!));
+    const known = answered.get(keyOf(chain!, hash!, ownAddress ?? ""));
     return known ? { status: "done", parties: known } : { status: "loading" };
   });
   useEffect(() => {
@@ -96,7 +100,7 @@ export function useTxParties(
       return;
     }
     let live = true;
-    const known = answered.get(keyOf(chain!, hash!));
+    const known = answered.get(keyOf(chain!, hash!, ownAddress ?? ""));
     setState(known ? { status: "done", parties: known } : { status: "loading" });
     void readTxParties(chain!, hash!, ownAddress ?? "").then((s) => {
       if (live) setState(s);

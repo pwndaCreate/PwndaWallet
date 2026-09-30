@@ -131,10 +131,15 @@ describe("readTxParties: one read per transaction, answers kept for the session"
       await readTxParties("xrp", "ef".repeat(32), "rB"); // same hex hash, other case
       expect(read).toHaveBeenCalledTimes(1);
 
+      // Another wallet asking about the same transaction gets its own read:
+      // for some readers (SPL direction, token legs) the answer depends on it.
+      await readTxParties("xrp", "EF".repeat(32), "rOtherWallet");
+      expect(read).toHaveBeenCalledTimes(2);
+
       read.mockResolvedValueOnce(null as unknown as TxParties);
       await readTxParties("xrp", "01".repeat(32), "rB");
       await readTxParties("xrp", "01".repeat(32), "rB");
-      expect(read).toHaveBeenCalledTimes(3);
+      expect(read).toHaveBeenCalledTimes(4);
     } finally {
       adapter.getTransactionParties = had;
     }

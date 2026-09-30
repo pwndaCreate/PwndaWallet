@@ -22,7 +22,8 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { readIntentsLiveDetails, swapLegChain } from "./swap-details";
 import { SwapDetailsModal } from "./SwapDetailsModal";
 import type { SwapHistoryEntry } from "./swap-history-store";
-import { getAdapter } from "../../wallets";
+import { ALL_CHAINS, getAdapter } from "../../wallets";
+import { ASSET_CAPABILITIES } from "./asset-capabilities";
 import type { TxParties } from "../../wallets/types";
 import { clearTxPartiesCache, readTxParties } from "../../lib/txParties";
 
@@ -92,6 +93,30 @@ describe("each leg's sender and recipient, read from its chain", () => {
     expect(swapLegChain("XMR")).toBe("monero");
     expect(swapLegChain("ZEPHUSD")).toBe("zephyr");
     expect(swapLegChain("NOT-AN-ASSET")).toBeNull();
+  });
+
+  it("a native EVM coin maps to its own chain, not the shared ethereum wallet", () => {
+    // Every EVM coin's `walletsByChainKey` is `ethereum` (one key), so a POL
+    // leg was looked up on Ethereum's RPCs until 2026-09-30 (found by the
+    // wiki pass).
+    expect(swapLegChain("ETH")).toBe("ethereum");
+    expect(swapLegChain("POL")).toBe("polygon");
+    expect(swapLegChain("AVAX")).toBe("avalanche");
+    expect(swapLegChain("FLR")).toBe("flare");
+    expect(swapLegChain("MON")).toBe("monad");
+    expect(swapLegChain("BNB")).toBe("bsc");
+  });
+
+  it("every native EVM swap coin lands on the wallet chain with its own ticker", () => {
+    const natives = Object.entries(ASSET_CAPABILITIES).filter(
+      ([t, cap]) => cap.chainKind === "EVM" && !ALL_CHAINS.some((c) => c === t.toLowerCase()),
+    );
+    expect(natives.length).toBeGreaterThanOrEqual(6);
+    for (const [ticker] of natives) {
+      const chain = swapLegChain(ticker);
+      expect(chain, ticker).not.toBeNull();
+      expect(getAdapter(chain!).ticker, ticker).toBe(ticker);
+    }
   });
 
   it("the deposit leg names the deposit address, the wallet's inputs, and its change", async () => {

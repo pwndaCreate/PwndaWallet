@@ -1,8 +1,9 @@
 /**
  * Everything the wallet knows about one swap, opened from any list that shows
- * swaps: RECENT SWAPS in both Swap layouts and the SWAPS filter in both
- * Activity layouts. ONE component, mounted by all four (landscape-first rule;
- * `landscapeRouterParity.test.ts` pins the mounts).
+ * swaps: RECENT SWAPS in the landscape Swap tab, the HISTORY list in the
+ * portrait one, and the SWAPS filter in both Activity layouts. ONE component,
+ * mounted by all four (landscape-first rule; `landscapeRouterParity.test.ts`
+ * pins the mounts).
  *
  * # Why (the operator's report, 2026-09-30)
  *

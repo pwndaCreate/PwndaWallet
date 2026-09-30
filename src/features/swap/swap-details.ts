@@ -493,8 +493,30 @@ export function swapLegChain(asset: string): ChainType | null {
   const lower = asset.toLowerCase();
   const leg = ALL_CHAINS.find((c) => c === lower);
   if (leg) return leg;
-  return ASSET_CAPABILITIES[asset.toUpperCase()]?.walletsByChainKey ?? null;
+  const cap = ASSET_CAPABILITIES[asset.toUpperCase()];
+  if (!cap) return null;
+  // A native EVM coin by its chain id: every EVM coin is held by the one
+  // `ethereum` wallet, so `walletsByChainKey` says `ethereum` for POL,
+  // AVAX, FLR, MON and BNB too, and their legs would have been looked up
+  // on Ethereum's RPCs (found by the wiki pass, 2026-09-30).
+  if (cap.chainKind === "EVM") {
+    return typeof cap.chainId === "number" ? (EVM_NATIVE_CHAIN[cap.chainId] ?? null) : null;
+  }
+  return cap.walletsByChainKey ?? null;
 }
+
+/** The wallet chain of each EVM chain id a swap coin can be native to. */
+const EVM_NATIVE_CHAIN: Readonly<Record<number, ChainType>> = {
+  1: "ethereum",
+  10: "optimism",
+  14: "flare",
+  56: "bsc",
+  137: "polygon",
+  143: "monad",
+  8453: "base",
+  42161: "arbitrum",
+  43114: "avalanche",
+};
 
 /** The network a swap asset lives on, as the swap screens name it. */
 export function swapNetworkName(asset: string): string {
