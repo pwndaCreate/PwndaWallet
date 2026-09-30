@@ -31,6 +31,7 @@ import {
   derivePerChoice,
 } from "../features/onboarding/derivation-detector";
 import { shouldUseAccountSend } from "../features/send/accountSend";
+import { isSendOutcomeUnknown } from "./send-outcome";
 
 const ABANDON =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -40,6 +41,8 @@ const ABANDON =
 let utxosByAddress: Record<string, KoiosUtxo[]>;
 let koiosCalls: string[];
 let submitted: Uint8Array[];
+/** When set, "submit" receives the bytes and then fails with this. */
+let submitFails: unknown;
 
 vi.mock("./cardano-koios", () => ({
   getEpochParams: async () => {
@@ -56,6 +59,7 @@ vi.mock("./cardano-koios", () => ({
   },
   submitTx: async (bytes: Uint8Array) => {
     submitted.push(bytes);
+    if (submitFails !== undefined) throw submitFails;
     return "koios-accepted";
   },
   getAddressBalance: async () => 0,
@@ -65,6 +69,7 @@ beforeEach(() => {
   utxosByAddress = {};
   koiosCalls = [];
   submitted = [];
+  submitFails = undefined;
 });
 
 const utxo = (ada: number, n = 0): KoiosUtxo => ({
@@ -320,5 +325,39 @@ describe("C4: change under 1 ADA is refused, not added to the fee (2026-09-29 se
     expect(tx.fee).toBeLessThan(200_000n); // the fee, not the fee plus ~0.99 ADA of change
     const inputs = 6_000_000n;
     expect(tx.outputs[0].coin + tx.outputs[1].coin + tx.fee).toBe(inputs);
+  });
+});
+
+// ── an unanswered submission (same class as the audit's six chains) ────────
+
+describe("a submission Koios did not clearly answer is 'may have been sent' (2026-09-29 send-safety audit)", () => {
+  const wallet = () => adaAdapter.deriveFromMnemonic(ABANDON);
+  const bodyHash = () => {
+    const tx = decodeSigned(submitted[0]);
+    return Buffer.from(blake2b(tx.bodyBytes, { dkLen: 32 })).toString("hex");
+  };
+
+  it("a 5xx from Koios's gateway: unknown, with the transaction's hash", async () => {
+    utxosByAddress[STANDARD] = [utxo(10)];
+    submitFails = new Error("Koios submit failed (HTTP 502): Bad Gateway");
+    const e: any = await rejection(dashboardSend(wallet(), RECIPIENT, "2"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toBe(bodyHash());
+  });
+
+  it("no answer through the proxy (Tauri rejects with a plain string): unknown", async () => {
+    utxosByAddress[STANDARD] = [utxo(10)];
+    submitFails = "error sending request for url (https://api.koios.rest/api/v1/submittx): operation timed out";
+    const e: any = await rejection(dashboardSend(wallet(), RECIPIENT, "2"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toBe(bodyHash());
+  });
+
+  it("a refusal (HTTP 400, the ledger's reason) stays an ordinary failure", async () => {
+    utxosByAddress[STANDARD] = [utxo(10)];
+    submitFails = new Error('Koios submit failed (HTTP 400): {"tag":"BadInputsUTxO"}');
+    const e = await rejection(dashboardSend(wallet(), RECIPIENT, "2"));
+    expect(isSendOutcomeUnknown(e)).toBe(false);
+    expect(e.message).toMatch(/HTTP 400/);
   });
 });

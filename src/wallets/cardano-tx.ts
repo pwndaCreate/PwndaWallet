@@ -58,6 +58,7 @@ import {
   type KoiosUtxo,
 } from "./cardano-koios";
 import { decimalToAtomic } from "./decimal-amount";
+import { SendOutcomeUnknownError } from "./send-outcome";
 
 /** Min lovelace per UTXO under the current `coins_per_utxo_size` rules.
  *  Babbage-era effective minimum for a simple ADA-only output is ~1 ADA
@@ -702,11 +703,35 @@ export interface SendAdaResult {
 
 /**
  * Build, sign, and submit an ADA transfer. Single call from the wallet
- * adapter's `sendTransaction`. Throws on insufficient funds, broadcast
- * failure, or any malformed input.
+ * adapter's `sendTransaction`. Throws on insufficient funds, a refused
+ * submission, or any malformed input — and `SendOutcomeUnknownError` when
+ * the submission got no clear answer (`submitFailure`).
  */
 export async function sendAda(args: BuildTxArgs): Promise<SendAdaResult> {
   const built = await buildAndSignTx(args);
-  const txHash = await submitTx(built.txCborBytes);
+  let txHash: string;
+  try {
+    txHash = await submitTx(built.txCborBytes);
+  } catch (e) {
+    throw submitFailure(e, built.txHashHex);
+  }
   return { txHash, feeLovelace: built.feeLovelace };
+}
+
+/**
+ * What a failed Koios submission means (2026-09-29 send-safety audit).
+ *
+ * A 4xx is Koios answering — a transaction the node refused comes back 400
+ * with the ledger's reason, a rate limit 429 — and nothing was sent. Anything
+ * else (no answer through the proxy, a 5xx from Koios's gateway) can come
+ * after the node took the transaction. That was reported as a failure with
+ * the form still filled; once the first transaction was in a block, another
+ * press spent its change in a NEW one and paid twice. The hash is known
+ * before submitting: it is the body hash.
+ */
+function submitFailure(e: unknown, txHashHex: string): Error {
+  const text = e instanceof Error ? e.message : String(e);
+  const status = Number(/Koios submit failed \(HTTP (\d{3})\)/.exec(text)?.[1]);
+  if (status >= 400 && status < 500) return e instanceof Error ? e : new Error(text);
+  return new SendOutcomeUnknownError(`Koios gave no clear answer to the ADA transfer: ${text}`, txHashHex);
 }

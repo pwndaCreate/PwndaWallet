@@ -13,6 +13,7 @@ import { ErgoAddress, ErgoBox } from "@fleet-sdk/core";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ergoAdapter } from "./erg-wallet";
+import { isSendOutcomeUnknown } from "./send-outcome";
 
 const ABANDON =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -39,10 +40,13 @@ let pages: Array<ReturnType<typeof box>[]>;
 let total: number;
 let requested: string[];
 let submitted: any[];
+/** Per mirror, in order: how submit answers ("throw" = no answer). Default: accept. */
+let submitAnswers: Array<number | "throw">;
 
 beforeEach(() => {
   requested = [];
   submitted = [];
+  submitAnswers = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
@@ -60,6 +64,9 @@ beforeEach(() => {
       if (u.pathname.endsWith("/mempool/transactions/submit") && init?.method === "POST") {
         const tx = JSON.parse(String(init.body));
         submitted.push(tx);
+        const answer = submitAnswers.shift();
+        if (answer === "throw") throw new TypeError("Failed to fetch");
+        if (answer !== undefined) return new Response("scripted", { status: answer });
         return new Response(JSON.stringify({ id: tx.id }), { status: 200 });
       }
       return new Response("not scripted", { status: 500 });
@@ -108,5 +115,35 @@ describe("Ergo reads every unspent box, not the first 200 (2026-09-29 send-safet
       /Insufficient balance: have 2 ERG/,
     );
     expect(submitted).toEqual([]);
+  });
+});
+
+// Same class as the audit's six chains: a broadcast no mirror clearly answered.
+describe("an Ergo broadcast without a clear answer is 'may have been sent' (2026-09-29 send-safety audit)", () => {
+  beforeEach(() => {
+    pages = [Array.from({ length: 5 }, (_, n) => box(n, 1_000_000_000n))];
+    total = 5;
+  });
+
+  it("no answer from either mirror: unknown, with the transaction id", async () => {
+    submitAnswers = ["throw", "throw"];
+    const e: any = await ergoAdapter.sendTransaction(me.privateKey, other, "1").catch((x) => x);
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toBe(submitted[0].id);
+    // The same signed transaction went to both mirrors: nothing re-signed.
+    expect(submitted[1].id).toBe(submitted[0].id);
+  });
+
+  it("a 5xx on one mirror and a refusal on the other is still unknown", async () => {
+    submitAnswers = [502, 400];
+    const e: any = await ergoAdapter.sendTransaction(me.privateKey, other, "1").catch((x) => x);
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+  });
+
+  it("a refusal from every mirror is an ordinary failure", async () => {
+    submitAnswers = [400, 400];
+    const e: any = await ergoAdapter.sendTransaction(me.privateKey, other, "1").catch((x) => x);
+    expect(isSendOutcomeUnknown(e)).toBe(false);
+    expect(e.message).toMatch(/refused by every mirror/);
   });
 });

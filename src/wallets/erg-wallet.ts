@@ -83,6 +83,7 @@ import type {
   FeeEstimate,
 } from "./types";
 import { ergoGet, ergoSubmitTx, ErgoRpcError } from "./erg-rpc";
+import { SendOutcomeUnknownError } from "./send-outcome";
 
 const DERIVATION_PATH = "m/44'/429'/0'/0/0";
 
@@ -483,18 +484,29 @@ async function sendTransaction(
   });
   const signedTx = new Prover().signTransaction(unsignedTx, [hdKey]);
 
-  // 7. Submit via mirror failover.
+  // 7. Submit via mirror failover. Both mirrors get the same signed bytes, so
+  //    a retry inside this call cannot pay twice.
   try {
     const result = await ergoSubmitTx(signedTx);
     return { hash: result.id };
   } catch (e) {
-    if (e instanceof ErgoRpcError) {
-      const trail = e.attempts
-        .map((a) => `${a.base} (${a.status})`)
-        .join(", ");
-      throw new Error(`Ergo broadcast failed across all mirrors: ${trail}`);
-    }
-    throw e;
+    const trail =
+      e instanceof ErgoRpcError
+        ? e.attempts.map((a) => `${a.base} (${a.status})`).join(", ")
+        : e instanceof Error
+          ? e.message
+          : String(e);
+    // Every mirror answered 4xx: refused, nothing was sent. A timeout, a
+    // dropped connection or a 5xx on ANY attempt can come after a node took
+    // the transaction (2026-09-29 send-safety audit): that was reported as
+    // "broadcast failed" with the form still filled, and one more press
+    // built a new transaction from the same boxes' successors and paid again.
+    const refused =
+      e instanceof ErgoRpcError &&
+      e.attempts.length > 0 &&
+      e.attempts.every((a) => typeof a.status === "number" && a.status >= 400 && a.status < 500);
+    if (refused) throw new Error(`Ergo broadcast refused by every mirror: ${trail}`);
+    throw new SendOutcomeUnknownError(`No Ergo mirror gave a clear answer to the transfer: ${trail}`, signedTx.id);
   }
 }
 

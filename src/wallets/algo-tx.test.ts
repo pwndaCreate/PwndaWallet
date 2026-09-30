@@ -20,6 +20,7 @@ import {
   sendAlgo,
 } from "./algo-tx";
 import { algoAddressFromPublicKey } from "./algo-wallet";
+import { isSendOutcomeUnknown } from "./send-outcome";
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 
@@ -165,12 +166,15 @@ describe("sendAlgo keeps the account's own minimum balance (2026-09-29 send-safe
   const to = algoAddressFromPublicKey(ed25519.getPublicKey(new Uint8Array(32).fill(3)));
   let account: Record<string, unknown>;
   let submits: number;
+  /** How algod answers POST /v2/transactions; the default accepts. */
+  let answerSubmit: () => Response;
   const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200 });
 
   beforeEach(() => {
     submits = 0;
     // 5 ALGO, two assets opted in: algod's own figure for the minimum.
     account = { address: from, amount: 5_000_000, "min-balance": 300_000 };
+    answerSubmit = () => json({}); // no txId: the wallet reports its own
     vi.stubGlobal(
       "fetch",
       vi.fn(async (url: string, init?: RequestInit) => {
@@ -187,7 +191,7 @@ describe("sendAlgo keeps the account's own minimum balance (2026-09-29 send-safe
         if (path.startsWith("/v2/accounts/")) return json(account);
         if (path === "/v2/transactions" && init?.method === "POST") {
           submits++;
-          return json({}); // no txId: the wallet reports its own
+          return answerSubmit();
         }
         return new Response("not scripted", { status: 500 });
       }),
@@ -216,5 +220,25 @@ describe("sendAlgo keeps the account's own minimum balance (2026-09-29 send-safe
       /must keep 0\.1 ALGO/,
     );
     await expect(sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "4.8" })).resolves.toBeTruthy();
+  });
+  // Same class as the audit's six chains: an unanswered submission.
+  it("a submission with no answer is 'may have been sent', with the transaction id", async () => {
+    answerSubmit = () => {
+      throw new TypeError("Failed to fetch");
+    };
+    const e: any = await sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "1" }).catch((x) => x);
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toMatch(/^[A-Z2-7]{52}$/);
+  });
+
+  it("a 5xx is 'may have been sent' too; a 4xx refusal stays an ordinary failure", async () => {
+    answerSubmit = () => new Response("upstream timed out", { status: 504 });
+    const unknown: any = await sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "1" }).catch((x) => x);
+    expect(isSendOutcomeUnknown(unknown), String(unknown)).toBe(true);
+
+    answerSubmit = () => new Response(JSON.stringify({ message: "overspend" }), { status: 400 });
+    const refused: any = await sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "1" }).catch((x) => x);
+    expect(isSendOutcomeUnknown(refused)).toBe(false);
+    expect(refused.message).toBe("Algorand rejected the transaction: overspend");
   });
 });

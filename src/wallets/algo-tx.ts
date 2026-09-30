@@ -34,6 +34,7 @@
  * encoding is right.
  */
 import { atomicToDecimal, decimalToAtomic } from "./decimal-amount";
+import { SendOutcomeUnknownError } from "./send-outcome";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha512_256 } from "@noble/hashes/sha2.js";
 import { base32 } from "@scure/base";
@@ -288,11 +289,29 @@ export function signTransaction(encodedTxn: Uint8Array, privateKey: Uint8Array):
   );
 }
 
-/** Submit a signed transaction blob. Returns algod's transaction id. */
+/** algod answered and refused the transaction (HTTP 4xx): nothing was sent. */
+export class AlgodRefusal extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = "AlgodRefusal";
+    Object.setPrototypeOf(this, AlgodRefusal.prototype);
+  }
+}
+
+/**
+ * Submit a signed transaction blob. Returns algod's transaction id, or
+ * undefined when algod accepted it without a readable one.
+ *
+ * Throws `AlgodRefusal` when algod refused it (4xx). Anything else it throws —
+ * no answer, a 5xx — says nothing about whether the node took it.
+ */
 export async function submitTransaction(
   signed: Uint8Array,
   api = ALGO_API,
-): Promise<string> {
+): Promise<string | undefined> {
   const r = await fetch(`${api}/v2/transactions`, {
     method: "POST",
     headers: { "Content-Type": "application/x-binary" },
@@ -306,9 +325,16 @@ export async function submitTransaction(
     } catch {
       /* algod returns plain text for some errors */
     }
-    throw new Error(`Algorand rejected the transaction: ${message}`);
+    if (r.status >= 400 && r.status < 500) {
+      throw new AlgodRefusal(`Algorand rejected the transaction: ${message}`, r.status);
+    }
+    throw new Error(`Algorand node answered HTTP ${r.status}: ${message}`);
   }
-  return JSON.parse(text).txId;
+  try {
+    return JSON.parse(text).txId;
+  } catch {
+    return undefined; // accepted; the id is computed locally anyway
+  }
 }
 
 /**
@@ -355,7 +381,20 @@ export async function sendAlgo(args: {
   const encoded = encodePayTransaction({ from, to, amountMicro, params, note });
   const signed = signTransaction(encoded, args.privateKey);
   const localId = transactionId(encoded);
-  const nodeId = await submitTransaction(signed, api);
+  let nodeId: string | undefined;
+  try {
+    nodeId = await submitTransaction(signed, api);
+  } catch (e) {
+    if (e instanceof AlgodRefusal) throw e;
+    // No answer, or a 5xx from the node's gateway: the node may have taken
+    // the payment (2026-09-29 send-safety audit). This was a plain failure
+    // with the form still filled, and one more press built a NEW transaction
+    // (fresh validity window, new id) that paid again once the first landed.
+    throw new SendOutcomeUnknownError(
+      `The Algorand node gave no clear answer to the payment: ${e instanceof Error ? e.message : String(e)}`,
+      localId,
+    );
+  }
 
   // A mismatch means our encoding and the node's differ — the transaction went
   // through, but our canonical encoder has a bug worth knowing about loudly.
