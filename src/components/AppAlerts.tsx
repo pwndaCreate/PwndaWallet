@@ -10,6 +10,10 @@
  * nothing readable: the button flipped back to "Send", and a user who pressed
  * it again could send twice. Same reason `UpdateBanner` is one component
  * mounted twice rather than two.
+ *
+ * Each line sits on an opaque base (`--bg`) under the alert's own tint: the
+ * tint is translucent (`--danger-dim`), and fixed over the page it let the
+ * header text behind show through the message.
  */
 export function AppAlerts({
   error,
@@ -43,39 +47,43 @@ export function AppAlerts({
       }}
     >
       {error && (
-        <div
-          className="alert alert-error"
-          role="alert"
-          style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
-        >
-          <span style={{ flex: 1, overflowWrap: "anywhere" }}>{error}</span>
-          <button
-            type="button"
-            aria-label="Dismiss"
-            onClick={() => setError("")}
-            style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
+        <div style={{ background: "var(--bg)" }}>
+          <div
+            className="alert alert-error"
+            role="alert"
+            style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
           >
-            ×
-          </button>
-        </div>
-      )}
-      {success && (
-        <div
-          className="alert alert-success"
-          role="status"
-          style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
-        >
-          <span style={{ flex: 1, overflowWrap: "anywhere" }}>{success}</span>
-          {setSuccess && (
+            <span style={{ flex: 1, overflowWrap: "anywhere" }}>{error}</span>
             <button
               type="button"
               aria-label="Dismiss"
-              onClick={() => setSuccess("")}
+              onClick={() => setError("")}
               style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
             >
               ×
             </button>
-          )}
+          </div>
+        </div>
+      )}
+      {success && (
+        <div style={{ background: "var(--bg)" }}>
+          <div
+            className="alert alert-success"
+            role="status"
+            style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
+          >
+            <span style={{ flex: 1, overflowWrap: "anywhere" }}>{success}</span>
+            {setSuccess && (
+              <button
+                type="button"
+                aria-label="Dismiss"
+                onClick={() => setSuccess("")}
+                style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
+              >
+                ×
+              </button>
+            )}
+          </div>
         </div>
       )}
     </div>
