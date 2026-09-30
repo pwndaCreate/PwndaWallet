@@ -248,6 +248,21 @@ export interface GasBudget {
 }
 
 /**
+ * The two memo kinds a Stellar payment can carry that an exchange asks for
+ * (2026-09-29). `text` is up to `ChainAdapter.memo.textMaxBytes` UTF-8 bytes;
+ * `id` is an unsigned 64-bit integer, written in decimal. They are different
+ * things on the ledger — `MEMO_ID 12345` and `MEMO_TEXT "12345"` do not match
+ * each other — so the type is the user's choice, never guessed.
+ */
+export type SendMemoType = "text" | "id";
+
+/** A validated memo: `value` is the text, or the ID as canonical decimal. */
+export interface SendMemo {
+  type: SendMemoType;
+  value: string;
+}
+
+/**
  * Per-send options beyond recipient and amount (2026-09-29).
  *
  * `destinationTag` is the XRP Ledger's 32-bit recipient tag. Exchanges and
@@ -255,6 +270,11 @@ export interface GasBudget {
  * right account by tag; a payment without the tag they asked for arrives at
  * the exchange and is credited to nobody. Only adapters that declare
  * `ChainAdapter.destinationTag` read it.
+ *
+ * `memo` is the same thing for Stellar (2026-09-29 send-safety audit): XLM
+ * sent to an exchange without the memo it gave arrives and is credited to
+ * nobody. Only adapters (or the session send) that declare `ChainAdapter.memo`
+ * read it.
  */
 export interface SendOptions {
   destinationTag?: number;
@@ -266,6 +286,7 @@ export interface SendOptions {
    * imports, LTC's legacy account — ignored the tier and budgeted a fixed size.
    */
   feeRate?: number;
+  memo?: SendMemo;
 }
 
 /**
@@ -469,6 +490,15 @@ export interface ChainAdapter {
    * else, so no other chain grows an input it would ignore.
    */
   destinationTag?: { label: string; hint: string };
+
+  /**
+   * Present when the chain has a recipient MEMO the Send modal must offer
+   * (Stellar, 2026-09-29 send-safety audit). `label` and `hint` are the
+   * modal's copy; `textMaxBytes` is the longest text memo the chain accepts,
+   * in UTF-8 bytes (Stellar: 28). An ID memo is always an unsigned 64-bit
+   * integer. Absent everywhere else, like `destinationTag`.
+   */
+  memo?: { label: string; hint: string; textMaxBytes: number };
 
   /**
    * Send from the WHOLE ACCOUNT rather than one derived address.

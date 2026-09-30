@@ -8,7 +8,10 @@ import {
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 import {
   getSendDestinationTag,
+  getSendMemo,
   parseDestinationTag,
+  parseSendMemo,
+  resetSendMemo,
   setSendAssetType,
   setSendDestinationTag,
   useSendAssetType,
@@ -20,6 +23,7 @@ import type {
   TxResult,
   WalletInfo,
 } from "../../wallets";
+import type { SendOptions } from "../../wallets/types";
 
 /**
  * Send-flow hook. Owns:
@@ -68,8 +72,11 @@ export function useSend(args: {
    * restart. Shared coins now sign with the wallet's own account path like
    * any other UTXO chain; the one real interaction (a swap funding a lock
    * from the same coins) is `sendGuard`'s job below.
+   *
+   * `opts` carries the same per-send extras `adapter.sendTransaction` gets —
+   * the Stellar memo reaches the session send this way (2026-09-29).
    */
-  sendOverride?: (to: string, amount: string) => Promise<TxResult>;
+  sendOverride?: (to: string, amount: string, opts?: SendOptions) => Promise<TxResult>;
   /**
    * Asked immediately before the send. Resolve with a message to refuse (it is
    * shown as the failure, and nothing is signed), or `null` to send.
@@ -121,18 +128,21 @@ export function useSend(args: {
     // funnel that makes every other call site safe by construction.
     // See the 2026-08-25 entry in `PwndaWalletVault/log.md`.
     setSendAssetType(typeof assetType === "string" ? assetType : undefined);
-    // A tag typed for one send must never ride along on the next.
+    // A tag (or memo) typed for one send must never ride along on the next.
     setSendDestinationTag("");
+    resetSendMemo();
     setShowSendModal(true);
   }, []);
   // Closing forgets the recipient and amount together with the tag
   // (2026-09-29). Clearing only the tag meant Cancel then reopen kept an
   // exchange address and dropped the tag it needs, and one press sent an
-  // untagged deposit the exchange cannot credit.
+  // untagged deposit the exchange cannot credit. The Stellar memo is the same
+  // thing and goes with it.
   const closeSendModal = useCallback(() => {
     setShowSendModal(false);
     setSendAssetType(undefined);
     setSendDestinationTag("");
+    resetSendMemo();
     setSendTo("");
     setSendAmount("");
   }, []);
@@ -230,16 +240,27 @@ export function useSend(args: {
       if (tagInput.error) throw new Error(tagInput.error);
       // The fee tier reaches the single-key path too (2026-09-29 send-safety
       // audit); it only ever went to `sendFromAccount`.
-      const sendOpts =
-        tagInput.tag !== undefined || feeRate !== undefined
+      //
+      // Stellar's memo, the same way as the tag (2026-09-29 send-safety
+      // audit). Before this the session send accepted a memo that nothing ever
+      // passed, so XLM sent to an exchange arrived without one and was
+      // credited to nobody.
+      const memoField = getSendMemo();
+      const memoInput = adapter.memo
+        ? parseSendMemo(memoField.raw, memoField.type, adapter.memo.textMaxBytes)
+        : {};
+      if (memoInput.error) throw new Error(memoInput.error);
+      const sendOpts: SendOptions | undefined =
+        tagInput.tag !== undefined || memoInput.memo || feeRate !== undefined
           ? {
               ...(tagInput.tag !== undefined ? { destinationTag: tagInput.tag } : {}),
+              ...(memoInput.memo ? { memo: memoInput.memo } : {}),
               ...(feeRate !== undefined ? { feeRate } : {}),
             }
           : undefined;
 
       const result = sendOverride
-        ? await sendOverride(sendTo, sendAmount)
+        ? await sendOverride(sendTo, sendAmount, sendOpts)
         : useAccountSend
           ? await adapter.sendFromAccount!(
               wallet.mnemonic!,
@@ -263,6 +284,7 @@ export function useSend(args: {
       setShowSendModal(false);
       setSendAssetType(undefined);
       setSendDestinationTag("");
+      resetSendMemo();
       refreshBalance();
       // Pre-emptively refresh tx history for the chain we just sent on so
       // the new (pending) transaction shows up in Activity within seconds
@@ -278,6 +300,7 @@ export function useSend(args: {
         setShowSendModal(false);
         setSendAssetType(undefined);
         setSendDestinationTag("");
+        resetSendMemo();
         setError(sendOutcomeUnknownText(e));
         refreshBalance();
         void refreshTxHistory(activeChain);

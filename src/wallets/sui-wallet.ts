@@ -36,9 +36,11 @@
  *   - `effects.timestamp` is an ISO-8601 string, not epoch milliseconds.
  *     `parseInt` on it yields the year (2026), i.e. a timestamp in 1970.
  *
- * Sending is NOT wired. The Rust signer (`swap_sign_sui_tx`) exists, but the
- * `executeSuiTransfer` this file used to point at was never written — see
- * `sendTransaction` below.
+ * Sending is not done HERE: the Rust signer (`swap_sign_sui_tx`) is
+ * session-gated, so the dashboard Send goes through
+ * `features/swap/session-send.ts::executeSuiTransfer` (wired 2026-09-02; the
+ * note that stood here said it had never been written, which stopped being
+ * true that day). See `sendTransaction` below.
  */
 
 import { mnemonicToSeedSync } from "@scure/bip39";
@@ -69,7 +71,21 @@ import { rpcsFor } from "./chain-rpcs";
 // BSC/Monad/Solana already), so this needed no allowlist change. Verified
 // live 2026-08-22 for all three methods this adapter calls
 // (suix_getBalance, suix_getReferenceGasPrice, suix_queryTransactionBlocks).
-const SUI_RPC = "https://sui-rpc.publicnode.com";
+//
+// Exported 2026-09-29 (send-safety audit): the SEND path in
+// `features/swap/session-send.ts` hard-coded the dead official host, so every
+// Sui send failed at build time with the same -32601 while balances loaded
+// fine from here. One constant, so the two cannot drift apart again. That path
+// calls it directly from the webview through the SDK's `SuiClient`; publicnode
+// answers CORS for any origin, including the SDK's own request headers
+// (preflight checked 2026-09-29).
+//
+// ⚠ publicnode's JSON-RPC surface may itself go away around mid-October 2026,
+// following the upstream JSON-RPC deprecation. When it does, the fix is the
+// GraphQL/gRPC migration (the reads here and the SDK transport for sends), not
+// another JSON-RPC host. Not migrated yet on purpose: a transport change to the
+// send path wants its own verification pass.
+export const SUI_RPC = "https://sui-rpc.publicnode.com";
 const DERIVATION_PATH = "m/44'/784'/0'/0'/0'";
 
 /** Queries take the short form; responses come back fully expanded. */
@@ -83,7 +99,8 @@ const MIST_PER_SUI = 1_000_000_000n;
 
 const SIGNATURE_SCHEME_ED25519 = 0x00;
 
-function suiAddressFromPublicKey(pk: Uint8Array): string {
+/** Exported 2026-09-29: the send path checks the signer's key against it. */
+export function suiAddressFromPublicKey(pk: Uint8Array): string {
   const input = new Uint8Array(1 + pk.length);
   input[0] = SIGNATURE_SCHEME_ED25519;
   input.set(pk, 1);

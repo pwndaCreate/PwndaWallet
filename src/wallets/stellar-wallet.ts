@@ -216,6 +216,20 @@ export const stellarAdapter: ChainAdapter = {
     standard: "SEP-0005 — all hardened, ed25519 SLIP-0010",
     hasAlternatives: false,
   },
+  /**
+   * The memo field (2026-09-29 send-safety audit). Exchanges receive every
+   * customer's XLM at one account and credit the deposit by memo; before this
+   * the Send modal had no memo field at all, so a deposit arrived without the
+   * memo and was credited to nobody. A destination that publishes SEP-29's
+   * `config.memo_required` is also refused without one (`session-send.ts`).
+   * 28 bytes is Stellar's MEMO_TEXT limit.
+   */
+  memo: {
+    label: "Memo",
+    hint:
+      "Required by most exchanges: use the memo they gave you, with the type they name (text or ID), or the XLM is credited to nobody. Leave empty for a personal wallet.",
+    textMaxBytes: 28,
+  },
   /** Arbitrary-path derivation — powers the generic finder + funded-path scan. */
   deriveAtPath(mnemonic: string, path: string): WalletInfo {
     const { secret, publicKey } = deriveKeypair(mnemonic, path);

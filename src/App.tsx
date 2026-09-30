@@ -1,12 +1,12 @@
-import { decimalToAtomic } from "./wallets/decimal-amount";
 import {
   openSendSession,
+  closeSendSession,
+  executeNearSend,
   executeStellarTransfer,
   executeSuiTransfer,
 } from "./features/swap/session-send";
-import { executeNearNativeTransfer } from "./features/swap/swap-sources";
-import { getNearAddress } from "./api/swap-rust";
 import { NEAR_RPCS } from "./wallets/chain-rpcs";
+import type { SendOptions, TxResult } from "./wallets/types";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { initOsDetection } from "./platform/os";
@@ -1471,42 +1471,56 @@ function App() {
    * both the vault and the swap feature. Opens a session per send (Rust
    * auto-relocks on TTL) using the session password already in memory, so the
    * user is not prompted again mid-flow.
+   *
+   * 2026-09-29 send-safety audit: the Stellar memo from the Send modal now
+   * arrives here (`opts.memo`) and is passed on — before, nothing passed one,
+   * so an exchange deposit arrived uncredited. NEAR goes through
+   * `executeNearSend`, which checks the session's account is the one on screen
+   * (this used to build the transfer from the recovery phrase's account
+   * whatever the dashboard showed). And the session is locked when the send is
+   * over instead of staying open for Rust's 5-minute TTL (`closeSendSession`
+   * locks only if the session is still this send's).
    */
   const sessionSignedSendOverride = useMemo(():
-    | ((to: string, amount: string) => Promise<{ hash: string }>)
+    | ((to: string, amount: string, opts?: SendOptions) => Promise<TxResult>)
     | undefined => {
     if (activeChain !== "stellar" && activeChain !== "near" && activeChain !== "sui") {
       return undefined;
     }
     const from = walletsByChain[activeChain]?.address;
     if (!from || !sessionPassword) return undefined;
-    return async (to, amount) => {
+    return async (to, amount, opts) => {
       const store = await getStore();
       const encrypted = await store.get<EncryptedData>("wallet");
       if (!encrypted) throw new Error("No saved vault found.");
       const sessionId = await openSendSession(encrypted, sessionPassword);
-      if (activeChain === "stellar") {
-        const r = await executeStellarTransfer({ sessionId, fromAddress: from, to, amount });
-        return { hash: r.txHash };
+      try {
+        if (activeChain === "stellar") {
+          const r = await executeStellarTransfer({
+            sessionId,
+            fromAddress: from,
+            to,
+            amount,
+            memo: opts?.memo,
+          });
+          return { hash: r.txHash };
+        }
+        if (activeChain === "sui") {
+          const r = await executeSuiTransfer({ sessionId, fromAddress: from, to, amount });
+          return { hash: r.txHash };
+        }
+        // NEAR needs the ed25519 public key alongside the account id, and only
+        // Rust can produce it from the session — `executeNearSend` asks for it.
+        return await executeNearSend({
+          sessionId,
+          fromAddress: from,
+          to,
+          amount,
+          rpcUrl: NEAR_RPCS()[0],
+        });
+      } finally {
+        await closeSendSession(sessionId);
       }
-      if (activeChain === "sui") {
-        const r = await executeSuiTransfer({ sessionId, fromAddress: from, to, amount });
-        return { hash: r.txHash };
-      }
-      // NEAR needs the ed25519 public key alongside the account id, and only
-      // Rust can produce it from the session — the TS adapter derives the
-      // implicit account but not the `ed25519:<base58>` form the tx requires.
-      const near = await getNearAddress(sessionId);
-      const yocto = decimalToAtomic(amount, 24, "NEAR amount");
-      const r = await executeNearNativeTransfer({
-        sessionId,
-        fromAccountId: near.accountId,
-        fromPublicKey: near.publicKey,
-        depositAddress: to,
-        amountAtomic: yocto.toString(),
-        rpcUrl: NEAR_RPCS()[0],
-      });
-      return { hash: r.txHash };
     };
   }, [activeChain, walletsByChain, sessionPassword]);
 

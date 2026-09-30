@@ -26,28 +26,235 @@
  * exact bug class as the CARDANO blocker resolved earlier the same
  * day. Deriving in TS unblocks it.
  *
- * In v1.x NEAR is destination-and-address-only here — `getBalance`,
- * `sendTransaction`, `getTransactionHistory`, etc. are stubs that
- * report zero / "Not implemented". Source-tx flow for NEAR Intents
- * still runs through the Rust `swap_sign_near_tx` + `executeNearNativeTransfer`
- * path; this adapter just exists so the address shows up everywhere
- * else the wallet expects a chain entry.
+ * Sending runs through the Rust `swap_sign_near_tx` + `executeNearNativeTransfer`
+ * path (the signer is session-gated), for both the dashboard Send and NEAR
+ * Intents deposits.
+ *
+ * 2026-09-29 send-safety audit: `getBalance` was hard-coded to "0" and
+ * `getTransactionHistory` to an empty list, so a funded NEAR wallet read as
+ * empty with "no transactions". The balance is now read with `view_account`
+ * across the NEAR RPC list; history, which no public NEAR RPC serves (it needs
+ * an indexer), now says it is unavailable instead of claiming there is none.
+ * This file also holds the NEAR RPC helpers and the account-ID rules the send
+ * path uses.
  */
 
 import { mnemonicToSeedSync } from "@scure/bip39";
 import { derivePath } from "ed25519-hd-key";
 import { ed25519 } from "@noble/curves/ed25519.js";
+import { atomicToDecimal } from "./decimal-amount";
+import { NEAR_RPCS } from "./chain-rpcs";
 import type {
   ChainAdapter,
   WalletInfo,
   TxResult,
   NetworkInfo,
-  ChainTx,
   TxHistoryPage,
   FeeEstimate,
 } from "./types";
 
 const DERIVATION_PATH = "m/44'/397'/0'";
+
+/** 1 NEAR = 10^24 yoctoNEAR. */
+export const NEAR_DECIMALS = 24;
+
+// =========================================================================
+// NEAR JSON-RPC
+// =========================================================================
+
+/**
+ * An error the NEAR node itself answered with. `causeName` is NEAR's
+ * machine-readable reason (`UNKNOWN_ACCOUNT`, `UNKNOWN_TRANSACTION`,
+ * `UNKNOWN_ACCESS_KEY`, `TIMEOUT_ERROR`, …), read from the error's
+ * `cause.name`. The old helper kept only `message`, which for every one of
+ * these is the literal "Server error".
+ */
+export class NearRpcError extends Error {
+  readonly causeName?: string;
+  readonly code?: number;
+  constructor(message: string, causeName?: string, code?: number) {
+    super(message);
+    this.name = "NearRpcError";
+    this.causeName = causeName;
+    this.code = code;
+  }
+}
+
+/** Per-request timeout. Mutable for tests only. */
+export const NEAR_RPC_TIMEOUT = { ms: 15_000 };
+
+/** One JSON-RPC call to one NEAR node. Throws `NearRpcError` for a node's own error. */
+export async function nearRpcCall<T>(url: string, method: string, params: unknown): Promise<T> {
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), NEAR_RPC_TIMEOUT.ms) : null;
+  try {
+    const resp = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
+      signal: ctl?.signal,
+    });
+    if (!resp.ok) throw new Error(`NEAR RPC ${method} at ${url}: HTTP ${resp.status}`);
+    const json = (await resp.json()) as {
+      result?: T;
+      error?: { message?: string; data?: unknown; code?: number; cause?: { name?: string } };
+    };
+    if (json.error) {
+      const e = json.error;
+      const detail = typeof e.data === "string" ? e.data : (e.message ?? "error");
+      throw new NearRpcError(
+        `NEAR RPC ${method}: ${e.cause?.name ? `${e.cause.name}: ` : ""}${detail}`,
+        e.cause?.name,
+        e.code,
+      );
+    }
+    if (json.result === undefined) throw new Error(`NEAR RPC ${method} at ${url}: no result`);
+    return json.result;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+/**
+ * The same call against each URL in turn until one answers.
+ *
+ * `isAnswer(e)` marks an error that IS the answer (e.g. `UNKNOWN_ACCOUNT` for
+ * `view_account`) and must not be rotated past: a second node would say the
+ * same. Everything else — HTTP errors, timeouts, a provider that does not
+ * serve the method (`1rpc.io/near` answers `query` with -32601, checked
+ * 2026-09-29) — moves on to the next URL. Throws the last error when all fail.
+ */
+export async function nearRpcAny<T>(
+  urls: string[],
+  method: string,
+  params: unknown,
+  isAnswer: (e: unknown) => boolean = () => false,
+): Promise<T> {
+  if (urls.length === 0) throw new Error("No NEAR RPC endpoints configured.");
+  let last: unknown;
+  for (const url of urls) {
+    try {
+      return await nearRpcCall<T>(url, method, params);
+    } catch (e) {
+      if (isAnswer(e)) throw e;
+      last = e;
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
+}
+
+export function isNearCause(e: unknown, causeName: string): boolean {
+  return e instanceof NearRpcError && e.causeName === causeName;
+}
+
+/** `view_account`'s answer, for the fields this wallet reads. */
+export interface NearAccountView {
+  /** Liquid balance in yoctoNEAR (includes the part held for storage). */
+  amount: string;
+  /** Validator stake, yoctoNEAR. Not spendable. */
+  locked: string;
+  /** Bytes of state the account pays storage for. */
+  storage_usage: number;
+}
+
+/**
+ * The account's state, or `null` when NEAR says it does not exist
+ * (`UNKNOWN_ACCOUNT`). An implicit account does not exist until it is first
+ * funded, so `null` is a legitimate empty wallet for one. Throws when no node
+ * can be reached.
+ */
+export async function viewNearAccount(
+  accountId: string,
+  urls: string[] = NEAR_RPCS(),
+): Promise<NearAccountView | null> {
+  try {
+    return await nearRpcAny<NearAccountView>(
+      urls,
+      "query",
+      { request_type: "view_account", finality: "final", account_id: accountId },
+      (e) => isNearCause(e, "UNKNOWN_ACCOUNT"),
+    );
+  } catch (e) {
+    if (isNearCause(e, "UNKNOWN_ACCOUNT")) return null;
+    throw e;
+  }
+}
+
+/**
+ * Storage staking: every byte of account state keeps 10^19 yoctoNEAR
+ * (1 NEAR per 100 kB) in the account, and that part of `amount` cannot be
+ * sent. NEAR's `storage_amount_per_byte`; unchanged since 2020.
+ */
+export const NEAR_STORAGE_YOCTO_PER_BYTE = 10n ** 19n;
+
+/**
+ * What the account can actually send, yoctoNEAR: `amount` minus the storage
+ * stake not already covered by `locked` (NEAR counts a validator stake toward
+ * storage). Never negative.
+ */
+export function nearAvailableYocto(v: NearAccountView): bigint {
+  const amount = BigInt(v.amount);
+  const locked = BigInt(v.locked || "0");
+  const storage = BigInt(v.storage_usage || 0) * NEAR_STORAGE_YOCTO_PER_BYTE;
+  const held = storage > locked ? storage - locked : 0n;
+  return amount > held ? amount - held : 0n;
+}
+
+// =========================================================================
+// Account IDs
+// =========================================================================
+
+/** NEAR's own account-ID grammar (nearcore `AccountId` validation). */
+const NEAR_ACCOUNT_ID =
+  /^(([a-z\d]+[-_])*[a-z\d]+\.)*([a-z\d]+[-_])*[a-z\d]+$/;
+
+/**
+ * A NEAR send recipient (2026-09-29 send-safety audit). The recipient used to
+ * go into the transaction untrimmed and unchecked.
+ *
+ *  - implicit account: exactly 64 lowercase hex characters (it is the public
+ *    key; a transfer creates it);
+ *  - named account: 2–64 characters, lowercase a–z and 0–9, parts joined by
+ *    single `-`, `_` or `.` separators. Whether it EXISTS is a network
+ *    question the send asks separately (a transfer to a missing named account
+ *    fails on chain);
+ *  - `0x` + 40 hex (an "ETH-implicit" account) is refused: NEAR would create
+ *    an account there that only an Ethereum wallet using NEAR's Ethereum-
+ *    wallet support can move funds from, and a user pasting it almost always
+ *    meant an Ethereum address.
+ *
+ * Only surrounding whitespace is removed. Upper case is refused, not
+ * lowered: "Alice.near" is not an account, and guessing which one was meant
+ * is not this wallet's call.
+ */
+export function parseNearRecipient(input: string): { accountId: string; implicit: boolean } {
+  const id = input.trim();
+  if (/^0x[0-9a-fA-F]{40}$/.test(id)) {
+    throw new Error(
+      "That is an Ethereum-style address. NEAR can hold funds there only for an Ethereum wallet " +
+        "using NEAR's Ethereum-wallet support, so this wallet does not send to it. Use a NEAR account " +
+        "(name.near, or a 64-character implicit account).",
+    );
+  }
+  if (/^[0-9a-fA-F]{64}$/.test(id)) {
+    if (id !== id.toLowerCase()) {
+      throw new Error("A NEAR implicit account is written in lowercase hex. Check the address.");
+    }
+    return { accountId: id, implicit: true };
+  }
+  if (id.length < 2 || id.length > 64) {
+    throw new Error(
+      `A NEAR account ID is 2 to 64 characters; this one has ${id.length}. Check the recipient.`,
+    );
+  }
+  if (!NEAR_ACCOUNT_ID.test(id)) {
+    throw new Error(
+      "That is not a valid NEAR account ID: only lowercase letters, digits, and single - _ or . " +
+        "between them (for example alice.near).",
+    );
+  }
+  return { accountId: id, implicit: false };
+}
 
 function deriveKeypair(mnemonic: string, path: string = DERIVATION_PATH): {
   secret: Uint8Array;
@@ -130,12 +337,19 @@ export const nearAdapter: ChainAdapter = {
     };
   },
 
-  async getBalance(_address: string): Promise<string> {
-    // v1.x: balance fetch not wired. Returning "0" rather than a real
-    // RPC call so the dashboard renders the row instead of hanging on
-    // a loading state. Wire up `account_view` RPC + yoctoNEAR formatting
-    // when NEAR balance reads are needed.
-    return "0";
+  /**
+   * The SPENDABLE balance (2026-09-29 send-safety audit): `view_account`'s
+   * `amount` minus the storage stake (see `nearAvailableYocto`). For an
+   * ordinary implicit account that is about 0.00182 NEAR less than an
+   * explorer's total. Used to be hard-coded "0" for every wallet.
+   *
+   * An account NEAR does not know yet (never funded) is a real 0; any failure
+   * to reach a node throws, per the `getBalance` contract.
+   */
+  async getBalance(address: string): Promise<string> {
+    const view = await viewNearAccount(address.trim());
+    if (!view) return "0";
+    return atomicToDecimal(nearAvailableYocto(view), NEAR_DECIMALS);
   },
 
   async sendTransaction(): Promise<TxResult> {
@@ -160,8 +374,16 @@ export const nearAdapter: ChainAdapter = {
     return { label: "Network", value: "mainnet", unit: "" };
   },
 
+  /**
+   * Not implemented — and says so (2026-09-29 send-safety audit). NEAR's
+   * public RPC has no per-account history; it needs an indexer this wallet
+   * does not use yet. This returned `{ items: [] }`, which every history
+   * surface renders as "No transactions yet", right after a send.
+   */
   async getTransactionHistory(): Promise<TxHistoryPage> {
-    return { items: [] as ChainTx[] };
+    throw new Error(
+      "NEAR transaction history is not available in this wallet yet. Look the account up on a NEAR explorer.",
+    );
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

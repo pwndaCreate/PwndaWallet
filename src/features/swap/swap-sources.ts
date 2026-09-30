@@ -15,8 +15,18 @@
  *     source-tx signing requires legacy P2PKH + (BCH) SIGHASH_FORKID
  *     signers in the Rust core, which lands in v1.1.
  */
+import { sha256 } from "@noble/hashes/sha2.js";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import { invoke } from "../../lib/tauri";
 import { broadcastTx, signEvm, signPsbt, type UtxoChain } from "../../api/swap-rust";
+import {
+  isNearCause,
+  nearRpcAny,
+  nearRpcCall,
+  parseNearRecipient,
+  viewNearAccount,
+} from "../../wallets/near-wallet";
+import { NEAR_RPCS } from "../../wallets/chain-rpcs";
 import {
   assertNearTransferShape,
   assertPsbtOutputShape,
@@ -280,16 +290,49 @@ export async function executeSplTransfer(args: {
 // ─── NEAR native ────────────────────────────────────────────────
 
 /**
+ * Timing for confirming a NEAR transfer after the broadcast. Mutable for tests
+ * only. A transfer executes within a few blocks (about a second each), so the
+ * budget is generous; what is not seen by then is reported unconfirmed, never
+ * failed.
+ */
+export const NEAR_CONFIRM = { pollMs: 1_500, budgetMs: 60_000, broadcastTries: 2 };
+
+/**
  * Build, sign, and broadcast a NEAR-native Transfer action to
- * `depositAddress`. Hand-rolls the NEAR `Transaction` borsh encoding so
- * we don't pull in `near-api-js` (it's a heavy dep with its own polyfill
- * needs).
+ * `depositAddress`, then wait for NEAR to say it executed. Hand-rolls the
+ * NEAR `Transaction` borsh encoding so we don't pull in `near-api-js` (it's a
+ * heavy dep with its own polyfill needs).
  *
  * **2026-05-06 fix.** `amountAtomic` is the yoctoNEAR string from
  * 1Click's `quote.amountIn` — already in atomic units. Previous
  * signature took a decimal-units `amountNear`; passing `amountIn` to
  * that field caused an `× 10^24` over-conversion. The NEAR cousin of
  * the EVM "5 sextillion ETH" bug.
+ *
+ * **2026-09-29 send-safety audit: every NEAR transfer before this was
+ * invalid, and reported as sent.** NEAR verifies a transaction's signature
+ * over `sha256(borsh(Transaction))` — the 32-byte transaction hash — and this
+ * signed the raw borsh bytes (Rust's `swap_sign_near_tx` signs whatever it is
+ * given). The broadcast is `broadcast_tx_async`, which answers with a hash
+ * BEFORE the network validates anything, so the invalid transaction still
+ * came back as a hash and the UI said "sent". Now:
+ *  1. the hash is what gets signed (pinned against a real mainnet transfer in
+ *     `nearSigning.test.ts`);
+ *  2. the signature is verified against the account's key before anything is
+ *     broadcast, so a wrong key or a wrong convention cannot leave the machine;
+ *  3. after the broadcast, the `tx` RPC is asked until NEAR reports the
+ *     transfer executed or failed.
+ *
+ * Also refused before anything is built: an invalid, ETH-style or (for named
+ * accounts) nonexistent recipient, and an amount of 0.
+ *
+ * Returns `confirmed: false` when the transfer was (or may have been)
+ * broadcast but NEAR did not report it executed within `NEAR_CONFIRM`. It may
+ * still land, so it is not a failure: the dashboard Send reports it as an
+ * unknown outcome (`session-send.ts::executeNearSend`), and a swap deposit
+ * keeps its hash for the tracker as it always did. Throws an ordinary Error
+ * for everything decided before the broadcast, and for a transfer NEAR
+ * executed and FAILED.
  *
  * Prerequisite: the user's NEAR account must have at least 0.1 NEAR for
  * gas + storage. Not enforced here; the UI surfaces the hint via
@@ -306,12 +349,27 @@ export async function executeNearNativeTransfer(args: {
   /** Atomic units (yoctoNEAR) as a decimal string; 1 NEAR = 1e24 yocto. */
   amountAtomic: string;
   rpcUrl: string;
-}): Promise<{ txHash: string }> {
+}): Promise<{ txHash: string; confirmed: boolean }> {
+  // 0. Everything decidable before building: plain errors, safe to retry.
+  const { accountId: receiverId, implicit } = parseNearRecipient(args.depositAddress);
   const yoctoAmount = atomicStringToBigInt(args.amountAtomic);
+  if (yoctoAmount <= 0n) {
+    throw new Error("The NEAR amount must be greater than zero.");
+  }
+  const rpcUrls = nearRpcList(args.rpcUrl);
+  // A transfer to a named account that does not exist FAILS on chain (the
+  // amount comes back, the fee does not). An implicit account is created by
+  // the transfer itself, so it needs no check.
+  if (!implicit && !(await viewNearAccount(receiverId, rpcUrls))) {
+    throw new Error(
+      `The NEAR account "${receiverId}" does not exist, so it cannot receive. Check the name. Nothing was sent.`,
+    );
+  }
+  const publicKeyBytes = decodeBase58(stripEd25519Prefix(args.fromPublicKey), 32);
 
   // 1. Query the access-key view to get the current nonce + recent block hash.
   const { nonce, blockHashB58 } = await fetchNearNonce(
-    args.rpcUrl,
+    rpcUrls,
     args.fromAccountId,
     args.fromPublicKey
   );
@@ -321,7 +379,7 @@ export async function executeNearNativeTransfer(args: {
     signerId: args.fromAccountId,
     publicKeyEd25519Base58: stripEd25519Prefix(args.fromPublicKey),
     nonce: nonce + 1n,
-    receiverId: args.depositAddress,
+    receiverId,
     blockHashB58,
     yoctoAmount,
   });
@@ -334,44 +392,153 @@ export async function executeNearNativeTransfer(args: {
   // the action layout or the amount field.
   const decoded = decodeNearTransferTransaction(txBytes);
   assertNearTransferShape({
-    expectedRecipient: args.depositAddress,
+    expectedRecipient: receiverId,
     recipientFromTx: decoded.receiverId,
     yoctoAmountFromTx: decoded.yoctoAmount,
     expectedYoctoAmount: yoctoAmount,
     actionTag: decoded.actionTag,
   });
 
-  // 3. Sign the borsh bytes with the NEAR ed25519 key.
+  // 3. Sign the transaction HASH, sha256(borsh(Transaction)) — NEAR's
+  //    convention, and also the transaction's id on chain.
+  const txHash32 = nearTxHash(txBytes);
+  const txHash = encodeBase58(txHash32);
   const sigB64 = await invoke<string>("swap_sign_near_tx", {
     sessionId: args.sessionId,
-    messageB64: bytesToBase64(txBytes),
+    messageB64: bytesToBase64(txHash32),
   });
   const sigBytes = base64ToBytes(sigB64);
   if (sigBytes.length !== 64) {
     throw new Error(`unexpected NEAR signature length: ${sigBytes.length}`);
+  }
+  // Nothing leaves the machine unless NEAR would accept the signature.
+  if (!ed25519.verify(sigBytes, txHash32, publicKeyBytes)) {
+    throw new Error(
+      "The NEAR signature does not match this account's key, so NEAR would reject the transfer. Nothing was sent.",
+    );
   }
 
   // 4. Wrap the signed transaction (borsh-encoded SignedTransaction).
   const signedBytes = encodeNearSignedTransaction(txBytes, sigBytes);
   const signedB64 = bytesToBase64(signedBytes);
 
-  // 5. Broadcast via NEAR JSON-RPC.
-  const txHash = await broadcastTx("NEAR", args.rpcUrl, signedB64);
-  return { txHash };
+  // 5. Broadcast. Only these identical signed bytes are ever re-sent (to the
+  //    next node, when one fails): the same transaction can land only once.
+  let broadcastProblem = "";
+  for (const url of rpcUrls.slice(0, Math.max(1, NEAR_CONFIRM.broadcastTries))) {
+    try {
+      const nodeHash = await broadcastTx("NEAR", url, signedB64);
+      if (nodeHash && nodeHash !== txHash) {
+        // Inference: cannot happen for a correctly hashed transaction. The
+        // locally computed hash is the one NEAR indexes the transfer under.
+        console.warn(`[near] node returned hash ${nodeHash}, computed ${txHash}`);
+      }
+      broadcastProblem = "";
+      break;
+    } catch (e) {
+      broadcastProblem = e instanceof Error ? e.message : String(e);
+    }
+  }
+
+  // 6. `broadcast_tx_async` answers before validation, so a hash proves
+  //    nothing: ask NEAR what happened to it. Asked even when every broadcast
+  //    threw — a dropped connection can still have delivered the transaction.
+  const outcome = await waitForNearOutcome(rpcUrls, txHash, args.fromAccountId);
+  if (outcome.kind === "success") return { txHash, confirmed: true };
+  if (outcome.kind === "failure") {
+    throw new Error(
+      `NEAR ran the transfer and it failed (${outcome.detail}). The amount was not transferred; ` +
+        `at most the network fee was spent. Hash: ${txHash}`,
+    );
+  }
+  if (broadcastProblem) {
+    console.warn(`[near] broadcast did not answer cleanly (${broadcastProblem}); outcome unknown`);
+  }
+  return { txHash, confirmed: false };
+}
+
+/** `rpcUrl` first, then the configured NEAR RPCs, without repeats. */
+function nearRpcList(rpcUrl: string): string[] {
+  return [...new Set([rpcUrl, ...NEAR_RPCS()].filter(Boolean))];
+}
+
+/** NEAR's transaction hash: sha256 of the borsh-encoded `Transaction`. */
+export function nearTxHash(txBytes: Uint8Array): Uint8Array {
+  return sha256(txBytes);
+}
+
+type NearOutcome =
+  | { kind: "success" }
+  | { kind: "failure"; detail: string }
+  | { kind: "unknown"; detail: string };
+
+/**
+ * Ask NEAR's `tx` method until the transfer has executed or failed, or the
+ * budget runs out. A node that does not know the transaction yet
+ * (`UNKNOWN_TRANSACTION`) or is still waiting (`TIMEOUT_ERROR`) is asked
+ * again; any other problem moves on to the next node.
+ */
+async function waitForNearOutcome(
+  urls: string[],
+  txHash: string,
+  senderId: string,
+): Promise<NearOutcome> {
+  const deadline = Date.now() + NEAR_CONFIRM.budgetMs;
+  let i = 0;
+  let last = "no answer yet";
+  for (;;) {
+    const url = urls[i % urls.length];
+    try {
+      const r = await nearRpcCall<{ status?: unknown }>(url, "tx", {
+        tx_hash: txHash,
+        sender_account_id: senderId,
+        wait_until: "EXECUTED_OPTIMISTIC",
+      });
+      const st = r?.status;
+      if (st && typeof st === "object") {
+        if ("Failure" in st) {
+          return { kind: "failure", detail: describeNearFailure((st as { Failure: unknown }).Failure) };
+        }
+        if ("SuccessValue" in st || "SuccessReceiptId" in st) return { kind: "success" };
+      }
+      last = `status ${JSON.stringify(st ?? null)}`;
+    } catch (e) {
+      last = e instanceof Error ? e.message : String(e);
+      if (!isNearCause(e, "UNKNOWN_TRANSACTION") && !isNearCause(e, "TIMEOUT_ERROR")) i++;
+    }
+    if (Date.now() >= deadline) return { kind: "unknown", detail: last };
+    await new Promise<void>((r) => setTimeout(r, NEAR_CONFIRM.pollMs));
+  }
+}
+
+function describeNearFailure(f: unknown): string {
+  const s = JSON.stringify(f) ?? String(f);
+  return s.length > 240 ? `${s.slice(0, 240)}…` : s;
 }
 
 async function fetchNearNonce(
-  rpcUrl: string,
+  rpcUrls: string[],
   accountId: string,
   publicKey: string
 ): Promise<{ nonce: bigint; blockHashB58: string }> {
-  const accessKeyResp = await rpcCall(rpcUrl, "query", {
-    request_type: "view_access_key",
-    finality: "final",
-    account_id: accountId,
-    public_key: publicKey,
-  });
-  const nonceRaw = (accessKeyResp as { nonce?: number | string })?.nonce;
+  let accessKeyResp: { nonce?: number | string } | undefined;
+  try {
+    accessKeyResp = await nearRpcAny<{ nonce?: number | string }>(
+      rpcUrls,
+      "query",
+      {
+        request_type: "view_access_key",
+        finality: "final",
+        account_id: accountId,
+        public_key: publicKey,
+      },
+      (e) => isNearCause(e, "UNKNOWN_ACCESS_KEY") || isNearCause(e, "UNKNOWN_ACCOUNT"),
+    );
+  } catch (e) {
+    if (!isNearCause(e, "UNKNOWN_ACCESS_KEY") && !isNearCause(e, "UNKNOWN_ACCOUNT")) throw e;
+    accessKeyResp = undefined;
+  }
+  const nonceRaw = accessKeyResp?.nonce;
   if (nonceRaw == null) {
     throw new Error(
       `NEAR account "${accountId}" has no access key for ${publicKey}. ` +
@@ -382,41 +549,38 @@ async function fetchNearNonce(
   // The block_hash field on the access-key response is the block we read
   // from. We use the actual current head for the tx's block_hash, since
   // NEAR validates block_hash recency at submission time.
-  const status = await rpcCall(rpcUrl, "status", []);
-  const blockHashB58 = (
-    status as { sync_info?: { latest_block_hash?: string } }
-  )?.sync_info?.latest_block_hash;
+  const status = await nearRpcAny<{ sync_info?: { latest_block_hash?: string } }>(
+    rpcUrls,
+    "status",
+    [],
+  );
+  const blockHashB58 = status?.sync_info?.latest_block_hash;
   if (!blockHashB58) {
     throw new Error("NEAR /status returned no latest_block_hash");
   }
   return { nonce: BigInt(nonceRaw), blockHashB58 };
 }
 
-async function rpcCall(
-  rpcUrl: string,
-  method: string,
-  params: unknown
-): Promise<unknown> {
-  const resp = await fetch(rpcUrl, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-  });
-  if (!resp.ok) {
-    throw new Error(`NEAR RPC ${method} returned ${resp.status}`);
-  }
-  const json = (await resp.json()) as {
-    result?: unknown;
-    error?: { message?: string };
-  };
-  if (json.error) {
-    throw new Error(`NEAR RPC ${method}: ${json.error.message ?? "error"}`);
-  }
-  return json.result;
-}
-
 function stripEd25519Prefix(pk: string): string {
   return pk.startsWith("ed25519:") ? pk.slice("ed25519:".length) : pk;
+}
+
+/** Base58 (Bitcoin alphabet) — NEAR's hash and key encoding. */
+function encodeBase58(bytes: Uint8Array): string {
+  const ALPHABET =
+    "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  let out = "";
+  while (n > 0n) {
+    out = ALPHABET[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  for (const b of bytes) {
+    if (b !== 0) break;
+    out = "1" + out;
+  }
+  return out;
 }
 
 /* ─── NEAR borsh encoder (hand-rolled, no near-api-js dep) ───── */
@@ -438,7 +602,8 @@ function stripEd25519Prefix(pk: string): string {
 // The borsh spec guarantees deterministic encoding so a future
 // near-api-js round-trip would be byte-identical.
 
-function encodeNearTransferTransaction(args: {
+/** Exported for the signing-convention test (`nearSigning.test.ts`). */
+export function encodeNearTransferTransaction(args: {
   signerId: string;
   publicKeyEd25519Base58: string; // base58 of 32 raw pubkey bytes
   nonce: bigint;

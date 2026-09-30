@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   ChainAdapter,
   FeeEstimate,
@@ -14,12 +14,34 @@ import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { useSendQuote } from "./useSendQuote";
 import {
   parseDestinationTag,
+  parseSendMemo,
   setSendDestinationTag,
+  setSendMemoText,
+  setSendMemoType,
   useSendAssetType,
   useSendDestinationTag,
+  useSendMemo,
 } from "./sendAssetStore";
 
 type Tier = "slow" | "normal" | "fast";
+
+/**
+ * Latest-reply-wins for an async read the modal re-issues as the user types
+ * (2026-09-29 send-safety audit). `begin()` stamps a request; a reply is
+ * applied only while `isCurrent(stamp)` — i.e. no newer request has started.
+ *
+ * `loadGas` re-ran on every keystroke of the recipient and the amount with no
+ * such check, so replies could land out of order: a slow estimate for "1"
+ * arriving after the one for "100" put back the "1" verdict, and the modal
+ * could show "enough to cover the fee" for an amount it had not priced.
+ */
+export function createLatestGate(): { begin(): number; isCurrent(stamp: number): boolean } {
+  let latest = 0;
+  return {
+    begin: () => ++latest,
+    isCurrent: (stamp) => stamp === latest,
+  };
+}
 
 export interface SendModalProps {
   adapter: ChainAdapter;
@@ -164,8 +186,12 @@ export function SendModal({
   // token and nothing else, so a zero-gas wallet holding real value is the
   // ordinary first state on Arbitrum and Base, not an edge case.
   const [gas, setGas] = useState<GasBudget | null>(null);
+  // Only the reply to the NEWEST request is applied (2026-09-29): this runs
+  // on every keystroke, and replies do not come back in order.
+  const gasGate = useRef(createLatestGate()).current;
 
   const loadGas = useCallback(async () => {
+    const stamp = gasGate.begin();
     if (!adapter.getGasBudget || !fromAddress) return;
     try {
       // `to`/`amount` are passed when present so the estimate is of the REAL
@@ -175,14 +201,14 @@ export function SendModal({
         to: sendTo || undefined,
         amount: sendAmount || undefined,
       });
-      setGas(r);
+      if (gasGate.isCurrent(stamp)) setGas(r);
     } catch (e) {
       // The adapter is documented not to throw; if a future one does, a
       // missing warning must not take the modal down with it.
       console.warn("[SendModal] gas budget failed:", e);
-      setGas(null);
+      if (gasGate.isCurrent(stamp)) setGas(null);
     }
-  }, [adapter, fromAddress, sendTo, sendAmount]);
+  }, [adapter, fromAddress, sendTo, sendAmount, gasGate]);
 
   useEffect(() => {
     void loadGas();
@@ -195,6 +221,18 @@ export function SendModal({
   // store, so the value `useSend` signs is the value shown here.
   const tagRaw = useSendDestinationTag();
   const tagError = adapter.destinationTag ? parseDestinationTag(tagRaw).error : undefined;
+
+  // Stellar memo (2026-09-29 send-safety audit): the same store pattern as the
+  // tag, so the memo `useSend` sends is the memo shown here.
+  const memoField = useSendMemo();
+  const memoError = adapter.memo
+    ? parseSendMemo(memoField.raw, memoField.type, adapter.memo.textMaxBytes).error
+    : undefined;
+  // A number typed as a TEXT memo is legal and sometimes right, so it does not
+  // block; but MEMO_ID 123 and MEMO_TEXT "123" are different memos, and an
+  // exchange that asked for one does not match the other.
+  const memoLooksLikeId =
+    !memoError && memoField.type === "text" && /^\d+$/.test(memoField.raw.trim());
 
 
   // Fetch fee estimate on mount and refresh every 30 s while open. Adapters
@@ -328,7 +366,10 @@ export function SendModal({
         {/* XRP only (2026-09-29): exchanges receive every customer's XRP at one
             address and credit the account by tag. Rendered only for adapters
             that declare `destinationTag`, so no other chain grows a field it
-            would ignore. Digits only, refused above 32 bits — never truncated. */}
+            would ignore. Digits only, refused above 32 bits — never truncated.
+            Kept exactly as typed (2026-09-29 send-safety audit): the field
+            used to strip non-digits, so a pasted "123-456" became tag 123456
+            without a word; now it is shown and refused, and Send stays off. */}
         {adapter.destinationTag && (
           <div className="form-group" data-destination-tag>
             <label>{adapter.destinationTag.label}</label>
@@ -338,7 +379,7 @@ export function SendModal({
               placeholder="optional"
               aria-label={adapter.destinationTag.label}
               value={tagRaw}
-              onChange={(e) => setSendDestinationTag(e.target.value.replace(/[^0-9]/g, ""))}
+              onChange={(e) => setSendDestinationTag(e.target.value)}
             />
             <div
               style={{
@@ -350,6 +391,67 @@ export function SendModal({
               }}
             >
               {tagError ?? adapter.destinationTag.hint}
+            </div>
+          </div>
+        )}
+        {/* Stellar only (2026-09-29 send-safety audit): the memo an exchange
+            credits the deposit by. Rendered only for adapters that declare
+            `memo`. The TYPE is the user's pick, never guessed from the text:
+            MEMO_ID 123 and MEMO_TEXT "123" are different memos. Refused, never
+            repaired, when malformed. */}
+        {adapter.memo && (
+          <div className="form-group" data-send-memo>
+            <label>{adapter.memo.label}</label>
+            <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+              <div role="group" aria-label="Memo type" style={{ display: "flex", gap: 4 }}>
+                {(["text", "id"] as const).map((t) => {
+                  const active = memoField.type === t;
+                  return (
+                    <button
+                      key={t}
+                      type="button"
+                      data-memo-type={t}
+                      aria-pressed={active}
+                      onClick={() => setSendMemoType(t)}
+                      style={{
+                        padding: "0 8px",
+                        background: active ? "rgba(242,242,242,0.9)" : "transparent",
+                        border: `1px solid ${active ? "rgba(242,242,242,0.9)" : "rgba(255,255,255,0.18)"}`,
+                        color: active ? "#0a0a0a" : "var(--text-dim)",
+                        cursor: "pointer",
+                        fontFamily: "var(--mono)",
+                        fontSize: 9,
+                        letterSpacing: 0.6,
+                      }}
+                    >
+                      {t === "text" ? "TEXT" : "ID"}
+                    </button>
+                  );
+                })}
+              </div>
+              <input
+                type="text"
+                inputMode={memoField.type === "id" ? "numeric" : undefined}
+                placeholder="optional"
+                aria-label={adapter.memo.label}
+                value={memoField.raw}
+                onChange={(e) => setSendMemoText(e.target.value)}
+                style={{ flex: "1 1 auto", minWidth: 0 }}
+              />
+            </div>
+            <div
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 9,
+                lineHeight: 1.5,
+                color: memoError ? "var(--warn)" : "var(--text-dim)",
+                marginTop: 4,
+              }}
+            >
+              {memoError ??
+                (memoLooksLikeId
+                  ? "This memo is a number. If the recipient asked for a memo ID (MEMO_ID), choose ID — a text memo with the same digits does not match it."
+                  : adapter.memo.hint)}
             </div>
           </div>
         )}
@@ -660,11 +762,14 @@ export function SendModal({
               !feeReady ||
               gasShort ||
               quoteBlocks ||
-              !!tagError
+              !!tagError ||
+              !!memoError
             }
             title={
               tagError
                 ? tagError
+                : memoError
+                ? memoError
                 : quoteBlocks
                 ? priced.failure?.message
                 : gasShort

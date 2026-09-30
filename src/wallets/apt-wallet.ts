@@ -31,6 +31,7 @@ import { mnemonicToSeedSync } from "@scure/bip39";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha3_256 } from "@noble/hashes/sha3.js";
 import { decimalToAtomic, atomicToDecimal } from "./decimal-amount";
+import { SendOutcomeUnknownError } from "./send-outcome";
 import type {
   ChainAdapter,
   WalletInfo,
@@ -96,13 +97,191 @@ export function deriveAptFromMnemonic(
   return { privateKey, publicKey, address: aptosAddressFromPublicKey(publicKey) };
 }
 
-/** Normalise a user-supplied address to the padded 0x + 64-hex form. */
+/**
+ * Normalise an address to the padded 0x + 64-hex form, FOR READS ONLY: the
+ * wallet's own address and the addresses in its history. Never for a
+ * recipient — see {@link parseAptosRecipient}.
+ */
 export function normalizeAptosAddress(address: string): string {
   const raw = address.trim().toLowerCase().replace(/^0x/, "");
   if (!/^[0-9a-f]{1,64}$/.test(raw)) {
     throw new Error(`Invalid Aptos address: ${address}`);
   }
   return "0x" + raw.padStart(64, "0");
+}
+
+/**
+ * A SEND recipient: exactly 64 hex characters (the `0x` is optional), and
+ * nothing is ever padded (2026-09-29 send-safety audit).
+ *
+ * The send used `normalizeAptosAddress`, which accepts 1–64 hex characters and
+ * zero-pads them. So an Ethereum address (0x + 40 hex) or a paste that lost
+ * its last character became a valid-looking 64-character address, and
+ * `aptos_account::transfer` CREATED an account there that nobody holds a key
+ * for. Short forms are refused too, even the legitimate special ones (0x1 is
+ * the framework): no person's wallet lives there, so a user typing one is a
+ * mistake, and refusing costs nothing.
+ */
+export function parseAptosRecipient(input: string): string {
+  const t = input.trim();
+  const hex = t.replace(/^0x/i, "");
+  if (!/^[0-9a-fA-F]+$/.test(hex)) {
+    throw new Error(
+      "That is not an Aptos address. An Aptos address is 0x followed by 64 hex characters (0-9, a-f).",
+    );
+  }
+  if (hex.length === 40) {
+    throw new Error(
+      "That looks like an Ethereum address (40 hex characters). An Aptos address has 64. " +
+        "Sending to it would create an Aptos account nobody controls. Nothing was sent.",
+    );
+  }
+  if (hex.length !== 64) {
+    throw new Error(
+      `An Aptos address has 64 hex characters after 0x; this one has ${hex.length}. ` +
+        "It may have been cut off — copy it again. Shorter forms are not accepted, because " +
+        "they are filled out with zeros into a different address that nobody owns.",
+    );
+  }
+  return "0x" + hex.toLowerCase();
+}
+
+/**
+ * Timing for confirming a send. Mutable for tests only.
+ *
+ *  - `expirySecs`: the signed transaction's own expiry. After the chain's
+ *    clock passes it, the transaction can never be committed — which is what
+ *    lets an uncertain send be settled as "did not happen" instead of
+ *    "unknown".
+ *  - `ledgerMarginSecs`: how far past the expiry the node's ledger must be
+ *    before a missing transaction counts as expired. The public endpoint is a
+ *    pool of fullnodes that can be a few seconds apart.
+ *  - `graceMs`: how long past the expiry to keep asking before giving up.
+ */
+export const APT_CONFIRM = {
+  pollMs: 1_000,
+  expirySecs: 30,
+  ledgerMarginSecs: 10,
+  graceMs: 30_000,
+};
+
+/**
+ * The floor for `maxGasAmount`: the SDK's own `MIN_MAX_GAS_AMOUNT`, below which
+ * it raises the value anyway (checked in @aptos-labs/ts-sdk 7.3.0).
+ */
+export const APT_MIN_MAX_GAS = 2_000n;
+
+/**
+ * `maxGasAmount` for a send whose simulation used `gasUsed` units: 1.5× that,
+ * never below {@link APT_MIN_MAX_GAS} (2026-09-29 send-safety audit).
+ *
+ * Why not the SDK default: `DEFAULT_MAX_GAS_AMOUNT` is 2,000,000 units, and
+ * the chain requires the sender to hold `maxGasAmount × gasUnitPrice` up front
+ * — 2 APT at the usual price of 100 octas. A wallet with less than about 2 APT
+ * could not send at all (INSUFFICIENT_BALANCE_FOR_TRANSACTION_FEE) while the
+ * modal quoted a fee of about 0.001 APT. Only gas actually used is charged, so
+ * the headroom costs nothing when it is not needed.
+ */
+export function aptMaxGasFor(gasUsed: bigint): bigint {
+  const withHeadroom = (gasUsed * 3n + 1n) / 2n; // ceil(1.5 × used)
+  return withHeadroom > APT_MIN_MAX_GAS ? withHeadroom : APT_MIN_MAX_GAS;
+}
+
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/** The node's ledger clock, in whole seconds; null when it cannot be read. */
+async function aptosLedgerSecs(): Promise<number | null> {
+  try {
+    const r = await fetch(APTOS_API);
+    if (!r.ok) return null;
+    const d = await r.json();
+    const us = d?.ledger_timestamp;
+    return us == null ? null : Number(BigInt(String(us)) / 1_000_000n);
+  } catch {
+    return null;
+  }
+}
+
+type AptosLookup =
+  | { state: "committed"; success: boolean; vmStatus: string }
+  | { state: "pending" }
+  | { state: "missing" }
+  | { state: "error"; detail: string };
+
+async function lookupAptosTx(hash: string): Promise<AptosLookup> {
+  try {
+    const r = await fetch(`${APTOS_API}/transactions/by_hash/${hash}`);
+    if (r.status === 404) return { state: "missing" };
+    if (!r.ok) return { state: "error", detail: `HTTP ${r.status} looking the transaction up` };
+    const t = await r.json();
+    if (t?.type === "pending_transaction") return { state: "pending" };
+    if (typeof t?.success === "boolean") {
+      return { state: "committed", success: t.success, vmStatus: String(t.vm_status ?? "") };
+    }
+    return { state: "error", detail: `unexpected lookup answer (type ${String(t?.type)})` };
+  } catch (e) {
+    return { state: "error", detail: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+/**
+ * Settle a submitted (or possibly-submitted) send by its hash.
+ *
+ * `accepted` says whether the node answered the submit with the transaction
+ * accepted. It decides only the case nothing else settles — still not
+ * committed and not provably expired when the time runs out: an accepted
+ * transaction is reported as submitted-not-confirmed (`pending`), one whose
+ * submit failed ambiguously as {@link SendOutcomeUnknownError}. Both close the
+ * Send form; neither invites a second press.
+ */
+async function settleAptosSend(
+  hash: string,
+  expireSecs: number,
+  accepted: boolean,
+  submitProblem: string,
+): Promise<TxResult> {
+  const deadline = Math.max(Date.now(), expireSecs * 1000) + APT_CONFIRM.graceMs;
+  let lastProblem = submitProblem;
+  for (;;) {
+    // The ledger clock FIRST, then the lookup: a node that had already passed
+    // the expiry before we asked would have shown a committed transaction.
+    const ledgerSecs = await aptosLedgerSecs();
+    const found = await lookupAptosTx(hash);
+    if (found.state === "committed") {
+      if (found.success) return { hash };
+      throw new Error(
+        `Aptos committed the transaction but it failed (${found.vmStatus || "no reason given"}). ` +
+          `The network fee was charged; the amount was not sent. Hash: ${hash}`,
+      );
+    }
+    if (
+      found.state === "missing" &&
+      ledgerSecs !== null &&
+      ledgerSecs > expireSecs + APT_CONFIRM.ledgerMarginSecs
+    ) {
+      throw new Error(
+        "The Aptos transaction expired before it was committed, so it can no longer go through. " +
+          `Nothing was sent; it is safe to send again. Hash: ${hash}`,
+      );
+    }
+    if (found.state === "error") lastProblem = found.detail;
+    if (Date.now() >= deadline) break;
+    await sleep(APT_CONFIRM.pollMs);
+  }
+  if (accepted) return { hash, pending: true };
+  throw new SendOutcomeUnknownError(
+    `Aptos did not confirm the transaction${lastProblem ? ` (${lastProblem})` : ""}.`,
+    hash,
+  );
+}
+
+/** A plain sentence for a simulation that says the transfer would fail. */
+function aptosRefusalText(vmStatus: string): string {
+  const s = vmStatus || "no reason given";
+  if (/INSUFFICIENT_BALANCE/i.test(s)) {
+    return `Not enough APT for this amount plus the network fee (Aptos: ${s}). Nothing was sent.`;
+  }
+  return `Aptos would refuse this transfer (${s}). Nothing was sent.`;
 }
 
 export const aptAdapter: ChainAdapter = {
@@ -171,46 +350,120 @@ export const aptAdapter: ChainAdapter = {
     return atomicToDecimal(BigInt(out?.[0] ?? 0), APT_DECIMALS);
   },
 
+  /**
+   * Build, price, sign ONCE, submit once, then settle by hash (2026-09-29
+   * send-safety audit).
+   *
+   * What changed, and why:
+   *  - The recipient must be exactly 64 hex characters ({@link
+   *    parseAptosRecipient}); it used to be zero-padded into an unowned address.
+   *  - The gas limit comes from a simulation ({@link aptMaxGasFor}); the SDK
+   *    default of 2,000,000 units made anyone holding under ~2 APT unable to
+   *    send.
+   *  - The SDK's `waitForTransaction` is gone. It throws on its own 20 s timeout
+   *    and on any non-404 4xx (a 429 included) even after the node accepted
+   *    the transaction, and that throw was reported as "Transaction failed" for
+   *    a transfer that had gone through — one more press paid twice. The hash
+   *    is now computed before the submit and the outcome looked up by it.
+   */
   async sendTransaction(
     privateKey: string,
     to: string,
     amount: string,
   ): Promise<TxResult> {
-    // Lazy — keeps 6.35 MB out of the bundle for every user who never sends APT.
-    const { Account, Aptos, AptosConfig, Ed25519PrivateKey, Network } = await import(
-      "@aptos-labs/ts-sdk"
-    );
+    // Decided before anything is built or signed: a plain error, safe to retry.
+    const recipient = parseAptosRecipient(to);
     const octas = decimalToAtomic(amount, APT_DECIMALS, "APT amount");
     if (octas <= 0n) throw new Error("Amount must be greater than zero.");
+
+    // Lazy — keeps 6.35 MB out of the bundle for every user who never sends APT.
+    const {
+      Account,
+      Aptos,
+      AptosConfig,
+      Ed25519PrivateKey,
+      Network,
+      generateUserTransactionHash,
+    } = await import("@aptos-labs/ts-sdk");
 
     const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }));
     const signer = Account.fromPrivateKey({
       privateKey: new Ed25519PrivateKey("0x" + privateKey.replace(/^0x/, "")),
     });
 
-    const transaction = await aptos.transaction.build.simple({
-      sender: signer.accountAddress,
-      data: {
-        function: "0x1::aptos_account::transfer",
-        functionArguments: [normalizeAptosAddress(to), octas],
-      },
-    });
-
     // `0x1::aptos_account::transfer` (not `0x1::coin::transfer`) because it
     // CREATES the destination account if it does not exist yet. `coin::transfer`
     // aborts on an unfunded destination, which is the common case for a first
     // send to a fresh wallet.
-    const committed = await aptos.signAndSubmitTransaction({
-      signer,
-      transaction,
+    const data = {
+      function: "0x1::aptos_account::transfer" as const,
+      functionArguments: [recipient, octas],
+    };
+
+    // 1. Price it. The draft is only simulated, never signed. With
+    //    `estimateMaxGasAmount` the node simulates at what the account can
+    //    afford, so the SDK's 2-APT default cannot fail the simulation itself.
+    const draft = await aptos.transaction.build.simple({ sender: signer.accountAddress, data });
+    const [sim] = await aptos.transaction.simulate.simple({
+      signerPublicKey: signer.publicKey,
+      transaction: draft,
+      options: { estimateMaxGasAmount: true, estimateGasUnitPrice: true },
     });
-    const result = await aptos.waitForTransaction({
-      transactionHash: committed.hash,
+    if (!sim) throw new Error("Aptos returned no simulation for this transfer. Nothing was sent.");
+    if (sim.success !== true) throw new Error(aptosRefusalText(String(sim.vm_status ?? "")));
+    const maxGasAmount = aptMaxGasFor(BigInt(sim.gas_used));
+    const gasUnitPrice = BigInt(sim.gas_unit_price);
+
+    // 2. The one transaction that is signed: the draft's sequence number, the
+    //    simulated price, and an expiry this code knows (see APT_CONFIRM).
+    const expireSecs = Math.floor(Date.now() / 1000) + APT_CONFIRM.expirySecs;
+    const transaction = await aptos.transaction.build.simple({
+      sender: signer.accountAddress,
+      data,
+      options: {
+        maxGasAmount: Number(maxGasAmount),
+        gasUnitPrice: Number(gasUnitPrice),
+        accountSequenceNumber: draft.rawTransaction.sequence_number,
+        expireTimestamp: expireSecs,
+      },
     });
-    if (result.success === false) {
-      throw new Error(`Aptos transaction failed: ${result.vm_status ?? "unknown reason"}`);
+
+    // 3. Sign once. The hash is known before anything leaves the machine, so
+    //    every outcome after this point can be looked up rather than guessed.
+    const senderAuthenticator = aptos.transaction.sign({ signer, transaction });
+    const hash = generateUserTransactionHash({ transaction, senderAuthenticator });
+
+    // 4. Submit once. Only a 4xx that is the node REFUSING the transaction is
+    //    a failure; a timeout, 408/409/429, a 5xx or a dropped connection may
+    //    have reached the mempool and is settled by hash like a success.
+    let accepted = false;
+    let submitProblem = "";
+    try {
+      const pending = await aptos.transaction.submit.simple({ transaction, senderAuthenticator });
+      accepted = true;
+      if (pending?.hash && pending.hash.toLowerCase() !== hash.toLowerCase()) {
+        // Inference: cannot happen for a correctly hashed transaction. Logged
+        // rather than trusted, and the locally computed hash is kept.
+        console.warn(`[aptos] node returned hash ${pending.hash}, computed ${hash}`);
+      }
+    } catch (e) {
+      const status = (e as { status?: unknown })?.status;
+      const detail = e instanceof Error ? e.message : String(e);
+      if (
+        typeof status === "number" &&
+        status >= 400 &&
+        status < 500 &&
+        status !== 408 &&
+        status !== 409 &&
+        status !== 429
+      ) {
+        throw new Error(`Aptos refused the transaction: ${detail}. Nothing was sent.`);
+      }
+      submitProblem = detail;
     }
-    return { hash: committed.hash };
+
+    // 5. Settle by hash.
+    return settleAptosSend(hash, expireSecs, accepted, submitProblem);
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {

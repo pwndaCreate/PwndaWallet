@@ -19,6 +19,7 @@
  * `undefined` means "the chain's native asset", exactly as before.
  */
 import { useSyncExternalStore } from "react";
+import type { SendMemo, SendMemoType } from "../../wallets/types";
 
 let current: string | undefined = undefined;
 const listeners = new Set<() => void>();
@@ -90,4 +91,97 @@ export function parseDestinationTag(raw: string): { tag?: number; error?: string
     return { error: "A destination tag is a whole number from 0 to 4294967295." };
   }
   return { tag: Number(t) };
+}
+
+// ─── The Stellar memo (2026-09-29 send-safety audit) ──────────────────────
+//
+// Same reason as the tag: the modal renders the field in whichever layout
+// mounted it, and `useSend` must send exactly what the field shows. Held as
+// the field's raw text plus the memo TYPE the user picked; parsed by
+// `parseSendMemo` at the two places that need a memo. Reset wherever the tag
+// is, so a memo typed for one send never rides along on the next.
+
+export interface SendMemoInput {
+  raw: string;
+  type: SendMemoType;
+}
+
+const EMPTY_MEMO: SendMemoInput = { raw: "", type: "text" };
+// One object per state, replaced on change: `useSyncExternalStore` compares
+// snapshots by reference.
+let memoState: SendMemoInput = EMPTY_MEMO;
+const memoListeners = new Set<() => void>();
+
+function subscribeMemo(cb: () => void): () => void {
+  memoListeners.add(cb);
+  return () => {
+    memoListeners.delete(cb);
+  };
+}
+
+function setMemoState(next: SendMemoInput): void {
+  if (next.raw === memoState.raw && next.type === memoState.type) return;
+  memoState = next;
+  for (const l of memoListeners) l();
+}
+
+export function getSendMemo(): SendMemoInput {
+  return memoState;
+}
+
+export function setSendMemoText(raw: string): void {
+  setMemoState({ raw, type: memoState.type });
+}
+
+export function setSendMemoType(type: SendMemoType): void {
+  setMemoState({ raw: memoState.raw, type });
+}
+
+/** Forget the memo and its type. Called everywhere the tag is cleared. */
+export function resetSendMemo(): void {
+  setMemoState(EMPTY_MEMO);
+}
+
+export function useSendMemo(): SendMemoInput {
+  return useSyncExternalStore(subscribeMemo, getSendMemo, getSendMemo);
+}
+
+/** The largest Stellar `MEMO_ID`: an unsigned 64-bit integer. */
+export const MAX_MEMO_ID = 18446744073709551615n;
+
+/**
+ * The field's text as a memo: `{}` when empty (no memo), `{ memo }` when
+ * valid, `{ error }` otherwise.
+ *
+ * Refused, never repaired, because a memo that is not exactly what the
+ * exchange gave credits nobody (or somebody else):
+ *  - an ID with anything but digits ("123-456", "0x10", "1e5") is an error,
+ *    not "123456" / 16 / 100000;
+ *  - an ID above 2^64 - 1 is an error. `@stellar/stellar-base`'s `Memo.id`
+ *    does NOT refuse it: checked 2026-09-29, `Memo.id("18446744073709551616")`
+ *    encodes as memo ID 0, and `Memo.id("0x10")` as 16;
+ *  - a text memo longer than `textMaxBytes` UTF-8 bytes is an error, not a
+ *    truncation.
+ * Surrounding whitespace is trimmed (a pasted memo often carries a newline).
+ */
+export function parseSendMemo(
+  raw: string,
+  type: SendMemoType,
+  textMaxBytes: number,
+): { memo?: SendMemo; error?: string } {
+  const t = raw.trim();
+  if (!t) return {};
+  if (type === "id") {
+    if (!/^\d{1,20}$/.test(t) || BigInt(t) > MAX_MEMO_ID) {
+      return { error: "A memo ID is a whole number from 0 to 18446744073709551615, digits only." };
+    }
+    return { memo: { type: "id", value: BigInt(t).toString() } };
+  }
+  const bytes = new TextEncoder().encode(t).length;
+  if (bytes > textMaxBytes) {
+    return {
+      error: `A text memo is at most ${textMaxBytes} bytes; this one is ${bytes}. Use the memo exactly as the recipient gave it.`,
+    };
+  }
+  return { memo: { type: "text", value: t } };
 }
