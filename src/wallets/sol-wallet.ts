@@ -6,6 +6,7 @@ import {
   Transaction,
   LAMPORTS_PER_SOL,
   type AccountInfo,
+  type ParsedTransactionWithMeta,
   type SignatureStatus,
   type TransactionError,
   type TransactionInstruction,
@@ -18,6 +19,7 @@ import { invoke } from "../lib/tauri";
 import { errorText } from "../lib/errorText";
 import { atomicToDecimal, decimalToAtomic } from "./decimal-amount";
 import { SendOutcomeUnknownError } from "./send-outcome";
+import { isSolanaSignature, solNativeParties } from "./parties-a-sol";
 import type {
   ChainAdapter,
   WalletInfo,
@@ -25,6 +27,7 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
 } from "./types";
 
@@ -335,6 +338,50 @@ async function runOnAnyRpc<T>(fn: (conn: Connection) => Promise<T>): Promise<T> 
   throw new Error(
     `All Solana RPC endpoints failed. Try again in a moment.\n${lines}`
   );
+}
+
+/**
+ * How many endpoints must answer "no such transaction" before that is
+ * believed. A node without full ledger history answers `null` for an old
+ * transaction, so one more opinion is worth a request; going on through all
+ * eleven would be eleven requests against endpoints this file documents as
+ * easy to rate-limit, for a signature that is simply unknown.
+ */
+const SOL_UNKNOWN_ANSWERS = 2;
+
+/**
+ * One transaction, parsed (`jsonParsed`, v0 included), and the host that
+ * served it — for `getTransactionParties`, native and SPL (2026-09-30). The
+ * sticky endpoint first, then the roster, like every read here. Resolves
+ * `null` for a string that is not a signature, and when the transaction was
+ * unknown to `SOL_UNKNOWN_ANSWERS` endpoints (or to every one that answered);
+ * throws, naming each endpoint's failure, when none answered.
+ */
+export async function readParsedSolanaTransaction(
+  signature: string,
+): Promise<{ tx: ParsedTransactionWithMeta; host: string } | null> {
+  const sig = String(signature ?? "").trim();
+  if (!isSolanaSignature(sig)) return null;
+  const failures: string[] = [];
+  let unknown = 0;
+  for (const url of rpcOrder()) {
+    const host = new URL(url).host;
+    try {
+      const tx = await withTimeout(
+        makeConnection(url).getParsedTransaction(sig, { maxSupportedTransactionVersion: 0 }),
+        PER_RPC_TIMEOUT_MS,
+        url,
+      );
+      stickyUrl = url;
+      if (tx) return { tx, host };
+      if (++unknown >= SOL_UNKNOWN_ANSWERS) return null;
+    } catch (e) {
+      failures.push(`${host}: ${errorText(e).replace(/\s+/g, " ").slice(0, 160)}`);
+      if (url === stickyUrl) stickyUrl = null;
+    }
+  }
+  if (unknown > 0) return null;
+  throw new Error(`every Solana RPC endpoint failed — ${failures.join("; ")}`);
 }
 
 // ─── Sending (2026-09-29 send-safety audit) ──────────────────────────────
@@ -1079,6 +1126,15 @@ export const solAdapter: ChainAdapter = {
     });
     const cursor = sigs.length === limit ? sigs[sigs.length - 1].signature : undefined;
     return { items, cursor };
+  },
+
+  /**
+   * Who sent one transaction and who received it, by signature: its System
+   * transfers, or else its lamport balance changes (`parties-a-sol.ts`).
+   */
+  async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+    const r = await readParsedSolanaTransaction(hash);
+    return r ? { ...solNativeParties(r.tx, ownAddress), source: r.host } : null;
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

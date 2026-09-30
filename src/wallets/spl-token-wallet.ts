@@ -66,6 +66,7 @@ import type {
   GasBudget,
   NetworkInfo,
   TxHistoryPage,
+  TxParties,
   TxResult,
   WalletInfo,
   ChainType,
@@ -73,6 +74,7 @@ import type {
 import {
   solAdapter,
   runOnAnySolanaRpc,
+  readParsedSolanaTransaction,
   submitSolanaTransaction,
   solanaKeypairFromPrivateKey,
   parseSolanaAddress,
@@ -84,6 +86,7 @@ import {
   TOKEN_PROGRAM_ID,
 } from "./sol-wallet";
 import { atomicToDecimal, decimalToAtomic } from "./decimal-amount";
+import { splParties } from "./parties-a-sol";
 
 const ASSOCIATED_TOKEN_PROGRAM_ID = new PublicKey(
   "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL",
@@ -607,6 +610,17 @@ export function createSplTokenAdapter(cfg: SplTokenAdapterConfig): ChainAdapter 
         confirmations: s.confirmationStatus === "processed" ? 0 : undefined,
       }));
       return { items };
+    },
+
+    /**
+     * The token's sender and recipient in one transaction — owners, not
+     * token accounts — plus what the rows above leave out: the wallet's
+     * direction and amount, and the fee when the wallet paid it
+     * (`parties-a-sol.ts`). One parsed transaction, only when a row is opened.
+     */
+    async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+      const r = await readParsedSolanaTransaction(hash);
+      return r ? { ...splParties(r.tx, cfg.mint, cfg.decimals, ownAddress), source: r.host } : null;
     },
 
     async getFeeEstimate(): Promise<FeeEstimate> {
