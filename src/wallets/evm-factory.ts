@@ -7,6 +7,7 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
   GasBudget,
 } from "./types";
@@ -19,6 +20,7 @@ import {
 } from "./evm-gas";
 import { sendEvmTransfer } from "./evm-send";
 import { fetchEvmHistory, type EvmExplorer } from "./evm-history";
+import { readEvmParties } from "./parties-a-evm";
 import { proxyGetJson } from "./_proxy";
 import { withFallback as withUrlFallback } from "./_fallback";
 
@@ -269,6 +271,16 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
         opts,
         (url) => proxyGetJson(url),
       );
+    },
+
+    /**
+     * Who sent one transaction and who received it, by hash, from this
+     * adapter's own RPCs in their order (`parties-a-evm.ts`): the native
+     * coin's `from` / `to`, or an ERC-20 leg's `Transfer` logs of its token.
+     * Works on BSC and Monad too, which have no history source.
+     */
+    async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+      return readEvmParties({ chainName: displayName, urls: allRpcUrls, tokenContract }, hash, ownAddress);
     },
 
     /**
