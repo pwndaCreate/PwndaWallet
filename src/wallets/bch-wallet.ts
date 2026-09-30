@@ -1605,7 +1605,10 @@ export const bchAdapter: ChainAdapter = {
     }>(
       `${BLOCKCHAIR_BASE}/dashboards/address/${address}?limit=${limit}&offset=${offset}`
     );
-    const entry = r.data?.[address];
+    // Which form Blockchair keys `data` by when asked with the prefixed
+    // address is not verified (its API answered HTTP 430 to the 2026-09-30
+    // probe), so both are looked up rather than reading "no transactions".
+    const entry = r.data?.[address] ?? r.data?.[address.toLowerCase().replace(/^bitcoincash:/, "")];
     const txids = (entry?.transactions ?? []).slice(0, limit);
     if (txids.length === 0) return { items: [] };
 
@@ -1619,14 +1622,18 @@ export const bchAdapter: ChainAdapter = {
         for (const txid of batch) {
           const d = detail.data?.[txid];
           if (!d) continue;
+          // `mine`, not `=== address` (2026-09-30): Blockchair prints BARE
+          // CashAddr (`qrepx94s…`, read live) and this wallet's addresses are
+          // `bitcoincash:`-prefixed, so the exact comparison never matched and
+          // every Blockchair row read as a 0 BCH "self" transfer.
           let outFromMe = 0;
           for (const inp of d.inputs ?? []) {
-            if (inp.recipient === address) outFromMe += inp.value || 0;
+            if (mine(inp.recipient)) outFromMe += inp.value || 0;
           }
           let inToMe = 0;
           let firstExternal: string | undefined;
           for (const out of d.outputs ?? []) {
-            if (out.recipient === address) inToMe += out.value || 0;
+            if (mine(out.recipient)) inToMe += out.value || 0;
             else if (!firstExternal && out.recipient) firstExternal = out.recipient;
           }
           const net = inToMe - outFromMe;
