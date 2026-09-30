@@ -900,7 +900,13 @@ export const dogeAdapter: ChainAdapter = {
               : undefined,
             height: d.transaction.block_id,
             counterparty: direction === "out" ? firstExternalOut : undefined,
-            meta: {},
+            // The signed net and the tx's addresses, for the account-wide
+            // merge (`accountTxHistory`, utxo-account-history.ts, 2026-09-30).
+            meta: {
+              netSat: net,
+              outputs: (d.outputs ?? []).map((o) => o.recipient ?? ""),
+              inputs: (d.inputs ?? []).map((i) => i.recipient ?? ""),
+            },
           });
         }
       } catch {

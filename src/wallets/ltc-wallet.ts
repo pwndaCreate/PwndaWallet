@@ -762,7 +762,15 @@ async function fetchHistoryBlockcypher(
       confirmations: tx.confirmations,
       height: tx.block_height,
       counterparty: direction === "out" ? firstExternal : undefined,
-      meta: { _via: "blockcypher" },
+      // The signed net and the tx's addresses, for the account-wide merge
+      // (`accountTxHistory`, utxo-account-history.ts, 2026-09-30) — the same
+      // facts the Esplora rows carry.
+      meta: {
+        _via: "blockcypher",
+        netSat: net,
+        outputs: (tx.outputs ?? []).map((o) => o.addresses?.[0] ?? ""),
+        inputs: (tx.inputs ?? []).map((i) => i.addresses?.[0] ?? ""),
+      },
     };
   });
   const heights = items
@@ -840,7 +848,13 @@ async function fetchHistoryBlockchair(
             : undefined,
           height: d.transaction.block_id,
           counterparty: direction === "out" ? firstExternal : undefined,
-          meta: { _via: "blockchair" },
+          // See the BlockCypher mapper above (2026-09-30).
+          meta: {
+            _via: "blockchair",
+            netSat: net,
+            outputs: (d.outputs ?? []).map((o) => o.recipient ?? ""),
+            inputs: (d.inputs ?? []).map((i) => i.recipient ?? ""),
+          },
         });
       }
     } catch {

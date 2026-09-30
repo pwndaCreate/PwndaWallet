@@ -39,6 +39,7 @@ import {
   SEGWIT_CHAIN_OUTPUTS,
   type BroadcastEndpoint,
 } from "./utxo-send";
+import { esploraTxToChainTx, type EsploraTx } from "./esplora-history";
 import { errorText } from "../lib/errorText";
 import {
   parseEsploraStats,
@@ -748,49 +749,19 @@ export const btcAdapter: ChainAdapter = {
     const path = opts?.cursor
       ? `/address/${address}/txs/chain/${opts.cursor}`
       : `/address/${address}/txs`;
-    const txs: any[] = await withFallback(BTC_API_URLS, async (base, signal) => {
+    const txs: EsploraTx[] = await withFallback(BTC_API_URLS, async (base, signal) => {
       const r = await fetch(`${base}${path}`, { signal });
       if (!r.ok) throw new Error(`HTTP ${r.status} from ${base}`);
-      return (await r.json()) as any[];
+      return (await r.json()) as EsploraTx[];
     });
 
-    const items: ChainTx[] = txs.slice(0, limit).map((tx) => {
-      // Determine direction by comparing sums of inputs vs outputs touching us.
-      let outFromMe = 0;
-      for (const vin of tx.vin ?? []) {
-        if (vin.prevout?.scriptpubkey_address === address) {
-          outFromMe += vin.prevout.value || 0;
-        }
-      }
-      let inToMe = 0;
-      let firstExternalOut: string | undefined;
-      for (const vout of tx.vout ?? []) {
-        if (vout.scriptpubkey_address === address) {
-          inToMe += vout.value || 0;
-        } else if (!firstExternalOut && vout.scriptpubkey_address) {
-          firstExternalOut = vout.scriptpubkey_address;
-        }
-      }
-      const net = inToMe - outFromMe;
-      const direction: ChainTx["direction"] =
-        net > 0 ? "in" : net < 0 ? "out" : "self";
-      const absSat = Math.abs(net);
-      const amount = (absSat / 1e8).toFixed(8);
-      const fee = tx.fee !== undefined ? (tx.fee / 1e8).toFixed(8) : undefined;
-      const confirmed = tx.status?.confirmed ?? false;
-      return {
-        chain: "bitcoin",
-        hash: tx.txid,
-        direction: confirmed ? direction : "pending",
-        amount,
-        fee: direction === "out" ? fee : undefined,
-        timestamp: tx.status?.block_time ?? undefined,
-        confirmations: confirmed ? undefined : 0,
-        height: tx.status?.block_height ?? undefined,
-        counterparty: direction === "out" ? firstExternalOut : undefined,
-        meta: { vin_count: tx.vin?.length, vout_count: tx.vout?.length },
-      };
-    });
+    // The shared Esplora mapper (2026-09-30), which LTC already used: the same
+    // row this built inline, plus `meta.netSat` (the address's SIGNED net) and
+    // every address the tx touches — what an account-wide history needs to net
+    // a send against its own change (`utxo-account-history.ts`).
+    const items: ChainTx[] = txs
+      .slice(0, limit)
+      .map((tx) => esploraTxToChainTx(tx, address, "bitcoin"));
     const cursor =
       items.length === limit && txs.length > 0 ? txs[txs.length - 1].txid : undefined;
     return { items, cursor };

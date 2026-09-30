@@ -1585,7 +1585,13 @@ export const bchAdapter: ChainAdapter = {
             timestamp: typeof d.time === "number" ? d.time : undefined,
             height: d.block?.height ?? undefined,
             counterparty: direction === "out" ? firstExternal : undefined,
-            meta: {},
+            // The signed net and the tx's addresses, for the account-wide
+            // merge (`accountTxHistory`, utxo-account-history.ts, 2026-09-30).
+            meta: {
+              netSat: net,
+              outputs: (d.outputs ?? []).map((o) => o.address ?? ""),
+              inputs: (d.inputs ?? []).map((i) => (i.coinbase ? "" : (i.address ?? ""))),
+            },
           };
         });
         return { items, cursor: rows.length === limit ? String(offset + limit) : undefined };
@@ -1640,7 +1646,12 @@ export const bchAdapter: ChainAdapter = {
               : undefined,
             height: d.transaction.block_id,
             counterparty: direction === "out" ? firstExternal : undefined,
-            meta: {},
+            // See the haskoin mapper above (2026-09-30).
+            meta: {
+              netSat: net,
+              outputs: (d.outputs ?? []).map((o) => o.recipient ?? ""),
+              inputs: (d.inputs ?? []).map((i) => i.recipient ?? ""),
+            },
           });
         }
       } catch {

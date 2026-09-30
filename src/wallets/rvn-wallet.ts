@@ -776,7 +776,18 @@ function bbTxToChainTx(tx: BlockBookTx, address: string): ChainTx {
     confirmations: tx.confirmations,
     height: tx.blockHeight,
     counterparty: direction === "out" ? firstExternal : undefined,
-    meta: { hadAsset: touchedAsset || undefined },
+    // The signed RVN net and the tx's addresses, for the account-wide merge
+    // (`accountTxHistory`, utxo-account-history.ts, 2026-09-30). Outputs are
+    // the plain RVN ones only, as for `firstExternal`: an asset transfer
+    // output is not where RVN went.
+    meta: {
+      hadAsset: touchedAsset || undefined,
+      netSat: Number(net),
+      outputs: (tx.vout ?? [])
+        .filter((v) => isPlainP2pkhScript(v.hex ?? ""))
+        .map((v) => v.addresses?.[0] ?? ""),
+      inputs: (tx.vin ?? []).map((v) => v.addresses?.[0] ?? ""),
+    },
   };
 }
 
@@ -818,6 +829,10 @@ function insightTxToChainTx(tx: any, address: string): ChainTx {
       hadAsset:
         net === 0 && (tx.vout?.length ?? 0) > 1 ? true : undefined,
       _via: "insight",
+      // See `bbTxToChainTx` (2026-09-30).
+      netSat: net,
+      outputs: (tx.vout ?? []).map((v: any) => v.scriptPubKey?.addresses?.[0] ?? ""),
+      inputs: (tx.vin ?? []).map((v: any) => v.addr ?? ""),
     },
   };
 }

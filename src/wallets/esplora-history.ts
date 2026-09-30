@@ -52,6 +52,10 @@ export function esploraTxToChainTx(tx: EsploraTx, address: string, chain: ChainT
       // Every address this tx touches, so a multi-address merge can pick a
       // counterparty that is not one of the wallet's own addresses.
       outputs: (tx.vout ?? []).map((v) => v.scriptpubkey_address).filter(Boolean),
+      // …and every input's, "" for one with no address (a coinbase), so the
+      // account merge knows whether the wallet funded the tx alone and so
+      // paid its fee (`netAccountTx`, utxo-account-history.ts, 2026-09-30).
+      inputs: (tx.vin ?? []).map((v) => v.prevout?.scriptpubkey_address ?? ""),
     },
   };
 }

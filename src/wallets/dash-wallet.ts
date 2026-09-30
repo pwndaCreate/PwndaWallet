@@ -350,14 +350,29 @@ async function fetchHistoryBlockcypher(
     unconfirmed_txrefs?: BlockCypherTxRef[];
   }>(`${BLOCKCYPHER_BASE}/addrs/${addr}?limit=${limit}`);
   const all = [...(r.unconfirmed_txrefs ?? []), ...(r.txrefs ?? [])];
-  return all.map<ChainTx>((t) => ({
+  // ONE row per transaction (2026-09-30). BlockCypher lists a txref per input
+  // and per output that touches the address, and this mapped each to a row,
+  // so a send whose change came back to the same address was two rows of one
+  // txid — "out" the whole spent input, "in" the change — and a history that
+  // keys on txid kept whichever came first. The address's net is the sum.
+  const byTx = new Map<string, { ref: BlockCypherTxRef; net: number }>();
+  for (const t of all) {
+    const signed = t.tx_input_n >= 0 ? -Math.abs(t.value) : Math.abs(t.value);
+    const seen = byTx.get(t.tx_hash);
+    if (seen) seen.net += signed;
+    else byTx.set(t.tx_hash, { ref: t, net: signed });
+  }
+  return [...byTx.values()].map<ChainTx>(({ ref: t, net }) => ({
     chain: "dash",
     hash: t.tx_hash,
-    direction: t.tx_input_n >= 0 ? "out" : "in",
-    amount: (Math.abs(t.value) / 1e8).toFixed(8),
+    direction: net > 0 ? "in" : net < 0 ? "out" : "self",
+    amount: (Math.abs(net) / 1e8).toFixed(8),
     timestamp: t.confirmed ? Math.floor(new Date(t.confirmed).getTime() / 1000) : undefined,
     confirmations: t.confirmations ?? 0,
     height: t.block_height > 0 ? t.block_height : undefined,
+    // The address's signed net, which an account-wide history sums per txid
+    // (`accountTxHistory`, utxo-account-history.ts).
+    meta: { netSat: net },
   }));
 }
 
@@ -682,7 +697,10 @@ export const dashAdapter: ChainAdapter = {
     opts?: { limit?: number; cursor?: string }
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
-    const items = await fetchHistoryBlockcypher(address, limit).catch(() => []);
+    // A failure throws (2026-09-30). It read as an empty history, which the
+    // history hook stores as the address's list; `ChainAdapter` says an adapter
+    // throws once every source has failed, and this is the only one.
+    const items = await fetchHistoryBlockcypher(address, limit);
     return { items };
   },
 
