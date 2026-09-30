@@ -13,11 +13,47 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { condenseHttpError } from "./tx-history-errors";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 const ALGO_API = "https://mainnet-api.algonode.cloud";
 const ALGO_INDEXER = "https://mainnet-idx.algonode.cloud";
+
+/**
+ * One indexer transaction as parties (2026-09-30). Exported for tests.
+ *
+ *  - `pay`: sender → receiver, plus `close-remainder-to` when the payment
+ *    closed the account (the rest of its ALGO went there).
+ *  - `axfer`: the asset's sender (`asset-sender` on a clawback, else the
+ *    transaction's) → receiver, plus `close-to`.
+ *  - anything else (app calls, key registration, asset configuration): the
+ *    sender, and no recipient.
+ */
+export function algoTxParties(tx: unknown, source?: string): TxParties | null {
+  if (!tx || typeof tx !== "object") return null;
+  const t = tx as Record<string, any>;
+  const src = source ? { source } : {};
+  if (t["tx-type"] === "pay") {
+    const p = t["payment-transaction"] ?? {};
+    return {
+      from: uniqueAddresses([t.sender]),
+      to: uniqueAddresses([p.receiver, p["close-remainder-to"]]),
+      ...src,
+    };
+  }
+  if (t["tx-type"] === "axfer") {
+    const a = t["asset-transfer-transaction"] ?? {};
+    return {
+      from: uniqueAddresses([a.sender ?? t.sender]),
+      to: uniqueAddresses([a.receiver, a["close-to"]]),
+      ...src,
+    };
+  }
+  return { from: uniqueAddresses([t.sender]), to: [], ...src };
+}
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -285,6 +321,23 @@ export const algoAdapter: ChainAdapter = {
       })
       .filter((x): x is ChainTx => x !== null);
     return { items, cursor: data["next-token"] };
+  },
+
+  /**
+   * The indexer's `/v2/transactions/{txid}`, through the proxy like the
+   * history (2026-09-30). An unknown id is HTTP 404 `no transaction found
+   * for transaction id: …`.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const id = hash.trim();
+    let d: { transaction?: unknown };
+    try {
+      d = await proxyGetJson(`${ALGO_INDEXER}/v2/transactions/${encodeURIComponent(id)}`);
+    } catch (e) {
+      if (e instanceof Error && /^HTTP 404\b/.test(e.message)) return null;
+      throw new Error(`${urlHost(ALGO_INDEXER)} could not read transaction ${id}: ${condenseHttpError(e)}`);
+    }
+    return algoTxParties(d.transaction, urlHost(ALGO_INDEXER));
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

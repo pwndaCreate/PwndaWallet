@@ -31,9 +31,10 @@
  * form exactly (no float arithmetic), and such a row is marked
  * `meta.amountApprox` so the details view can say so.
  */
-import type { ChainTx, TxHistoryPage } from "./types";
+import type { ChainTx, TxHistoryPage, TxParties } from "./types";
 import { atomicToDecimal } from "./decimal-amount";
 import { dedupeTxRows } from "./tx-row-key";
+import { uniqueAddresses } from "./parties-b-common";
 
 export const NEARBLOCKS_API = "https://api.nearblocks.io";
 export const NEARBLOCKS_HOST = "api.nearblocks.io";
@@ -157,4 +158,69 @@ export async function fetchNearHistory(
     items: dedupeTxRows(items),
     cursor: txns.length >= limit && (typeof next === "string" || typeof next === "number") ? String(next) : undefined,
   };
+}
+
+/**
+ * One transaction from NearBlocks, WITH its receipts' parties, or `null`
+ * when NearBlocks does not have it (yet): an unknown hash answers HTTP 200
+ * `{"txns":[]}` (checked 2026-09-30). Throws on a failed request.
+ *
+ * `/v1/txns/<hash>/full`, not `/v1/txns/<hash>`: both are keyless on the host
+ * the history already uses, but only `/full` names each receipt's
+ * `predecessor_account_id` and `receiver_account_id` — the plain one lists
+ * receipts as bare `{ fts, nfts }` (both read 2026-09-30 for BiuXnScW…).
+ */
+export async function fetchNearblocksTxn(hash: string): Promise<Record<string, unknown> | null> {
+  const url = `${NEARBLOCKS_API}/v1/txns/${encodeURIComponent(hash)}/full`;
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), NEAR_HISTORY_TIMEOUT.ms) : null;
+  let body: unknown;
+  try {
+    const resp = await fetch(url, { signal: ctl?.signal });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`HTTP ${resp.status} from ${url}: ${text.slice(0, 200)}`);
+    }
+    body = await resp.json();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const txns = (body as { txns?: unknown } | null)?.txns;
+  if (!Array.isArray(txns)) throw new Error("NEAR transaction: unexpected response from NearBlocks");
+  const txn = txns.find((t) => (t as { transaction_hash?: unknown })?.transaction_hash === hash) ?? txns[0];
+  return txn && typeof txn === "object" ? (txn as Record<string, unknown>) : null;
+}
+
+/**
+ * A NearBlocks transaction as parties, from `own`'s side. Exported for tests.
+ *
+ * The transaction's own `signer_account_id` → `receiver_account_id`, unless
+ * `own` is neither and appears only in a receipt. Then the receipts that
+ * touch `own` are the parties: every NEAR Intents withdrawal is
+ * `intents.near → <account>` inside a relayer's transaction, whose signer
+ * and receiver name neither this wallet nor the payer (the history reads the
+ * same receipts, `nearblocksReceiptRow`). Gas refunds (`system → …`) are not
+ * payments and are skipped.
+ */
+export function nearblocksTxnParties(txn: Record<string, unknown>, own: string, source = NEARBLOCKS_HOST): TxParties {
+  const signer = typeof txn.signer_account_id === "string" ? txn.signer_account_id : "";
+  const receiver = typeof txn.receiver_account_id === "string" ? txn.receiver_account_id : "";
+  if (own && own !== signer && own !== receiver) {
+    const receipts = (Array.isArray(txn.receipts) ? txn.receipts : []) as Array<Record<string, unknown>>;
+    const moves = receipts.filter(
+      (r) =>
+        typeof r?.predecessor_account_id === "string" &&
+        typeof r?.receiver_account_id === "string" &&
+        r.predecessor_account_id !== "system",
+    );
+    const toMe = moves.filter((r) => r.receiver_account_id === own);
+    if (toMe.length > 0) {
+      return { from: uniqueAddresses(toMe.map((r) => r.predecessor_account_id)), to: [own], source };
+    }
+    const fromMe = moves.filter((r) => r.predecessor_account_id === own);
+    if (fromMe.length > 0) {
+      return { from: [own], to: uniqueAddresses(fromMe.map((r) => r.receiver_account_id)), source };
+    }
+  }
+  return { from: uniqueAddresses([signer]), to: uniqueAddresses([receiver]), source };
 }

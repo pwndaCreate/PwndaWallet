@@ -44,7 +44,14 @@ import { derivePath } from "ed25519-hd-key";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { atomicToDecimal } from "./decimal-amount";
 import { NEAR_RPCS } from "./chain-rpcs";
-import { fetchNearHistory } from "./near-history";
+import {
+  NEARBLOCKS_HOST,
+  fetchNearHistory,
+  fetchNearblocksTxn,
+  nearblocksTxnParties,
+} from "./near-history";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
+import { errorText } from "../lib/errorText";
 import type {
   ChainAdapter,
   WalletInfo,
@@ -52,6 +59,7 @@ import type {
   NetworkInfo,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 
 const DERIVATION_PATH = "m/44'/397'/0'";
@@ -257,6 +265,40 @@ export function parseNearRecipient(input: string): { accountId: string; implicit
   return { accountId: id, implicit: false };
 }
 
+/**
+ * A transaction this wallet signed, from the NEAR RPC nodes (`tx`), for when
+ * NearBlocks has not indexed it yet or cannot be reached (2026-09-30).
+ *
+ * `tx` needs the signer's account id to find the transaction's shard, and
+ * the public nodes are not archival: a days-old transaction answers
+ * `UNKNOWN_TRANSACTION` (drpc, checked 2026-09-30). So this finds exactly the
+ * case NearBlocks can miss — this wallet's own fresh send — and nothing else.
+ * `wait_until: "NONE"` returns at once, with the transaction when the node
+ * knows it. `"unknown"` for `UNKNOWN_TRANSACTION`; throws when no node
+ * answered.
+ */
+async function nearRpcOwnTxParties(hash: string, own: string): Promise<TxParties | "unknown"> {
+  const urls = NEAR_RPCS();
+  let last: unknown = new Error("No NEAR RPC endpoints configured.");
+  for (const url of urls) {
+    try {
+      const r = await nearRpcCall<{ transaction?: { signer_id?: unknown; receiver_id?: unknown } }>(
+        url,
+        "tx",
+        { tx_hash: hash, sender_account_id: own, wait_until: "NONE" },
+      );
+      const t = r?.transaction;
+      // Known, not executed yet: nothing to name.
+      if (!t || typeof t.signer_id !== "string") return "unknown";
+      return { from: [t.signer_id], to: uniqueAddresses([t.receiver_id]), source: urlHost(url) };
+    } catch (e) {
+      if (isNearCause(e, "UNKNOWN_TRANSACTION")) return "unknown";
+      last = e;
+    }
+  }
+  throw last instanceof Error ? last : new Error(String(last));
+}
+
 function deriveKeypair(mnemonic: string, path: string = DERIVATION_PATH): {
   secret: Uint8Array;
   publicKey: Uint8Array;
@@ -389,6 +431,43 @@ export const nearAdapter: ChainAdapter = {
     opts?: { limit?: number; cursor?: string },
   ): Promise<TxHistoryPage> {
     return fetchNearHistory(address.trim(), opts);
+  },
+
+  /**
+   * NearBlocks first (the history's host, fetched directly the same way),
+   * then the RPC nodes for this wallet's own fresh send (2026-09-30).
+   *
+   * `null` when NearBlocks answered that it does not have the hash and no
+   * node knows it as this wallet's send. When NearBlocks FAILED, a node's
+   * "unknown" settles nothing (the transaction may be someone else's, which
+   * `tx` cannot find by this wallet's id), so that throws.
+   */
+  async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+    const id = hash.trim();
+    const own = ownAddress.trim();
+    let indexedError: unknown = null;
+    try {
+      const txn = await fetchNearblocksTxn(id);
+      if (txn) return nearblocksTxnParties(txn, own);
+    } catch (e) {
+      indexedError = e;
+    }
+    let rpc: TxParties | "unknown";
+    try {
+      rpc = own ? await nearRpcOwnTxParties(id, own) : "unknown";
+    } catch (e) {
+      if (!indexedError) return null;
+      throw new Error(
+        `NEAR transaction ${id} could not be read: ${NEARBLOCKS_HOST}: ${errorText(indexedError)}; ` +
+          `RPC nodes: ${errorText(e)}`,
+      );
+    }
+    if (rpc !== "unknown") return rpc;
+    if (!indexedError) return null;
+    throw new Error(
+      `NEAR transaction ${id} could not be read: ${NEARBLOCKS_HOST}: ${errorText(indexedError)} ` +
+        `(and it is not a recent transaction of this wallet's)`,
+    );
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

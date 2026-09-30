@@ -20,8 +20,11 @@ import type {
   FeeEstimate,
   GasBudget,
   SendOptions,
+  TxParties,
 } from "./types";
 import { SendOutcomeUnknownError, isSendOutcomeUnknown } from "./send-outcome";
+import { errorText } from "../lib/errorText";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 const XRP_RPC_URLS = [
   "wss://xrplcluster.com",
@@ -383,14 +386,15 @@ export function deriveXrpAtPath(mnemonic: string, path: string): WalletInfo {
   };
 }
 
-async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
+/** `fn` also gets the server's URL, for callers that report their source. */
+async function withClient<T>(fn: (client: Client, url: string) => Promise<T>): Promise<T> {
   let lastError: any;
   for (const url of XRP_RPC_URLS) {
     try {
       const client = new Client(url);
       await client.connect();
       try {
-        return await fn(client);
+        return await fn(client, url);
       } finally {
         await client.disconnect();
       }
@@ -403,6 +407,51 @@ async function withClient<T>(fn: (client: Client) => Promise<T>): Promise<T> {
     }
   }
   throw lastError;
+}
+
+/** A drops string as a bigint; `null` for anything else (an issued-currency object). */
+function dropsOf(v: unknown): bigint | null {
+  return typeof v === "string" && /^\d+$/.test(v) ? BigInt(v) : null;
+}
+
+/**
+ * A rippled `tx` result as parties (2026-09-30). Exported for tests.
+ *
+ * API v2 (xrpl.js 4.x's default) nests the transaction under `tx_json`; v1
+ * put its fields on the result itself, so both are read.
+ *
+ *  - A Payment, and an AccountDelete (which sends what the account held to
+ *    its Destination), go from `Account` to `Destination`. The destination
+ *    tag is not part of the address; the history row carries it in `meta`.
+ *  - Any other type has no single recipient. Its parties are the accounts
+ *    whose XRP balance fell (`Account` first: it paid the fee) and rose, read
+ *    from the AccountRoot entries of `meta.AffectedNodes`.
+ */
+export function xrpTxParties(result: unknown, source?: string): TxParties | null {
+  if (!result || typeof result !== "object") return null;
+  const r = result as Record<string, any>;
+  const tx = (r.tx_json && typeof r.tx_json === "object" ? r.tx_json : r) as Record<string, any>;
+  if (typeof tx.Account !== "string" || !tx.Account) return null;
+  const src = source ? { source } : {};
+  if (tx.TransactionType === "Payment" || tx.TransactionType === "AccountDelete") {
+    return { from: [tx.Account], to: uniqueAddresses([tx.Destination]), ...src };
+  }
+  const fell: unknown[] = [];
+  const rose: unknown[] = [];
+  const nodes: any[] = Array.isArray(r.meta?.AffectedNodes) ? r.meta.AffectedNodes : [];
+  for (const node of nodes) {
+    const n = node?.ModifiedNode ?? node?.CreatedNode ?? node?.DeletedNode;
+    if (!n || n.LedgerEntryType !== "AccountRoot") continue;
+    const fields = n.FinalFields ?? n.NewFields ?? {};
+    const after = dropsOf(fields.Balance);
+    // A created account had nothing before; an entry without PreviousFields
+    // did not change its balance.
+    const before = dropsOf(n.PreviousFields?.Balance) ?? (node.CreatedNode ? 0n : after);
+    if (after === null || before === null) continue;
+    if (after < before) fell.push(fields.Account);
+    else if (after > before) rose.push(fields.Account);
+  }
+  return { from: uniqueAddresses([tx.Account, ...fell]), to: uniqueAddresses(rose), ...src };
 }
 
 export const xrpAdapter: ChainAdapter = {
@@ -757,6 +806,35 @@ export const xrpAdapter: ChainAdapter = {
       const cursor = m ? btoa(JSON.stringify(m)) : undefined;
       return { items, cursor };
     });
+  },
+
+  /**
+   * rippled `tx`, through the same servers in the same order as every other
+   * read (2026-09-30). A server answering `txnNotFound` is asked no further,
+   * but the next one is: `s1.ripple.com` does not keep full history, so its
+   * "not found" for an old payment is not the ledger's. `null` when at least
+   * one server said so and none found it; a throw when none could answer.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const id = hash.trim();
+    let notFound = false;
+    try {
+      return await withClient(async (client, url) => {
+        try {
+          const r: any = await client.request({ command: "tx", transaction: id } as any);
+          return xrpTxParties(r.result, urlHost(url));
+        } catch (e: any) {
+          if (e?.data?.error === "txnNotFound") notFound = true;
+          throw e;
+        }
+      });
+    } catch (e) {
+      if (notFound) return null;
+      throw new Error(
+        `No XRP Ledger server could read transaction ${id} ` +
+          `(${XRP_RPC_URLS.map(urlHost).join(", ")}): ${errorText(e)}`,
+      );
+    }
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

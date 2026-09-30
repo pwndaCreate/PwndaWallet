@@ -67,6 +67,7 @@ import { HDKey } from "@scure/bip32";
 import { getPublicKey } from "@noble/secp256k1";
 import {
   ErgoAddress,
+  FEE_CONTRACT,
   OutputBuilder,
   RECOMMENDED_MIN_FEE_VALUE,
   SAFE_MIN_BOX_VALUE,
@@ -81,9 +82,12 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { ergoGet, ergoSubmitTx, ErgoRpcError } from "./erg-rpc";
 import { SendOutcomeUnknownError } from "./send-outcome";
+import { errorText } from "../lib/errorText";
+import { uniqueAddresses } from "./parties-b-common";
 
 const DERIVATION_PATH = "m/44'/429'/0'/0/0";
 
@@ -232,6 +236,14 @@ function classifyTxDirection(
 } {
   // For an eUTXO row from the explorer, sum nano-value contributed by
   // `ownAddr` on each side. Direction = sign of (outs - ins).
+  //
+  // The miner-fee box is an output too, and is nobody's (2026-09-30): it was
+  // taken for the counterparty of any send whose only other output was the
+  // fee — a consolidation read "sent 0.0011 ERG to 2iHkR7…", and the "self"
+  // branch below, written for `delta === 0`, could never fire, since the fee
+  // always leaves. A spend whose outputs all return here (fee aside) is now
+  // "self", and the fee box is never a counterparty.
+  const feeAddr = ergoMinerFeeAddress();
   let ownIn = 0n;
   let ownOut = 0n;
   let counterIn: string | undefined;
@@ -242,11 +254,11 @@ function classifyTxDirection(
   }
   for (const o of row.outputs ?? []) {
     if (o.address === ownAddr) ownOut += BigInt(o.value || "0");
-    else if (o.address && !counterOut) counterOut = o.address;
+    else if (o.address && o.address !== feeAddr && !counterOut) counterOut = o.address;
   }
   const delta = ownOut - ownIn;
-  if (delta === 0n && ownIn > 0n) {
-    return { direction: "self", amount: ownIn, counterparty: counterIn };
+  if (ownIn > 0n && delta <= 0n && !counterOut) {
+    return { direction: "self", amount: ownOut, counterparty: counterIn };
   }
   if (delta > 0n) {
     return { direction: "in", amount: delta, counterparty: counterIn };
@@ -286,6 +298,53 @@ async function getTransactionHistory(
     items,
     cursor: items.length === limit ? String(nextOffset) : undefined,
   };
+}
+
+/**
+ * The miner-fee contract's address. Every Ergo transaction pays its fee as an
+ * OUTPUT to this P2S script (Fleet's `FEE_CONTRACT`, which encodes to the
+ * `2iHkR7CWvD1R4j1y…` address the fee box of a live mainnet transaction
+ * carried on 2026-09-30). It is the fee, not a recipient.
+ */
+let minerFeeAddress: string | null = null;
+function ergoMinerFeeAddress(): string {
+  minerFeeAddress ??= ErgoAddress.fromErgoTree(FEE_CONTRACT).encode();
+  return minerFeeAddress;
+}
+
+/**
+ * One explorer transaction as parties (2026-09-30). Exported for tests.
+ * Every input's address, then every output's (change included) except the
+ * miner-fee box, in the transaction's order.
+ */
+export function ergoTxParties(tx: unknown): TxParties | null {
+  if (!tx || typeof tx !== "object") return null;
+  const t = tx as { inputs?: Array<{ address?: unknown }>; outputs?: Array<{ address?: unknown }> };
+  const fee = ergoMinerFeeAddress();
+  return {
+    from: uniqueAddresses((t.inputs ?? []).map((i) => i?.address)),
+    to: uniqueAddresses((t.outputs ?? []).map((o) => o?.address).filter((a) => a !== fee)),
+  };
+}
+
+/**
+ * `/transactions/{id}` through `ergoGet`, the mirror failover every Ergo read
+ * uses. A mirror answers 404 for an id it has not indexed (checked live for
+ * an unknown id; inference: a transaction still in the mempool too, since
+ * this route serves confirmed ones); a 404 from any mirror, with none
+ * finding it, is "not found". `source` is left out: `ergoGet` does not say
+ * which mirror answered.
+ */
+async function getTransactionParties(hash: string): Promise<TxParties | null> {
+  const id = hash.trim();
+  try {
+    return ergoTxParties(await ergoGet<unknown>(`/transactions/${encodeURIComponent(id)}`));
+  } catch (e) {
+    if (e instanceof ErgoRpcError && e.attempts.some((a) => a.status === 404)) return null;
+    const trail =
+      e instanceof ErgoRpcError ? e.attempts.map((a) => `${a.base} (${a.status})`).join(", ") : errorText(e);
+    throw new Error(`No Ergo explorer could read transaction ${id}: ${trail}`);
+  }
 }
 
 async function getNetworkInfo(): Promise<NetworkInfo> {
@@ -557,5 +616,6 @@ export const ergoAdapter: ChainAdapter = {
   sendTransaction,
   getNetworkInfo,
   getTransactionHistory,
+  getTransactionParties,
   getFeeEstimate,
 };

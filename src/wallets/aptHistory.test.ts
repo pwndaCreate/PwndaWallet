@@ -69,7 +69,13 @@ describe("Aptos history", () => {
   it("a successful send keeps its direction and fee; a receipt carries no fee of ours", async () => {
     stubNode([
       transfer({}),
-      transfer({ hash: "0x" + "00".repeat(31) + "03", sender: THEM, payload: { function: "0x1::coin::transfer", arguments: [ME, "100000000"] } }),
+      // `coin::transfer` is generic over the coin, so the API always names it
+      // (2026-09-30: the history now skips coins that are not APT).
+      transfer({
+        hash: "0x" + "00".repeat(31) + "03",
+        sender: THEM,
+        payload: { function: "0x1::coin::transfer", type_arguments: ["0x1::aptos_coin::AptosCoin"], arguments: [ME, "100000000"] },
+      }),
     ]);
     const [sent, received] = (await aptAdapter.getTransactionHistory!(ME)).items;
     expect(sent).toMatchObject({ direction: "out", amount: "0.00005445", fee: "0.000011", counterparty: THEM });

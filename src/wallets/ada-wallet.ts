@@ -11,8 +11,11 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { proxyPostJson, proxyGetJson } from "./_proxy";
+import { condenseHttpError } from "./tx-history-errors";
+import { uniqueAddresses } from "./parties-b-common";
 import {
   deriveCardanoKeySet,
   deriveCardanoKeySetFromMaster,
@@ -164,6 +167,104 @@ export function cardanoSignerFor(mnemonic: string, address: string): CardanoSign
     }
   }
   return null;
+}
+
+/** Lovelace as ADA with six fixed decimals ("5.000000"), the rows' format, without floats. */
+function lovelaceFixed6(lovelace: bigint): string {
+  const neg = lovelace < 0n;
+  const n = neg ? -lovelace : lovelace;
+  return `${neg ? "-" : ""}${n / 1_000_000n}.${(n % 1_000_000n).toString().padStart(6, "0")}`;
+}
+
+/** A Koios `tx_info` input or output: its address and lovelace. */
+function koiosUtxoOf(u: unknown): { address?: string; lovelace: bigint } {
+  const r = (u ?? {}) as { value?: unknown; payment_addr?: { bech32?: unknown } | null };
+  const address = typeof r.payment_addr?.bech32 === "string" ? r.payment_addr.bech32 : undefined;
+  const value = String(r.value ?? "");
+  return { ...(address ? { address } : {}), lovelace: /^\d+$/.test(value) ? BigInt(value) : 0n };
+}
+
+/**
+ * A `tx_info` row's inputs and outputs in the ledger's order. Koios does not
+ * order them: the same transaction's two outputs came back in both orders
+ * on two reads, 2026-09-30. Outputs sort by their index; inputs, a set on
+ * the ledger, by the (transaction, index) they spend — the order a
+ * transaction body encodes them in.
+ */
+function koiosInOut(detail: unknown): { inputs: unknown[]; outputs: unknown[] } {
+  const d = (detail ?? {}) as { inputs?: unknown; outputs?: unknown };
+  const at = (u: unknown) => {
+    const r = (u ?? {}) as { tx_hash?: unknown; tx_index?: unknown };
+    return { hash: String(r.tx_hash ?? ""), index: Number(r.tx_index ?? 0) };
+  };
+  const inputs = (Array.isArray(d.inputs) ? [...d.inputs] : []).sort((a, b) => {
+    const x = at(a);
+    const y = at(b);
+    return x.hash < y.hash ? -1 : x.hash > y.hash ? 1 : x.index - y.index;
+  });
+  const outputs = (Array.isArray(d.outputs) ? [...d.outputs] : []).sort((a, b) => at(a).index - at(b).index);
+  return { inputs, outputs };
+}
+
+/**
+ * This address's side of one Koios `tx_info` row (with `_inputs: true`).
+ * Exported for tests.
+ *
+ * Corrected 2026-09-30. The history asked Koios for outputs only and called
+ * a transaction "in" whenever any output paid this address — so a send whose
+ * change came back here read as a receipt of the change — and "out"
+ * otherwise, with an amount from `outFromMe`, a variable nothing ever set:
+ * every other send read 0.000000 ADA.
+ *
+ * Now by what this address gained or lost across its inputs and outputs:
+ *  - gained (or spent nothing here): a receipt of the gain, from the first
+ *    other input (the payer);
+ *  - lost, with outputs to other addresses: a send of the loss less the fee
+ *    — exactly the amount paid out when this wallet built the transaction,
+ *    and still this wallet's share when another party's (script) input and
+ *    output ride in the same transaction;
+ *  - lost only the fee: "self" (a consolidation), of what came back.
+ * The counterparty is the first other output (send) or input (receipt).
+ */
+export function cardanoFlow(
+  detail: unknown,
+  me: string,
+): { direction: "in" | "out" | "self"; lovelace: bigint; counterparty?: string } {
+  const { inputs, outputs } = koiosInOut(detail);
+  const feeRaw = String((detail as { fee?: unknown } | null)?.fee ?? "");
+  const fee = /^\d+$/.test(feeRaw) ? BigInt(feeRaw) : 0n;
+  let fromMe = 0n;
+  let toMe = 0n;
+  let payer: string | undefined;
+  let payee: string | undefined;
+  for (const i of inputs) {
+    const u = koiosUtxoOf(i);
+    if (u.address === me) fromMe += u.lovelace;
+    else if (u.address) payer ??= u.address;
+  }
+  for (const o of outputs) {
+    const u = koiosUtxoOf(o);
+    if (u.address === me) toMe += u.lovelace;
+    else if (u.address) payee ??= u.address;
+  }
+  const net = toMe - fromMe;
+  if (fromMe === 0n || net > 0n) {
+    return { direction: "in", lovelace: fromMe === 0n ? toMe : net, ...(payer ? { counterparty: payer } : {}) };
+  }
+  if (!payee) return { direction: "self", lovelace: toMe };
+  const lost = -net;
+  return { direction: "out", lovelace: lost > fee ? lost - fee : lost, counterparty: payee };
+}
+
+/**
+ * One Koios `tx_info` row as parties: every input address, then every output
+ * address (change included), in the ledger's order. Exported for tests.
+ */
+export function cardanoTxParties(detail: unknown, source?: string): TxParties | null {
+  if (!detail || typeof detail !== "object") return null;
+  const { inputs, outputs } = koiosInOut(detail);
+  const addrs = (list: unknown[]) => uniqueAddresses(list.map((u) => koiosUtxoOf(u).address));
+  return { from: addrs(inputs), to: addrs(outputs), ...(source ? { source } : {}) };
 }
 
 /** A Cardano send needs the mnemonic: see `sendTransaction`. */
@@ -363,21 +464,27 @@ export const adaAdapter: ChainAdapter = {
     opts?: { limit?: number; cursor?: string }
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
-    // Koios POST /address_txs takes a body with the address list. Cursor
-    // is the lower-bound block number to page further back.
-    const body: any = { _addresses: [address] };
-    if (opts?.cursor) body._after_block_height = Number(opts.cursor);
+    // Koios POST /address_txs answers the address's whole list, newest
+    // first, in one response (up to its 1000-row page), so the cursor is an
+    // offset into that list. Corrected 2026-09-30: the cursor was the last
+    // row's block height, sent back as `_after_block_height` — which Koios
+    // reads as "at or ABOVE this height" (checked live on the test seed:
+    // 12303592 returned the five newest rows), so a next page repeated the
+    // newest rows instead of going further back.
+    const offset = opts?.cursor && /^\d+$/.test(opts.cursor) ? Number(opts.cursor) : 0;
     const list = await proxyPostJson<Array<{ tx_hash: string; block_height: number; block_time: number }>>(
       `${KOIOS_BASE}/address_txs`,
-      body
+      { _addresses: [address] }
     );
-    const sliced = list.slice(0, limit);
+    const sliced = list.slice(offset, offset + limit);
     if (sliced.length === 0) return { items: [] };
 
-    // Koios `tx_info` returns full tx detail in batch.
+    // Koios `tx_info` returns full tx detail in batch. Inputs too, since
+    // 2026-09-30: without them a send could not be told from a receipt
+    // (`cardanoFlow`). Same single request.
     const detail = await proxyPostJson<any[]>(`${KOIOS_BASE}/tx_info`, {
       _tx_hashes: sliced.map((t) => t.tx_hash),
-      _inputs: false,
+      _inputs: true,
       _metadata: false,
       _assets: false,
       _withdrawals: false,
@@ -389,31 +496,15 @@ export const adaAdapter: ChainAdapter = {
 
     const items: ChainTx[] = sliced.map((row) => {
       const d = detailByHash.get(row.tx_hash);
-      // Compute net lovelace flow on `address` from the outputs.
-      let inToMe = 0n;
-      let outFromMe = 0n;
-      let counterparty: string | undefined;
-      for (const o of d?.outputs ?? []) {
-        if (o.payment_addr?.bech32 === address) {
-          inToMe += BigInt(o.value ?? 0);
-        } else if (!counterparty && o.payment_addr?.bech32) {
-          counterparty = o.payment_addr.bech32;
-        }
-      }
-      // Inputs: Koios omits prev-output values in this lean call, so we
-      // approximate direction by whether anything came back to us. A
-      // detail drawer can pull `_inputs: true` for full accounting.
-      const direction: ChainTx["direction"] = inToMe > 0n ? "in" : "out";
-      const amount = direction === "in"
-        ? (Number(inToMe) / 1_000_000).toFixed(6)
-        : (Number(outFromMe || inToMe) / 1_000_000).toFixed(6);
-      const fee = d?.fee ? (Number(d.fee) / 1_000_000).toFixed(6) : undefined;
+      const { direction, lovelace, counterparty } = cardanoFlow(d, address);
+      const fee = /^\d+$/.test(String(d?.fee ?? "")) ? lovelaceFixed6(BigInt(d.fee)) : undefined;
       return {
         chain: "cardano",
         hash: row.tx_hash,
         direction,
-        amount,
-        fee: direction === "out" ? fee : undefined,
+        amount: lovelaceFixed6(lovelace),
+        // The fee is this wallet's when it spent an input here.
+        fee: direction !== "in" ? fee : undefined,
         timestamp: row.block_time,
         height: row.block_height,
         counterparty,
@@ -421,9 +512,35 @@ export const adaAdapter: ChainAdapter = {
       };
     });
 
-    const cursor =
-      sliced.length === limit ? String(sliced[sliced.length - 1].block_height) : undefined;
+    const cursor = offset + limit < list.length ? String(offset + limit) : undefined;
     return { items, cursor };
+  },
+
+  /**
+   * Koios `tx_info`, the call the history makes, for one hash with its
+   * inputs (2026-09-30). Koios answers `[]` for a hash it does not know.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const id = hash.trim().toLowerCase();
+    let rows: unknown[];
+    try {
+      rows = await proxyPostJson<unknown[]>(`${KOIOS_BASE}/tx_info`, {
+        _tx_hashes: [id],
+        _inputs: true,
+        _metadata: false,
+        _assets: false,
+        _withdrawals: false,
+        _certs: false,
+        _scripts: false,
+        _bytecode: false,
+      });
+    } catch (e) {
+      throw new Error(`api.koios.rest could not read transaction ${id}: ${condenseHttpError(e)}`);
+    }
+    const d = (Array.isArray(rows) ? rows : []).find(
+      (r) => (r as { tx_hash?: unknown })?.tx_hash === id,
+    );
+    return d ? cardanoTxParties(d, "api.koios.rest") : null;
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

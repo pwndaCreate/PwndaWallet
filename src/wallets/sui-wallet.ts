@@ -55,9 +55,11 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { httpProxyCall } from "./_proxy";
 import { rpcsFor } from "./chain-rpcs";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 // The official public endpoint (`fullnode.mainnet.sui.io`) was DEPRECATED
 // upstream 2026-08-22: every `suix_*` method now returns
@@ -198,6 +200,14 @@ async function suiGraphQL<T>(
   query: string,
   variables: Record<string, unknown> = {}
 ): Promise<T> {
+  return (await suiGraphQLAt<T>(query, variables)).data;
+}
+
+/** `suiGraphQL`, also saying which endpoint answered (for a `source` line). */
+async function suiGraphQLAt<T>(
+  query: string,
+  variables: Record<string, unknown> = {}
+): Promise<{ data: T; url: string }> {
   const endpoints = rpcsFor("SUI");
   const failures: string[] = [];
 
@@ -238,13 +248,102 @@ async function suiGraphQL<T>(
       failures.push(`${url}: 200 but no data`);
       continue;
     }
-    return parsed.data;
+    return { data: parsed.data, url };
   }
 
   throw new Error(
     `Sui GraphQL failed on all ${endpoints.length} endpoint(s): ${failures.join(" | ")}`
   );
 }
+
+// =========================================================================
+// Transaction parties (2026-09-30)
+// =========================================================================
+
+/** One balance change, owner and amount read out of either API's shape. */
+export interface SuiBalanceChange {
+  /** The owning address; absent for object-owned, shared or immutable owners. */
+  owner?: string;
+  coinType: string;
+  /** Signed, in the coin's base unit (MIST for SUI). */
+  amount: bigint;
+}
+
+/** JSON-RPC `balanceChanges` (`owner: { AddressOwner }`, `amount` as a string). */
+export function suiRpcBalanceChanges(raw: unknown): SuiBalanceChange[] {
+  const out: SuiBalanceChange[] = [];
+  for (const c of Array.isArray(raw) ? raw : []) {
+    const amount = String(c?.amount ?? "");
+    if (!/^-?\d+$/.test(amount)) continue;
+    const owner = c?.owner?.AddressOwner;
+    out.push({
+      ...(typeof owner === "string" ? { owner } : {}),
+      coinType: String(c?.coinType ?? ""),
+      amount: BigInt(amount),
+    });
+  }
+  return out;
+}
+
+/**
+ * A transaction's parties from its sender and its balance changes. Exported
+ * for tests.
+ *
+ * `from` is the transaction's SENDER, not the gas payer: a sponsored
+ * transaction's gas comes from the sponsor (`gasData.owner`), whose SUI falls
+ * while the sender's may not move at all (seen live 2026-09-30, digest
+ * 5iVDN5Kz…). `to` is every owner whose SUI rose; when no SUI rose (a
+ * transfer of another coin, whose sender paid only gas), every owner whose
+ * balance of any coin rose. Nobody when nothing rose — a call that paid
+ * only gas.
+ */
+export function suiTransferParties(
+  sender: string | undefined,
+  changes: readonly SuiBalanceChange[],
+  source?: string,
+): TxParties {
+  const risers = (list: readonly SuiBalanceChange[]) =>
+    uniqueAddresses(list.filter((c) => c.amount > 0n).map((c) => c.owner));
+  const sui = changes.filter((c) => isSuiCoin(c.coinType));
+  const to = risers(sui).length > 0 ? risers(sui) : risers(changes);
+  return { from: uniqueAddresses([sender]), to, ...(source ? { source } : {}) };
+}
+
+/**
+ * The other side of a history row, from its SUI balance changes (the list
+ * query asks for nothing else). A send's counterparty is the owner whose SUI
+ * rose the most; a receipt's, the owner whose SUI fell the most — the sender,
+ * who also paid the gas. Inference for a sponsored receipt: the sponsor's
+ * fall is only gas, so the sender's (the amount) is still the larger one.
+ */
+function suiRowCounterparty(
+  changes: readonly SuiBalanceChange[],
+  me: string,
+  direction: "in" | "out",
+): string | undefined {
+  let best: SuiBalanceChange | undefined;
+  for (const c of changes) {
+    if (!c.owner || c.owner.toLowerCase() === me || !isSuiCoin(c.coinType)) continue;
+    const toward = direction === "out" ? c.amount > 0n : c.amount < 0n;
+    if (!toward) continue;
+    const mag = c.amount < 0n ? -c.amount : c.amount;
+    const bestMag = best ? (best.amount < 0n ? -best.amount : best.amount) : -1n;
+    if (mag > bestMag) best = c;
+  }
+  return best?.owner;
+}
+
+/** publicnode's answer for a digest it does not hold (checked live 2026-09-30). */
+function isSuiRpcNotFound(e: unknown): boolean {
+  return /Could not find the referenced transaction/i.test(errorText(e));
+}
+
+const SUI_TX_PARTIES_QUERY = `query ($digest: String!) {
+  transaction(digest: $digest) {
+    sender { address }
+    effects { balanceChanges { nodes { owner { address } amount coinType { repr } } } }
+  }
+}`;
 
 // =========================================================================
 // Adapter
@@ -400,17 +499,32 @@ export const suiAdapter: ChainAdapter = {
             c.owner.AddressOwner?.toLowerCase() === address.toLowerCase()
         );
         const amountMist = change ? BigInt(change.amount) : 0n;
-        const direction: ChainTx["direction"] =
-          amountMist < 0n ? "out" : "in";
+        const direction = amountMist < 0n ? "out" : "in";
         const absMist = amountMist < 0n ? -amountMist : amountMist;
         const intPart = absMist / 1_000_000_000n;
         const fracPart = absMist % 1_000_000_000n;
         const amount = `${intPart}.${fracPart.toString().padStart(9, "0")}`;
+        // The other side, from the same balance changes (2026-09-30: rows
+        // named nobody). `meta.from` / `meta.to` are what the details read.
+        const counterparty = suiRowCounterparty(
+          suiRpcBalanceChanges(tx.balanceChanges),
+          address.toLowerCase(),
+          direction,
+        );
         return {
           chain: "sui",
           hash: tx.digest,
           direction,
           amount,
+          ...(counterparty
+            ? {
+                counterparty,
+                meta:
+                  direction === "out"
+                    ? { from: address, to: counterparty }
+                    : { from: counterparty, to: address },
+              }
+            : {}),
           timestamp: tx.timestampMs
             ? Math.floor(parseInt(tx.timestampMs, 10) / 1000)
             : undefined,
@@ -425,6 +539,59 @@ export const suiAdapter: ChainAdapter = {
       .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
       .slice(0, limit);
     return { items };
+  },
+
+  /**
+   * `sui_getTransactionBlock` on the history's host (publicnode), then Sui's
+   * GraphQL — the adapter's other host — when publicnode does not have it
+   * (2026-09-30).
+   *
+   * The second source is not redundancy for its own sake: publicnode PRUNES.
+   * Checked live 2026-09-30 on the public test seed's history, a digest its
+   * own `suix_queryTransactionBlocks` still lists (EFPAnhSs…, 2026-05-11)
+   * answers `-32602 Could not find the referenced transaction`, while
+   * graphql.mainnet.sui.io returns it in full. So publicnode's "not found"
+   * is not the chain's; GraphQL's `transaction: null` is.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const digest = hash.trim();
+    const failures: string[] = [];
+    try {
+      const r = await suiRpcCall<{
+        transaction?: { data?: { sender?: string } };
+        balanceChanges?: unknown;
+      }>("sui_getTransactionBlock", [digest, { showInput: true, showBalanceChanges: true }]);
+      return suiTransferParties(
+        r.transaction?.data?.sender,
+        suiRpcBalanceChanges(r.balanceChanges),
+        urlHost(SUI_RPC),
+      );
+    } catch (e) {
+      failures.push(`${urlHost(SUI_RPC)}: ${isSuiRpcNotFound(e) ? "not found (pruned or unknown)" : errorText(e)}`);
+    }
+    try {
+      type Node = { owner?: { address?: string } | null; amount?: string; coinType?: { repr?: string } | null };
+      const { data: d, url } = await suiGraphQLAt<{
+        transaction: {
+          sender?: { address?: string } | null;
+          effects?: { balanceChanges?: { nodes?: Node[] } | null } | null;
+        } | null;
+      }>(SUI_TX_PARTIES_QUERY, { digest });
+      if (d.transaction == null) return null;
+      const changes: SuiBalanceChange[] = [];
+      for (const n of d.transaction.effects?.balanceChanges?.nodes ?? []) {
+        if (!/^-?\d+$/.test(String(n?.amount ?? ""))) continue;
+        changes.push({
+          ...(typeof n.owner?.address === "string" ? { owner: n.owner.address } : {}),
+          coinType: String(n.coinType?.repr ?? ""),
+          amount: BigInt(String(n.amount)),
+        });
+      }
+      return suiTransferParties(d.transaction.sender?.address, changes, urlHost(url));
+    } catch (e) {
+      failures.push(errorText(e));
+    }
+    throw new Error(`Sui transaction ${digest} could not be read: ${failures.join(" | ")}`);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

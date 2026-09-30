@@ -40,7 +40,10 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
+import { errorText } from "../lib/errorText";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 const APTOS_API = "https://api.mainnet.aptoslabs.com/v1";
 
@@ -108,6 +111,109 @@ export function normalizeAptosAddress(address: string): string {
     throw new Error(`Invalid Aptos address: ${address}`);
   }
   return "0x" + raw.padStart(64, "0");
+}
+
+/** {@link normalizeAptosAddress}, or the input when it is not an address. */
+function readAptosAddress(address: string): string {
+  try {
+    return normalizeAptosAddress(address);
+  } catch {
+    return address;
+  }
+}
+
+/** Two Move types name the same type (`0x1::…` and its padded form compare equal). */
+function sameMoveType(a: string, b: string): boolean {
+  const [addrA, ...restA] = a.trim().split("::");
+  const [addrB, ...restB] = b.trim().split("::");
+  return (
+    restA.length > 0 &&
+    restA.join("::") === restB.join("::") &&
+    readAptosAddress(addrA) === readAptosAddress(addrB)
+  );
+}
+
+/** APT as a legacy coin type, and as a fungible asset (its metadata object is `0xa`). */
+const APT_COIN_TYPE = "0x1::aptos_coin::AptosCoin";
+const APT_FA_METADATA = normalizeAptosAddress("0xa");
+
+/** One recipient of a transfer payload, and the base units it was sent. */
+export interface AptosTransferLeg {
+  to: string;
+  units: bigint;
+}
+
+/**
+ * What a framework transfer payload moves: its recipients, and whether the
+ * asset is APT. `null` for any other payload, or a transfer whose arguments
+ * do not read. Exported for tests; the history and `getTransactionParties`
+ * both read payloads through it.
+ *
+ * # Why not `const [dest, value] = payload.arguments` (corrected 2026-09-30)
+ *
+ * That is the shape of `aptos_account::transfer`, `transfer_coins` and
+ * `coin::transfer` only. `primary_fungible_store::transfer` — the fungible-
+ * asset transfer, and what APT itself moved to — is `(metadata, recipient,
+ * amount)` (`@aptos-labs/ts-sdk`'s `transferFungibleAsset` builds exactly
+ * that), with the metadata rendered as `{ "inner": "0x…" }`. The history read
+ * the metadata object as the recipient ("[object Object]") and the recipient
+ * address as the amount (`BigInt("0x…")` parses hex), and it listed every
+ * coin and fungible asset sent this way as APT.
+ */
+export function aptosTransferOf(payload: unknown): { legs: AptosTransferLeg[]; apt: boolean } | null {
+  const p = (payload ?? {}) as { function?: unknown; type_arguments?: unknown; arguments?: unknown };
+  const m = /^(0x[0-9a-fA-F]{1,64})::(\w+)::(\w+)$/.exec(typeof p.function === "string" ? p.function : "");
+  if (!m || readAptosAddress(m[1]) !== readAptosAddress("0x1")) return null;
+  const args: unknown[] = Array.isArray(p.arguments) ? p.arguments : [];
+  const typeArg = Array.isArray(p.type_arguments) ? String(p.type_arguments[0] ?? "") : "";
+  const coinIsApt = () => sameMoveType(typeArg, APT_COIN_TYPE);
+  const metadataIsApt = (v: unknown) => {
+    const inner = v && typeof v === "object" ? (v as { inner?: unknown }).inner : v;
+    return typeof inner === "string" && readAptosAddress(inner) === APT_FA_METADATA;
+  };
+  const leg = (to: unknown, units: unknown): AptosTransferLeg | null =>
+    typeof to === "string" && /^\d+$/.test(String(units)) ? { to, units: BigInt(String(units)) } : null;
+  const one = (l: AptosTransferLeg | null, apt: boolean) => (l ? { legs: [l], apt } : null);
+  const many = (tos: unknown, amounts: unknown, apt: boolean) => {
+    if (!Array.isArray(tos) || !Array.isArray(amounts) || tos.length !== amounts.length) return null;
+    const legs = tos.map((to, i) => leg(to, amounts[i]));
+    return legs.every((l): l is AptosTransferLeg => l !== null) ? { legs, apt } : null;
+  };
+  switch (`${m[2]}::${m[3]}`) {
+    case "aptos_account::transfer":
+      return one(leg(args[0], args[1]), true);
+    case "aptos_account::transfer_coins":
+    case "coin::transfer":
+      return one(leg(args[0], args[1]), coinIsApt());
+    case "aptos_account::transfer_fungible_assets":
+    case "primary_fungible_store::transfer":
+      return one(leg(args[1], args[2]), metadataIsApt(args[0]));
+    case "aptos_account::batch_transfer":
+      return many(args[0], args[1], true);
+    case "aptos_account::batch_transfer_coins":
+      return many(args[0], args[1], coinIsApt());
+    case "aptos_account::batch_transfer_fungible_assets":
+      return many(args[1], args[2], metadataIsApt(args[0]));
+    default:
+      return null;
+  }
+}
+
+/**
+ * One transaction (`/transactions/by_hash`) as parties. Exported for tests.
+ * `from` is the sender; `to`, the recipients of a framework transfer, or
+ * nobody for any other call (a DEX call's counterparties are contract state,
+ * not arguments). Addresses come back padded, as the wallet's own is.
+ */
+export function aptosTxParties(tx: unknown, source?: string): TxParties | null {
+  if (!tx || typeof tx !== "object") return null;
+  const t = tx as { sender?: unknown; payload?: unknown };
+  const xfer = aptosTransferOf(t.payload);
+  return {
+    from: uniqueAddresses([typeof t.sender === "string" ? readAptosAddress(t.sender) : undefined]),
+    to: uniqueAddresses((xfer?.legs ?? []).map((l) => readAptosAddress(l.to))),
+    ...(source ? { source } : {}),
+  };
 }
 
 /**
@@ -487,6 +593,11 @@ export const aptAdapter: ChainAdapter = {
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
     const addr = normalizeAptosAddress(address);
+    // Note (2026-09-30): this endpoint lists the transactions the account
+    // SENT, by sequence number. A transfer TO it is someone else's
+    // transaction and is not here — for the public test seed it returned its
+    // two sends and none of the receipts that funded them. Not changed here;
+    // see the fix log of that day.
     const r = await fetch(`${APTOS_API}/accounts/${addr}/transactions?limit=${limit}`);
     if (r.status === 404) return { items: [] };
     if (!r.ok) throw new Error(`Aptos node HTTP ${r.status}`);
@@ -495,15 +606,19 @@ export const aptAdapter: ChainAdapter = {
     const items: ChainTx[] = [];
     for (const t of Array.isArray(rows) ? rows : []) {
       if (t.type !== "user_transaction") continue;
-      // Covers the legacy coin path AND the post-migration fungible-asset one:
-      // `aptos_account::transfer`, `aptos_account::transfer_coins`,
-      // `coin::transfer`, `primary_fungible_store::transfer`.
-      const fn = String(t?.payload?.function ?? "");
-      if (!/::(aptos_account|coin|primary_fungible_store)::transfer/.test(fn)) continue;
-      const [dest, value] = t?.payload?.arguments ?? [];
+      // Covers the legacy coin path AND the post-migration fungible-asset one,
+      // each read with its own argument order (`aptosTransferOf`). A transfer
+      // of another coin or fungible asset is skipped, not listed as APT
+      // (corrected 2026-09-30).
+      const xfer = aptosTransferOf(t?.payload);
+      if (!xfer || !xfer.apt) continue;
       const outgoing =
         normalizeAptosAddress(String(t.sender ?? "0x0")) === addr;
       const intended = outgoing ? "out" : "in";
+      // A send moved every leg; a receipt, the legs paid to this address.
+      const units = xfer.legs
+        .filter((l) => outgoing || readAptosAddress(l.to) === addr)
+        .reduce((sum, l) => sum + l.units, 0n);
       // A transaction that aborted is committed too — it paid gas — but it
       // moved nothing. Corrected 2026-09-30: it was listed as a send of its
       // full amount with `confirmations: 0`, which reads "unconfirmed" (0
@@ -515,7 +630,7 @@ export const aptAdapter: ChainAdapter = {
         chain: "aptos",
         hash: String(t.hash ?? ""),
         direction: failed ? "failed" : intended,
-        amount: atomicToDecimal(BigInt(value ?? 0), APT_DECIMALS),
+        amount: atomicToDecimal(units, APT_DECIMALS),
         // The gas is this wallet's only when it sent the transaction.
         fee: outgoing
           ? atomicToDecimal(BigInt(t.gas_used ?? 0) * BigInt(t.gas_unit_price ?? 0), APT_DECIMALS)
@@ -528,7 +643,7 @@ export const aptAdapter: ChainAdapter = {
         // with its version as the block reads "confirmed"; a count of 1
         // read "confirming (1)" and "1 / 6 pending" in the details.
         confirmations: undefined,
-        counterparty: outgoing ? String(dest ?? "") : String(t.sender ?? ""),
+        counterparty: outgoing ? xfer.legs[0]?.to ?? "" : String(t.sender ?? ""),
         meta: {
           intended,
           ...(failed ? { failure: String(t.vm_status ?? "aborted") } : {}),
@@ -536,6 +651,25 @@ export const aptAdapter: ChainAdapter = {
       });
     }
     return { items };
+  },
+
+  /**
+   * `/transactions/by_hash`, the lookup the send already settles by, fetched
+   * directly like every Aptos read (2026-09-30). The node answers 404
+   * `transaction_not_found` for a hash it does not know; a pending
+   * transaction has its sender and payload already, so it reads the same.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const url = `${APTOS_API}/transactions/by_hash/${encodeURIComponent(hash.trim())}`;
+    let r: Response;
+    try {
+      r = await fetch(url);
+    } catch (e) {
+      throw new Error(`${urlHost(APTOS_API)} could not be reached: ${errorText(e)}`);
+    }
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error(`${urlHost(APTOS_API)} answered HTTP ${r.status} for transaction ${hash.trim()}`);
+    return aptosTxParties(await r.json(), urlHost(APTOS_API));
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

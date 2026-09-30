@@ -10,8 +10,11 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { errorText } from "../lib/errorText";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 // Conflux Core Space mainnet RPC endpoints
 const CFX_RPC_URLS = [
@@ -195,6 +198,11 @@ function privateKeyToHexAddress(privateKey: Uint8Array): string {
 // ── RPC helper ──
 
 async function cfxRpcCall(method: string, params: any[]): Promise<any> {
+  return (await cfxRpcCallAt(method, params)).result;
+}
+
+/** `cfxRpcCall`, also saying which endpoint answered (for a `source` line). */
+async function cfxRpcCallAt(method: string, params: any[]): Promise<{ result: any; url: string }> {
   let lastError: any;
   for (const url of CFX_RPC_URLS) {
     try {
@@ -217,7 +225,7 @@ async function cfxRpcCall(method: string, params: any[]): Promise<any> {
         lastError = new Error(data.error.message || JSON.stringify(data.error));
         continue;
       }
-      return data.result;
+      return { result: data.result, url };
     } catch (e) {
       lastError = e;
       continue;
@@ -362,7 +370,10 @@ export const cfxAdapter: ChainAdapter = {
       return {
         chain: "conflux",
         hash: t.hash,
-        direction: t.status === 1 ? direction : direction, // 0=success in CFX
+        // 0 = success, 1 = the transaction failed (Conflux's `outcomeStatus`).
+        // Corrected 2026-09-30: both arms of this read `direction`, so a failed
+        // transaction was listed as a completed send.
+        direction: t.status === 1 ? "failed" : direction,
         amount,
         fee: direction === "out" ? fee : undefined,
         timestamp: t.timestamp,
@@ -379,6 +390,31 @@ export const cfxAdapter: ChainAdapter = {
         ? String(skip + limit)
         : undefined;
     return { items, cursor };
+  },
+
+  /**
+   * `cfx_getTransactionByHash` on the adapter's RPC endpoints, fetched the
+   * way the balance is (2026-09-30). The node answers `result: null` for a
+   * hash it does not know. A contract deployment has no `to`; its recipient
+   * is the contract it created.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const id = hash.trim();
+    let r: { result: any; url: string };
+    try {
+      r = await cfxRpcCallAt("cfx_getTransactionByHash", [id]);
+    } catch (e) {
+      throw new Error(
+        `No Conflux RPC could read transaction ${id} (${CFX_RPC_URLS.map(urlHost).join(", ")}): ${errorText(e)}`,
+      );
+    }
+    const t = r.result;
+    if (!t || typeof t !== "object") return null;
+    return {
+      from: uniqueAddresses([t.from]),
+      to: uniqueAddresses([t.to ?? t.contractCreated]),
+      source: urlHost(r.url),
+    };
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

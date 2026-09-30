@@ -26,10 +26,14 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { condenseHttpError } from "./tx-history-errors";
+import { uniqueAddresses } from "./parties-b-common";
 
 const HORIZON_BASE = "https://horizon.stellar.org";
+const HORIZON_HOST = "horizon.stellar.org";
 const DERIVATION_PATH = "m/44'/148'/0'";
 
 // =========================================================================
@@ -173,7 +177,73 @@ interface HorizonOperation {
   funder?: string;
   account?: string;
   starting_balance?: string;
+  /** `account_merge`: the account that received the merged one's XLM. */
+  into?: string;
+  /** Path payments: the asset the sender paid (`asset_type` is the one delivered). */
+  source_asset_type?: string;
   transaction_hash: string;
+}
+
+/**
+ * One operation's value transfer: who paid, who was paid, and whether XLM
+ * moved. `null` for operations that pay nobody (trust lines, offers, options,
+ * sponsorship markers). `create_account` and `account_merge` name their
+ * parties in fields of their own (`funder` / `account`, `account` / `into`).
+ */
+function operationTransfer(
+  op: HorizonOperation,
+): { from?: string; to?: string; native: boolean } | null {
+  switch (op.type) {
+    case "payment":
+      return { from: op.from, to: op.to, native: op.asset_type === "native" };
+    case "path_payment_strict_send":
+    case "path_payment_strict_receive":
+      return {
+        from: op.from,
+        to: op.to,
+        native: op.asset_type === "native" || op.source_asset_type === "native",
+      };
+    case "create_account":
+      return { from: op.funder, to: op.account, native: true };
+    case "account_merge":
+      return { from: op.account, to: op.into, native: true };
+    default:
+      return null;
+  }
+}
+
+/**
+ * A transaction's operations (Horizon `/transactions/{hash}/operations`, in
+ * the transaction's order) as parties (2026-09-30). Exported for tests.
+ *
+ * XLM transfers are preferred over other assets' (this is the XLM adapter);
+ * among them, the ones that involve `own`, else all — the rule the contract
+ * gives token legs. A transaction that pays nobody names its source account
+ * as the sender and no recipient.
+ */
+export function stellarOperationsParties(
+  records: readonly HorizonOperation[],
+  own: string,
+  source?: string,
+): TxParties | null {
+  if (records.length === 0) return null;
+  const src = source ? { source } : {};
+  const transfers = records
+    .map(operationTransfer)
+    .filter((t): t is { from?: string; to?: string; native: boolean } => t !== null);
+  const native = transfers.filter((t) => t.native);
+  const pool = native.length > 0 ? native : transfers;
+  const me = own.trim().toUpperCase();
+  const mine = pool.filter((t) => t.from?.toUpperCase() === me || t.to?.toUpperCase() === me);
+  const chosen = mine.length > 0 ? mine : pool;
+  if (chosen.length === 0) {
+    return { from: uniqueAddresses([records[0].source_account]), to: [], ...src };
+  }
+  return {
+    from: uniqueAddresses(chosen.map((t) => t.from)),
+    to: uniqueAddresses(chosen.map((t) => t.to)),
+    ...src,
+  };
 }
 
 /**
@@ -355,6 +425,26 @@ export const stellarAdapter: ChainAdapter = {
     const limit = opts?.limit ?? 25;
     const items = await fetchHistory(address, limit);
     return { items };
+  },
+
+  /**
+   * Horizon's operations for one transaction, through the proxy like every
+   * other Horizon read (2026-09-30). 200 is Horizon's page maximum and a
+   * transaction holds at most 100 operations, so one page is all of them.
+   * An unknown hash is Horizon's 404 ("Resource Missing").
+   */
+  async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+    const id = hash.trim();
+    let r: { _embedded?: { records?: HorizonOperation[] } };
+    try {
+      r = await proxyGetJson(
+        `${HORIZON_BASE}/transactions/${encodeURIComponent(id)}/operations?limit=200`,
+      );
+    } catch (e) {
+      if (e instanceof Error && /^HTTP 404\b/.test(e.message)) return null;
+      throw new Error(`${HORIZON_HOST} could not read transaction ${id}: ${condenseHttpError(e)}`);
+    }
+    return stellarOperationsParties(r._embedded?.records ?? [], ownAddress, HORIZON_HOST);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

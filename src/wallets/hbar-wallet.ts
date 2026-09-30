@@ -9,14 +9,93 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  TxParties,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { condenseHttpError } from "./tx-history-errors";
+import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 // Hedera's official public mirror node. Documented at 100 req/s per IP —
 // one of the most generous keyless tiers we work with.
 const MIRROR_BASE = "https://mainnet-public.mirrornode.hedera.com";
 const MIRROR_API = `${MIRROR_BASE}/api/v1`;
 const DERIVATION_PATH = "m/44'/3030'/0'/0/0";
+
+/**
+ * System accounts that collect transaction fees: 0.0.98 (the network fee
+ * account) and 0.0.800–0.0.802. In a live sample of mainnet transfers on
+ * 2026-09-30 every fee went to 0.0.802; older transactions paid 0.0.98 and
+ * the submitting node. Nobody sends a payment to these.
+ */
+const HEDERA_FEE_ACCOUNTS = ["0.0.98", "0.0.800", "0.0.801", "0.0.802"];
+
+/** A tinybar count from the mirror's JSON (a number), or 0n. */
+function tinybarsOf(v: unknown): bigint {
+  const n = typeof v === "number" ? v : typeof v === "string" ? Number(v) : NaN;
+  return Number.isFinite(n) ? BigInt(Math.trunc(n)) : 0n;
+}
+
+/** Tinybars as HBAR with eight fixed decimals, the rows' format, without floats. */
+function tinybarsFixed8(t: bigint): string {
+  const n = t < 0n ? -t : t;
+  return `${n / 100_000_000n}.${(n % 100_000_000n).toString().padStart(8, "0")}`;
+}
+
+/** The paying account of a transaction id (`0.0.1234-1790788932-436079025` → `0.0.1234`). */
+function hederaPayerOf(transactionId: unknown): string | undefined {
+  const m = /^(\d+\.\d+\.\d+)[-@]/.exec(typeof transactionId === "string" ? transactionId : "");
+  return m ? m[1] : undefined;
+}
+
+/**
+ * A mirror-node transaction's HBAR transfers with its fee taken out, so what
+ * is left is what moved between accounts. Exported for tests.
+ *
+ * `transfers` holds every account's delta, the fee included: the payer's
+ * entry is the amount PLUS `charged_tx_fee`, and the fee lands in the
+ * collecting accounts. Read raw (as the history did until 2026-09-30), a
+ * small send's largest positive entry is the fee collector — a live 1-tinybar
+ * transfer read "sent 0.00088997 HBAR to 0.0.802". So the fee is removed
+ * from its collectors (the fee accounts first, then the submitting node) and
+ * given back to the payer. A collector's entry above the fee is a payment
+ * and stays (live: 9 tinybars to node 0.0.28 on top of a fee paid to 0.0.802).
+ */
+export function hederaValueTransfers(tx: unknown): Array<{ account: string; tinybars: bigint }> {
+  const t = (tx ?? {}) as { transfers?: unknown; charged_tx_fee?: unknown; node?: unknown; transaction_id?: unknown };
+  const moves = (Array.isArray(t.transfers) ? t.transfers : [])
+    .filter((x: any) => typeof x?.account === "string")
+    .map((x: any) => ({ account: x.account as string, tinybars: tinybarsOf(x.amount) }));
+  let left = tinybarsOf(t.charged_tx_fee);
+  const fee = left;
+  for (const collector of [...HEDERA_FEE_ACCOUNTS, typeof t.node === "string" ? t.node : ""]) {
+    for (const m of moves) {
+      if (left <= 0n || m.account !== collector || m.tinybars <= 0n) continue;
+      const take = m.tinybars < left ? m.tinybars : left;
+      m.tinybars -= take;
+      left -= take;
+    }
+  }
+  const payer = moves.find((m) => m.account === hederaPayerOf(t.transaction_id));
+  if (payer) payer.tinybars += fee - left;
+  return moves.filter((m) => m.tinybars !== 0n);
+}
+
+/**
+ * One mirror-node transaction as parties (2026-09-30). Exported for tests.
+ * Senders are the accounts whose HBAR fell, recipients those whose HBAR
+ * rose, once the fee is taken out (`hederaValueTransfers`); a transaction
+ * that moved nothing but its fee names its payer as the sender.
+ */
+export function hederaTxParties(tx: unknown, source?: string): TxParties | null {
+  if (!tx || typeof tx !== "object") return null;
+  const moves = hederaValueTransfers(tx);
+  const from = uniqueAddresses(moves.filter((m) => m.tinybars < 0n).map((m) => m.account));
+  return {
+    from: from.length > 0 ? from : uniqueAddresses([hederaPayerOf((tx as { transaction_id?: unknown }).transaction_id)]),
+    to: uniqueAddresses(moves.filter((m) => m.tinybars > 0n).map((m) => m.account)),
+    ...(source ? { source } : {}),
+  };
+}
 
 function bytesToHex(bytes: Uint8Array): string {
   return Array.from(bytes)
@@ -187,32 +266,35 @@ export const hbarAdapter: ChainAdapter = {
       `${MIRROR_API}/transactions?account.id=${accountId}&order=desc&limit=${limit}${cursorPart}`
     );
     const items: ChainTx[] = (data.transactions ?? []).map((tx) => {
-      // `transfers` lists every account's hbar delta within the tx. The
-      // entry for our account tells us direction + amount.
-      const ours = tx.transfers?.find((t: any) => t.account === accountId);
-      const tinybars = Number(ours?.amount ?? 0);
-      const direction: ChainTx["direction"] = tinybars > 0 ? "in" : tinybars < 0 ? "out" : "self";
-      // Counterparty: the largest opposite-sign transfer.
-      const others: any[] = (tx.transfers ?? []).filter(
-        (t: any) => t.account !== accountId
-      );
-      const counterparty = others
-        .filter((t) =>
-          direction === "in" ? Number(t.amount) < 0 : Number(t.amount) > 0
-        )
-        .sort(
-          (a, b) =>
-            Math.abs(Number(b.amount)) - Math.abs(Number(a.amount))
-        )[0]?.account;
+      // `transfers` lists every account's hbar delta within the tx, fee
+      // included; with the fee taken out (2026-09-30, `hederaValueTransfers`)
+      // the entry for our account tells us direction + amount. A transaction
+      // this account paid only a fee for is an "out" of 0, with its fee.
+      const moves = hederaValueTransfers(tx);
+      const tinybars = moves.find((m) => m.account === accountId)?.tinybars ?? 0n;
+      const paidFeeOnly = tinybars === 0n && hederaPayerOf(tx.transaction_id) === accountId;
+      const direction: ChainTx["direction"] =
+        tinybars > 0n ? "in" : tinybars < 0n || paidFeeOnly ? "out" : "self";
+      // Counterparty: the largest opposite-sign transfer, fee collectors no
+      // longer among them.
+      const counterparty = moves
+        .filter((m) => m.account !== accountId && (direction === "in" ? m.tinybars < 0n : m.tinybars > 0n))
+        .sort((a, b) => {
+          const ma = a.tinybars < 0n ? -a.tinybars : a.tinybars;
+          const mb = b.tinybars < 0n ? -b.tinybars : b.tinybars;
+          return mb > ma ? 1 : mb < ma ? -1 : 0;
+        })[0]?.account;
       const success = tx.result === "SUCCESS";
       return {
         chain: "hedera",
         hash: tx.transaction_id,
         direction: success ? direction : "failed",
-        amount: (Math.abs(tinybars) / 1e8).toFixed(8),
-        fee: tx.charged_tx_fee
-          ? (Number(tx.charged_tx_fee) / 1e8).toFixed(8)
-          : undefined,
+        amount: tinybarsFixed8(tinybars),
+        // The fee is this account's only when it paid for the transaction.
+        fee:
+          tx.charged_tx_fee && hederaPayerOf(tx.transaction_id) === accountId
+            ? tinybarsFixed8(tinybarsOf(tx.charged_tx_fee))
+            : undefined,
         timestamp: tx.consensus_timestamp
           ? Math.floor(Number(tx.consensus_timestamp.split(".")[0]))
           : undefined,
@@ -234,6 +316,35 @@ export const hbarAdapter: ChainAdapter = {
       if (m) nextCursor = m[1];
     }
     return { items, cursor: nextCursor };
+  },
+
+  /**
+   * The mirror node's `/transactions/{id}`, through the proxy like the
+   * history (2026-09-30). `hash` is what the history rows carry: the
+   * transaction id (`0.0.payer-seconds-nanos`); the `@` form wallets print
+   * (`0.0.payer@seconds.nanos`) is accepted too. An unknown id is HTTP 404
+   * (`{"_status":{"messages":[{"message":"Not found"}]}}`).
+   *
+   * The addresses are account ids (`0.0.x`), while this wallet's own address
+   * is its public key, so the details cannot mark the wallet's side by
+   * string alone.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    const at = /^(\d+\.\d+\.\d+)@(\d+)\.(\d+)$/.exec(hash.trim());
+    const id = at ? `${at[1]}-${at[2]}-${at[3]}` : hash.trim();
+    let d: { transactions?: unknown };
+    try {
+      d = await proxyGetJson(`${MIRROR_API}/transactions/${encodeURIComponent(id)}`);
+    } catch (e) {
+      if (e instanceof Error && /^HTTP 404\b/.test(e.message)) return null;
+      throw new Error(`${urlHost(MIRROR_BASE)} could not read transaction ${id}: ${condenseHttpError(e)}`);
+    }
+    const txs = (Array.isArray(d.transactions) ? d.transactions : []) as Array<Record<string, unknown>>;
+    if (txs.length === 0) return null;
+    // One id also names the child and scheduled transactions it triggered
+    // (nonce > 0); the user's own transaction is nonce 0.
+    const tx = txs.find((t) => (t.nonce ?? 0) === 0 && t.scheduled !== true) ?? txs[0];
+    return hederaTxParties(tx, urlHost(MIRROR_BASE));
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {
