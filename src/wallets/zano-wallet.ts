@@ -26,10 +26,13 @@ import type {
   TxHistoryPage,
   FeeEstimate,
   SendableBalance,
+  TxParties,
 } from "./types";
 import { keccak_256 } from "@noble/hashes/sha3.js";
 import { SendOutcomeUnknownError } from "./send-outcome";
 import { errorText } from "../lib/errorText";
+import { invoke } from "../lib/tauri";
+import { uniqueAddresses } from "./parties-b-common";
 import {
   generateZanoSeed,
   validateZanoSeed,
@@ -389,6 +392,71 @@ export function zanoTransfersToChainTx(
 }
 
 // =========================================================================
+// Transaction parties (2026-09-30)
+// =========================================================================
+
+/** A wallet_transfer_info that spent this wallet's coins. */
+function zanoEntryIsOutgoing(e: Record<string, any>): boolean {
+  const spent = e?.employed_entries?.spent;
+  if (Array.isArray(spent) && spent.length > 0) return true;
+  const subs: any[] = [
+    ...(Array.isArray(e?.subtransfers_by_pid)
+      ? e.subtransfers_by_pid.flatMap((p: any) => (Array.isArray(p?.subtransfers) ? p.subtransfers : []))
+      : []),
+    ...(Array.isArray(e?.subtransfers) ? e.subtransfers : []),
+  ];
+  return subs.some((s) => s?.is_income === false);
+}
+
+/**
+ * A `search_for_transactions2` answer for `txid` as parties, from the wallet
+ * whose address is `own`. Exported for tests. Read from the vendored
+ * simplewallet source, v2.2.1.506 — the version the app runs
+ * (`.swap-sidecar-work/zano-build`); no funded Zano wallet was available to
+ * observe a live answer.
+ *
+ *  - The answer is `{ in, out, pool }` lists of `wallet_transfer_info`
+ *    (`COMMAND_RPC_SEARCH_FOR_TRANSACTIONS`). The confirmed lists are
+ *    filtered by `tx_id`; the POOL list is not (`on_search_for_transactions2`
+ *    pushes every unconfirmed transfer), so entries are matched by
+ *    `tx_hash` here.
+ *  - `remote_addresses` holds "destination if it's outgoing transfer or
+ *    sender if it's incoming" (its DOC_DSCR). A sender appears only when it
+ *    attached itself to the transaction (`tx_payer`, `show_sender`); the
+ *    RPC's own `push_payer` is refused as unsupported, so for most receipts
+ *    the sender is hidden, as the protocol intends.
+ *  - A sent transaction's recipients are known when this wallet sent it
+ *    (kept from its unconfirmed record) or the transaction carries them.
+ */
+export function zanoTransferParties(
+  result: unknown,
+  txid: string,
+  own: string,
+  source?: string,
+): TxParties | null {
+  const r = (result ?? {}) as { in?: unknown; out?: unknown; pool?: unknown };
+  const id = txid.trim().toLowerCase();
+  const pick = (list: unknown) =>
+    (Array.isArray(list) ? list : []).filter(
+      (e: any) => typeof e?.tx_hash === "string" && e.tx_hash.toLowerCase() === id,
+    ) as Array<Record<string, any>>;
+  const sent = pick(r.out);
+  const received = pick(r.in);
+  const pooled = pick(r.pool);
+  const entries = [...sent, ...received, ...pooled];
+  if (entries.length === 0) return null;
+  const src = source ? { source } : {};
+  const remote = uniqueAddresses(
+    entries.flatMap((e) => (Array.isArray(e.remote_addresses) ? e.remote_addresses : [])),
+  );
+  if (sent.length > 0 || pooled.some(zanoEntryIsOutgoing)) {
+    return { from: uniqueAddresses([own]), to: remote, ...src };
+  }
+  if (remote.length > 0) return { from: remote, to: uniqueAddresses([own]), ...src };
+  return { from: [], to: uniqueAddresses([own]), senderHidden: true, ...src };
+}
+
+// =========================================================================
 // Recipient validation (2026-09-29 send-safety audit, finding 4)
 // =========================================================================
 //
@@ -655,6 +723,37 @@ export const zanoAdapter: ChainAdapter = {
     const limit = opts?.limit ?? 25;
     const entries = await getZanoTransactionHistory();
     return { items: zanoTransfersToChainTx(entries, limit) };
+  },
+
+  /**
+   * This wallet's own record of one transaction, from simplewallet's
+   * `search_for_transactions2` by `tx_id` (2026-09-30), through the existing
+   * `zano_rpc_call` passthrough; parsed by `zanoTransferParties`. `null`
+   * when the wallet holds no transfer with that hash.
+   */
+  async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+    if (!session) {
+      throw new Error("The Zano wallet is not open, so its transactions cannot be read.");
+    }
+    const txid = hash.trim();
+    let result: unknown;
+    try {
+      result = await invoke("zano_rpc_call", {
+        method: "search_for_transactions2",
+        params: {
+          tx_id: txid,
+          in: true,
+          out: true,
+          pool: true,
+          filter_by_height: false,
+          min_height: 0,
+          max_height: 0,
+        },
+      });
+    } catch (e) {
+      throw new Error(`Zano simplewallet (local) could not read transaction ${txid}: ${errorText(e)}`);
+    }
+    return zanoTransferParties(result, txid, session.currentAddress || ownAddress, "zano simplewallet (local)");
   },
 
   /**

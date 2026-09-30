@@ -34,10 +34,12 @@ import type {
   FeeEstimate,
   SendQuote,
   SendableBalance,
+  TxParties,
 } from "./types";
 import { SEND_QUOTE_MAX_AGE_MS, SendQuoteError } from "./send-quote";
 import { isSendOutcomeUnknown } from "./send-outcome";
 import { settleRelayFailure } from "./xmr-rpc";
+import { readWalletRpcTransferParties } from "./parties-b-walletrpc";
 import { errorText } from "../lib/errorText";
 import {
   generateZephyrSeed,
@@ -1101,6 +1103,25 @@ export const zphAdapter: ChainAdapter = {
     transfers.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
     const items: ChainTx[] = transfers.slice(0, limit).map(zphTransferToChainTx);
     return { items };
+  },
+
+  /**
+   * This wallet's own record of one of its transactions, from
+   * zephyr-wallet-rpc's `get_transfer_by_txid` (2026-09-30), read exactly as
+   * Monero's (`parties-b-walletrpc.ts`): zephyr-wallet-rpc is a
+   * monero-wallet-rpc fork with the same method, and the send path already
+   * settles relays with it (`lookupOwnZphTransfer`). A receipt's sender is
+   * hidden by the protocol.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    if (!session) {
+      throw new Error("The Zephyr wallet is not open, so its transactions cannot be read.");
+    }
+    return readWalletRpcTransferParties({
+      command: "zph_rpc_call",
+      sidecar: "zephyr-wallet-rpc",
+      txid: hash.trim(),
+    });
   },
 
   /**

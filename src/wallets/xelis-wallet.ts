@@ -33,9 +33,13 @@ import type {
   SendQuote,
   SendableBalance,
   TxHistoryPage,
+  TxParties,
   TxResult,
   WalletInfo,
 } from "./types";
+import { invoke } from "../lib/tauri";
+import { errorText } from "../lib/errorText";
+import { uniqueAddresses } from "./parties-b-common";
 import { SEND_QUOTE_MAX_AGE_MS, SendQuoteError } from "./send-quote";
 import { SendOutcomeUnknownError, isSendOutcomeUnknown } from "./send-outcome";
 import {
@@ -67,6 +71,7 @@ import {
   switchDaemon,
   xelisSendMayHaveBroadcast,
   xelisToAtomic,
+  XELIS_NATIVE_ASSET,
   type XelisSyncStatus,
   type XelisTransferEntry,
 } from "./xelis-rpc";
@@ -428,6 +433,47 @@ export function xelisTransfersToChainTx(entries: readonly XelisTransferEntry[]):
 }
 
 // =========================================================================
+// Transaction parties (2026-09-30)
+// =========================================================================
+
+/**
+ * One raw `list_transactions` entry as parties, from the wallet whose
+ * address is `own`. Exported for tests. XELIS addresses are public (only
+ * amounts are encrypted), so both sides are named where the entry names
+ * them — the same variant fields `xelis-rpc.ts::parseTransferEntry` reads:
+ *
+ *  - `incoming`: its `from` → this wallet;
+ *  - `outgoing`: this wallet → every destination of its XEL transfers (of
+ *    all its transfers when none moved XEL);
+ *  - `coinbase`: a mining reward, which has no sender;
+ *  - `burn`: this wallet, and no recipient;
+ *  - `incoming_blob` / `incoming_contract` carry a `from` like `incoming`;
+ *    every other variant is a call this wallet made, to no one address.
+ */
+export function xelisEntryParties(entry: unknown, own: string, source?: string): TxParties | null {
+  if (!entry || typeof entry !== "object") return null;
+  const e = entry as Record<string, any>;
+  const src = source ? { source } : {};
+  const me = uniqueAddresses([own]);
+  if (e.incoming != null) return { from: uniqueAddresses([e.incoming.from]), to: me, ...src };
+  if (e.outgoing != null) {
+    const transfers: any[] = Array.isArray(e.outgoing.transfers) ? e.outgoing.transfers : [];
+    const xel = transfers.filter((t) => t?.asset == null || t.asset === XELIS_NATIVE_ASSET);
+    return {
+      from: me,
+      to: uniqueAddresses((xel.length > 0 ? xel : transfers).map((t) => t?.destination)),
+      ...src,
+    };
+  }
+  if (e.coinbase != null) return { from: [], to: me, ...src };
+  const inbound = e.incoming_blob ?? e.incoming_contract;
+  if (inbound != null && typeof inbound.from === "string") {
+    return { from: uniqueAddresses([inbound.from]), to: me, ...src };
+  }
+  return { from: me, to: [], ...src };
+}
+
+// =========================================================================
 // Send quoting
 // =========================================================================
 
@@ -596,6 +642,37 @@ export const xelisAdapter: ChainAdapter = {
     const limit = opts?.limit ?? 25;
     const entries = await listTransactions({ limit });
     return { items: xelisTransfersToChainTx(entries) };
+  },
+
+  /**
+   * The wallet's own entry for one transaction (2026-09-30), found in the
+   * `list_transactions` answer the history reads (same params, no limit),
+   * through the existing `xelis_rpc_call` passthrough. The wallet API also
+   * has a by-hash method, but what it answers for a hash the wallet does not
+   * hold was never observed, so "not found" could not be told from a failure
+   * there; here it is simply no entry. The list is the wallet's own local
+   * storage, so reading all of it costs no network.
+   */
+  async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+    if (!session) {
+      throw new Error("The Xelis wallet is not open, so its transactions cannot be read.");
+    }
+    const id = hash.trim().toLowerCase();
+    let rows: unknown;
+    try {
+      rows = await invoke("xelis_rpc_call", {
+        method: "list_transactions",
+        params: { asset: XELIS_NATIVE_ASSET },
+      });
+    } catch (e) {
+      throw new Error(`xelis_wallet (local) could not list its transactions: ${errorText(e)}`);
+    }
+    const entry = (Array.isArray(rows) ? rows : []).find(
+      (r) => typeof (r as { hash?: unknown })?.hash === "string" && (r as { hash: string }).hash.toLowerCase() === id,
+    );
+    return entry
+      ? xelisEntryParties(entry, session.currentAddress || ownAddress, "xelis_wallet (local)")
+      : null;
   },
 
   /**

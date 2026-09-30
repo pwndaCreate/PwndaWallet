@@ -30,8 +30,10 @@ import type {
   TxHistoryPage,
   FeeEstimate,
   SendableBalance,
+  TxParties,
 } from "./types";
 import { errorText } from "../lib/errorText";
+import { readWalletRpcTransferParties } from "./parties-b-walletrpc";
 import {
   generateXmrSeed,
   xmrAddressFromSeed,
@@ -1108,6 +1110,26 @@ export const xmrAdapter: ChainAdapter = {
     transfers.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
     const items: ChainTx[] = transfers.slice(0, limit).map((t) => xmrTransferToChainTx(t));
     return { items };
+  },
+
+  /**
+   * This wallet's own record of one of its transactions, from
+   * monero-wallet-rpc's `get_transfer_by_txid` (2026-09-30; see
+   * `parties-b-walletrpc.ts`). Monero hides who sent what arrives, so a
+   * receipt is `senderHidden` with the receiving subaddress; a send names
+   * its recipients when this wallet built it. `null` for a txid the wallet
+   * does not hold. No public source exists to ask instead: the chain itself
+   * does not say.
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    if (!session) {
+      throw new Error("The Monero wallet is not open, so its transactions cannot be read.");
+    }
+    return readWalletRpcTransferParties({
+      command: "xmr_rpc_call",
+      sidecar: "monero-wallet-rpc",
+      txid: hash.trim(),
+    });
   },
 
   /**
