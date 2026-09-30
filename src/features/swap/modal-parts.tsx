@@ -10,6 +10,8 @@
  * `zIndex: 60` and `fade-in .15s ease`: the legacy `.modal-overlay` class in
  * legacy.css uses z-index 2000, and building the desk modals on that idiom
  * would stack them above every other swap surface in a way nothing else does.
+ * (Since 2026-09-30 `Backdrop` is `components/ModalBackdrop.tsx`, rendered at
+ * the page root at `MODAL_BACKDROP_Z`; its header gives the order.)
  *
  * `formatPwndaFee` deliberately did NOT move — `swapkit-live.test.ts` imports
  * it from `./SwapConfirmModal` with no module mocking, and eight exact-string

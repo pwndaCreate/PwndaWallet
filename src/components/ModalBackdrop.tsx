@@ -34,8 +34,18 @@
  * control on the card.
  */
 import type { ReactNode } from "react";
+import { createPortal } from "react-dom";
 
 export const BACKDROP_TITLEBAR_STRIP_PX = 36;
+/**
+ * The backdrop's layer at the page root (2026-09-30). Above the page (`.app`,
+ * 1) and the portrait bottom nav (`BottomNav`, 10); below the landscape title
+ * bar (`LandscapeShell`, 20), whose window buttons stay usable. The portrait
+ * title bar (`design/shell/TitleBar`) has no layer of its own, so a modal
+ * covers it there, as it always has: the top strip above is what moves the
+ * window then. `modalBackdrop.test.ts` pins the order against those files.
+ */
+export const MODAL_BACKDROP_Z = 15;
 /** How far the pointer may travel between press and release and still be a
  *  click rather than a drag. */
 export const BACKDROP_DRAG_SLOP_PX = 4;
@@ -82,6 +92,14 @@ export function backdropClickCloses(e: BackdropPointerEvent): boolean {
   );
 }
 
+/**
+ * Rendered into `document.body` (2026-09-30). Inside `.app` — a stacking
+ * context of its own at z-index 1 — no z-index could lift a modal over the
+ * portrait bottom nav, which sits outside `.app` at 10: the nav painted over
+ * the Activity sheet's buttons and stayed clickable behind every modal, so a
+ * tab switch could unmount one mid-flow. Without a DOM (the unit tests) it
+ * renders in place.
+ */
 export function ModalBackdrop({
   children,
   onClick,
@@ -92,7 +110,7 @@ export function ModalBackdrop({
   /** `center` for a modal card, `end` for a bottom sheet. */
   align?: "center" | "end";
 }) {
-  return (
+  const backdrop = (
     <div
       data-modal-backdrop
       onMouseDown={noteBackdropPress}
@@ -106,7 +124,7 @@ export function ModalBackdrop({
         display: "flex",
         alignItems: align === "end" ? "flex-end" : "center",
         justifyContent: "center",
-        zIndex: 60,
+        zIndex: MODAL_BACKDROP_Z,
         animation: "fade-in .15s ease",
       }}
     >
@@ -125,4 +143,5 @@ export function ModalBackdrop({
       {children}
     </div>
   );
+  return typeof document === "undefined" ? backdrop : createPortal(backdrop, document.body);
 }
