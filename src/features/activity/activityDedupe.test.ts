@@ -17,6 +17,8 @@
  *    of a chain's keys could mix in a previous wallet's history.
  */
 import { describe, expect, it } from "vitest";
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import type { ChainTx } from "../../wallets/types";
 import { dedupeTxRows, normalizeTxHash, txRowKey } from "../../wallets/tx-row-key";
 import { mergeChainTx, pruneToKeys } from "./useTxHistory";
@@ -94,6 +96,26 @@ describe("mergeChainTx (the views' per-chain merge)", () => {
     const { txs } = mergeChainTx({ txByChain: { "litecoin:c0": [a], "litecoin:c2": [b] } }, "litecoin");
     expect(txs).toHaveLength(1);
     expect(txs[0]).toMatchObject({ direction: "out", amount: "1.20001410" });
+  });
+});
+
+describe("the lists' React keys are unique (operator report 2026-09-30)", () => {
+  // The build the operator ran listed one LTC send 7 times and one BCH
+  // receipt 4 times, each copy with the same key; switching ALL / SENT /
+  // RECEIVED then changed the side panel but not the rows. Both views now
+  // pass the flattened rows through `dedupeTxRows` before rendering.
+  it("both views dedupe the flattened rows by their key", () => {
+    for (const view of ["ActivityLandscapeView.tsx", "ActivityViewPortrait.tsx"]) {
+      const src = readFileSync(resolve(__dirname, view), "utf8");
+      expect(src).toContain("dedupChainTxsAgainstSwaps(dedupeTxRows(out), swapHashes)");
+    }
+  });
+
+  it("seven copies of one row become one", () => {
+    const ltc: ChainTx = { chain: "litecoin", hash: "0af8b931", direction: "out", amount: "4.02888049" };
+    const rows = dedupeTxRows(Array.from({ length: 7 }, () => ({ ...ltc })));
+    expect(rows).toHaveLength(1);
+    expect(new Set(rows.map(txRowKey)).size).toBe(rows.length);
   });
 });
 

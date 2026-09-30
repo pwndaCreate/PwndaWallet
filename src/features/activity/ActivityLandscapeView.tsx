@@ -4,7 +4,8 @@ import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
 import { txDisplayTicker, txUsdPrice } from "../../wallets/tx-display";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
-import { txRowKey } from "../../wallets/tx-row-key";
+import { dedupeTxRows, txRowKey } from "../../wallets/tx-row-key";
+import { txFilterSide } from "./txFilters";
 import type { ChainTx, ChainType } from "../../wallets";
 import { TxDetails } from "./TxDetails";
 import { HistoryStatusLine } from "./HistoryStatusLine";
@@ -100,18 +101,21 @@ export function ActivityLandscapeView({
   const allTxs = useMemo(() => {
     const out: ChainTx[] = [];
     for (const s of statuses) out.push(...s.txs);
-    const deduped = dedupChainTxsAgainstSwaps(out, swapHashes);
+    // One row per key before rendering (2026-09-30): the rows are React keys,
+    // and the operator's build listed one LTC send 7 times and one BCH receipt
+    // 4 times under the same key. With duplicate keys React stopped updating
+    // the list — ALL / SENT / RECEIVED changed the side panel and left the
+    // rows as they were. The per-chain merge already gives one row per
+    // transaction; this keeps a repeat from ever reaching the list again.
+    const deduped = dedupChainTxsAgainstSwaps(dedupeTxRows(out), swapHashes);
     deduped.sort(compareTxNewestFirst);
     return deduped;
   }, [statuses, swapHashes]);
 
   const filtered = useMemo(() => {
     if (filter === "all") return allTxs;
-    if (filter === "sent")
-      return allTxs.filter(
-        (t) => t.direction === "out" || t.direction === "pending"
-      );
-    if (filter === "received") return allTxs.filter((t) => t.direction === "in");
+    if (filter === "sent") return allTxs.filter((t) => txFilterSide(t) === "sent");
+    if (filter === "received") return allTxs.filter((t) => txFilterSide(t) === "received");
     // Swap filter is handled separately in the render branch — return
     // an empty chain-tx array here so the existing tx-rendering path
     // doesn't try to display swap rows.

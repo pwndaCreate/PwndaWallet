@@ -4,7 +4,7 @@ import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
 import { txDisplayTicker } from "../../wallets/tx-display";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
-import { txRowKey } from "../../wallets/tx-row-key";
+import { dedupeTxRows, txRowKey } from "../../wallets/tx-row-key";
 import type { ChainTx, ChainType } from "../../wallets";
 import { TxDetailsSheet } from "./TxDetails";
 import { HistoryStatusLine } from "./HistoryStatusLine";
@@ -12,7 +12,7 @@ import { chainHistoryStatuses, summarizeHistoryStatus } from "./historyStatus";
 import { chainAddresses, compareTxNewestFirst } from "./useTxHistory";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
-import { txIsMeaningful } from "./txFilters";
+import { txFilterSide, txIsMeaningful } from "./txFilters";
 import {
   computeDriftFraction,
   driftTone,
@@ -99,7 +99,13 @@ export function ActivityViewPortrait({
     // Suppress chain-txs whose hash appears in a swap row (#19 dedup).
     // The swap row is the canonical representation of that hash in the
     // unified timeline; per-chain dashboards still surface it natively.
-    const deduped = dedupChainTxsAgainstSwaps(out, swapHashes);
+    // One row per key before rendering (2026-09-30): the rows are React keys,
+    // and the operator's build listed one LTC send 7 times and one BCH receipt
+    // 4 times under the same key. With duplicate keys React stopped updating
+    // the list — ALL / SENT / RECEIVED changed the side panel and left the
+    // rows as they were. The per-chain merge already gives one row per
+    // transaction; this keeps a repeat from ever reaching the list again.
+    const deduped = dedupChainTxsAgainstSwaps(dedupeTxRows(out), swapHashes);
     deduped.sort(compareTxNewestFirst);
     return deduped;
   }, [statuses, swapHashes]);
@@ -107,9 +113,8 @@ export function ActivityViewPortrait({
   const filteredTxs = useMemo(() => {
     let pool: ChainTx[];
     if (filter === "all") pool = allTxs;
-    else if (filter === "sent")
-      pool = allTxs.filter((t) => t.direction === "out" || t.direction === "pending");
-    else if (filter === "received") pool = allTxs.filter((t) => t.direction === "in");
+    else if (filter === "sent") pool = allTxs.filter((t) => txFilterSide(t) === "sent");
+    else if (filter === "received") pool = allTxs.filter((t) => txFilterSide(t) === "received");
     else pool = [];
     if (amountFilter === "meaningful") pool = pool.filter(txIsMeaningful);
     return pool;
@@ -118,9 +123,8 @@ export function ActivityViewPortrait({
     if (amountFilter !== "meaningful") return 0;
     let pool: ChainTx[];
     if (filter === "all") pool = allTxs;
-    else if (filter === "sent")
-      pool = allTxs.filter((t) => t.direction === "out" || t.direction === "pending");
-    else if (filter === "received") pool = allTxs.filter((t) => t.direction === "in");
+    else if (filter === "sent") pool = allTxs.filter((t) => txFilterSide(t) === "sent");
+    else if (filter === "received") pool = allTxs.filter((t) => txFilterSide(t) === "received");
     else pool = [];
     return pool.filter((t) => !txIsMeaningful(t)).length;
   }, [allTxs, filter, amountFilter]);
