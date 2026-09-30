@@ -4,6 +4,7 @@ import type { ChainTx, ChainType } from "../../wallets";
 import { getAdapter } from "../../wallets";
 import { txDisplayTicker } from "../../wallets/tx-display";
 import { openExternal } from "../../utils/openExternal";
+import { isHistoryUnavailableMessage } from "../../wallets/tx-history-errors";
 
 /**
  * Per-chain transaction history card for the portrait dashboard.
@@ -41,7 +42,17 @@ export function ChainTxCard({
       title="TRANSACTION HISTORY"
       right={loading ? <span className="gas-info">Loading…</span> : undefined}
     >
-      {error && txs.length === 0 ? (
+      {error && txs.length === 0 && isHistoryUnavailableMessage(error) ? (
+        // No history source for this chain (BSC, Monad, 2026-09-30): not a
+        // failure, so not the orange "Couldn't fetch" line, and not "no
+        // transactions" either — Activity words it the same way.
+        <p className="no-wallet-msg">
+          Transaction history for {adapter.displayName ?? adapter.ticker} is
+          not available in the wallet yet: no free explorer serves it. Your
+          balance is unaffected, and the chain's explorer lists every
+          transaction.
+        </p>
+      ) : error && txs.length === 0 ? (
         <p className="no-wallet-msg" style={{ color: "#ff9966" }}>
           Couldn't fetch {adapter.ticker} transactions: {error}
         </p>
