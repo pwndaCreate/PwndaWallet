@@ -12,6 +12,7 @@ import type {
   FeeEstimate,
 } from "./types";
 import { httpProxyCall, proxyGetJson } from "./_proxy";
+import { fetchTrxHistory, type TronHistorySources } from "./tron-history";
 import { verifyTronTransaction } from "./tron-tx-verify";
 import { SendOutcomeUnknownError } from "./send-outcome";
 
@@ -110,6 +111,24 @@ export async function tronFetchFrom(
 export async function tronFetch(path: string, init?: RequestInit): Promise<Response> {
   return (await tronFetchFrom(path, init)).resp;
 }
+
+const TRONSCAN_API = "https://apilist.tronscanapi.com";
+
+/**
+ * History sources for TRX and TRC-20 (`tron-history.ts`, operator report
+ * 2026-09-30). TronGrid's indexed `/v1/*` paths, spaced like every other
+ * TronGrid call; then TronScan's public API. Both through the backend proxy
+ * (`trongrid.io` and `tronscanapi.com` are allowlisted). TronStack is not a
+ * history source: it has no `/v1/*`, and the full-node API cannot list an
+ * account's transactions.
+ */
+export const TRON_HISTORY_SOURCES: TronHistorySources = {
+  tronGrid: async (path) => {
+    await trongridSlot();
+    return proxyGetJson(`${TRON_API_URLS[0]}${path}`);
+  },
+  tronScan: (path) => proxyGetJson(`${TRONSCAN_API}${path}`),
+};
 
 /** A sun amount from a TRON API number field; absent is zero. */
 function sunOf(v: unknown): bigint {
@@ -562,64 +581,17 @@ export const trxAdapter: ChainAdapter = {
     }
   },
 
+  /**
+   * TronGrid, then TronScan (`tron-history.ts`). Until 2026-09-30 the
+   * fallback was TronStack's `/v1/*`, which is always 404: a TronGrid 429
+   * surfaced as "HTTP 404 from https://api.tronstack.io/…" and TRX sat in
+   * the Activity header's error list (operator report 2026-09-30).
+   */
   async getTransactionHistory(
     address: string,
     opts?: { limit?: number; cursor?: string }
   ): Promise<TxHistoryPage> {
-    const limit = opts?.limit ?? 25;
-    const fingerprint = opts?.cursor ? `&fingerprint=${opts.cursor}` : "";
-    let lastError: unknown = null;
-    for (const base of TRON_API_URLS) {
-      try {
-        // Same per-IP TronGrid budget as `tronFetch`, whichever path it takes.
-        if (base === TRON_API_URLS[0]) await trongridSlot();
-        const data = await proxyGetJson<{ data: any[]; meta?: { fingerprint?: string } }>(
-          `${base}/v1/accounts/${address}/transactions?limit=${limit}&only_confirmed=true${fingerprint}`
-        );
-        const items: ChainTx[] = (data.data ?? [])
-          .map((tx) => {
-            const c =
-              tx.raw_data?.contract?.[0]?.parameter?.value ?? null;
-            if (!c) return null;
-            const contractType = tx.raw_data?.contract?.[0]?.type;
-            if (contractType !== "TransferContract") return null; // skip non-TRX transfers
-            const fromHex = c.owner_address;
-            const toHex = c.to_address;
-            const fromTron = hexToTronAddress(fromHex);
-            const toTron = hexToTronAddress(toHex);
-            const isOut = fromTron === address;
-            const direction: ChainTx["direction"] =
-              isOut && toTron === address ? "self" : isOut ? "out" : "in";
-            const sun = Number(c.amount ?? 0);
-            const amount = (sun / 1_000_000).toFixed(6);
-            const success =
-              tx.ret?.[0]?.contractRet === "SUCCESS" || !tx.ret?.[0]?.contractRet;
-            return {
-              chain: "tron",
-              hash: tx.txID,
-              direction: success ? direction : "failed",
-              amount,
-              fee: tx.net_fee
-                ? (Number(tx.net_fee) / 1_000_000).toFixed(6)
-                : undefined,
-              timestamp: tx.block_timestamp
-                ? Math.floor(tx.block_timestamp / 1000)
-                : undefined,
-              height: tx.blockNumber,
-              counterparty: direction === "out" ? toTron : fromTron,
-              meta: { contractType, raw_ret: tx.ret },
-            } as ChainTx;
-          })
-          .filter((x): x is ChainTx => x !== null);
-        return { items, cursor: data.meta?.fingerprint };
-      } catch (e) {
-        lastError = e;
-        continue;
-      }
-    }
-    throw lastError instanceof Error
-      ? lastError
-      : new Error("All Tron sources failed");
+    return fetchTrxHistory(address, opts, TRON_HISTORY_SOURCES, hexToTronAddress);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {
@@ -630,6 +602,9 @@ export const trxAdapter: ChainAdapter = {
     // `getTransactionFee`, default 1000 sun/byte).
     let perByte = 1000; // default per Tron docs
     try {
+      // Spaced like every other TronGrid call (2026-09-30): this one was not,
+      // and it lands in the same burst as the balance and history reads.
+      await trongridSlot();
       const params = await proxyGetJson<{ chainParameter: { key: string; value?: number }[] }>(
         `${TRONGRID_API}/wallet/getchainparameters`
       );

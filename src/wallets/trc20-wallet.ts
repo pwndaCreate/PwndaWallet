@@ -54,7 +54,9 @@ import {
   tronAddressToHex,
   tronNodeMessage,
   waitForTronExecution,
+  TRON_HISTORY_SOURCES,
 } from "./trx-wallet";
+import { fetchTrc20History } from "./tron-history";
 import { verifyTronTransaction } from "./tron-tx-verify";
 import { atomicToDecimalString, decimalStringToAtomic } from "./spl-token-wallet";
 
@@ -466,36 +468,22 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
       return trxAdapter.getNetworkInfo();
     },
 
+    /**
+     * TronGrid, then TronScan (`tron-history.ts`). The fallback used to be
+     * TronStack's `/v1/*` through `tronFetch`, which is always 404 (operator
+     * report 2026-09-30). Failures still throw: until 2026-09-29 a failure
+     * became an empty list, indistinguishable from "no transfers".
+     */
     async getTransactionHistory(
       address: string,
       opts?: { limit?: number; cursor?: string },
     ): Promise<TxHistoryPage> {
-      const limit = opts?.limit ?? 25;
-      const fingerprint = opts?.cursor ? `&fingerprint=${encodeURIComponent(opts.cursor)}` : "";
-      // `tronFetch` throws once every source has failed, which is the
-      // adapter contract. Until 2026-09-29 a failure became an empty list,
-      // indistinguishable on the Activity tab from "no transfers".
-      const resp = await tronFetch(
-        `/v1/accounts/${address}/transactions/trc20?limit=${limit}&only_confirmed=true&contract_address=${cfg.contract}${fingerprint}`,
+      return fetchTrc20History(
+        { chain: cfg.chain, ticker: cfg.ticker, contract: cfg.contract, decimals: cfg.decimals },
+        address,
+        opts,
+        TRON_HISTORY_SOURCES,
       );
-      const data = await resp.json();
-      if (!Array.isArray(data?.data)) throw new Error(`${cfg.ticker} history: unexpected response`);
-      const rows: any[] = data.data;
-      return {
-        items: rows.map((r) => {
-          const toMe = String(r.to ?? "") === address;
-          const fromMe = String(r.from ?? "") === address;
-          return {
-            chain: cfg.chain,
-            hash: String(r.transaction_id ?? ""),
-            direction: toMe && fromMe ? ("self" as const) : toMe ? ("in" as const) : ("out" as const),
-            amount: atomicToDecimalString(BigInt(String(r.value ?? "0")), cfg.decimals),
-            timestamp: r.block_timestamp ? Math.floor(r.block_timestamp / 1000) : undefined,
-            counterparty: toMe ? r.from : r.to,
-          };
-        }),
-        cursor: data.meta?.fingerprint,
-      };
     },
 
     async getFeeEstimate(): Promise<FeeEstimate> {
