@@ -40,6 +40,7 @@ import {
 import { SettingsLandscapeView } from "../settings/SettingsLandscapeView";
 import { MinerSetupView } from "../mining/MinerSetupView";
 import { ActiveSendModal } from "../send/SendModal";
+import { AppAlerts } from "../../components/AppAlerts";
 import { ZephyrSwapModal } from "../zephyr/ZephyrSwapModal";
 import { DeskSwapTrackerModal, type DeskTrackerState } from "../swap";
 import { SidecarSwapTracker, type SidecarSwapState } from "../swap-sidecar";
@@ -930,63 +931,16 @@ export function LandscapeRoot(props: {
         </div>
       )}
 
-      {/* App-wide error / success lines. Fixed and above `.modal-overlay`
-          (z-index 2000) because the send that fails does so with its modal
-          still open — rendering in flow behind the backdrop would repeat the
-          2026-09-12 "Send does nothing" report. */}
-      {(error || success) && (
-        <div
-          data-landscape-alerts
-          style={{
-            position: "fixed",
-            top: 44,
-            left: "50%",
-            transform: "translateX(-50%)",
-            width: "min(640px, calc(100vw - 32px))",
-            zIndex: 2100,
-            display: "flex",
-            flexDirection: "column",
-            gap: 6,
-          }}
-        >
-          {error && (
-            <div
-              className="alert alert-error"
-              role="alert"
-              style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
-            >
-              <span style={{ flex: 1 }}>{error}</span>
-              <button
-                type="button"
-                aria-label="Dismiss"
-                onClick={() => setError("")}
-                style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
-              >
-                ×
-              </button>
-            </div>
-          )}
-          {success && (
-            <div
-              className="alert alert-success"
-              role="status"
-              style={{ margin: 0, display: "flex", gap: 10, alignItems: "flex-start" }}
-            >
-              <span style={{ flex: 1 }}>{success}</span>
-              {setSuccess && (
-                <button
-                  type="button"
-                  aria-label="Dismiss"
-                  onClick={() => setSuccess("")}
-                  style={{ background: "transparent", border: 0, color: "inherit", cursor: "pointer", fontFamily: "var(--mono)" }}
-                >
-                  ×
-                </button>
-              )}
-            </div>
-          )}
-        </div>
-      )}
+      {/* App-wide error / success lines: the shared `AppAlerts`, fixed above
+          `.modal-overlay` because a send that fails does so with its modal
+          still open (the 2026-09-12 "Send does nothing" report). Portrait
+          mounts the same component (2026-09-29). */}
+      <AppAlerts
+        error={error}
+        success={success}
+        setError={setError}
+        setSuccess={setSuccess}
+      />
 
       {/* Modals still rendered on top */}
       {showSendModal && walletsByChain[activeChain] && (

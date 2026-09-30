@@ -27,6 +27,7 @@ import {
 } from "./components/Primitives";
 import { TitleBar, Card } from "./components/PrimitivesV2";
 import { UpdateBanner } from "./components/UpdateBanner";
+import { AppAlerts } from "./components/AppAlerts";
 import { ActiveSendModal } from "./features/send/SendModal";
 import { ZephyrSwapModal } from "./features/zephyr/ZephyrSwapModal";
 import { DeskSwapTrackerModal, type DeskTrackerState } from "./features/swap";
@@ -570,8 +571,16 @@ export function ViewRouter(props: ViewRouterProps) {
         </div>
       </header>
 
-      {error && <div className="alert alert-error">{error}</div>}
-      {success && <div className="alert alert-success">{success}</div>}
+      {/* The same fixed lines landscape shows (`AppAlerts`, 2026-09-29). These
+          were in page flow, so a send that failed with its modal open showed
+          its error BEHIND the backdrop, and the only visible change was the
+          button reverting to "Send" — an invitation to press it again. */}
+      <AppAlerts
+        error={error}
+        success={success}
+        setError={setError}
+        setSuccess={setSuccess}
+      />
       {/* Update notice. Shared with LandscapeShell — see UpdateBanner's header
           for why it is one component mounted twice rather than two. */}
       <UpdateBanner onOpenSettings={() => setView("settings")} />

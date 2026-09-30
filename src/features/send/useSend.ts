@@ -1,6 +1,11 @@
 import { useCallback, useState } from "react";
 import { shouldUseAccountSend } from "./accountSend";
-import { sendFailureText } from "./sendErrors";
+import {
+  sendFailureText,
+  sendOutcomeUnknownText,
+  sendSuccessText,
+} from "./sendErrors";
+import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 import {
   getSendDestinationTag,
   parseDestinationTag,
@@ -120,10 +125,16 @@ export function useSend(args: {
     setSendDestinationTag("");
     setShowSendModal(true);
   }, []);
+  // Closing forgets the recipient and amount together with the tag
+  // (2026-09-29). Clearing only the tag meant Cancel then reopen kept an
+  // exchange address and dropped the tag it needs, and one press sent an
+  // untagged deposit the exchange cannot credit.
   const closeSendModal = useCallback(() => {
     setShowSendModal(false);
     setSendAssetType(undefined);
     setSendDestinationTag("");
+    setSendTo("");
+    setSendAmount("");
   }, []);
 
   /**
@@ -239,7 +250,7 @@ export function useSend(args: {
                 sendAssetType,
                 sendOpts
               );
-      setSuccess(`Transaction sent! Hash: ${result.hash}`);
+      setSuccess(sendSuccessText(result));
       setSendTo("");
       setSendAmount("");
       setShowSendModal(false);
@@ -251,6 +262,20 @@ export function useSend(args: {
       // instead of waiting for the next 60s poll.
       void refreshTxHistory(activeChain);
     } catch (e) {
+      if (isSendOutcomeUnknown(e)) {
+        // The transaction may be on the network (2026-09-29). Close the form so
+        // the same press cannot be repeated — a second one would sign a NEW
+        // transaction and pay twice if the first lands — and say what is known.
+        setSendTo("");
+        setSendAmount("");
+        setShowSendModal(false);
+        setSendAssetType(undefined);
+        setSendDestinationTag("");
+        setError(sendOutcomeUnknownText(e));
+        refreshBalance();
+        void refreshTxHistory(activeChain);
+        return;
+      }
       // Not `e.message`: wallet-rpc failures arrive as plain strings (Tauri's
       // `Err(String)`), which printed "Transaction failed: undefined".
       setError(sendFailureText(e));

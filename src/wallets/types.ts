@@ -100,6 +100,16 @@ export interface WalletInfo {
 
 export interface TxResult {
   hash: string;
+  /**
+   * The network accepted the transaction, but the wallet has not seen it
+   * confirmed yet (2026-09-29). The UI says "submitted", not "sent", and the
+   * form is closed all the same, so the send cannot be repeated by accident.
+   * Absent means confirmed — or a chain whose send returns only once final.
+   *
+   * An outcome that is not even known to be accepted is not a result at all:
+   * throw `SendOutcomeUnknownError` (`send-outcome.ts`).
+   */
+  pending?: boolean;
 }
 
 export interface NetworkInfo {
