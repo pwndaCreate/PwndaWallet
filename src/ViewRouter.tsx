@@ -803,6 +803,8 @@ export function ViewRouter(props: ViewRouterProps) {
           errors={chainTxErrors}
           chainsOwned={ownedChains}
           addressByChain={addressByChain}
+          pricesByTicker={pricesByTicker}
+          zphStats={zphReserveInfo.stats}
         />
       )}
 

@@ -1,12 +1,14 @@
 import { useMemo, useState } from "react";
 import { ST } from "../../components/Primitives";
-import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
-import { txDisplayTicker, txFeeTicker, txUsdPrice } from "../../wallets/tx-display";
+import { txDisplayTicker, txUsdPrice } from "../../wallets/tx-display";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
-import { explorerTxUrl } from "../../wallets/explorers";
+import { txRowKey } from "../../wallets/tx-row-key";
 import type { ChainTx, ChainType } from "../../wallets";
+import { TxDetails } from "./TxDetails";
+import { HistoryStatusLine } from "./HistoryStatusLine";
+import { chainHistoryStatuses, summarizeHistoryStatus } from "./historyStatus";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
 import {
@@ -82,18 +84,25 @@ export function ActivityLandscapeView({
   // A swap row opens the shared swap details modal (2026-09-30).
   const [openSwapId, setOpenSwapId] = useState<string | null>(null);
 
+  // One status per DISTINCT chain, its rows merged across every address key
+  // (`historyStatus.ts`, operator report 2026-09-30). This read one key per
+  // entry of `chainsOwned`, which repeats a UTXO chain once per account
+  // address — so each of those rows was listed once per address — and it only
+  // ever read the LAST address `addressByChain` held for the chain.
+  const statuses = useMemo(
+    () => chainHistoryStatuses(chainsOwned, { txByChain, loading, errors }),
+    [chainsOwned, txByChain, loading, errors]
+  );
+  const statusSummary = useMemo(() => summarizeHistoryStatus(statuses), [statuses]);
+
   // Flatten + dedup against swap hashes + sort newest-first.
   const allTxs = useMemo(() => {
     const out: ChainTx[] = [];
-    for (const c of chainsOwned) {
-      const k = `${c}:${addressByChain[c] ?? ""}`;
-      const list = txByChain[k] ?? [];
-      out.push(...list);
-    }
+    for (const s of statuses) out.push(...s.txs);
     const deduped = dedupChainTxsAgainstSwaps(out, swapHashes);
     deduped.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
     return deduped;
-  }, [chainsOwned, txByChain, addressByChain, swapHashes]);
+  }, [statuses, swapHashes]);
 
   const filtered = useMemo(() => {
     if (filter === "all") return allTxs;
@@ -136,28 +145,16 @@ export function ActivityLandscapeView({
     return { inflowUsd: inU, outflowUsd: outU };
   }, [allTxs, pricesByTicker, zphStats]);
 
-  const errorChains = useMemo(
-    () =>
-      chainsOwned.filter(
-        (c) => errors?.[`${c}:${addressByChain[c] ?? ""}`]
-      ),
-    [chainsOwned, errors, addressByChain]
-  );
-  const loadingChains = useMemo(
-    () =>
-      chainsOwned.filter(
-        (c) => loading?.[`${c}:${addressByChain[c] ?? ""}`]
-      ),
-    [chainsOwned, loading, addressByChain]
-  );
+  const loadingAny = statusSummary.loading.length > 0;
+  const unreadable = statusSummary.unavailable.length + statusSummary.failures.reduce((n, f) => n + f.chains.length, 0);
 
-  // Detail = the selected tx, or the first row of the filtered set.
+  // Detail = the selected tx, or the first row of the filtered set. Rows are
+  // identified by `txRowKey` (was chain:hash:direction, which changes as a
+  // row settles and collides for two legs of one transaction).
   const detail = useMemo(() => {
     if (filtered.length === 0) return null;
     if (selectedKey) {
-      const found = filtered.find(
-        (t) => `${t.chain}:${t.hash}:${t.direction}` === selectedKey
-      );
+      const found = filtered.find((t) => txRowKey(t) === selectedKey);
       if (found) return found;
     }
     return filtered[0];
@@ -288,27 +285,13 @@ export function ActivityLandscapeView({
               );
             })}
             <div style={{ flex: 1 }} />
-            {(loadingChains.length > 0 || errorChains.length > 0) && (
-              <span
-                style={{
-                  fontFamily: "var(--font-mono)",
-                  fontSize: 9,
-                  color: "var(--text-dim)",
-                  alignSelf: "center",
-                }}
-              >
-                {loadingChains.length > 0 &&
-                  `loading ${loadingChains
-                    .map((c) => getAdapter(c).ticker)
-                    .join(", ")}`}
-                {errorChains.length > 0 && (
-                  <span style={{ color: "var(--warn)", marginLeft: 6 }}>
-                    · errors on{" "}
-                    {errorChains.map((c) => getAdapter(c).ticker).join(", ")}
-                  </span>
-                )}
-              </span>
-            )}
+            {/* Per chain, by name and reason — was "· errors on ETH, USDT,
+                USDT, USDC, …", tickers only, with NEAR's missing history
+                counted as an error (operator report 2026-09-30). */}
+            <HistoryStatusLine
+              summary={statusSummary}
+              style={{ alignSelf: "center", textAlign: "right", maxWidth: "70%" }}
+            />
           </div>
         </div>
 
@@ -371,19 +354,21 @@ export function ActivityLandscapeView({
             >
               {chainsOwned.length === 0
                 ? "No wallets loaded."
-                : loadingChains.length > 0
+                : loadingAny
                   ? "Fetching transactions…"
-                  : "No transactions found."}
+                  : unreadable > 0 && allTxs.length === 0
+                    ? "No transactions loaded. History could not be read for some chains — see above."
+                    : "No transactions found."}
             </div>
           ) : (
             filtered.map((tx) => {
               const adapter = getAdapter(tx.chain);
-              const key = `${tx.chain}:${tx.hash}:${tx.direction}`;
-              const a = detail
-                ? `${detail.chain}:${detail.hash}:${detail.direction}` === key
-                : false;
+              const key = txRowKey(tx);
+              const a = detail ? txRowKey(detail) === key : false;
               const isIn = tx.direction === "in";
               const failed = tx.direction === "failed";
+              const self = tx.direction === "self";
+              const pending = tx.direction === "pending";
               const dirColor = failed
                 ? "var(--danger)"
                 : isIn
@@ -431,7 +416,13 @@ export function ActivityLandscapeView({
                       ? "✗ failed"
                       : isIn
                         ? "▼ recv"
-                        : "▲ sent"}
+                        : self
+                          ? "⟲ self"
+                          : pending
+                            ? tx.height
+                              ? "◌ transfer"
+                              : "◌ pending"
+                            : "▲ sent"}
                   </span>
                   <span
                     className="tnum"
@@ -453,8 +444,8 @@ export function ActivityLandscapeView({
                       textAlign: "right",
                     }}
                   >
-                    {failed ? "" : isIn ? "+" : "−"}
-                    {tx.amount} {rowTicker}
+                    {failed || self || pending ? "" : isIn ? "+" : "−"}
+                    {tx.amount || "—"} {rowTicker}
                   </span>
                   <span
                     className="tnum"
@@ -508,8 +499,15 @@ export function ActivityLandscapeView({
           <ST>transaction</ST>
         </div>
 
+        {/* The shared details (`TxDetails.tsx`) — portrait opens the same
+            component in a sheet (operator report 2026-09-30). */}
         {detail ? (
-          <DetailPanel detail={detail} />
+          <TxDetails
+            tx={detail}
+            ownAddress={addressByChain[detail.chain]}
+            pricesByTicker={pricesByTicker}
+            zphStats={zphStats}
+          />
         ) : (
           <div
             style={{
@@ -530,245 +528,6 @@ export function ActivityLandscapeView({
         onClose={() => setOpenSwapId(null)}
         onHistoryChanged={reloadSwapHistory}
       />
-    </div>
-  );
-}
-
-function DetailPanel({ detail }: { detail: ChainTx }) {
-  const adapter = getAdapter(detail.chain);
-  const ticker = txDisplayTicker(detail, adapter.ticker);
-  const feeTicker = txFeeTicker(detail, adapter.ticker);
-  const isIn = detail.direction === "in";
-  const failed = detail.direction === "failed";
-  const dirLabel = failed
-    ? "✗ failed"
-    : isIn
-      ? "▼ received"
-      : "▲ sent";
-  const dirColor = failed
-    ? "var(--danger)"
-    : isIn
-      ? "var(--accent)"
-      : "var(--warn)";
-  // `confirmations: undefined` means the adapter gives no count, NOT zero
-  // (`ChainTx`: "0 = unconfirmed/in-mempool"). TRON history is fetched
-  // confirmed-only and carries a block height instead. Portrait always read
-  // it that way; this panel read it as 0 and labelled final TRON payments
-  // "unconfirmed / 0 of 6 / PENDING" (seen 2026-09-29).
-  const counted = detail.confirmations !== undefined;
-  const conf = detail.confirmations ?? 0;
-  const finalThreshold = 6;
-  const status = !counted
-    ? detail.height
-      ? "confirmed"
-      : "—"
-    : conf >= finalThreshold
-      ? "confirmed"
-      : conf > 0
-        ? "pending"
-        : "unconfirmed";
-
-  const onCopy = () => navigator.clipboard.writeText(detail.hash);
-  const onExplorer = () => {
-    const url = explorerTxUrl(detail.chain, detail.hash);
-    if (url) void openExternal(url);
-    else void navigator.clipboard.writeText(detail.hash);
-  };
-
-  return (
-    <>
-      <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <CoinIcon sym={ticker} size={42} accent={adapter.color} />
-        <div style={{ minWidth: 0 }}>
-          <div
-            style={{
-              fontSize: 10,
-              color: dirColor,
-              letterSpacing: 1.5,
-              textTransform: "uppercase",
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            {dirLabel}
-          </div>
-          <div
-            className="tnum"
-            style={{
-              fontSize: 22,
-              color: failed
-                ? "var(--danger)"
-                : isIn
-                  ? "var(--accent)"
-                  : "var(--white)",
-              fontWeight: 600,
-              marginTop: 2,
-              lineHeight: 1.1,
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            {failed ? "" : isIn ? "+" : "−"}
-            {detail.amount}{" "}
-            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
-              {ticker}
-            </span>
-          </div>
-          <div
-            className="tnum"
-            style={{
-              fontSize: 11,
-              color: "var(--text-muted)",
-              marginTop: 2,
-              fontFamily: "var(--font-mono)",
-            }}
-          >
-            {detail.timestamp
-              ? new Date(detail.timestamp * 1000).toLocaleString()
-              : "—"}
-          </div>
-        </div>
-      </div>
-
-      <div
-        style={{
-          height: 1,
-          background: "var(--border-soft)",
-          margin: "4px 0",
-        }}
-      />
-
-      <div
-        style={{
-          display: "flex",
-          flexDirection: "column",
-          gap: 8,
-          fontSize: 10,
-          fontFamily: "var(--font-mono)",
-        }}
-      >
-        <DetailRow k="chain" v={adapter.displayName} />
-        <DetailRow k="hash" v={truncMiddle(detail.hash, 12, 8)} title={detail.hash} />
-        <DetailRow
-          k="block"
-          v={detail.height ? detail.height.toLocaleString() : "—"}
-        />
-        <DetailRow k="confirmations" v={counted ? `${conf}` : "—"} />
-        <DetailRow
-          k="fee"
-          v={
-            detail.fee
-              ? feeTicker
-                ? `${detail.fee} ${feeTicker}`
-                : `${detail.fee} (paid by the sender)`
-              : "—"
-          }
-        />
-        <DetailRow
-          k="status"
-          v={status}
-          accent={status === "confirmed"}
-          warn={status === "unconfirmed"}
-        />
-        <DetailRow k="when" v={fmtRelative(detail.timestamp)} />
-      </div>
-
-      {/* confirmations progress — only for chains that report a count */}
-      {counted && (
-      <div style={{ marginTop: 4 }}>
-        <div
-          style={{
-            fontSize: 9,
-            color: "var(--text-dim)",
-            letterSpacing: 1.5,
-            textTransform: "uppercase",
-            marginBottom: 6,
-            fontFamily: "var(--font-mono)",
-          }}
-        >
-          confirmations
-        </div>
-        <ConfBar value={Math.min(conf, finalThreshold)} max={finalThreshold} />
-        <div
-          style={{
-            display: "flex",
-            justifyContent: "space-between",
-            marginTop: 6,
-            fontSize: 9,
-            color: "var(--text-dim)",
-            fontFamily: "var(--font-mono)",
-          }}
-          className="tnum"
-        >
-          <span>{Math.min(conf, finalThreshold)} / {finalThreshold} minimum</span>
-          <span
-            style={{
-              color: conf >= finalThreshold ? "var(--accent)" : "var(--warn)",
-            }}
-          >
-            {conf >= finalThreshold ? "FINAL" : "PENDING"}
-          </span>
-        </div>
-      </div>
-      )}
-
-      <div style={{ flex: 1 }} />
-
-      <div style={{ display: "flex", gap: 8 }}>
-        <Btn variant="ghost" full size="md" onClick={onCopy}>
-          Copy hash
-        </Btn>
-        <Btn variant="primary" full size="md" onClick={onExplorer}>
-          View on explorer
-        </Btn>
-      </div>
-    </>
-  );
-}
-
-function DetailRow({
-  k,
-  v,
-  title,
-  accent,
-  warn,
-}: {
-  k: string;
-  v: string;
-  title?: string;
-  accent?: boolean;
-  warn?: boolean;
-}) {
-  return (
-    <div
-      style={{
-        display: "flex",
-        justifyContent: "space-between",
-        gap: 12,
-      }}
-    >
-      <span
-        style={{
-          color: "var(--text-dim)",
-          letterSpacing: 1,
-          textTransform: "uppercase",
-          flexShrink: 0,
-        }}
-      >
-        {k}
-      </span>
-      <span
-        title={title}
-        className="tnum"
-        style={{
-          color: accent ? "var(--accent)" : warn ? "var(--warn)" : "var(--text)",
-          textAlign: "right",
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-          minWidth: 0,
-        }}
-      >
-        {v}
-      </span>
     </div>
   );
 }
@@ -944,23 +703,4 @@ function LandscapeSwapRow({
       </div>
     </div>
   );
-}
-
-function ConfBar({ value, max }: { value: number; max: number }) {
-  const cells = [];
-  for (let i = 0; i < max; i++) {
-    cells.push(
-      <div
-        key={i}
-        style={{
-          flex: 1,
-          height: 5,
-          background:
-            i < value ? "var(--accent)" : "rgba(255,255,255,0.06)",
-          boxShadow: i < value ? "0 0 4px var(--accent)" : "none",
-        }}
-      />
-    );
-  }
-  return <div style={{ display: "flex", gap: 2 }}>{cells}</div>;
 }

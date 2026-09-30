@@ -14,7 +14,10 @@ import { txDisplayTicker } from "../../wallets/tx-display";
 import { explorerTxUrl } from "../../wallets/explorers";
 import type { ChainTx, ChainType } from "../../wallets";
 import { openExternal } from "../../utils/openExternal";
+import { txRowKey } from "../../wallets/tx-row-key";
 import { txIsMeaningful } from "./txFilters";
+import { HistoryStatusLine } from "./HistoryStatusLine";
+import { chainHistoryStatuses, summarizeHistoryStatus } from "./historyStatus";
 import {
   computeDriftFraction,
   driftTone,
@@ -133,12 +136,18 @@ export function ActivityView({
   // Flatten all txs from owned chains, suppress hashes that already
   // appear in a swap row, normalize timestamps, then merge swap rows
   // and sort newest-first.
+  // One status per distinct chain, merged across its address keys — the same
+  // data path as the two mounted views (`historyStatus.ts`, 2026-09-30).
+  const statuses = useMemo(
+    () => chainHistoryStatuses(chainsOwned, { txByChain, loading, errors }),
+    [chainsOwned, txByChain, loading, errors]
+  );
+  const statusSummary = useMemo(() => summarizeHistoryStatus(statuses), [statuses]);
+
   const allRows = useMemo<ActivityRow[]>(() => {
     const out: ActivityRow[] = [];
-    for (const c of chainsOwned) {
-      const k = `${c}:${addressByChain[c] ?? ""}`;
-      const list = txByChain[k] ?? [];
-      for (const tx of list) {
+    for (const s of statuses) {
+      for (const tx of s.txs) {
         if (swapHashes.has(tx.hash.toLowerCase())) continue;
         out.push({ kind: "chain", tx, timestamp: tx.timestamp ?? 0 });
       }
@@ -148,7 +157,7 @@ export function ActivityView({
     }
     out.sort((a, b) => b.timestamp - a.timestamp);
     return out;
-  }, [chainsOwned, txByChain, addressByChain, swapHashes, swapHistory]);
+  }, [statuses, swapHashes, swapHistory]);
 
   const filteredRows = useMemo(() => {
     return allRows.filter((row) => {
@@ -187,14 +196,7 @@ export function ActivityView({
     ).length;
   }, [allRows, chainFilter, amountFilter]);
 
-  const errorChains = useMemo(
-    () => chainsOwned.filter((c) => errors?.[`${c}:${addressByChain[c] ?? ""}`]),
-    [chainsOwned, errors, addressByChain]
-  );
-  const loadingChains = useMemo(
-    () => chainsOwned.filter((c) => loading?.[`${c}:${addressByChain[c] ?? ""}`]),
-    [chainsOwned, loading, addressByChain]
-  );
+  const loadingAny = statusSummary.loading.length > 0;
 
   return (
     <div
@@ -280,21 +282,12 @@ export function ActivityView({
               ` · ${getAdapter(chainFilter).ticker}`}
             {directionFilter !== "all" && ` · ${directionFilter.toUpperCase()}`}
           </Mono>
-          {loadingChains.length > 0 && (
-            <Mono size={9} color="var(--text-dim)">
-              · loading {loadingChains.map((c) => getAdapter(c).ticker).join(", ")}
-            </Mono>
-          )}
           {hiddenZeroCount > 0 && (
             <Mono size={9} color="var(--text-dim)">
               · {hiddenZeroCount} zero-amount hidden
             </Mono>
           )}
-          {errorChains.length > 0 && (
-            <Mono size={9} color="var(--text-dim)">
-              · {errorChains.length} of {chainsOwned.length} chain explorers unreachable
-            </Mono>
-          )}
+          <HistoryStatusLine summary={statusSummary} failureTone="var(--text-dim)" />
         </div>
       </Panel>
 
@@ -310,7 +303,7 @@ export function ActivityView({
             <EmptyState
               chainFilter={chainFilter}
               hasAnyChain={chainsOwned.length > 0}
-              loading={loadingChains.length > 0}
+              loading={loadingAny}
               hiddenByMeaningful={
                 amountFilter === "meaningful" && hiddenZeroCount > 0
               }
@@ -319,10 +312,7 @@ export function ActivityView({
           ) : (
             filteredRows.map((row) =>
               row.kind === "chain" ? (
-                <TxRow
-                  key={`chain-${row.tx.chain}-${row.tx.hash}-${row.tx.direction}`}
-                  tx={row.tx}
-                />
+                <TxRow key={`chain-${txRowKey(row.tx)}`} tx={row.tx} />
               ) : (
                 <SwapRow key={`swap-${row.swap.id}`} swap={row.swap} />
               )

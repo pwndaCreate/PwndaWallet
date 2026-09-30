@@ -3,8 +3,12 @@ import { ST } from "../../components/Primitives";
 import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
 import { txDisplayTicker } from "../../wallets/tx-display";
-import { explorerTxUrl } from "../../wallets/explorers";
+import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
+import { txRowKey } from "../../wallets/tx-row-key";
 import type { ChainTx, ChainType } from "../../wallets";
+import { TxDetailsSheet } from "./TxDetails";
+import { HistoryStatusLine } from "./HistoryStatusLine";
+import { chainHistoryStatuses, summarizeHistoryStatus } from "./historyStatus";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
 import { txIsMeaningful } from "./txFilters";
@@ -47,22 +51,27 @@ export function ActivityViewPortrait({
   errors,
   chainsOwned,
   addressByChain,
+  pricesByTicker,
+  zphStats,
 }: {
   txByChain: Record<string, ChainTx[]>;
   loading?: Record<string, boolean>;
   errors?: Record<string, string | null>;
   chainsOwned: ChainType[];
   addressByChain: Record<string, string>;
+  /** For the details sheet's USD value. Absent → no USD shown. */
+  pricesByTicker?: Record<string, number>;
+  zphStats?: ZphLiveStats | null;
 }) {
   const [filter, setFilter] = useState<DirectionFilter>("all");
   // T1.3 — default to MEANINGFUL so the panel doesn't open as 62 rows
   // of `+0 XRP` from third-party drops, faucets, and dust.
   const [amountFilter, setAmountFilter] = useState<AmountFilter>("meaningful");
-  // UXS-20260516-106: when many chains fail, the inline comma-list
-  // becomes unreadable (and the ETH ticker repeats across arbitrum /
-  // base / optimism, looking like a bug). Default to a summarized
-  // chip; let the user expand to see the deduplicated full list.
-  const [errorsExpanded, setErrorsExpanded] = useState(false);
+  // The row whose details sheet is open (operator report 2026-09-30: "click
+  // on transactions whether in or out and see the data on them"). A tap used
+  // to open a block explorer straight away; the explorer is now one button
+  // inside the details.
+  const [selected, setSelected] = useState<ChainTx | null>(null);
 
   // Cross-chain swap history — loaded once on mount. Drives both the
   // dedup of `all`-mode chain-tx rows (suppress hashes that already
@@ -73,20 +82,26 @@ export function ActivityViewPortrait({
   // A swap row opens the shared swap details modal (2026-09-30).
   const [openSwapId, setOpenSwapId] = useState<string | null>(null);
 
+  // One status per DISTINCT chain, merged across its address keys — the
+  // same data path as landscape (`historyStatus.ts`, operator report
+  // 2026-09-30: `chainsOwned` repeats a UTXO chain per account address, so
+  // this listed those rows once per address).
+  const statuses = useMemo(
+    () => chainHistoryStatuses(chainsOwned, { txByChain, loading, errors }),
+    [chainsOwned, txByChain, loading, errors]
+  );
+  const statusSummary = useMemo(() => summarizeHistoryStatus(statuses), [statuses]);
+
   const allTxs = useMemo(() => {
     const out: ChainTx[] = [];
-    for (const c of chainsOwned) {
-      const k = `${c}:${addressByChain[c] ?? ""}`;
-      const list = txByChain[k] ?? [];
-      out.push(...list);
-    }
+    for (const s of statuses) out.push(...s.txs);
     // Suppress chain-txs whose hash appears in a swap row (#19 dedup).
     // The swap row is the canonical representation of that hash in the
     // unified timeline; per-chain dashboards still surface it natively.
     const deduped = dedupChainTxsAgainstSwaps(out, swapHashes);
     deduped.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
     return deduped;
-  }, [chainsOwned, txByChain, addressByChain, swapHashes]);
+  }, [statuses, swapHashes]);
 
   const filteredTxs = useMemo(() => {
     let pool: ChainTx[];
@@ -109,45 +124,9 @@ export function ActivityViewPortrait({
     return pool.filter((t) => !txIsMeaningful(t)).length;
   }, [allTxs, filter, amountFilter]);
 
-  const errorChains = useMemo(
-    () => chainsOwned.filter((c) => errors?.[`${c}:${addressByChain[c] ?? ""}`]),
-    [chainsOwned, errors, addressByChain]
-  );
-  const loadingChains = useMemo(
-    () => chainsOwned.filter((c) => loading?.[`${c}:${addressByChain[c] ?? ""}`]),
-    [chainsOwned, loading, addressByChain]
-  );
-  // Deduplicate by ticker so ETH on mainnet + ETH on arbitrum + ETH on
-  // base + ETH on optimism collapse to a single "ETH" entry (the
-  // story called out 4 repeated ETH entries as confusing).
-  const errorTickers = useMemo(() => {
-    const seen = new Set<string>();
-    const order: string[] = [];
-    for (const c of errorChains) {
-      const t = getAdapter(c).ticker;
-      if (!seen.has(t)) {
-        seen.add(t);
-        order.push(t);
-      }
-    }
-    return order;
-  }, [errorChains]);
-  const loadingTickers = useMemo(() => {
-    const seen = new Set<string>();
-    const order: string[] = [];
-    for (const c of loadingChains) {
-      const t = getAdapter(c).ticker;
-      if (!seen.has(t)) {
-        seen.add(t);
-        order.push(t);
-      }
-    }
-    return order;
-  }, [loadingChains]);
-  const totalOwned = chainsOwned.length;
-  // Inline list only when ≤ 5 distinct tickers; otherwise summary chip
-  // with a [show] / [hide] toggle.
-  const ERROR_INLINE_THRESHOLD = 5;
+  const loadingAny = statusSummary.loading.length > 0;
+  const unreadable =
+    statusSummary.unavailable.length + statusSummary.failures.reduce((n, f) => n + f.chains.length, 0);
 
   return (
     <div
@@ -232,69 +211,14 @@ export function ActivityViewPortrait({
         </button>
       </div>
 
-      {(loadingChains.length > 0 || errorChains.length > 0) && (
-        <div
-          style={{
-            display: "flex",
-            flexDirection: "column",
-            gap: 4,
-            fontFamily: "var(--font-mono)",
-            fontSize: 9,
-            color: "var(--text-dim)",
-            marginBottom: 10,
-          }}
-        >
-          {loadingTickers.length > 0 && (
-            <span>
-              loading{" "}
-              {loadingTickers.length <= ERROR_INLINE_THRESHOLD
-                ? loadingTickers.join(", ")
-                : `${loadingTickers.length} chain${loadingTickers.length === 1 ? "" : "s"}`}
-            </span>
-          )}
-          {errorTickers.length > 0 && (
-            // T1.3 — demoted from var(--warn) (red) to var(--text-dim).
-            // The same UI fires whenever any explorer 503s in production,
-            // so this should not pre-attention-grab in normal use. The
-            // info still surfaces; the alarm tone does not.
-            <span style={{ color: "var(--text-dim)", display: "flex", gap: 6, alignItems: "baseline", flexWrap: "wrap" }}>
-              {errorTickers.length <= ERROR_INLINE_THRESHOLD ? (
-                <span>
-                  {errorTickers.length} of {totalOwned} chain explorers unreachable: {errorTickers.join(", ")}
-                </span>
-              ) : (
-                <>
-                  <span>
-                    {errorTickers.length} of {totalOwned} chain explorers unreachable
-                  </span>
-                  <button
-                    type="button"
-                    onClick={() => setErrorsExpanded((v) => !v)}
-                    aria-expanded={errorsExpanded}
-                    style={{
-                      background: "transparent",
-                      border: "1px solid var(--border)",
-                      color: "var(--text-dim)",
-                      cursor: "pointer",
-                      fontFamily: "var(--font-mono)",
-                      fontSize: 9,
-                      padding: "1px 6px",
-                      letterSpacing: 0.5,
-                    }}
-                  >
-                    {errorsExpanded ? "hide" : "show"}
-                  </button>
-                  {errorsExpanded && (
-                    <span style={{ flexBasis: "100%", color: "var(--text-dim)", opacity: 0.85, marginTop: 2 }}>
-                      {errorTickers.join(", ")}
-                    </span>
-                  )}
-                </>
-              )}
-            </span>
-          )}
-        </div>
-      )}
+      {/* Per chain, by name and reason (`historyStatus.ts`, operator report
+          2026-09-30); was "N of M chain explorers unreachable" whatever had
+          happened. T1.3 kept: failures stay in the dim tone here. */}
+      <HistoryStatusLine
+        summary={statusSummary}
+        failureTone="var(--text-dim)"
+        style={{ display: "block", marginBottom: 10 }}
+      />
 
       <div
         style={{
@@ -324,11 +248,13 @@ export function ActivityViewPortrait({
             msg={
               chainsOwned.length === 0
                 ? "No wallets loaded."
-                : loadingChains.length > 0
+                : loadingAny
                   ? "Fetching transactions…"
                   : amountFilter === "meaningful" && hiddenZeroCount > 0
                     ? `No meaningful transactions yet. ${hiddenZeroCount} zero-amount tx hidden — click "show zero" to view.`
-                    : "No transactions found."
+                    : unreadable > 0 && allTxs.length === 0
+                      ? "No transactions loaded. History could not be read for some chains — see above."
+                      : "No transactions found."
             }
           />
         ) : (
@@ -336,14 +262,25 @@ export function ActivityViewPortrait({
             const isLast = i === arr.length - 1;
             return (
               <TxRow
-                key={`${tx.chain}-${tx.hash}-${tx.direction}`}
+                key={txRowKey(tx)}
                 tx={tx}
                 last={isLast}
+                onSelect={setSelected}
               />
             );
           })
         )}
       </div>
+
+      {selected && (
+        <TxDetailsSheet
+          tx={selected}
+          ownAddress={addressByChain[selected.chain]}
+          pricesByTicker={pricesByTicker}
+          zphStats={zphStats}
+          onClose={() => setSelected(null)}
+        />
+      )}
 
       {/* The shared swap details modal (2026-09-30), opened by a SWAPS row. */}
       <SwapDetailsModal
@@ -355,10 +292,19 @@ export function ActivityViewPortrait({
   );
 }
 
-function TxRow({ tx, last }: { tx: ChainTx; last: boolean }) {
+function TxRow({
+  tx,
+  last,
+  onSelect,
+}: {
+  tx: ChainTx;
+  last: boolean;
+  onSelect: (tx: ChainTx) => void;
+}) {
   const adapter = getAdapter(tx.chain);
   const isIn = tx.direction === "in";
   const failed = tx.direction === "failed";
+  const self = tx.direction === "self";
   const pending =
     tx.direction === "pending" ||
     (tx.confirmations !== undefined && tx.confirmations === 0);
@@ -366,7 +312,13 @@ function TxRow({ tx, last }: { tx: ChainTx; last: boolean }) {
     ? "✗ failed"
     : isIn
       ? "▼ received"
-      : "▲ sent";
+      : self
+        ? "⟲ to yourself"
+        : tx.direction === "pending"
+          ? tx.height
+            ? "◌ transfer"
+            : "◌ pending"
+          : "▲ sent";
   const directionColor = isIn
     ? "var(--accent)"
     : failed
@@ -382,16 +334,16 @@ function TxRow({ tx, last }: { tx: ChainTx; last: boolean }) {
 
   return (
     <div
-      onClick={(e) => {
-        if (e.shiftKey) {
-          void navigator.clipboard.writeText(tx.hash);
-          return;
+      role="button"
+      tabIndex={0}
+      onClick={() => onSelect(tx)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          onSelect(tx);
         }
-        const url = explorerTxUrl(tx.chain, tx.hash);
-        if (url) void openExternal(url);
-        else void navigator.clipboard.writeText(tx.hash);
       }}
-      title={`${tx.hash}\nClick: open in explorer · Shift-click: copy`}
+      title={`${tx.hash}\nClick for details`}
       style={{
         display: "flex",
         alignItems: "center",
@@ -445,8 +397,8 @@ function TxRow({ tx, last }: { tx: ChainTx; last: boolean }) {
             fontFamily: "var(--font-mono)",
           }}
         >
-          {isIn ? "+" : failed ? "" : "−"}
-          {tx.amount} {txDisplayTicker(tx, adapter.ticker)}
+          {isIn ? "+" : failed || self || tx.direction === "pending" ? "" : "−"}
+          {tx.amount || "—"} {txDisplayTicker(tx, adapter.ticker)}
         </div>
         <div
           style={{

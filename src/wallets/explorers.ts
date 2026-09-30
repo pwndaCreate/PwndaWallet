@@ -16,6 +16,48 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
       return `https://mempool.space/tx/${h}`;
     case "ethereum":
       return `https://eth.blockscout.com/tx/0x${h}`;
+    // Added 2026-09-30 with the shared transaction details view (operator
+    // report: "click on transactions … and see the data on them"). These
+    // chains had no link at all, so their "view on explorer" only copied the
+    // hash. Each route was fetched once with a real transaction id that day:
+    // the Blockscout hosts, explorer.optimism.io, monadscan.com, nearblocks.io
+    // and the Aptos explorer served a page naming the id; bscscan.com answered
+    // its bot check (HTTP 403 "Just a moment…" to a script — a browser
+    // passes); stellar.expert, suiscan.xyz, explorer.ergoplatform.com and
+    // insight.dash.org served their app shell (HTTP 200; the page is built in
+    // the browser, so the id cannot be seen in the raw HTML).
+    case "arbitrum":
+    case "usdc-arb":
+    case "usdt0-arb":
+      return `https://arbitrum.blockscout.com/tx/0x${h}`;
+    case "base":
+    case "usdc-base":
+      return `https://base.blockscout.com/tx/0x${h}`;
+    case "optimism":
+    case "usdt-op":
+    case "usdc-op":
+      return `https://explorer.optimism.io/tx/0x${h}`;
+    case "bsc":
+    case "usdt-bsc":
+    case "usdc-bsc":
+      return `https://bscscan.com/tx/0x${h}`;
+    case "usdc-sol":
+    case "usdt-sol":
+      return `https://explorer.solana.com/tx/${hash}`;
+    case "usdt-tron":
+      return `https://tronscan.org/#/transaction/${hash}`;
+    case "near":
+      return `https://nearblocks.io/txns/${hash}`;
+    case "stellar":
+      return `https://stellar.expert/explorer/public/tx/${h}`;
+    case "sui":
+      return `https://suiscan.xyz/mainnet/tx/${hash}`;
+    case "ergo":
+      return `https://explorer.ergoplatform.com/en/transactions/${h}`;
+    case "aptos":
+      return `https://explorer.aptoslabs.com/txn/0x${h}?network=mainnet`;
+    case "dash":
+      return `https://insight.dash.org/insight/tx/${h}`;
     case "avalanche":
       return `https://snowtrace.io/tx/0x${h}`;
     // Stablecoin legs resolve to their PARENT chain's explorer — the tx lives
@@ -29,7 +71,9 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
     case "monad":
     case "usdc-monad":
     case "usdt0-monad":
-      return `https://explorer.monad.xyz/tx/0x${h}`;
+      // Was explorer.monad.xyz, which does not resolve (ENOTFOUND,
+      // 2026-09-30). MonadScan served the transaction page for a real id.
+      return `https://monadscan.com/tx/0x${h}`;
     case "usdc-pol":
     case "usdt0-pol":
       return `https://polygon.blockscout.com/tx/0x${h}`;
