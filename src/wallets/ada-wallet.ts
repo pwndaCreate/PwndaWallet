@@ -173,10 +173,11 @@ function requireMnemonic(keyMaterial: string): void {
     keyMaterial.trim().split(/\s+/).length >= 12;
   if (!looksLikeMnemonic) {
     throw new Error(
-      "Cardano send requires the wallet's BIP-39 mnemonic — BIP-32-Ed25519 " +
-        "signing needs the chain code, which a raw payment private key " +
-        "doesn't carry. Use the dashboard's Send button (which reads the " +
-        "mnemonic from the unlocked vault)."
+      "Cardano send requires the wallet's BIP-39 mnemonic: the wallet finds " +
+        "the key for the address it shows among the derivations it knows, and " +
+        "a raw payment private key does not say which address it belongs to. " +
+        "Use the dashboard's Send button (which reads the mnemonic from the " +
+        "unlocked vault)."
     );
   }
 }
@@ -275,10 +276,11 @@ export const adaAdapter: ChainAdapter = {
     to: string,
     amount: string
   ): Promise<TxResult> {
-    // BIP-32-Ed25519 signing requires the FULL extended secret AND the
-    // chain code, which can only be re-derived from the mnemonic. The
-    // 64-byte payment private-key hex returned by import paths doesn't
-    // carry the chain code, so it cannot sign Cardano txs on its own.
+    // The mnemonic, not the payment key, because the signing key is found by
+    // re-deriving (`cardanoSignerFor`). Corrected 2026-09-30: this said
+    // signing needs the chain code, which the 64-byte payment key lacks; the
+    // send-safety fixes showed the extended secret alone signs, and what the
+    // raw key cannot tell is which derivation (and so which address) it is.
     //
     // `useSend` (`src/features/send/useSend.ts`) routes Cardano sends
     // with `keyMaterial = wallet.mnemonic` rather than the private key.

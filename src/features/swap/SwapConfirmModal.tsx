@@ -74,7 +74,8 @@ import { withTimeout } from "./broadcast-outcome";
  *
  * 2026-09-29 send-safety audit (F2, F3, F4, F9, F10): the modal signs the
  * quote it was OPENED on, re-checks that quote against the swap on screen
- * and its deposit deadline before asking for the password, cannot be closed
+ * and its deposit deadline when the password is submitted (before the vault
+ * is unlocked or anything is signed), cannot be closed
  * mid-signature, writes the history row the moment a hash exists, shows an
  * ambiguous broadcast as "unknown — check the explorer" with the hash, and
  * never offers Retry on a NEAR Intents quote: a new attempt is a new quote.
@@ -562,9 +563,8 @@ export function SwapConfirmModal({
       );
       const destinationAsset = toMeta?.nearIntentsAsset ?? "";
 
-      // Refusals that need no password and sign nothing (F2/F3/F4/F9). The
-      // executor repeats the first three; asking here first means the user
-      // hears it before typing into a vault prompt that cannot help.
+      // Refusals that need no key and sign nothing (F2/F3/F4/F9), run before
+      // the vault is unlocked. The executor repeats the first three.
       const prior = intentsDepositAttempt(depositAddr);
       if (prior) {
         setUsedInfo({ hash: prior.txHash });

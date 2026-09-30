@@ -1820,12 +1820,13 @@ export async function accountSendAvailable(args: {
  * # Units
  *
  * `amountAtomic` is 1Click's `amountIn` (satoshis). The adapters take a
- * decimal string and parse it back with `Math.round(parseFloat(amount) *
- * 1e8)`. The conversion here is exact bigint arithmetic, and the adapter's
- * parse is replayed before anything is signed: an amount that would not come
- * back as the same number of satoshis is refused, never "close enough" —
- * for an EXACT_INPUT quote a deposit one satoshi short is refunded, not
- * swapped.
+ * decimal string; since the 2026-09-29 send-safety fixes they parse it with
+ * the exact `decimalToAtomic` (they used `Math.round(parseFloat(amount) *
+ * 1e8)` before). The conversion here is exact bigint arithmetic and is
+ * round-tripped before anything is signed, and the old float parse is still
+ * replayed as a second check: an amount that would not come back as the same
+ * number of satoshis is refused, never "close enough" — for an EXACT_INPUT
+ * quote a deposit one satoshi short is refunded, not swapped.
  */
 export async function executeAccountUtxoTransfer(args: {
   chainKey: ChainType;

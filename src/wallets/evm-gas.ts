@@ -13,8 +13,8 @@
  *
  * L2s make this the NORMAL first state rather than an edge case: bridging
  * USDC to Arbitrum or Base moves the token and nothing else, so a freshly
- * bridged wallet holds real value and exactly zero gas. Twelve token adapters
- * across seven chains are in this position (`eth-wallet.ts`).
+ * bridged wallet holds real value and exactly zero gas. Every ERC-20 leg in
+ * `eth-wallet.ts` is in this position.
  *
  * # Why a table rather than a lookup on the native adapter
  *
