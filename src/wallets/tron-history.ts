@@ -24,7 +24,7 @@
  * `meta.from` / `meta.to`, and a failed contract result as `failed`. TRC-20
  * approvals are no longer listed as transfers.
  */
-import type { ChainTx, ChainType, TxHistoryPage } from "./types";
+import type { ChainTx, ChainType, TxHistoryPage, TxParties } from "./types";
 import { atomicToDecimal } from "./decimal-amount";
 import { condenseHttpError } from "./tx-history-errors";
 import { dedupeTxRows } from "./tx-row-key";
@@ -333,4 +333,267 @@ export async function fetchTrc20History(
   };
   const attempts = cursor?.s === "ts" ? [tronScan] : cursor ? [tronGrid] : [tronGrid, tronScan];
   return trySources(cfg.ticker, attempts);
+}
+
+// ── One transaction's parties (2026-09-30) ──────────────────────────────────
+//
+// `ChainAdapter.getTransactionParties`: who sent a TRX or TRC-20 transaction
+// and who received it, by txid, for the details views (operator request: "in
+// the info I can see which address each transaction was sent and received
+// from"). TronGrid's full-node API first, then TronScan's `transaction-info`,
+// through the same spaced and proxied getters as the history above. Read live
+// 2026-09-30 with the world-public test address TPrkFhZ8LH8Mruco8vXyA496TaeFBrbmeU:
+//
+//  - both hosts answer an unknown txid with HTTP 200 `{}`;
+//  - TronGrid prints addresses as hex: `41…` in `/wallet/gettransactionbyid`,
+//    and in `/wallet/gettransactioninfobyid` logs the contract and the topic
+//    words carry no `41` / `0x` prefix at all;
+//  - a TRC-20 transfer that failed on chain (its `receipt.result`
+//    `OUT_OF_ENERGY` or `REVERT`) has no log, only its calldata
+//    (`a9059cbb…`), which names the intended parties.
+//
+// A host that does not know the txid does not end the search; `null` means
+// neither had it.
+
+/** keccak256("Transfer(address,address,uint256)"), as TRON prints topics. */
+const TRANSFER_TOPIC = "ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+
+/** A TRON txid: 32 bytes of hex. */
+const TXID = /^[0-9a-f]{64}$/;
+
+type Parties = { from: string[]; to: string[] };
+
+/** One token transfer's parties, as base58 `T…` addresses. */
+export interface TronTransfer {
+  from: string;
+  to: string;
+}
+
+function uniqueAddrs(list: Array<string | undefined>): string[] {
+  const out: string[] = [];
+  for (const a of list) if (a && !out.includes(a)) out.push(a);
+  return out;
+}
+
+/** The transfers that involve `me`, or all of them when none does. */
+function transferParties(transfers: TronTransfer[], me: string): Parties {
+  const mine = transfers.filter((t) => t.from === me || t.to === me);
+  const pick = mine.length ? mine : transfers;
+  return { from: uniqueAddrs(pick.map((t) => t.from)), to: uniqueAddrs(pick.map((t) => t.to)) };
+}
+
+/** `{}`: the host does not know the transaction. */
+function isEmptyAnswer(v: unknown): boolean {
+  return !!v && typeof v === "object" && !Array.isArray(v) && Object.keys(v).length === 0;
+}
+
+function refusal(v: unknown): Error {
+  // TronGrid says why in `Error`, TronScan in `message`.
+  const r = v as { Error?: unknown; message?: unknown } | null;
+  const why = [r?.Error, r?.message].find((x): x is string => typeof x === "string" && x !== "");
+  return new Error(why ?? "unexpected response");
+}
+
+/** The TRON address in a 32-byte ABI word or log topic, as hex: `41` + its last 20 bytes. */
+function wordToHex(word: unknown): string {
+  const w = typeof word === "string" ? word.toLowerCase().replace(/^0x/, "") : "";
+  return /^[0-9a-f]{64}$/.test(w) ? `41${w.slice(24)}` : "";
+}
+
+/** A contract address as 20 bytes of lower-case hex, whether or not it carries `41`. */
+function hex20(v: unknown): string {
+  const h = typeof v === "string" ? v.toLowerCase().replace(/^0x/, "") : "";
+  return h.length === 42 && h.startsWith("41") ? h.slice(2) : h;
+}
+
+/**
+ * A TronGrid `/wallet/gettransactionbyid` answer as the transaction's
+ * parties, `null` for `{}`. Hex addresses become `T…` through `toBase58`.
+ * Exported for tests.
+ */
+export function trongridTxParties(
+  raw: unknown,
+  txid: string,
+  toBase58: (hex: string) => string,
+): Parties | null {
+  if (isEmptyAnswer(raw)) return null;
+  const tx = raw as Record<string, any> | null;
+  if (!tx || typeof tx.txID !== "string" || tx.txID.toLowerCase() !== txid) throw refusal(raw);
+  const v = tx.raw_data?.contract?.[0]?.parameter?.value ?? {};
+  // `to_address` for a TRX (or TRC-10) transfer, `contract_address` for a
+  // contract call, `receiver_address` for a resource delegation.
+  const to = v.to_address ?? v.contract_address ?? v.receiver_address;
+  return {
+    from: uniqueAddrs([toBase58(String(v.owner_address ?? ""))]),
+    to: uniqueAddrs([toBase58(String(to ?? ""))]),
+  };
+}
+
+/** A TronScan `/api/transaction-info` answer as the transaction's parties, `null` for `{}`. Exported for tests. */
+export function tronscanTxParties(raw: unknown, txid: string): Parties | null {
+  if (isEmptyAnswer(raw)) return null;
+  const r = raw as Record<string, any> | null;
+  if (!r || typeof r.hash !== "string" || r.hash.toLowerCase() !== txid) throw refusal(raw);
+  const from = r.ownerAddress ?? r.contractData?.owner_address;
+  const to = r.toAddress ?? r.contractData?.to_address;
+  return {
+    from: uniqueAddrs([typeof from === "string" ? from : undefined]),
+    to: uniqueAddrs([typeof to === "string" ? to : undefined]),
+  };
+}
+
+/**
+ * The `Transfer` logs of the token at `contractHex` in a TronGrid
+ * `/wallet/gettransactioninfobyid` answer. Exported for tests.
+ */
+export function trongridTrc20Transfers(
+  info: unknown,
+  contractHex: string,
+  toBase58: (hex: string) => string,
+): TronTransfer[] {
+  const logs = (info as { log?: unknown } | null)?.log;
+  if (!Array.isArray(logs)) return [];
+  const want = hex20(contractHex);
+  const out: TronTransfer[] = [];
+  for (const l of logs) {
+    const topics = l?.topics;
+    if (hex20(l?.address) !== want || !Array.isArray(topics) || topics.length !== 3) continue;
+    if (String(topics[0]).toLowerCase().replace(/^0x/, "") !== TRANSFER_TOPIC) continue;
+    out.push({ from: toBase58(wordToHex(topics[1])), to: toBase58(wordToHex(topics[2])) });
+  }
+  return out;
+}
+
+/** The `Transfer` entries of `contract` in a TronScan `transaction-info` answer. Exported for tests. */
+export function tronscanTrc20Transfers(info: unknown, contract: string): TronTransfer[] {
+  const list = (info as { trc20TransferInfo?: unknown } | null)?.trc20TransferInfo;
+  if (!Array.isArray(list)) return [];
+  return list
+    .filter((e) => e?.contract_address === contract && (e.type === undefined || e.type === "Transfer"))
+    .map((e) => ({ from: String(e.from_address ?? ""), to: String(e.to_address ?? "") }));
+}
+
+/**
+ * The transfer a TRC-20 call ASKED for, from its calldata: `transfer` (the
+ * caller is the sender) or `transferFrom`. What a failed transfer leaves to
+ * read. Exported for tests.
+ */
+export function trc20CalldataTransfer(
+  data: unknown,
+  caller: string,
+  toBase58: (hex: string) => string,
+): TronTransfer | null {
+  const d = typeof data === "string" ? data.toLowerCase().replace(/^0x/, "") : "";
+  const word = (i: number) => d.slice(8 + 64 * i, 8 + 64 * (i + 1));
+  if (d.startsWith("a9059cbb") && d.length >= 8 + 64 * 2) {
+    return { from: caller, to: toBase58(wordToHex(word(0))) };
+  }
+  if (d.startsWith("23b872dd") && d.length >= 8 + 64 * 3) {
+    return { from: toBase58(wordToHex(word(0))), to: toBase58(wordToHex(word(1))) };
+  }
+  return null;
+}
+
+async function firstParties(
+  label: string,
+  attempts: { host: string; run: () => Promise<Parties | null> }[],
+): Promise<TxParties | null> {
+  const failures: string[] = [];
+  let unknown = false;
+  for (const a of attempts) {
+    try {
+      const p = await a.run();
+      if (!p) {
+        unknown = true;
+        continue;
+      }
+      return { ...p, source: a.host };
+    } catch (e) {
+      failures.push(`${a.host}: ${condenseHttpError(e)}`);
+    }
+  }
+  if (unknown) return null;
+  throw new Error(`every ${label} transaction source failed — ${failures.join("; ")}`);
+}
+
+function txidOf(hash: string): string | null {
+  const t = String(hash ?? "").trim().toLowerCase().replace(/^0x/, "");
+  return TXID.test(t) ? t : null;
+}
+
+/** `getTransactionParties` for TRX: the transaction's owner and its `to`. */
+export async function fetchTrxParties(
+  hash: string,
+  src: TronHistorySources,
+  toBase58: (hex: string) => string,
+): Promise<TxParties | null> {
+  const txid = txidOf(hash);
+  if (!txid) return null;
+  return firstParties("TRX", [
+    {
+      host: TRONGRID_HOST,
+      run: async () =>
+        trongridTxParties(await src.tronGrid(`/wallet/gettransactionbyid?value=${txid}`), txid, toBase58),
+    },
+    {
+      host: TRONSCAN_HOST,
+      run: async () => tronscanTxParties(await src.tronScan(`/api/transaction-info?hash=${txid}`), txid),
+    },
+  ]);
+}
+
+/**
+ * `getTransactionParties` for a TRC-20 leg: the token transfer's parties, not
+ * the transaction's (whose `to` is the token contract). `contractHex` is the
+ * contract as `41…` hex, for reading TronGrid's logs.
+ */
+export async function fetchTrc20Parties(
+  cfg: Trc20HistoryConfig & { contractHex: string },
+  hash: string,
+  ownAddress: string,
+  src: TronHistorySources,
+  toBase58: (hex: string) => string,
+): Promise<TxParties | null> {
+  const txid = txidOf(hash);
+  if (!txid) return null;
+  const none: Parties = { from: [], to: [] };
+  return firstParties(cfg.ticker, [
+    {
+      host: TRONGRID_HOST,
+      run: async () => {
+        const info = await src.tronGrid(`/wallet/gettransactioninfobyid?value=${txid}`);
+        // `{}` also while the transaction is not in a block: no log to read yet.
+        if (isEmptyAnswer(info)) return null;
+        const id = (info as { id?: unknown } | null)?.id;
+        if (typeof id !== "string" || id.toLowerCase() !== txid) throw refusal(info);
+        const transfers = trongridTrc20Transfers(info, cfg.contractHex, toBase58);
+        if (transfers.length) return transferParties(transfers, ownAddress);
+        // No log of this token: failed on chain, or it moved none of it.
+        const tx = await src.tronGrid(`/wallet/gettransactionbyid?value=${txid}`);
+        const v = (tx as { raw_data?: any } | null)?.raw_data?.contract?.[0]?.parameter?.value;
+        const asked =
+          v && hex20(v.contract_address) === hex20(cfg.contractHex)
+            ? trc20CalldataTransfer(v.data, toBase58(String(v.owner_address ?? "")), toBase58)
+            : null;
+        return asked ? transferParties([asked], ownAddress) : none;
+      },
+    },
+    {
+      host: TRONSCAN_HOST,
+      run: async () => {
+        const info = await src.tronScan(`/api/transaction-info?hash=${txid}`);
+        if (isEmptyAnswer(info)) return null;
+        const r = info as Record<string, any> | null;
+        if (!r || typeof r.hash !== "string" || r.hash.toLowerCase() !== txid) throw refusal(info);
+        const transfers = tronscanTrc20Transfers(r, cfg.contract);
+        if (transfers.length) return transferParties(transfers, ownAddress);
+        const c = r.contractData;
+        const asked =
+          c?.contract_address === cfg.contract && typeof c.owner_address === "string"
+            ? trc20CalldataTransfer(c.data, c.owner_address, toBase58)
+            : null;
+        return asked ? transferParties([asked], ownAddress) : none;
+      },
+    },
+  ]);
 }

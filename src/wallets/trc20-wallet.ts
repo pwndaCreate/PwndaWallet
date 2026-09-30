@@ -42,6 +42,7 @@ import type {
   GasBudget,
   NetworkInfo,
   TxHistoryPage,
+  TxParties,
   TxResult,
 } from "./types";
 import {
@@ -49,6 +50,7 @@ import {
   tronFetch,
   broadcastTronTransaction,
   ethAddressToTron,
+  hexToTronAddress,
   isTronAddress,
   readTronBalanceSun,
   tronAddressToHex,
@@ -56,7 +58,7 @@ import {
   waitForTronExecution,
   TRON_HISTORY_SOURCES,
 } from "./trx-wallet";
-import { fetchTrc20History } from "./tron-history";
+import { fetchTrc20History, fetchTrc20Parties } from "./tron-history";
 import { verifyTronTransaction } from "./tron-tx-verify";
 import { atomicToDecimalString, decimalStringToAtomic } from "./spl-token-wallet";
 
@@ -483,6 +485,27 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
         address,
         opts,
         TRON_HISTORY_SOURCES,
+      );
+    },
+
+    /**
+     * The token transfer's sender and recipient, by txid — not the
+     * transaction's `to`, which is the token contract. TronGrid's
+     * `gettransactioninfobyid` logs, then TronScan (`tron-history.ts`).
+     */
+    async getTransactionParties(hash: string, ownAddress: string): Promise<TxParties | null> {
+      return fetchTrc20Parties(
+        {
+          chain: cfg.chain,
+          ticker: cfg.ticker,
+          contract: cfg.contract,
+          decimals: cfg.decimals,
+          contractHex: tronAddressToHex(cfg.contract),
+        },
+        hash,
+        ownAddress,
+        TRON_HISTORY_SOURCES,
+        hexToTronAddress,
       );
     },
 

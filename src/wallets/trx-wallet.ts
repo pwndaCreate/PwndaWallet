@@ -9,10 +9,11 @@ import type {
   NetworkInfo,
   ChainTx,
   TxHistoryPage,
+  TxParties,
   FeeEstimate,
 } from "./types";
 import { httpProxyCall, proxyGetJson } from "./_proxy";
-import { fetchTrxHistory, type TronHistorySources } from "./tron-history";
+import { fetchTrxHistory, fetchTrxParties, type TronHistorySources } from "./tron-history";
 import { verifyTronTransaction } from "./tron-tx-verify";
 import { SendOutcomeUnknownError } from "./send-outcome";
 
@@ -594,6 +595,14 @@ export const trxAdapter: ChainAdapter = {
     return fetchTrxHistory(address, opts, TRON_HISTORY_SOURCES, hexToTronAddress);
   },
 
+  /**
+   * Who sent one transaction and who received it, by txid: TronGrid's
+   * `/wallet/gettransactionbyid`, then TronScan (`tron-history.ts`).
+   */
+  async getTransactionParties(hash: string): Promise<TxParties | null> {
+    return fetchTrxParties(hash, TRON_HISTORY_SOURCES, hexToTronAddress);
+  },
+
   async getFeeEstimate(): Promise<FeeEstimate> {
     // Standard TRX transfer is 268 bytes ≈ 268 bandwidth points. Free tier
     // covers most simple transfers; if exhausted, the network burns ~0.268 TRX
@@ -626,7 +635,8 @@ export const trxAdapter: ChainAdapter = {
   },
 };
 
-function hexToTronAddress(hex: string): string {
+/** `41…` hex (as TronGrid prints addresses) → a `T…` address; "" for anything else. */
+export function hexToTronAddress(hex: string): string {
   if (!hex) return "";
   const clean = hex.startsWith("0x") ? hex.slice(2) : hex;
   // Tron addresses are 21-byte bs58check (0x41 prefix + 20-byte address).
