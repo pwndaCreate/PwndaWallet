@@ -23,6 +23,7 @@
  *  - an unchanged result is not an update.
  */
 import type { ChainTx } from "../../wallets/types";
+import { normalizeTxHash, txRowKey } from "../../wallets/tx-row-key";
 
 /** Longest a failing pair is left alone, whatever its failure count. */
 export const MAX_BACKOFF_MS = 60 * 60_000;
@@ -57,22 +58,27 @@ export function isDue(now: number, lastAttemptAt: number, intervalMs: number): b
 export function pollPageOverlaps(prev: ChainTx[] | undefined, page: ChainTx[], pollLimit: number): boolean {
   if (!prev || prev.length === 0) return false;
   if (page.length < pollLimit) return true; // the page reached the end of history
-  const held = new Set(prev.map((t) => t.hash));
-  return page.some((t) => held.has(t.hash));
+  const held = new Set(prev.map((t) => normalizeTxHash(t.hash)));
+  return page.some((t) => held.has(normalizeTxHash(t.hash)));
 }
 
 /**
  * Merge a newer page into the held list: a row in `page` replaces the held row
- * with the same hash (confirmations, status and amounts move), held rows not
- * in the page are kept, newest first (a row with no timestamp - mempool - sorts
- * to the top), capped at `cap`.
+ * with the same identity (confirmations, status and amounts move), held rows
+ * not in the page are kept, newest first (a row with no timestamp - mempool -
+ * sorts to the top), capped at `cap`.
+ *
+ * Identity is `txRowKey`, not the bare hash (2026-09-30): keyed by hash, the
+ * two legs of one transaction (a Zephyr conversion's `out` and `in`, two
+ * ERC-20 transfers in one transaction) replaced each other on every poll, and
+ * a hash spelled in another case was a second row.
  */
 export function mergeHistoryPage(prev: ChainTx[] | undefined, page: ChainTx[], cap: number): ChainTx[] {
-  const byHash = new Map<string, ChainTx>();
-  for (const t of prev ?? []) byHash.set(t.hash, t);
-  for (const t of page) byHash.set(t.hash, t);
+  const byKey = new Map<string, ChainTx>();
+  for (const t of prev ?? []) byKey.set(txRowKey(t), t);
+  for (const t of page) byKey.set(txRowKey(t), t);
   const ts = (t: ChainTx) => (t.timestamp === undefined ? Number.POSITIVE_INFINITY : t.timestamp);
-  return [...byHash.values()].sort((a, b) => ts(b) - ts(a)).slice(0, cap);
+  return [...byKey.values()].sort((a, b) => ts(b) - ts(a)).slice(0, cap);
 }
 
 /** Exact equality of two held lists, so an unchanged poll commits nothing. */

@@ -23,6 +23,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Store } from "@tauri-apps/plugin-store";
 import { getAdapterByChain } from "../../wallets";
 import type { ChainTx, ChainType } from "../../wallets";
+import { dedupeTxRows, normalizeTxHash, txAssetKey, txRowKey } from "../../wallets/tx-row-key";
 import {
   isDue,
   mergeHistoryPage,
@@ -71,6 +72,16 @@ export interface UseTxHistoryResult {
  * Rows that cannot be signed (`pending`, or an address row with no direction)
  * keep the old first-occurrence behaviour for that txid; a mempool tx is
  * shown once, not netted from a partial picture.
+ *
+ * Corrected 2026-09-30 (operator report: Activity rows and "errors on …").
+ * Rows were grouped by bare `tx.hash`, so rows the adapter returned SEPARATELY
+ * under one address were netted into one: a Zephyr conversion's `out` ZEPH
+ * and `in` ZEPHUSD legs share a txid, and netting them either kept only the
+ * first leg (12-decimal amounts fail `signedAtomic`) or subtracted one asset
+ * from another. Netting is for the same asset seen from DIFFERENT addresses,
+ * so rows now group by hash + asset (`txRowKey`'s parts) and a group is
+ * netted only when it spans more than one address; within one address list
+ * the rows stay as the adapter returned them, less exact duplicates.
  */
 export function mergeChainTx(
   result: {
@@ -83,22 +94,30 @@ export function mergeChainTx(
   const prefix = `${chain}:`;
   const loadingMap = result.loading ?? {};
   const errorsMap = result.errors ?? {};
-  const byHash = new Map<string, ChainTx[]>();
+  // hash + asset → the rows seen, and which address list each came from.
+  const groups = new Map<string, { key: string; tx: ChainTx }[]>();
   const order: string[] = [];
   const ownAddresses = new Set<string>();
   for (const [k, list] of Object.entries(result.txByChain)) {
     if (!k.startsWith(prefix)) continue;
     ownAddresses.add(k.slice(prefix.length));
     for (const tx of list) {
-      const rows = byHash.get(tx.hash);
-      if (rows) rows.push(tx);
+      const id = `${normalizeTxHash(tx.hash)}|${txAssetKey(tx)}`;
+      const rows = groups.get(id);
+      if (rows) rows.push({ key: k, tx });
       else {
-        byHash.set(tx.hash, [tx]);
-        order.push(tx.hash);
+        groups.set(id, [{ key: k, tx }]);
+        order.push(id);
       }
     }
   }
-  const txs = order.map((h) => netAcrossAddresses(byHash.get(h)!, ownAddresses));
+  const txs: ChainTx[] = [];
+  for (const id of order) {
+    const rows = groups.get(id)!;
+    const fromOneList = rows.every((r) => r.key === rows[0].key);
+    if (fromOneList) txs.push(...dedupeTxRows(rows.map((r) => r.tx)));
+    else txs.push(netAcrossAddresses(dedupeAcrossLists(rows), ownAddresses));
+  }
   txs.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
 
   let loading = false;
@@ -118,6 +137,24 @@ export function mergeChainTx(
   }
 
   return { txs, loading, error };
+}
+
+/**
+ * The rows of a cross-address group, less a row repeated within ONE address
+ * list (an explorer page that lists a transaction twice): that copy is the
+ * same address's view again, and netting it would count it twice. The same
+ * row under two different addresses is kept — that is what gets netted.
+ */
+function dedupeAcrossLists(rows: { key: string; tx: ChainTx }[]): ChainTx[] {
+  const seen = new Set<string>();
+  const out: ChainTx[] = [];
+  for (const r of rows) {
+    const id = `${r.key}\u0000${txRowKey(r.tx)}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    out.push(r.tx);
+  }
+  return out;
 }
 
 /** Signed amount of one address row in atomic units, or null if unsignable. */
@@ -185,6 +222,20 @@ const FLUSH_MAX_WAIT_MS = 5_000;
 
 function key(chain: ChainType, address: string) {
   return `${chain}:${address}`;
+}
+
+/**
+ * `m` without the keys outside `live` — the SAME object when nothing is
+ * dropped, so a state setter given it does not re-render. Exported for tests.
+ */
+export function pruneToKeys<T>(m: Record<string, T>, live: ReadonlySet<string>): Record<string, T> {
+  let dropped = false;
+  const out: Record<string, T> = {};
+  for (const [k, v] of Object.entries(m)) {
+    if (live.has(k)) out[k] = v;
+    else dropped = true;
+  }
+  return dropped ? out : m;
 }
 
 let _store: Store | null = null;
@@ -274,6 +325,10 @@ export function useTxHistory(
   // Per-key in-flight gate — coalesces concurrent fetches.
   const inFlight = useRef<Map<string, Promise<void>>>(new Map());
 
+  // The `chain:address` keys of the CURRENT pair set (set by the pair-set
+  // effect below, before the scheduler's first fetch). See `pruneToKeys`.
+  const liveKeys = useRef<Set<string>>(new Set());
+
   const flushNow = useCallback(() => {
     if (flushTimer.current) {
       clearTimeout(flushTimer.current);
@@ -359,10 +414,18 @@ export function useTxHistory(
           }
           st.fullDone = true;
           st.failures = 0;
+          // A pair dropped while its fetch was in flight (a wallet switch)
+          // must not put its rows back.
+          if (!liveKeys.current.has(k)) return;
           if (!sameHistory(prev, items)) pendingTx.current[k] = items;
           if (heldErr.current[k] != null || pendingErr.current[k] != null) pendingErr.current[k] = null;
         } catch (e) {
           st.failures += 1;
+          if (!liveKeys.current.has(k)) return;
+          // Recorded as the error STRING whatever it is. A chain with no
+          // history source throws `HistoryUnavailableError`, whose message
+          // the Activity views recognise (`historyStatus.ts`) and show as
+          // "not available", not as an error (operator report 2026-09-30).
           const msg = e instanceof Error ? e.message : String(e);
           if (!sameError(pendingErr.current[k] ?? heldErr.current[k], msg)) pendingErr.current[k] = msg;
         } finally {
@@ -378,8 +441,27 @@ export function useTxHistory(
     [limit, pollLimit, scheduleFlush]
   );
 
-  // Hydrate cache once per pair set.
+  // Per pair set: forget pairs that left it, then hydrate the cache.
+  //
+  // Pruning added 2026-09-30. The Activity views now merge every
+  // `chain:address` key of a chain (`mergeChainTx`), so they show the UTXO
+  // account's other addresses; without pruning, a key left over from a
+  // previous wallet (switching wallets swaps the pair set; this state kept
+  // every key it had ever seen) would be merged into the current wallet's
+  // history. The tx-cache file keeps those entries; switching back
+  // re-hydrates them.
   useEffect(() => {
+    const live = new Set(pairs.map((p) => key(p.chain, p.address)));
+    liveKeys.current = live;
+    heldTx.current = pruneToKeys(heldTx.current, live);
+    heldErr.current = pruneToKeys(heldErr.current, live);
+    pendingTx.current = pruneToKeys(pendingTx.current, live);
+    pendingErr.current = pruneToKeys(pendingErr.current, live);
+    for (const k of [...pairState.current.keys()]) if (!live.has(k)) pairState.current.delete(k);
+    setTxByChain((m) => pruneToKeys(m, live));
+    setErrors((m) => pruneToKeys(m, live));
+    setLoading((m) => pruneToKeys(m, live));
+
     let cancelled = false;
     (async () => {
       try {
