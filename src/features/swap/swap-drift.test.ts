@@ -108,6 +108,26 @@ describe("formatDriftPercent — chip display string", () => {
 });
 
 describe("extractActualReceivedFromIntents — NEAR Intents response shapes", () => {
+  // 2026-09-30: the live 1Click status response. The delivered amount is
+  // under `swapDetails`; the quoted one under `quoteResponse.quote`. The
+  // values here are invented, the field layout is the live one.
+  it("reads swapDetails.amountOut, where 1Click actually puts it", () => {
+    const resp = {
+      status: "SUCCESS" as const,
+      swapDetails: { amountOut: "41150000", amountOutFormatted: "41.15" },
+      quoteResponse: { quote: { amountOut: "40900000" } },
+    };
+    expect(extractActualReceivedFromIntents(resp)).toBe("41150000");
+  });
+
+  it("never reports the quoted amount as the delivered one", () => {
+    const resp = {
+      status: "SUCCESS" as const,
+      quoteResponse: { quote: { amountOut: "40900000" } },
+    };
+    expect(extractActualReceivedFromIntents(resp)).toBeUndefined();
+  });
+
   it("reads from resp.swap.amountOut (canonical 1Click SUCCESS shape)", () => {
     const resp = { status: "SUCCESS" as const, swap: { amountOut: "3610000" } };
     expect(extractActualReceivedFromIntents(resp)).toBe("3610000");

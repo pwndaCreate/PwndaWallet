@@ -58,13 +58,20 @@ export function formatActualReceived(
 
 /**
  * Pull the actual delivered atomic-units amount from a NEAR Intents
- * terminal status response. The 1Click `/api/intents/status/{depositAddress}`
- * SUCCESS shape includes `swap.amountOut` (the canonical executed amount)
- * with a `swap.amountOutFormatted` display-units backup. Order of fallback:
+ * terminal status response. Order of fallback:
  *
- *   resp.swap.amountOut       → most reliable, atomic units
- *   resp.amountOut            → some response variants flatten this
- *   resp.quote.amountOut      → very old responses echo the quote here
+ *   resp.swapDetails.amountOut → what 1Click actually returns (atomic units)
+ *   resp.swap.amountOut        → the shape this function was written for
+ *   resp.amountOut             → some response variants flatten this
+ *   resp.quote.amountOut       → very old responses echo the quote here
+ *
+ * Corrected 2026-09-30: this read only the last three, and none of them is
+ * in 1Click's status response. A live read of a finished LTC → USDC swap
+ * returned `swapDetails.amountOut: "21035759"` (delivered) beside
+ * `quoteResponse.quote.amountOut: "20931037"` (quoted), so the delivered
+ * amount of every NEAR Intents swap was silently never recorded. The
+ * quote's figure under `quoteResponse` is deliberately NOT a fallback: it
+ * is what was promised, not what arrived.
  *
  * Returns `undefined` when none of those are present. Drift indicator
  * just hides; everything else still renders.
@@ -73,10 +80,11 @@ export function extractActualReceivedFromIntents(
   resp: IntentsStatusResponse | undefined
 ): string | undefined {
   if (!resp || typeof resp !== "object") return undefined;
+  const details = (resp as { swapDetails?: { amountOut?: unknown } }).swapDetails;
   const swap = (resp as { swap?: { amountOut?: unknown } }).swap;
   const direct = (resp as { amountOut?: unknown }).amountOut;
   const inQuote = (resp as { quote?: { amountOut?: unknown } }).quote?.amountOut;
-  const candidates = [swap?.amountOut, direct, inQuote];
+  const candidates = [details?.amountOut, swap?.amountOut, direct, inQuote];
   for (const c of candidates) {
     if (typeof c === "string" && c.length > 0) return c;
     if (typeof c === "number" && Number.isFinite(c)) return c.toString();
