@@ -583,19 +583,28 @@ export function createSplTokenAdapter(cfg: SplTokenAdapterConfig): ChainAdapter 
       const owner = new PublicKey(address);
       const ata = ataFor(owner, mint);
       const limit = opts?.limit ?? 25;
+      // No `.catch(() => [])` (2026-09-30, operator report on Activity
+      // errors): when every Solana RPC failed, that turned the failure into
+      // an empty list, which Activity shows as "no transactions". The
+      // adapter contract is to throw.
       const sigs = await runOnAnySolanaRpc((conn: Connection) =>
         conn.getSignaturesForAddress(ata, { limit }),
-      ).catch(() => []);
+      );
       const items: ChainTx[] = sigs.map((s) => ({
         chain: cfg.chain,
         hash: s.signature,
         // Direction needs the parsed transaction to know which side moved;
         // that is one RPC call per row, so it is left unresolved rather than
         // guessed. `pending` is honest: "on chain, direction not determined".
-        direction: "pending",
+        // A transaction that failed on chain says so in its signature info.
+        direction: s.err ? "failed" : "pending",
         amount: "",
         timestamp: s.blockTime ?? undefined,
-        confirmations: s.confirmationStatus === "finalized" ? 1 : 0,
+        // The slot is the block; "processed" is the only status not yet voted
+        // on. Was `finalized ? 1 : 0`, which called a confirmed transfer
+        // "unconfirmed" and invented a count of 1.
+        height: typeof s.slot === "number" ? s.slot : undefined,
+        confirmations: s.confirmationStatus === "processed" ? 0 : undefined,
       }));
       return { items };
     },
