@@ -6,6 +6,7 @@ import {
   type ChainDetectionResult,
 } from "../onboarding/derivation-detector";
 import { sweepLegacyLtcToModern } from "../../wallets/ltc-wallet";
+import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 
 type Phase =
   | { kind: "loading" }
@@ -20,6 +21,8 @@ type MigrateState =
   | { kind: "confirm" }
   | { kind: "sweeping" }
   | { kind: "swept"; txid: string; destination: string; sweptLits: number }
+  /** The move may have been broadcast (2026-09-29 send-safety audit). */
+  | { kind: "unknown"; txid?: string; message: string }
   | { kind: "error"; message: string };
 
 /**
@@ -144,6 +147,10 @@ export function LitecoinDerivationPanel(props: {
         }
       }
     } catch (e: any) {
+      if (isSendOutcomeUnknown(e)) {
+        setMigrate({ kind: "unknown", txid: e.hash, message: e.message });
+        return;
+      }
       setMigrate({ kind: "error", message: e?.message ?? String(e) });
     }
   };
@@ -281,6 +288,13 @@ export function LitecoinDerivationPanel(props: {
             )}
             {migrate.kind === "sweeping" && (
               <div style={{ color: "var(--text-dim)" }}>Broadcasting…</div>
+            )}
+            {migrate.kind === "unknown" && (
+              <div style={{ color: "var(--warn, #ffb020)", wordBreak: "break-all" }}>
+                Not confirmed: the move may have been sent
+                {migrate.txid ? ` (txid ${migrate.txid})` : ""}. Check a block
+                explorer before trying again. ({migrate.message})
+              </div>
             )}
             {migrate.kind === "error" && (
               <div style={{ color: "#ff6b6b", wordBreak: "break-word" }}>

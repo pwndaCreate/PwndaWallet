@@ -2,6 +2,7 @@ import { useCallback, useState } from "react";
 import { Card } from "../../components/PrimitivesV2";
 import { ST } from "../../components/Primitives";
 import { getAdapter } from "../../wallets";
+import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 import type { ChainType } from "../../wallets/types";
 import {
   satsToDecimal,
@@ -434,10 +435,14 @@ function ConsolidatePanel({
   summary: UtxoAccountSummary;
   onDone: () => void;
 }) {
-  const [stage, setStage] = useState<"idle" | "review" | "sending" | "done">(
-    "idle",
-  );
+  const [stage, setStage] = useState<
+    "idle" | "review" | "sending" | "done" | "unknown"
+  >("idle");
   const [error, setError] = useState("");
+  // An outcome that is not known (2026-09-29 send-safety audit): the
+  // transaction may be out. Returning to "Review — nothing has been sent" with
+  // Send enabled, as this did, told the user the opposite.
+  const [unknown, setUnknown] = useState<{ hash?: string; detail: string } | null>(null);
   const [result, setResult] = useState<{ hash: string; moved: number } | null>(
     null,
   );
@@ -481,10 +486,31 @@ function ConsolidatePanel({
         onDone();
       })
       .catch((e) => {
+        if (isSendOutcomeUnknown(e)) {
+          setUnknown({ hash: e.hash, detail: e.message });
+          setStage("unknown");
+          onDone();
+          return;
+        }
         setError(e instanceof Error ? e.message : String(e));
         setStage("review");
       });
   };
+
+  if (stage === "unknown" && unknown) {
+    return (
+      <div style={{ ...BOX, borderColor: "var(--warn, #ffb020)" }}>
+        <div style={{ color: "var(--warn, #ffb020)", marginBottom: 4 }}>
+          Not confirmed: the consolidation may have been sent
+        </div>
+        <div style={{ color: "var(--text-dim)", wordBreak: "break-all" }}>
+          {unknown.hash ? `tx ${unknown.hash}. ` : ""}Check Activity or a block
+          explorer before trying again: sending again would build a second
+          transaction. ({unknown.detail})
+        </div>
+      </div>
+    );
+  }
 
   if (stage === "done" && result) {
     return (

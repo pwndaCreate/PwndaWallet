@@ -6,6 +6,7 @@ import {
   getLegacyBtcBalanceSats,
   sweepLegacyBtcToAddress,
 } from "../../wallets/btc-wallet";
+import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 
 type SweepState =
   | { kind: "idle" }
@@ -14,6 +15,8 @@ type SweepState =
   | { kind: "empty" }
   | { kind: "sweeping" }
   | { kind: "swept"; txid: string }
+  /** The sweep may have been broadcast (2026-09-29 send-safety audit). */
+  | { kind: "unknown"; txid?: string; message: string }
   | { kind: "error"; message: string };
 
 /**
@@ -69,6 +72,10 @@ export function BtcLegacyPanel(props: {
       const result = await sweepLegacyBtcToAddress(legacyPrivateKey, standardAddress);
       setState({ kind: "swept", txid: result.hash });
     } catch (e: any) {
+      if (isSendOutcomeUnknown(e)) {
+        setState({ kind: "unknown", txid: e.hash, message: e.message });
+        return;
+      }
       setState({ kind: "error", message: e?.message || String(e) });
     }
   };
@@ -153,6 +160,13 @@ export function BtcLegacyPanel(props: {
             >
               View on mempool.space →
             </a>
+          </div>
+        )}
+        {state.kind === "unknown" && (
+          <div style={{ color: "var(--warn, #ffb020)", fontSize: 10, marginTop: 6, wordBreak: "break-all" }}>
+            Not confirmed: the sweep may have been sent
+            {state.txid ? ` (tx ${state.txid})` : ""}. Check mempool.space
+            before trying again. ({state.message})
           </div>
         )}
         {state.kind === "error" && (
