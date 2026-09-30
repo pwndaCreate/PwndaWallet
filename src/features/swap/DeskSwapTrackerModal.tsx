@@ -31,6 +31,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Backdrop, Row, Stat, truncate } from "./modal-parts";
+import { openExplorer } from "./TxHashField";
 import { Btn, ProgressBar } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import {
@@ -582,15 +583,7 @@ export function DeskSwapTrackerModal({
                   >
                     {step.txLabel}
                     {href ? (
-                      <a
-                        href={href}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="tnum"
-                        style={{ color: "var(--accent)" }}
-                      >
-                        {truncate(hash)}
-                      </a>
+                      <ExplorerHashLink href={href} hash={hash} />
                     ) : (
                       <span className="tnum">{truncate(hash)}</span>
                     )}
@@ -799,18 +792,39 @@ function TxLine({
     <div style={{ fontSize: 10, color: "var(--text-dim)", paddingLeft: 20 }}>
       {label}
       {href ? (
-        <a
-          href={href}
-          target="_blank"
-          rel="noreferrer"
-          className="tnum"
-          style={{ color: "var(--accent)" }}
-        >
-          {truncate(hash)}
-        </a>
+        <ExplorerHashLink href={href} hash={hash} />
       ) : (
         <span className="tnum">{truncate(hash)}</span>
       )}
     </div>
+  );
+}
+
+/**
+ * A truncated hash that opens the explorer (2026-09-30). These were
+ * `<a href target="_blank">`, which Tauri's webview never opens by itself and
+ * the opener plugin's window listener never heard inside a modal card: the
+ * same dead link the operator reported in the NEAR confirm modal (see
+ * `TxHashField.tsx`). The full hash is in the tooltip.
+ */
+function ExplorerHashLink({ href, hash }: { href: string; hash: string }) {
+  return (
+    <button
+      type="button"
+      className="tnum"
+      title={`${hash} — open in your browser`}
+      onClick={() => void openExplorer(href)}
+      style={{
+        color: "var(--accent)",
+        background: "transparent",
+        border: 0,
+        padding: 0,
+        font: "inherit",
+        cursor: "pointer",
+        textDecoration: "underline",
+      }}
+    >
+      {truncate(hash)}
+    </button>
   );
 }
