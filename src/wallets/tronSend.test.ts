@@ -13,9 +13,17 @@
  *  - whatever transaction the node returned was signed, unchecked;
  *  - `broadcast: result true` was reported as sent even when the transfer
  *    then failed in its block (OUT_OF_ENERGY).
+ *
+ * The 2026-09-29 send-safety audit added TronStack, reached through the Rust
+ * proxy (`_proxy.httpProxyCall`, the second fake): it serves the full-node
+ * `/wallet/*` API and answers 404 for TronGrid's `/v1/*`, as the live host
+ * does. Its tests pin the fallback's account read, the check that must not be
+ * skipped when that read fails, and a broadcast whose answer is DUP or never
+ * comes.
  */
 import { ethers } from "ethers";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { isSendOutcomeUnknown } from "./send-outcome";
 
 const ABANDON =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -49,14 +57,40 @@ const BTC_ADDRESS = "1BvBMSEYstWetqTFn5Au4m4GFg7xJaNVN2";
 type Route = (body: any) => unknown;
 let routes: Record<string, Route>;
 let calls: string[];
+/** TronGrid failures by path ("*" = every path): an HTTP status, or "throw" for no answer. */
+let gridFail: Record<string, number | "throw">;
+/** TronStack's `/wallet/*` routes. A route returning an Error makes the proxy call throw. */
+let stack: Record<string, Route>;
+let stackCalls: string[];
+
+vi.mock("./_proxy", () => ({
+  httpProxyCall: async (opts: { url: string; body?: string }) => {
+    const path = new URL(opts.url).pathname;
+    stackCalls.push(path);
+    // The live host: no `/v1/*` at all (verified 2026-09-29).
+    if (path.startsWith("/v1/")) return { status: 404, body: "404 page not found", headers: [] };
+    const route = stack[path];
+    if (!route) return { status: 500, body: "not scripted", headers: [] };
+    const out = route(opts.body ? JSON.parse(opts.body) : undefined);
+    if (out instanceof Error) throw out;
+    return { status: 200, body: JSON.stringify(out), headers: [] };
+  },
+  proxyGetJson: async () => {
+    throw new Error("proxyGetJson is not scripted here");
+  },
+}));
 
 function install() {
   calls = [];
+  stackCalls = [];
   vi.stubGlobal(
     "fetch",
     vi.fn(async (url: string, init?: RequestInit) => {
       const path = new URL(url).pathname;
       calls.push(path);
+      const fail = gridFail[path] ?? gridFail["*"];
+      if (fail === "throw") throw new TypeError("Failed to fetch");
+      if (fail !== undefined) return new Response("scripted failure", { status: fail });
       const route = routes[path] ?? routes[path.replace(/\/v1\/accounts\/[^/]+$/, "/v1/accounts/*")];
       if (!route) return new Response("not scripted", { status: 500 });
       const body = init?.body ? JSON.parse(String(init.body)) : undefined;
@@ -104,8 +138,21 @@ function baseRoutes(trxSun: number): Record<string, Route> {
   };
 }
 
+/** TronStack answering like the TronGrid routes, through its own paths. */
+function stackRoutes(trxSun: number): Record<string, Route> {
+  const grid = baseRoutes(trxSun);
+  return {
+    ...grid,
+    // `/wallet/getaccount` omits `balance` at zero and prints `{}` for an
+    // account that does not exist yet.
+    "/wallet/getaccount": () => (trxSun > 0 ? { address: "T", balance: trxSun } : {}),
+  };
+}
+
 beforeEach(() => {
   routes = baseRoutes(50_000_000);
+  gridFail = {};
+  stack = {};
   install();
 });
 
@@ -259,5 +306,146 @@ describe("native TRX", () => {
     await expect(trx.trxAdapter.sendTransaction(key, recipient, "1.234567")).rejects.toThrow(
       "Account resource insufficient error.",
     );
+  });
+});
+
+/** The error a promise rejects with (for assertions `toThrow` cannot make). */
+async function rejection(p: Promise<unknown>): Promise<any> {
+  try {
+    await p;
+  } catch (e) {
+    return e;
+  }
+  throw new Error("expected the send to be rejected");
+}
+
+const dup = (b: any) => ({
+  result: false,
+  code: "DUP_TRANSACTION_ERROR",
+  txid: b?.txID,
+  message: Buffer.from("dup transaction").toString("hex"),
+});
+
+describe("the TronStack fallback reads accounts through /wallet/getaccount (2026-09-29 send-safety audit)", () => {
+  it("reads the TRX balance when TronGrid rate-limits", async () => {
+    // TronStack answers `/v1/accounts` 404, so this read had no fallback.
+    gridFail["*"] = 429;
+    stack = stackRoutes(12_345_678);
+    const { trx } = await load();
+    const owner = trx.trxAdapter.deriveFromMnemonic(ABANDON).address;
+    await expect(trx.trxAdapter.getBalance(owner)).resolves.toBe("12.345678");
+    expect(stackCalls).toContain("/wallet/getaccount");
+  });
+
+  it("reads an account that does not exist yet as zero, and a node error as a failure", async () => {
+    gridFail["*"] = 429;
+    stack = stackRoutes(0);
+    const { trx } = await load();
+    const owner = trx.trxAdapter.deriveFromMnemonic(ABANDON).address;
+    await expect(trx.trxAdapter.getBalance(owner)).resolves.toBe("0.000000");
+    stack["/wallet/getaccount"] = () => ({ Error: "class java.lang.NullPointerException : null" });
+    await expect(trx.trxAdapter.getBalance(owner)).rejects.toThrow(/Unexpected TRX balance response/);
+  });
+
+  it("keeps the USDT send's TRX check working while TronGrid rate-limits", async () => {
+    // The check used to become "unknown" here, and the send went ahead.
+    gridFail["*"] = 429;
+    stack = stackRoutes(5_000_000); // 5 TRX; the transfer burns ~6.43
+    const { usdt, key, recipient } = await load();
+    await expect(usdt.sendTransaction(key, recipient, "1.234567")).rejects.toThrow(
+      /burns about 6\.43 TRX .* this address has 5\.0 TRX/,
+    );
+    expect(stackCalls).not.toContain("/wallet/triggersmartcontract");
+  });
+
+  it("refuses the USDT send when the TRX check cannot be made at all", async () => {
+    gridFail["*"] = 429;
+    stack = stackRoutes(50_000_000);
+    stack["/wallet/getaccount"] = () => new Error("tronstack unreachable");
+    const { usdt, key, recipient } = await load();
+    await expect(usdt.sendTransaction(key, recipient, "1.234567")).rejects.toThrow(
+      /Could not check .* Nothing was sent/,
+    );
+    expect([...calls, ...stackCalls]).not.toContain("/wallet/triggersmartcontract");
+    expect([...calls, ...stackCalls]).not.toContain("/wallet/broadcasttransaction");
+  });
+});
+
+describe("a broadcast whose answer is DUP or never comes (2026-09-29 send-safety audit)", () => {
+  it("TRX: TronGrid takes it and times out, TronStack says DUP for our id — that is sent", async () => {
+    gridFail["/wallet/broadcasttransaction"] = "throw";
+    stack = { "/wallet/broadcasttransaction": dup };
+    const { trx, key, recipient } = await load();
+    await expect(trx.trxAdapter.sendTransaction(key, recipient, "1.234567")).resolves.toEqual({
+      hash: TRX_TX.txID,
+    });
+  });
+
+  it("USDT: a DUP for our id still waits for the transfer to execute", async () => {
+    gridFail["/wallet/broadcasttransaction"] = 504;
+    stack = { "/wallet/broadcasttransaction": dup };
+    const { usdt, key, recipient } = await load();
+    await expect(usdt.sendTransaction(key, recipient, "1.234567")).resolves.toEqual({
+      hash: USDT_TX.txID,
+    });
+    expect(calls.at(-1)).toBe("/wallet/gettransactioninfobyid");
+  });
+
+  it("USDT: a DUP followed by an on-chain failure is reported as that failure", async () => {
+    gridFail["/wallet/broadcasttransaction"] = "throw";
+    stack = { "/wallet/broadcasttransaction": dup };
+    routes["/wallet/gettransactioninfobyid"] = (b) => ({
+      id: b?.value,
+      result: "FAILED",
+      receipt: { result: "OUT_OF_ENERGY" },
+    });
+    const { usdt, key, recipient } = await load();
+    await expect(usdt.sendTransaction(key, recipient, "1.234567")).rejects.toThrow(
+      /failed on chain: OUT_OF_ENERGY/,
+    );
+  });
+
+  it("no answer from either node, and not in a block: 'may have been sent', with the hash", async () => {
+    gridFail["/wallet/broadcasttransaction"] = "throw";
+    stack = { "/wallet/broadcasttransaction": () => new Error("proxy: operation timed out") };
+    routes["/wallet/gettransactioninfobyid"] = () => ({});
+    const { trx, key, recipient } = await load();
+    const e = await rejection(trx.trxAdapter.sendTransaction(key, recipient, "1.234567"));
+    expect(isSendOutcomeUnknown(e), String(e)).toBe(true);
+    expect(e.hash).toBe(TRX_TX.txID);
+  });
+
+  it("an unanswered broadcast found executed by id is a success", async () => {
+    gridFail["/wallet/broadcasttransaction"] = 502;
+    stack = { "/wallet/broadcasttransaction": () => new Error("proxy: connection reset") };
+    const { usdt, key, recipient } = await load();
+    await expect(usdt.sendTransaction(key, recipient, "1.234567")).resolves.toEqual({
+      hash: USDT_TX.txID,
+    });
+  });
+
+  it("a node that answers with a refusal, nothing uncertain before it, is an ordinary failure", async () => {
+    // 429: TronGrid did not process the request, so TronStack's answer decides.
+    gridFail["/wallet/broadcasttransaction"] = 429;
+    stack = {
+      "/wallet/broadcasttransaction": () => ({
+        result: false,
+        code: "SIGERROR",
+        message: Buffer.from("validate signature error").toString("hex"),
+      }),
+    };
+    const { trx, key, recipient } = await load();
+    const e = await rejection(trx.trxAdapter.sendTransaction(key, recipient, "1.234567"));
+    expect(isSendOutcomeUnknown(e)).toBe(false);
+    expect(String(e.message)).toContain("validate signature error");
+  });
+
+  it("USDT: accepted but not executed within the wait is 'submitted', not 'sent'", async () => {
+    routes["/wallet/gettransactioninfobyid"] = () => ({});
+    const { usdt, key, recipient } = await load();
+    await expect(usdt.sendTransaction(key, recipient, "1.234567")).resolves.toEqual({
+      hash: USDT_TX.txID,
+      pending: true,
+    });
   });
 });

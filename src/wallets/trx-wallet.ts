@@ -13,6 +13,7 @@ import type {
 } from "./types";
 import { httpProxyCall, proxyGetJson } from "./_proxy";
 import { verifyTronTransaction } from "./tron-tx-verify";
+import { SendOutcomeUnknownError } from "./send-outcome";
 
 const TRON_API_URLS = [
   "https://api.trongrid.io",
@@ -48,6 +49,9 @@ function headerRecord(h: HeadersInit | undefined): Record<string, string> | unde
   return { ...(h as Record<string, string>) };
 }
 
+/** Which TRON API host answered a `tronFetchFrom` call. */
+export type TronSource = "trongrid" | "tronstack";
+
 /**
  * GET/POST a TRON node API path: TronGrid first, TronStack second.
  *
@@ -57,36 +61,99 @@ function headerRecord(h: HeadersInit | undefined): Record<string, string> | unde
  * make could never succeed from the web view, and the fallback was dead code
  * — confirmed 2026-09-29 by a TronGrid 429 followed by "blocked by CORS
  * policy" on api.tronstack.io.
+ *
+ * `fallback` asks TronStack something else: it serves the full-node
+ * `/wallet/*` API only, and answers 404 for TronGrid's indexed `/v1/*` paths
+ * (verified 2026-09-29 for `/v1/accounts/<addr>` and `…/transactions/trc20`).
  */
-export async function tronFetch(path: string, init?: RequestInit): Promise<Response> {
+export async function tronFetchFrom(
+  path: string,
+  init?: RequestInit,
+  fallback?: { path: string; init?: RequestInit },
+): Promise<{ resp: Response; source: TronSource }> {
   let lastError: unknown;
   await trongridSlot();
   try {
     const resp = await fetch(`${TRON_API_URLS[0]}${path}`, init);
-    if (resp.ok) return resp;
+    if (resp.ok) return { resp, source: "trongrid" };
     lastError = new Error(`HTTP ${resp.status} from ${TRON_API_URLS[0]}`);
   } catch (e) {
     lastError = e;
   }
+  const fbPath = fallback?.path ?? path;
+  const fbInit = fallback ? fallback.init : init;
   try {
-    const method = (init?.method ?? "GET").toUpperCase() === "POST" ? "POST" : "GET";
+    const method = (fbInit?.method ?? "GET").toUpperCase() === "POST" ? "POST" : "GET";
     const r = await httpProxyCall({
       method,
-      url: `${TRON_API_URLS[1]}${path}`,
-      headers: headerRecord(init?.headers),
-      body: typeof init?.body === "string" ? init.body : undefined,
+      url: `${TRON_API_URLS[1]}${fbPath}`,
+      headers: headerRecord(fbInit?.headers),
+      body: typeof fbInit?.body === "string" ? fbInit.body : undefined,
     });
     if (r.status >= 200 && r.status < 300) {
-      return new Response(r.body, {
-        status: r.status,
-        headers: { "Content-Type": "application/json" },
-      });
+      return {
+        resp: new Response(r.body, {
+          status: r.status,
+          headers: { "Content-Type": "application/json" },
+        }),
+        source: "tronstack",
+      };
     }
     lastError = new Error(`HTTP ${r.status} from ${TRON_API_URLS[1]}`);
   } catch (e) {
     lastError = e;
   }
   throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+/** {@link tronFetchFrom} for callers that ask both hosts the same path. */
+export async function tronFetch(path: string, init?: RequestInit): Promise<Response> {
+  return (await tronFetchFrom(path, init)).resp;
+}
+
+/** A sun amount from a TRON API number field; absent is zero. */
+function sunOf(v: unknown): bigint {
+  if (v === undefined || v === null) return 0n;
+  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
+  if (typeof v === "string" && /^\d+$/.test(v)) return BigInt(v);
+  throw new Error("Unexpected TRX balance response");
+}
+
+/**
+ * An account's TRX balance, in sun.
+ *
+ * TronGrid answers its indexed `/v1/accounts/<addr>`; TronStack has no `/v1/*`
+ * (HTTP 404, 2026-09-29 send-safety audit), so its fallback read is the
+ * full-node `/wallet/getaccount`, which both hosts serve. Before that the
+ * fallback asked TronStack for `/v1/accounts` too: when TronGrid rate-limited
+ * (429), the TRX balance and the USDT send's TRX check had no fallback at all,
+ * and the check silently became "unknown".
+ */
+export async function readTronBalanceSun(address: string): Promise<bigint> {
+  const { resp, source } = await tronFetchFrom(`/v1/accounts/${address}`, undefined, {
+    path: "/wallet/getaccount",
+    init: {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address, visible: true }),
+    },
+  });
+  const data = await resp.json();
+  if (source === "trongrid") {
+    // An account that has never received anything is `data: []` — a real
+    // zero. A body without a `data` array is not an answer at all, and the
+    // adapter contract says to throw rather than show 0 for it.
+    if (!Array.isArray(data?.data)) throw new Error("Unexpected TRX balance response");
+    return sunOf(data.data[0]?.balance);
+  }
+  // `/wallet/getaccount` prints `{}` for an account that does not exist yet
+  // (java-tron's GetAccountServlet, when the lookup finds nothing — a real
+  // zero), `{ Error }` for a failure, and omits `balance` when it is zero.
+  if (!data || typeof data !== "object" || Array.isArray(data) || data.Error) {
+    const why = data && typeof data === "object" ? tronNodeMessage(data.Error) : "";
+    throw new Error(`Unexpected TRX balance response${why ? `: ${why}` : ""}`);
+  }
+  return sunOf(data.balance);
 }
 
 const TRONGRID_API = TRON_API_URLS[0];
@@ -201,6 +268,138 @@ export async function waitForTronExecution(
   }
 }
 
+/** One node's answer to `broadcasttransaction`, read. */
+type BroadcastVerdict =
+  /** The node holds the transaction now. */
+  | { kind: "accepted" }
+  /** The node refused THIS transaction; another node would say the same. */
+  | { kind: "refused"; message: string }
+  /** The node did not take it for a reason of its own; try the other one. */
+  | { kind: "busy"; message: string }
+  /** No telling whether it was taken. */
+  | { kind: "uncertain"; message: string };
+
+/** Codes that describe the node, not the transaction (`Return.response_code`). */
+const NODE_LOCAL_CODES = new Set(["SERVER_BUSY", "NO_CONNECTION", "NOT_ENOUGH_EFFECTIVE_CONNECTION"]);
+
+function readBroadcastAnswer(result: any, txID: string): BroadcastVerdict {
+  if (result?.result === true) return { kind: "accepted" };
+  const code = typeof result?.code === "string" ? result.code : "";
+  const message = tronNodeMessage(result?.message) || code || "Broadcast failed";
+  if (code === "DUP_TRANSACTION_ERROR") {
+    // The node already holds a transaction with this id: an earlier attempt
+    // of THIS send reached the network (TronGrid took it and then timed out,
+    // say, and TronStack heard of it). That is acceptance. Reported as a
+    // failure until 2026-09-29, so the Send form stayed filled and one more
+    // press signed a new transaction and paid twice.
+    const id = typeof result?.txid === "string" ? result.txid.toLowerCase() : "";
+    if (!id || id === txID.toLowerCase()) return { kind: "accepted" };
+    return { kind: "uncertain", message };
+  }
+  if (NODE_LOCAL_CODES.has(code)) return { kind: "busy", message };
+  return { kind: "refused", message };
+}
+
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+/**
+ * Broadcast ONE signed transaction, TronGrid first and TronStack second, and
+ * say whether the network has it (2026-09-29 send-safety audit).
+ *
+ * `tronFetch` used to carry the broadcast, which hides WHY an attempt failed.
+ * For a broadcast that matters: a 429 or a 4xx means the request was not
+ * processed, while a timeout, a dropped connection or a 5xx can come after a
+ * node took the transaction. Once any attempt may have reached a node, a
+ * later refusal no longer proves nothing was sent — the transaction is looked
+ * up by id instead, and if it is still unknown the send ends in
+ * `SendOutcomeUnknownError`, never in "failed" (which kept the form filled
+ * for a second, differently-signed payment).
+ *
+ * Only these bytes are ever re-sent: a TRON transaction is applied once per
+ * id, so re-broadcasting it cannot pay twice.
+ *
+ * Returns `"accepted"` (a node holds it; execution not yet seen) or
+ * `"confirmed"` (seen executed in a block, after an uncertain broadcast).
+ * Throws an ordinary Error for a definite refusal — nothing reached the
+ * network, so another attempt is safe — and whatever `waitForTronExecution`
+ * throws for a transaction that was included and failed.
+ */
+export async function broadcastTronTransaction(
+  txData: { txID: string },
+  label: string,
+): Promise<"accepted" | "confirmed"> {
+  const txID = txData.txID;
+  const body = JSON.stringify(txData);
+  const headers = { "Content-Type": "application/json" };
+  const attempts: Array<() => Promise<{ status: number; text: string }>> = [
+    async () => {
+      await trongridSlot();
+      const r = await fetch(`${TRON_API_URLS[0]}/wallet/broadcasttransaction`, {
+        method: "POST",
+        headers,
+        body,
+      });
+      return { status: r.status, text: await r.text() };
+    },
+    async () => {
+      const r = await httpProxyCall({
+        method: "POST",
+        url: `${TRON_API_URLS[1]}/wallet/broadcasttransaction`,
+        headers,
+        body,
+      });
+      return { status: r.status, text: r.body };
+    },
+  ];
+
+  // Why an attempt MAY have reached a node without saying so (first one wins).
+  let uncertain: string | null = null;
+  let refusal: string | null = null;
+  for (const attempt of attempts) {
+    let answer: { status: number; text: string };
+    try {
+      answer = await attempt();
+    } catch (e) {
+      uncertain ??= `no answer, ${errorText(e)}`;
+      continue;
+    }
+    if (answer.status < 200 || answer.status >= 300) {
+      // A gateway can answer 5xx after the node behind it took the request.
+      if (answer.status >= 500) uncertain ??= `HTTP ${answer.status}`;
+      else refusal ??= `HTTP ${answer.status}`;
+      continue;
+    }
+    let result: unknown;
+    try {
+      result = JSON.parse(answer.text);
+    } catch {
+      uncertain ??= "an unreadable answer";
+      continue;
+    }
+    const verdict = readBroadcastAnswer(result, txID);
+    if (verdict.kind === "accepted") return "accepted";
+    if (verdict.kind === "uncertain") {
+      uncertain ??= verdict.message;
+      continue;
+    }
+    refusal = verdict.message;
+    if (verdict.kind === "refused") break;
+  }
+
+  if (uncertain === null) {
+    // Every node answered, and none took it: nothing was sent.
+    throw new Error(refusal ?? `${label} broadcast failed`);
+  }
+  // Look it up by id. Throws if it was included and failed on chain.
+  if ((await waitForTronExecution(txID)) === "confirmed") return "confirmed";
+  throw new SendOutcomeUnknownError(
+    `TRON gave no clear answer to the ${label} broadcast: ${uncertain}. It is not in a block yet.`,
+    txID,
+  );
+}
+
 /**
  * Derive the TRON wallet at an ARBITRARY HD path. Pwnda's DEFAULT reuses the
  * EVM key (`m/44'/60'/0'/0/0`, via `ethers.Wallet.fromPhrase`); Exodus/Atomic
@@ -285,20 +484,13 @@ export const trxAdapter: ChainAdapter = {
   },
 
   async getBalance(address: string): Promise<string> {
-    // Route through tronFetch for the TronGrid → TronStack fallback so
-    // a 429 / 5xx on the primary doesn't fail the whole call. Previously
-    // used raw fetch on TRONGRID_API only — surfaced as a "GET …
-    // 429 (Too Many Requests)" in the dev console under load.
-    const resp = await tronFetch(`/v1/accounts/${address}`);
-    if (!resp.ok) throw new Error("Failed to fetch TRX balance");
-    const data = await resp.json();
-    // An account that has never received anything is `data: []` — a real
-    // zero. A body without a `data` array is not an answer at all, and the
-    // adapter contract says to throw rather than show 0 for it.
-    if (!Array.isArray(data?.data)) throw new Error("Unexpected TRX balance response");
-    if (data.data.length === 0) return "0.000000";
+    // TronGrid → TronStack fallback, so a 429 / 5xx on the primary doesn't
+    // fail the whole call. Previously used raw fetch on TRONGRID_API only —
+    // surfaced as a "GET … 429 (Too Many Requests)" in the dev console under
+    // load — and then a fallback that asked TronStack for a path it does not
+    // serve (`readTronBalanceSun`).
+    const sun = await readTronBalanceSun(address);
     // Six fixed decimals, as before, but without the float division.
-    const sun = BigInt(data.data[0].balance ?? 0);
     return `${sun / 1_000_000n}.${(sun % 1_000_000n).toString().padStart(6, "0")}`;
   },
 
@@ -348,18 +540,10 @@ export const trxAdapter: ChainAdapter = {
 
     // Broadcast (with fallback). Tron node propagation: regardless of
     // which API mirror accepts the broadcast, the tx fans out across
-    // the actual Tron network within a block, so we don't need to retry
-    // both — first success is final.
-    const broadcastResp = await tronFetch(`/wallet/broadcasttransaction`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(txData),
-    });
-    if (!broadcastResp.ok) throw new Error("Failed to broadcast TRX transaction");
-    const result = await broadcastResp.json();
-    if (!result.result) {
-      throw new Error(tronNodeMessage(result.message) || result.code || "Broadcast failed");
-    }
+    // the actual Tron network within a block, so the first acceptance is
+    // final. A node answering DUP_TRANSACTION_ERROR for this id, or an
+    // answer that never came, is not a failure (`broadcastTronTransaction`).
+    await broadcastTronTransaction(txData, "TRX");
     return { hash: txID };
   },
 

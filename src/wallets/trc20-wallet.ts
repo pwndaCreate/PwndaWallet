@@ -47,8 +47,10 @@ import type {
 import {
   trxAdapter,
   tronFetch,
+  broadcastTronTransaction,
   ethAddressToTron,
   isTronAddress,
+  readTronBalanceSun,
   tronAddressToHex,
   tronNodeMessage,
   waitForTronExecution,
@@ -130,24 +132,28 @@ const accountCache = new Map<string, { v: TronAccountState; at: number }>();
  * TRX balance plus unspent energy and bandwidth. Cached 15 s per address:
  * the Send modal asks on every keystroke, and TronGrid suspends a keyless
  * client for 5 s past 3 requests a second.
+ *
+ * The balance comes from `readTronBalanceSun`, whose TronStack fallback asks
+ * `/wallet/getaccount`. Until 2026-09-29 this read `/v1/accounts` from both
+ * hosts, TronStack answers that path 404, and a TronGrid 429 turned the check
+ * below into "unknown" — which the send then went ahead on.
  */
 async function tronAccountState(address: string, fresh: boolean): Promise<TronAccountState> {
   const hit = accountCache.get(address);
   if (!fresh && hit && Date.now() - hit.at < 15_000) return hit.v;
-  const [acctResp, resResp] = await Promise.all([
-    tronFetch(`/v1/accounts/${address}`),
+  const [balanceSun, resResp] = await Promise.all([
+    readTronBalanceSun(address),
     tronFetch(`/wallet/getaccountresource`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ address, visible: true }),
     }),
   ]);
-  const acct = await acctResp.json();
   const res = await resResp.json();
-  if (!Array.isArray(acct?.data) || res?.Error) throw new Error("TRON account lookup failed");
+  if (!res || typeof res !== "object" || res.Error) throw new Error("TRON account lookup failed");
   const n = (x: unknown) => BigInt(typeof x === "number" ? Math.trunc(x) : 0);
   const v: TronAccountState = {
-    balanceSun: n(acct.data[0]?.balance),
+    balanceSun,
     energyFree: max0(n(res.EnergyLimit) - n(res.EnergyUsed)),
     bandwidthFree:
       max0(n(res.freeNetLimit) - n(res.freeNetUsed)) + max0(n(res.NetLimit) - n(res.NetUsed)),
@@ -198,6 +204,7 @@ async function simulateTransferEnergy(
  * Can `address` pay, in TRX, for a TRC-20 transfer? `requiredSun` is what the
  * transfer would burn after spending the account's free/staked energy and
  * bandwidth; `null` when the prices or the account could not be read.
+ * `accountRead` says whether the account itself was.
  */
 async function trc20Budget(
   contract: string,
@@ -205,7 +212,7 @@ async function trc20Budget(
   address: string,
   opts: { to?: string; amount?: string } | undefined,
   fresh: boolean,
-): Promise<{ budget: GasBudget; requiredSun: bigint | null }> {
+): Promise<{ budget: GasBudget; requiredSun: bigint | null; accountRead: boolean }> {
   const base = { ticker: "TRX", chainName: "TRON", includesAmount: false };
   let state: TronAccountState;
   try {
@@ -213,7 +220,11 @@ async function trc20Budget(
   } catch (e) {
     // Unknown is not zero: say nothing rather than "you have no TRX".
     console.warn("[trc20] account read failed:", e);
-    return { budget: { ...base, available: "0", required: null, sufficient: null }, requiredSun: null };
+    return {
+      budget: { ...base, available: "0", required: null, sufficient: null },
+      requiredSun: null,
+      accountRead: false,
+    };
   }
   let requiredSun: bigint | null = null;
   try {
@@ -251,6 +262,7 @@ async function trc20Budget(
       sufficient,
     },
     requiredSun,
+    accountRead: true,
   };
 }
 
@@ -362,7 +374,7 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
 
       // Refuse before building when this account definitely cannot pay the
       // TRX the transfer burns. Fresh read: this is the decision, not a hint.
-      const { budget, requiredSun } = await trc20Budget(
+      const { budget, requiredSun, accountRead } = await trc20Budget(
         cfg.contract,
         cfg.decimals,
         from,
@@ -378,7 +390,17 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
             : `This address has no TRX to pay for the transfer's energy. Add TRX first.`,
         );
       }
-      if (requiredSun !== null && requiredSun > BigInt(FEE_LIMIT_SUN)) {
+      // An unanswered check is not a passed one (2026-09-29 send-safety
+      // audit). The Send modal may say "unknown"; the send itself must not go
+      // ahead on it, or a transfer this account cannot pay for is built,
+      // broadcast, and runs out of energy — burning the TRX it used.
+      if (!accountRead || requiredSun === null) {
+        throw new Error(
+          `Could not check that this address can pay the TRX a ${cfg.ticker} transfer burns for ` +
+            `energy — the TRON API did not answer. Nothing was sent; try again in a moment.`,
+        );
+      }
+      if (requiredSun > BigInt(FEE_LIMIT_SUN)) {
         throw new Error(
           `This transfer would burn about ${trxText(requiredSun, true)} TRX, above the ` +
             `${trxText(BigInt(FEE_LIMIT_SUN))} TRX fee limit — it would run out of energy. Try again later.`,
@@ -425,22 +447,19 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
           (signature.v === 27 ? "00" : "01"),
       ];
 
-      const broadcast = await tronFetch(`/wallet/broadcasttransaction`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(txData),
-      });
-      if (!broadcast.ok) throw new Error(`Failed to broadcast ${cfg.ticker} transfer`);
-      const result = await broadcast.json();
-      if (!result.result) {
-        throw new Error(tronNodeMessage(result.message) || result.code || `${cfg.ticker} broadcast failed`);
-      }
-      // Accepted into a pool is not executed. Wait for the block and throw if
-      // the transfer failed in it (OUT_OF_ENERGY, REVERT); "pending" after the
-      // wait is not a failure, so the hash is returned as before.
+      // DUP_TRANSACTION_ERROR for this id is acceptance, and an answer that
+      // never came is looked up by id (`broadcastTronTransaction`).
+      const outcome = await broadcastTronTransaction(txData, cfg.ticker);
       accountCache.delete(from);
-      await waitForTronExecution(txData.txID);
-      return { hash: txData.txID };
+      // Already seen executed (the uncertain-broadcast path looked it up).
+      if (outcome === "confirmed") return { hash: txData.txID };
+      // Accepted into a pool is not executed. Wait for the block and throw if
+      // the transfer failed in it (OUT_OF_ENERGY, REVERT). Nothing known yet
+      // after the wait is not a failure: "submitted, not confirmed".
+      const executed = await waitForTronExecution(txData.txID);
+      return executed === "pending"
+        ? { hash: txData.txID, pending: true }
+        : { hash: txData.txID };
     },
 
     async getNetworkInfo(): Promise<NetworkInfo> {
