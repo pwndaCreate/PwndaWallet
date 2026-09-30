@@ -8,7 +8,8 @@
  * signature, and (c) echoes back the same transaction id we computed locally. Run that
  * after touching anything in `algo-tx.ts`.
  */
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519.js";
 import {
   encodeCanonicalMap,
   addressToPublicKey,
@@ -16,7 +17,9 @@ import {
   encodePayTransaction,
   transactionId,
   ALGO_MIN_BALANCE_MICRO,
+  sendAlgo,
 } from "./algo-tx";
+import { algoAddressFromPublicKey } from "./algo-wallet";
 
 const hex = (b: Uint8Array) => Buffer.from(b).toString("hex");
 
@@ -147,5 +150,71 @@ describe("minimum balance", () => {
     // checks it up front and explains it rather than letting algod reject after
     // the user has confirmed.
     expect(ALGO_MIN_BALANCE_MICRO).toBe(100_000n);
+  });
+});
+
+/**
+ * 2026-09-29 send-safety audit: `sendAlgo` checked a hardcoded 0.1 ALGO
+ * minimum, while algod reports each account's own `min-balance` (0.1 plus
+ * 0.1 per asset opted into, more for apps and boxes). An account holding two
+ * assets must keep 0.3 ALGO; the check let it try to spend down to 0.1.
+ */
+describe("sendAlgo keeps the account's own minimum balance (2026-09-29 send-safety audit)", () => {
+  const seed = new Uint8Array(32).fill(9);
+  const from = algoAddressFromPublicKey(ed25519.getPublicKey(seed));
+  const to = algoAddressFromPublicKey(ed25519.getPublicKey(new Uint8Array(32).fill(3)));
+  let account: Record<string, unknown>;
+  let submits: number;
+  const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200 });
+
+  beforeEach(() => {
+    submits = 0;
+    // 5 ALGO, two assets opted in: algod's own figure for the minimum.
+    account = { address: from, amount: 5_000_000, "min-balance": 300_000 };
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (url: string, init?: RequestInit) => {
+        const path = new URL(url).pathname;
+        if (path === "/v2/transactions/params") {
+          return json({
+            "min-fee": 1000,
+            fee: 0,
+            "last-round": 50_000_000,
+            "genesis-id": "mainnet-v1.0",
+            "genesis-hash": Buffer.alloc(32, 7).toString("base64"),
+          });
+        }
+        if (path.startsWith("/v2/accounts/")) return json(account);
+        if (path === "/v2/transactions" && init?.method === "POST") {
+          submits++;
+          return json({}); // no txId: the wallet reports its own
+        }
+        return new Response("not scripted", { status: 500 });
+      }),
+    );
+  });
+  afterEach(() => vi.unstubAllGlobals());
+
+  it("refuses a send that would dip under algod's min-balance, before submitting", async () => {
+    // 4.8 + 0.001 fee + 0.1 = 4.901 passed the old check; 4.8 + 0.001 + 0.3 does not fit in 5.
+    await expect(sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "4.8" })).rejects.toThrow(
+      /must keep 0\.3 ALGO .* short by 0\.101 ALGO/,
+    );
+    expect(submits).toBe(0);
+  });
+
+  it("sends right up to it", async () => {
+    await expect(
+      sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "4.699" }),
+    ).resolves.toEqual({ hash: expect.stringMatching(/^[A-Z2-7]{52}$/) });
+    expect(submits).toBe(1);
+  });
+
+  it("falls back to 0.1 ALGO only when algod does not report a minimum", async () => {
+    delete account["min-balance"];
+    await expect(sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "4.95" })).rejects.toThrow(
+      /must keep 0\.1 ALGO/,
+    );
+    await expect(sendAlgo({ privateKey: seed, fromAddress: from, to, amount: "4.8" })).resolves.toBeTruthy();
   });
 });

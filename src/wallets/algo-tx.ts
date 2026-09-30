@@ -33,7 +33,7 @@
  * same bytes that are signed, which is why a correct txId is decent evidence the
  * encoding is right.
  */
-import { decimalToAtomic } from "./decimal-amount";
+import { atomicToDecimal, decimalToAtomic } from "./decimal-amount";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { sha512_256 } from "@noble/hashes/sha2.js";
 import { base32 } from "@scure/base";
@@ -44,11 +44,33 @@ const ALGO_API = "https://mainnet-api.algonode.cloud";
 const MICRO = 1_000_000n;
 
 /**
- * Algorand's minimum account balance. An account must retain this much or the
- * transaction fails; it rises by 0.1 ALGO per asset opted into. Surfaced to the
- * caller rather than silently deducted — see `sendAlgo`.
+ * Algorand's minimum account balance for a bare account. An account must
+ * retain its minimum or the transaction fails; the minimum rises by 0.1 ALGO
+ * per asset opted into (and more for apps and boxes). `sendAlgo` uses the
+ * account's own figure, algod's `min-balance`, and this only when algod does
+ * not report one — see `accountMinBalance`.
  */
 export const ALGO_MIN_BALANCE_MICRO = 100_000n;
+
+/**
+ * The minimum balance THIS account must keep, in microAlgos: algod's
+ * `min-balance`, which counts every asset, app and box the account holds.
+ *
+ * Until 2026-09-29 (send-safety audit) the check used 0.1 ALGO for every
+ * account, so an account holding two assets (minimum 0.3) could be offered a
+ * send that algod then refused. Falls back to the bare-account 0.1 only when
+ * the field is absent or not a whole number.
+ */
+export function accountMinBalance(account: unknown): bigint {
+  const v = (account as Record<string, unknown> | null)?.["min-balance"];
+  if (typeof v === "number" && Number.isSafeInteger(v) && v >= 0) return BigInt(v);
+  return ALGO_MIN_BALANCE_MICRO;
+}
+
+/** microAlgos as ALGO, exact, trailing zeros dropped. */
+function algoText(micro: bigint): string {
+  return atomicToDecimal(micro, 6);
+}
 
 // ─── canonical msgpack (the subset Algorand uses) ───────────────────────
 
@@ -317,13 +339,14 @@ export async function sendAlgo(args: {
   if (balResp.ok) {
     const acct = await balResp.json();
     const balance = BigInt(acct.amount ?? 0);
-    const required = amountMicro + params.fee + ALGO_MIN_BALANCE_MICRO;
+    const minBalance = accountMinBalance(acct);
+    const required = amountMicro + params.fee + minBalance;
     if (balance < required) {
-      const short = Number(required - balance) / 1e6;
       throw new Error(
-        `Not enough ALGO. This send needs ${Number(amountMicro) / 1e6} plus ` +
-          `${Number(params.fee) / 1e6} fee and Algorand's ${Number(ALGO_MIN_BALANCE_MICRO) / 1e6} ` +
-          `minimum balance, which every account must keep — short by ${short.toFixed(6)} ALGO.`,
+        `Not enough ALGO. This send needs ${algoText(amountMicro)} plus the ${algoText(params.fee)} ` +
+          `fee, and this account must keep ${algoText(minBalance)} ALGO — Algorand's minimum balance, ` +
+          `which rises with every asset or app an account holds — short by ` +
+          `${algoText(required - balance)} ALGO.`,
       );
     }
   }

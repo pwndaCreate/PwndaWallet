@@ -330,7 +330,45 @@ interface UnspentBox {
   index: number;
 }
 
-function greedySelectBoxes(boxes: UnspentBox[], needed: bigint): UnspentBox[] {
+/** Boxes per explorer page, and the most pages one send reads (10,000 boxes). */
+const BOX_PAGE = 200;
+const MAX_BOX_PAGES = 50;
+
+/**
+ * Every unspent box at `address`, page by page (2026-09-29 send-safety audit).
+ *
+ * The send read `offset=0&limit=200` only. A mining payout address collects
+ * a box per payout, so past 200 the send saw part of the balance: it refused
+ * with "Insufficient balance: have X ERG" beside a dashboard showing more,
+ * and picked its "largest first" from whichever 200 the explorer returned.
+ * Boxes are keyed by id, so a box that moves between pages while paging is
+ * counted once. `complete` is false only when the page cap stopped the read.
+ */
+async function fetchUnspentBoxes(address: string): Promise<{ boxes: UnspentBox[]; complete: boolean }> {
+  type Page = { items?: UnspentBox[]; total?: number };
+  const byId = new Map<string, UnspentBox>();
+  for (let page = 0; page < MAX_BOX_PAGES; page++) {
+    const resp = await ergoGet<Page>(
+      `/boxes/unspent/byAddress/${address}?offset=${page * BOX_PAGE}&limit=${BOX_PAGE}`,
+    ).catch((e: unknown): Page => {
+      // Explorer v1 sometimes returns 404 instead of empty when the address
+      // has never been funded. Treat as zero boxes.
+      if (e instanceof ErgoRpcError && e.attempts.every((a) => a.status === 404)) {
+        return { items: [] };
+      }
+      throw e;
+    });
+    const items = resp.items ?? [];
+    for (const b of items) byId.set(b.boxId, b);
+    const read = (page + 1) * BOX_PAGE;
+    if (items.length < BOX_PAGE || (typeof resp.total === "number" && read >= resp.total)) {
+      return { boxes: [...byId.values()], complete: true };
+    }
+  }
+  return { boxes: [...byId.values()], complete: false };
+}
+
+function greedySelectBoxes(boxes: UnspentBox[], needed: bigint, complete = true): UnspentBox[] {
   // Sort by value desc → minimize input count.
   const sorted = [...boxes].sort((a, b) => {
     const av = BigInt(a.value);
@@ -345,7 +383,11 @@ function greedySelectBoxes(boxes: UnspentBox[], needed: bigint): UnspentBox[] {
     if (total >= needed) return out;
   }
   throw new Error(
-    `Insufficient balance: have ${nanoErgToErg(total)} ERG, need ${nanoErgToErg(needed)} ERG`,
+    complete
+      ? `Insufficient balance: have ${nanoErgToErg(total)} ERG, need ${nanoErgToErg(needed)} ERG`
+      : `Not enough ERG in the ${sorted.length} largest boxes this wallet read: they hold ` +
+          `${nanoErgToErg(total)} ERG and this send needs ${nanoErgToErg(needed)} ERG. This address ` +
+          `holds more boxes than one send reads; send a smaller amount first to combine them.`,
   );
 }
 
@@ -379,23 +421,12 @@ async function sendTransaction(
     );
   }
 
-  // 1. Fetch unspent boxes + current height in parallel.
-  const [boxesResp, info] = await Promise.all([
-    ergoGet<{ items: UnspentBox[] }>(
-      `/boxes/unspent/byAddress/${fromAddress}?offset=0&limit=200`,
-    ).catch((e: unknown) => {
-      // Explorer v1 sometimes returns 404 instead of empty when the address
-      // has never been funded. Treat as zero boxes.
-      if (e instanceof ErgoRpcError) {
-        const all404 = e.attempts.every((a) => a.status === 404);
-        if (all404) return { items: [] };
-      }
-      throw e;
-    }),
+  // 1. Fetch every unspent box (all pages) + current height in parallel.
+  const [{ boxes, complete }, info] = await Promise.all([
+    fetchUnspentBoxes(fromAddress),
     ergoGet<{ height: number }>(`/info`),
   ]);
 
-  const boxes = boxesResp.items ?? [];
   if (boxes.length === 0) {
     throw new Error("No unspent boxes for sender address");
   }
@@ -403,7 +434,7 @@ async function sendTransaction(
   // 2. Greedy box selection covering amount + fee + dust-headroom for change.
   const fee = RECOMMENDED_MIN_FEE_VALUE; // bigint
   const needed = amountNano + fee + SAFE_MIN_BOX_VALUE;
-  const selected = greedySelectBoxes(boxes, needed);
+  const selected = greedySelectBoxes(boxes, needed, complete);
 
   // 3. Compute change. If change would be dust, refuse (PR-6c will add Send Max).
   const inSum = selected.reduce((s, b) => s + BigInt(b.value), 0n);
