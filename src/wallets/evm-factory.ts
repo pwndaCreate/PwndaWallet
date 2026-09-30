@@ -15,7 +15,9 @@ import {
   fallbackGasLimit,
   gasTokenFor,
   totalNativeRequired,
+  withGasMargin,
 } from "./evm-gas";
+import { sendEvmTransfer } from "./evm-send";
 import { proxyGetJson } from "./_proxy";
 import { withFallback as withUrlFallback } from "./_fallback";
 
@@ -90,7 +92,13 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
     return new ethers.JsonRpcProvider(url);
   }
 
-  /** Try an async operation across all RPC endpoints until one succeeds */
+  /**
+   * Try an async operation across all RPC endpoints until one succeeds.
+   *
+   * For READS only. It reruns `fn` from the top on the next endpoint after any
+   * error, which is harmless for a read and was a double-send for the send
+   * that used to run inside it (2026-09-29 send-safety audit; `evm-send.ts`).
+   */
   async function withFallback<T>(fn: (provider: ethers.JsonRpcProvider) => Promise<T>): Promise<T> {
     let lastError: any;
     for (const url of allRpcUrls) {
@@ -188,28 +196,35 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
       });
     },
 
+    /**
+     * Sign once, broadcast the same bytes, settle by hash: `evm-send.ts`.
+     *
+     * 2026-09-29 send-safety audit: this ran sign + broadcast + `tx.wait()`
+     * inside `withFallback`, so an error after a node had already taken the
+     * transfer (a receipt read, the `eth_blockNumber` ethers batches with the
+     * broadcast, a 5xx on the broadcast reply) re-ran everything on the next
+     * RPC: a fresh pending nonce, a NEW signature, a second transfer. It also
+     * reported a send that landed as failed, and waited for a receipt forever.
+     */
     async sendTransaction(
       privateKey: string,
       to: string,
       amount: string
     ): Promise<TxResult> {
-      return withFallback(async (provider) => {
-        const wallet = new ethers.Wallet(privateKey, provider);
-
-        if (tokenContract) {
-          const contract = new ethers.Contract(tokenContract, ERC20_ABI, wallet);
-          const parsedAmount = ethers.parseUnits(amount, tokenDecimals);
-          const tx = await contract.transfer(to, parsedAmount);
-          await tx.wait();
-          return { hash: tx.hash };
-        } else {
-          const tx = await wallet.sendTransaction({
-            to,
-            value: ethers.parseEther(amount),
-          });
-          await tx.wait();
-          return { hash: tx.hash };
-        }
+      const gas = gasTokenFor(chainId);
+      return sendEvmTransfer({
+        privateKey,
+        to,
+        amount,
+        urls: allRpcUrls,
+        chainId,
+        // A token adapter's displayName is "USDC (Arbitrum)"; messages about
+        // the network and its fee coin need "Arbitrum" and "ETH".
+        chainName: gas?.chainName ?? displayName,
+        ticker,
+        gasTicker: gas?.ticker ?? ticker,
+        tokenContract,
+        decimals: tokenContract ? tokenDecimals : 18,
       });
     },
 
@@ -380,23 +395,31 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
           const price = feeData.maxFeePerGas ?? feeData.gasPrice;
           if (!price) throw new Error("no fee data");
 
+          // Trimmed as the send trims them (2026-09-29): a pasted trailing
+          // space used to fail the estimate as an ENS lookup.
+          const to = opts?.to?.trim() ?? "";
+          const amount = opts?.amount?.trim() ?? "";
           let gasLimit: bigint;
-          if (opts?.to && opts.to.trim() && opts?.amount) {
+          if (to && amount) {
             // Simulate the real call, from this address, so the estimate is
             // the one the chain would actually charge.
-            const parsed = ethers.parseUnits(opts.amount, tokenDecimals);
+            const parsed = ethers.parseUnits(amount, tokenDecimals);
+            let estimate: bigint;
             if (tokenContract) {
               const c = new ethers.Contract(tokenContract, ERC20_ABI, provider);
-              gasLimit = await c.transfer.estimateGas(opts.to, parsed, {
+              estimate = await c.transfer.estimateGas(to, parsed, {
                 from: address,
               });
             } else {
-              gasLimit = await provider.estimateGas({
+              estimate = await provider.estimateGas({
                 from: address,
-                to: opts.to,
+                to,
                 value: parsed,
               });
             }
+            // The limit the send will sign, not the bare estimate: the node
+            // checks the balance against that (`withGasMargin`).
+            gasLimit = withGasMargin(estimate);
           } else {
             gasLimit = fallbackGasLimit(chainId, Boolean(tokenContract));
           }
@@ -404,10 +427,7 @@ export function createEvmAdapter(config: EvmChainConfig): ChainAdapter {
           // `parseUnits(amount, tokenDecimals)` is correct for the native
           // leg too: `tokenDecimals` defaults to 18 and is overridden only on
           // token adapters, where the amount is not added anyway.
-          const amountWei =
-            opts?.amount && opts.amount.trim()
-              ? ethers.parseUnits(opts.amount, tokenDecimals)
-              : 0n;
+          const amountWei = amount ? ethers.parseUnits(amount, tokenDecimals) : 0n;
           return totalNativeRequired(
             gasLimit * price,
             amountWei,

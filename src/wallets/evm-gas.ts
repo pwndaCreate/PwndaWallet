@@ -115,6 +115,31 @@ export function fallbackGasLimit(
   return isToken ? FALLBACK_ERC20_GAS : FALLBACK_NATIVE_GAS;
 }
 
+/** Headroom on a node's gas estimate, in percent. See {@link withGasMargin}. */
+export const GAS_LIMIT_MARGIN_PERCENT = 20n;
+
+/**
+ * The gas limit to sign for a node's `eth_estimateGas` answer (2026-09-29
+ * send-safety audit).
+ *
+ * An estimate describes the chain at the moment it was asked; the transfer
+ * runs seconds later. On Arbitrum the estimate also folds in an L1 data cost
+ * that moves with L1 fees. A limit of exactly the estimate can run out of gas,
+ * which reverts the transfer and still spends the fee. The send path before
+ * this date signed the bare estimate (ethers' default), so this is new.
+ *
+ * A plain value transfer (an estimate of exactly 21,000) gets no margin. That
+ * cost is fixed by the protocol for a recipient without code, while a node
+ * checks `value + gasLimit x maxFeePerGas` against the balance up front: the
+ * margin would refuse a send of nearly the whole balance for headroom it can
+ * never use. `getGasBudget` prices the same limit, so the modal's "enough
+ * gas?" answer matches what the node will check.
+ */
+export function withGasMargin(estimate: bigint): bigint {
+  if (estimate <= FALLBACK_NATIVE_GAS) return estimate;
+  return estimate + (estimate * GAS_LIMIT_MARGIN_PERCENT + 99n) / 100n;
+}
+
 /**
  * Can `availableWei` cover `requiredWei`?
  *
