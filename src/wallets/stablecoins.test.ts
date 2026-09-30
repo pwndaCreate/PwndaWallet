@@ -5,8 +5,13 @@ import {
   groupStablecoins,
   isStablecoinChain,
   stablecoinNetworkFor,
+  stablecoinRailGroups,
+  tokenLegsHeldBy,
 } from "./stablecoins";
 import { getAdapter, ALL_CHAINS } from "./index";
+import { deriveTrxAtPath, trxAdapter } from "./trx-wallet";
+import { usdtTronAdapter } from "./trc20-wallet";
+import { readFileSync } from "node:fs";
 import type { ChainType } from "./types";
 import { SOURCE_CAPABLE_BLOCKCHAINS } from "../features/swap/intents-source-capability";
 
@@ -142,6 +147,105 @@ describe("groupStablecoins — stacking, and what a missing balance means", () =
         SOURCE_CAPABLE_BLOCKCHAINS.has(id as never),
         `${n.chain} advertises a NEAR route but ${n.parent} has no source signer`,
       ).toBe(true);
+    }
+  });
+});
+
+/**
+ * USDT on TRON must sit on the same account as TRX (2026-09-29).
+ *
+ * The TRC-20 adapter derives by delegating to TRON's DEFAULT derivation. A
+ * derivation choice (an Exodus/Atomic import puts TRX on TRX's own coin type,
+ * m/44'/195'/...) moved `tron` and left `usdt-tron` behind, so the dashboard
+ * showed two different TRON addresses, USDT's without the TRX its sends burn
+ * for energy, and a swap paying out USDT landed where the TRX row was not.
+ */
+describe("token legs follow their parent's chosen path", () => {
+  const ABANDON =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+  it("moves USDT on TRON to wherever TRON was derived", () => {
+    const tronAlt = deriveTrxAtPath(ABANDON, "m/44'/195'/0'/0/0");
+    const legs = tokenLegsHeldBy("tron", tronAlt);
+    expect(legs["usdt-tron"]?.address).toBe(tronAlt.address);
+    expect(legs["usdt-tron"]?.privateKey).toBe(tronAlt.privateKey);
+    expect(legs["usdt-tron"]?.chain).toBe("usdt-tron");
+    // The adapter on its own still derives the default path, which is the
+    // divergence this closes.
+    expect(usdtTronAdapter.deriveFromMnemonic(ABANDON).address).not.toBe(tronAlt.address);
+  });
+
+  it("changes nothing on the default path", () => {
+    const legs = tokenLegsHeldBy("tron", trxAdapter.deriveFromMnemonic(ABANDON));
+    expect(legs["usdt-tron"]).toEqual(usdtTronAdapter.deriveFromMnemonic(ABANDON));
+  });
+
+  it("returns nothing for a coin with no token legs, or no parent entry", () => {
+    expect(tokenLegsHeldBy("xrp", trxAdapter.deriveFromMnemonic(ABANDON))).toEqual({});
+    expect(tokenLegsHeldBy("tron", undefined)).toEqual({});
+  });
+
+  it("is applied at unlock, on a single-coin path change and on a profile switch", () => {
+    // Wiring check: those are the three places `useVault` re-derives TRON
+    // from a derivation choice. Missing one reopens the split for that flow.
+    const src = readFileSync(
+      new URL("../features/vault/useVault.ts", import.meta.url),
+      "utf8",
+    );
+    expect(src).toContain('Object.assign(newWallets, tokenLegsHeldBy("tron", perChoice.tron));');
+    expect(src).toContain("...tokenLegsHeldBy(coin, next[coin]),");
+    expect(src).toContain('...tokenLegsHeldBy("tron", next.tron),');
+  });
+});
+
+/**
+ * Every stablecoin family is listed whether or not anything is held.
+ *
+ * Reported 2026-09-29: "I don't see USDT or USDC provided in the pwnda wallet,
+ * I don't see any UI for it." Both layouts dropped a family until something
+ * was held, so a wallet that had never held a stablecoin had no row to
+ * receive one into, in either layout. USDC and USDT were listed always that
+ * day, and then every family: "show even if it has a 0 balance, let this be
+ * true for any other assets that might have the same or similar attribute".
+ */
+describe("the stablecoin rows the wallet lists", () => {
+  it("lists USDC and USDT on an empty wallet", () => {
+    const groups = stablecoinRailGroups({});
+    expect(groups.map((g) => g.symbol)).toEqual(["USDC", "USDT"]);
+    // Nothing read yet: "—", not a claimed zero.
+    for (const g of groups) expect(g.total).toBeNull();
+  });
+
+  it("reaches every leg in the registry at a zero balance", () => {
+    const zeros = Object.fromEntries(STABLECOIN_NETWORKS.map((n) => [n.chain, "0"]));
+    const groups = stablecoinRailGroups(zeros);
+    const listed = groups.flatMap((g) => g.rows.map((r) => r.chain)).sort();
+    expect(listed).toEqual(STABLECOIN_NETWORKS.map((n) => n.chain).sort());
+    for (const g of groups) expect(g.total).toBe(0);
+    // Control: USD₮0 is a family of its own in the registry, so "every leg is
+    // reachable" is not just "every family has a row".
+    expect(STABLECOINS.map((f) => f.symbol)).toContain("USDT0");
+  });
+
+  it("files USD₮0 under USDT, labelled, and counts it into the total", () => {
+    const usdt = stablecoinRailGroups({ "usdt0-arb": "12.5", "usdt-tron": "1" }).find(
+      (g) => g.symbol === "USDT",
+    )!;
+    const arb = usdt.rows.find((r) => r.chain === "usdt0-arb")!;
+    expect(arb.network).toBe("Arbitrum · USD₮0");
+    expect(usdt.total).toBe(13.5);
+    // No separate USD₮0 family row left behind.
+    expect(stablecoinRailGroups({ "usdt0-arb": "12.5" }).map((g) => g.symbol)).toEqual([
+      "USDC",
+      "USDT",
+    ]);
+  });
+
+  it("is the one rule both layouts use", () => {
+    const portrait = readFileSync(new URL("../features/wallet/DashboardView.tsx", import.meta.url), "utf8");
+    const landscape = readFileSync(new URL("../features/wallet/WalletLandscapeView.tsx", import.meta.url), "utf8");
+    for (const src of [portrait, landscape]) {
+      expect(src).toContain("stablecoinRailGroups(balancesByChain)");
     }
   });
 });

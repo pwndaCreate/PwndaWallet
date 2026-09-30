@@ -116,6 +116,18 @@ export const COIN_METADATA: Record<ChainType, CoinMeta> = {
     color: "#2775ca",
     addressPlaceholder: "0x...",
   },
+  "usdc-monad": {
+    ticker: "USDC",
+    displayName: "USDC (Monad)",
+    color: "#2775ca",
+    addressPlaceholder: "0x...",
+  },
+  "usdt0-monad": {
+    ticker: "USDT0",
+    displayName: "USD₮0 (Monad)",
+    color: "#26a17b",
+    addressPlaceholder: "0x...",
+  },
   "usdc-bsc": {
     ticker: "USDC",
     displayName: "USDC (BNB Chain)",
@@ -355,7 +367,7 @@ export const ALL_CHAINS: ChainType[] = Object.keys(COIN_METADATA) as ChainType[]
 
 /**
  * Canonical display order for assets — roughly market cap / prominence
- * (2026), with stablecoins grouped last. Display-only: it has NO effect on
+ * (2026). Display-only: it has NO effect on
  * derivation, balances, or routing. Two consumers share it so the wallet
  * and the swap feel consistent:
  *   - the swap asset pickers (`getDropdownTickers`) render in this order;
@@ -365,15 +377,18 @@ export const ALL_CHAINS: ChainType[] = Object.keys(COIN_METADATA) as ChainType[]
  * Tickers not listed sort to the end — callers add a stable secondary key.
  */
 export const CANONICAL_ASSET_ORDER: readonly string[] = [
-  // Majors, descending market cap (approx, 2026).
-  "BTC", "ETH", "SOL", "BNB", "XRP", "ADA", "DOGE", "AVAX", "TRX", "POL",
+  // Majors, descending market cap (approx, 2026). USDT and USDC sit where
+  // their market caps put them (2026-09-29). They were "grouped last", which
+  // left them at the bottom of an 18-row swap picker and — once the wallet
+  // began listing them at $0 — at the bottom of the asset list, and they were
+  // reported as missing from both: "I don't see USDT or USDC anywhere".
+  "BTC", "ETH", "USDT", "SOL", "BNB", "XRP", "USDC", "ADA", "DOGE", "AVAX", "TRX", "POL",
   "LTC", "BCH", "NEAR", "XLM", "SUI", "APT", "DASH", "MON", "FLR",
   // Long-tail L1s Pwnda surfaces.
   "RVN", "CFX", "HBAR", "ALGO", "ERG",
   // Privacy + Pwnda-native Zephyr ecosystem.
   "XMR", "ZEPH", "ZEPHUSD", "ZEPHRSV", "ZEPHYRS", "ZANO", "XEL",
-  // Stablecoins grouped last.
-  "USDC", "USDT", "DAI",
+  "DAI",
 ];
 
 const ASSET_RANK: ReadonlyMap<string, number> = new Map(

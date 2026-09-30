@@ -7,10 +7,12 @@ import { CANONICAL_ASSET_ORDER, assetRank } from "./coin-metadata";
  * portfolio tiebreak, so the two surfaces feel consistent.
  */
 describe("assetRank — canonical asset ordering", () => {
-  it("leads with BTC, ETH, SOL", () => {
+  it("leads with BTC, ETH, then USDT by market cap", () => {
     expect(assetRank("BTC")).toBe(0);
     expect(assetRank("ETH")).toBe(1);
-    expect(assetRank("SOL")).toBe(2);
+    // Since 2026-09-29 (see the next test): USDT is third, not last.
+    expect(assetRank("USDT")).toBe(2);
+    expect(assetRank("SOL")).toBe(3);
   });
 
   it("is case-insensitive", () => {
@@ -18,15 +20,18 @@ describe("assetRank — canonical asset ordering", () => {
     expect(assetRank("Eth")).toBe(assetRank("ETH"));
   });
 
-  it("ranks every native before the stablecoins", () => {
-    const stableMin = Math.min(
-      assetRank("USDC"),
-      assetRank("USDT"),
-      assetRank("DAI")
-    );
-    for (const native of ["BTC", "ETH", "SOL", "ADA", "XMR", "ZEPH"]) {
-      expect(assetRank(native)).toBeLessThan(stableMin);
+  it("ranks USDT and USDC among the majors, where a user looks for them", () => {
+    // Until 2026-09-29 this asserted the opposite: every native before any
+    // stablecoin. That put USDC and USDT at the foot of an 18-row swap picker
+    // and at the foot of the asset list, and the operator reported them
+    // missing from both. They now rank by market cap, like everything else.
+    expect(assetRank("USDT")).toBeLessThan(assetRank("SOL"));
+    expect(assetRank("USDC")).toBeLessThan(assetRank("ADA"));
+    for (const later of ["ADA", "XMR", "ZEPH"]) {
+      expect(assetRank(later)).toBeGreaterThan(assetRank("USDC"));
     }
+    // Legs rank as their symbol: USD₮0 on Arbitrum sorts with USDT.
+    expect(assetRank("USDT0-ARB")).toBe(assetRank("USDT"));
   });
 
   it("sends unknown tickers to the end", () => {

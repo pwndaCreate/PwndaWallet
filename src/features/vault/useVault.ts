@@ -6,6 +6,7 @@ import {
   type NetworkInfo,
   type WalletInfo,
 } from "../../wallets";
+import { tokenLegsHeldBy } from "../../wallets/stablecoins";
 import {
   saveVault,
   loadVault,
@@ -388,6 +389,13 @@ export function useVault(args: {
       newWallets.tron = perChoice.tron;
       newWallets.ravencoin = perChoice.ravencoin;
       newWallets.dash = perChoice.dash;
+      // USDT on TRON is a balance OF the TRON account, so it follows TRON's
+      // chosen path; its adapter alone re-derives the default one (2026-09-29).
+      // Solana's SPL legs have the same shape and stay on their adapters'
+      // default here for now: moving them changes where existing USDC/USDT
+      // balances on Solana are read from, which is its own decision (log.md
+      // 2026-09-29).
+      Object.assign(newWallets, tokenLegsHeldBy("tron", perChoice.tron));
       return newWallets;
     },
     []
@@ -1412,7 +1420,13 @@ export function useVault(args: {
         await saveVault(updated, sessionPassword, activeWalletId);
         setActiveDerivationChoice(nextChoice);
         const next = derivePerChoice(payload.bip39, nextChoice);
-        setWalletsByChain((prev) => ({ ...prev, [coin]: next[coin] }));
+        // The coin's token legs move with it (USDT with TRON; none for the
+        // other three) — see `tokenLegsHeldBy`.
+        setWalletsByChain((prev) => ({
+          ...prev,
+          [coin]: next[coin],
+          ...tokenLegsHeldBy(coin, next[coin]),
+        }));
         setSuccess(`${coin.toUpperCase()} derivation updated.`);
       } catch (e: any) {
         setError(`Failed to update ${coin} derivation: ` + (e?.message || String(e)));
@@ -1468,6 +1482,7 @@ export function useVault(args: {
           litecoin: next.litecoin,
           xrp: next.xrp,
           tron: next.tron,
+          ...tokenLegsHeldBy("tron", next.tron),
           ravencoin: next.ravencoin,
           dash: next.dash,
         }));

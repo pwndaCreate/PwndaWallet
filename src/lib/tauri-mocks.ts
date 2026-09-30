@@ -2287,6 +2287,11 @@ function intentsTokenCatalog(): Array<{
     { assetId: "nep141:xrp.omft.near", decimals: 6, blockchain: "xrp", symbol: "XRP", price: priceFor("XRP") },
     { assetId: "nep141:tron.omft.near", decimals: 6, blockchain: "tron", symbol: "TRX", price: priceFor("TRX") },
     { assetId: "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near", decimals: 6, blockchain: "tron", symbol: "USDT", price: priceFor("USDT") },
+    // LTC (2026-09-29). Missing until now, so every LTC pair's MIN answered
+    // "NEAR's token list does not carry both assets" in the sandbox — the
+    // fixture gap the note above warns about, met while re-checking the
+    // LTC → TRX report. The live catalog carries it.
+    { assetId: "nep141:ltc.omft.near", decimals: 8, blockchain: "ltc", symbol: "LTC", price: priceFor("LTC") },
   ];
 }
 

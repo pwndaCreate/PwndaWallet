@@ -438,6 +438,18 @@ export const NEAR_INTENTS_ASSETS: readonly IntentsAsset[] = [
     blockchain: "pol",
     contractAddress: "0xc2132d05d31c914a87c6611c10748aeb04b58e8f",
   },
+  // Monad USD₮0 (2026-09-29), added by hand beside the curated rows: a full
+  // re-sync now yields 148 assets (was 45) and would change the multi-chain
+  // inputs for ETH/BTC/etc. (see log.md 2026-09-29). Filed under USDT like the
+  // Arbitrum and Polygon USD₮0 rows. Contract verified on chain (symbol USDT0).
+  {
+    assetId: "nep245:v2_1.omni.hot.tg:143_4EJiJxSALvGoTZbnc8K7Ft9533et",
+    symbol: "USDT",
+    displayName: "USDT (Monad / USDT0)",
+    decimals: 6,
+    blockchain: "monad",
+    contractAddress: "0xe7cd86e13ac4309349f30b3435a9d337750fc82d",
+  },
   // OP USDT under nep245 (2026-05-08).
   {
     assetId: "nep245:v2_1.omni.hot.tg:10_359RPSJVdTxwTJT9TyGssr2rFoWo",

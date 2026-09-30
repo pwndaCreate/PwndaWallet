@@ -536,10 +536,23 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
     : isIn
       ? "var(--accent)"
       : "var(--warn)";
+  // `confirmations: undefined` means the adapter gives no count, NOT zero
+  // (`ChainTx`: "0 = unconfirmed/in-mempool"). TRON history is fetched
+  // confirmed-only and carries a block height instead. Portrait always read
+  // it that way; this panel read it as 0 and labelled final TRON payments
+  // "unconfirmed / 0 of 6 / PENDING" (seen 2026-09-29).
+  const counted = detail.confirmations !== undefined;
   const conf = detail.confirmations ?? 0;
   const finalThreshold = 6;
-  const status =
-    conf >= finalThreshold ? "confirmed" : conf > 0 ? "pending" : "unconfirmed";
+  const status = !counted
+    ? detail.height
+      ? "confirmed"
+      : "—"
+    : conf >= finalThreshold
+      ? "confirmed"
+      : conf > 0
+        ? "pending"
+        : "unconfirmed";
 
   const onCopy = () => navigator.clipboard.writeText(detail.hash);
   const onExplorer = () => {
@@ -624,7 +637,7 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
           k="block"
           v={detail.height ? detail.height.toLocaleString() : "—"}
         />
-        <DetailRow k="confirmations" v={`${conf}`} />
+        <DetailRow k="confirmations" v={counted ? `${conf}` : "—"} />
         <DetailRow
           k="fee"
           v={
@@ -644,7 +657,8 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
         <DetailRow k="when" v={fmtRelative(detail.timestamp)} />
       </div>
 
-      {/* confirmations progress */}
+      {/* confirmations progress — only for chains that report a count */}
+      {counted && (
       <div style={{ marginTop: 4 }}>
         <div
           style={{
@@ -680,6 +694,7 @@ function DetailPanel({ detail }: { detail: ChainTx }) {
           </span>
         </div>
       </div>
+      )}
 
       <div style={{ flex: 1 }} />
 

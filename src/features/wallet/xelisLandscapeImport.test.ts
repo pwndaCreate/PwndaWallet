@@ -11,7 +11,8 @@
  *  - 2026-08-28: portrait's asset list left ZANO out of `CANONICAL_DEFAULTS`,
  *    so the chain could never become active and its panel was unreachable for a
  *    day, in both layouts. (That hand list was replaced on 2026-09-16 by the
- *    shared `importableChains` / `isAlwaysListed`, keyed on the adapter flag.)
+ *    shared `importableChains`, keyed on the adapter flag; since 2026-09-29
+ *    portrait does not collapse its list at all.)
  *
  * Source assertions, like `layout-parity.test.ts`: these views need a full app
  * context to render.
@@ -19,7 +20,7 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { importableChains, isAlwaysListed } from "./wallet-surface";
+import { importableChains } from "./wallet-surface";
 
 const read = (rel: string) =>
   readFileSync(resolve(__dirname, rel), "utf8").replace(/\r\n/g, "\n");
@@ -58,9 +59,10 @@ describe("landscape reaches the Xelis import panel with no Xelis wallet", () => 
 describe("Xelis can be selected in the first place", () => {
   // Until 2026-09-16 the first assertion here read portrait's hand-kept
   // `CANONICAL_DEFAULTS` ticker set for "XEL". That set is gone: both layouts
-  // now list a not-yet-imported Xelis through the same helper, and portrait's
-  // collapse keeps a held one by the same adapter flag. So the reachability
-  // this pins is now the helper's behaviour plus both views calling it.
+  // now list a not-yet-imported Xelis through the same helper, and since
+  // 2026-09-29 neither hides a held one for having a zero balance
+  // (`layout-parity.test.ts`). So the reachability this pins is the helper's
+  // behaviour plus both views calling it.
   it("the shared helper offers an import row for Xelis until a wallet exists", () => {
     expect(importableChains({})).toContain("xelis");
     expect(
@@ -68,8 +70,6 @@ describe("Xelis can be selected in the first place", () => {
         xelis: { chain: "xelis", address: "", mnemonic: "", privateKey: "" },
       }),
     ).not.toContain("xelis");
-    // A held Xelis wallet with no balance is never collapsed away in portrait.
-    expect(isAlwaysListed("xelis")).toBe(true);
   });
 
   it("both layouts render those rows", () => {

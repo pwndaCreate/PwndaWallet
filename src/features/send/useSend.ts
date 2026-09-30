@@ -1,7 +1,13 @@
 import { useCallback, useState } from "react";
 import { shouldUseAccountSend } from "./accountSend";
 import { sendFailureText } from "./sendErrors";
-import { setSendAssetType, useSendAssetType } from "./sendAssetStore";
+import {
+  getSendDestinationTag,
+  parseDestinationTag,
+  setSendAssetType,
+  setSendDestinationTag,
+  useSendAssetType,
+} from "./sendAssetStore";
 import { quoteMatchesSend } from "../../wallets/send-quote";
 import type {
   ChainAdapter,
@@ -110,11 +116,14 @@ export function useSend(args: {
     // funnel that makes every other call site safe by construction.
     // See the 2026-08-25 entry in `PwndaWalletVault/log.md`.
     setSendAssetType(typeof assetType === "string" ? assetType : undefined);
+    // A tag typed for one send must never ride along on the next.
+    setSendDestinationTag("");
     setShowSendModal(true);
   }, []);
   const closeSendModal = useCallback(() => {
     setShowSendModal(false);
     setSendAssetType(undefined);
+    setSendDestinationTag("");
   }, []);
 
   /**
@@ -202,6 +211,15 @@ export function useSend(args: {
           ? quoteArg
           : null;
 
+      // XRP's destination tag (2026-09-29), from the field the modal shows —
+      // read once, here, and refused rather than dropped when malformed.
+      const tagInput = adapter.destinationTag
+        ? parseDestinationTag(getSendDestinationTag())
+        : {};
+      if (tagInput.error) throw new Error(tagInput.error);
+      const sendOpts =
+        tagInput.tag !== undefined ? { destinationTag: tagInput.tag } : undefined;
+
       const result = sendOverride
         ? await sendOverride(sendTo, sendAmount)
         : useAccountSend
@@ -218,13 +236,15 @@ export function useSend(args: {
                 keyMaterial,
                 sendTo,
                 sendAmount,
-                sendAssetType
+                sendAssetType,
+                sendOpts
               );
       setSuccess(`Transaction sent! Hash: ${result.hash}`);
       setSendTo("");
       setSendAmount("");
       setShowSendModal(false);
       setSendAssetType(undefined);
+      setSendDestinationTag("");
       refreshBalance();
       // Pre-emptively refresh tx history for the chain we just sent on so
       // the new (pending) transaction shows up in Activity within seconds

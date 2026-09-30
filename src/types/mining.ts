@@ -110,6 +110,8 @@ export const CHAIN_MINING_PREFIX: Record<ChainType, string> = {
   "usdc-bsc": "USDC",
   "usdt0-arb": "USDT0",
   "usdt0-pol": "USDT0",
+  "usdc-monad": "USDC",
+  "usdt0-monad": "USDT0",
   "usdc-sol": "USDC",
   "usdt-sol": "USDT",
   "usdt-tron": "USDT",

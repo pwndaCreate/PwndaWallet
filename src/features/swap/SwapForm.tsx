@@ -176,10 +176,12 @@ export function SwapForm({
     destinationDisplayName?: string;
   } | null;
   /** Ask NEAR for this pair's minimum on demand (`useSwapQuote.probeMinimumNow`).
-   *  Behind the MIN button when no minimum is known yet (2026-09-04). */
+   *  Behind the MIN button when no minimum is known yet (2026-09-04).
+   *  `local: true` means NEAR was never asked and `detail` is the wallet's
+   *  own reason, not NEAR's reply. */
   onProbeMinimum?: (
     hiAmountDisplay?: string,
-  ) => Promise<{ amount: string | null; detail: string | null }>;
+  ) => Promise<{ amount: string | null; detail: string | null; local?: boolean }>;
   /** True when the user's typed amount is below `intentsMinimum`. */
   belowMinimum?: boolean;
   /** User's preferred routing system. Drives the segmented control. */
@@ -657,9 +659,15 @@ export function SwapForm({
           : fromBalance != null && fromBalance > 0
             ? fromBalance.toFixed(8).replace(/0+$/, "").replace(/\.$/, "")
             : undefined;
-      const { amount, detail } = await onProbeMinimum(hi);
+      const { amount, detail, local } = await onProbeMinimum(hi);
       if (amount) {
         setFromAmt(amount);
+      } else if (local) {
+        // Never reached NEAR, so neither "did not quote at any size" nor
+        // "NEAR said" is true (2026-09-29, LTC → TRX).
+        onSwapToast?.(
+          `Could not look up NEAR's minimum for ${fromCoin} → ${toCoin}: ${(detail ?? "unknown reason").slice(0, 220)}`,
+        );
       } else {
         const said = detail ? ` NEAR said: ${detail.replace(/^Quote request rejected by upstream: /, "").slice(0, 220)}` : "";
         onSwapToast?.(

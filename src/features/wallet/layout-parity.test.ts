@@ -129,6 +129,9 @@ interface Surface {
  */
 const SURFACES: Surface[] = [
   { name: "DerivationInfoCard", landscapeEquivalent: null },
+  // 2026-09-29: token legs on this account / the token's other networks. The
+  // way to reach USDT on TRON before any USDT is held; same component in both.
+  { name: "TokenLegsCard", landscapeEquivalent: null },
   { name: "BtcLegacyPanel", landscapeEquivalent: null },
   { name: "AdaLegacyPanel", landscapeEquivalent: null },
   { name: "CardanoDerivationPanel", landscapeEquivalent: null },
@@ -436,9 +439,15 @@ describe("the asset list's always-shown set is not a hand list", () => {
     expect(src).not.toMatch(tickerArray);
   });
 
-  it("portrait's collapse keeps rows by the shared flag", () => {
-    expect(PORTRAIT).toContain("alwaysListed: isAlwaysListed(chain)");
-    expect(PORTRAIT).toMatch(/r\.positiveBalance \|\| r\.chain === activeChain \|\| r\.alwaysListed/);
+  it("neither layout hides a row for having a zero balance", () => {
+    // 2026-09-29, the operator: "show even if it has a 0 balance, let this be
+    // true for any other assets that might have the same or similar
+    // attribute". Portrait collapsed every empty chain behind "show all N
+    // chains"; landscape listed Zephyr's own assets only while held.
+    expect(PORTRAIT).not.toContain("pwnda-wallet-chains-show-all");
+    expect(PORTRAIT).not.toMatch(/positiveBalance|meaningfulRows/);
+    expect(LANDSCAPE).toContain("zephyrAssetRowsFrom(zphSession?.assetBalances");
+    expect(LANDSCAPE).not.toMatch(/asset_type !== "ZPH" && b\.balance > 0/);
   });
 });
 

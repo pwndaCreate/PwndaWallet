@@ -12,7 +12,12 @@ import { errorText } from "../../lib/errorText";
 import { sendAssetTicker, sendAssetUsdPrice } from "../../wallets/tx-display";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { useSendQuote } from "./useSendQuote";
-import { useSendAssetType } from "./sendAssetStore";
+import {
+  parseDestinationTag,
+  setSendDestinationTag,
+  useSendAssetType,
+  useSendDestinationTag,
+} from "./sendAssetStore";
 
 type Tier = "slow" | "normal" | "fast";
 
@@ -186,6 +191,11 @@ export function SendModal({
   /** A definite "cannot pay the fee". Never true on an unestimable answer. */
   const gasShort = gas?.sufficient === false;
 
+  // XRP destination tag (2026-09-29): the raw field text lives in the send
+  // store, so the value `useSend` signs is the value shown here.
+  const tagRaw = useSendDestinationTag();
+  const tagError = adapter.destinationTag ? parseDestinationTag(tagRaw).error : undefined;
+
 
   // Fetch fee estimate on mount and refresh every 30 s while open. Adapters
   // throw `not initialized` for sidecar chains until the wallet is open;
@@ -315,6 +325,34 @@ export function SendModal({
             onChange={(e) => setSendTo(e.target.value)}
           />
         </div>
+        {/* XRP only (2026-09-29): exchanges receive every customer's XRP at one
+            address and credit the account by tag. Rendered only for adapters
+            that declare `destinationTag`, so no other chain grows a field it
+            would ignore. Digits only, refused above 32 bits — never truncated. */}
+        {adapter.destinationTag && (
+          <div className="form-group" data-destination-tag>
+            <label>{adapter.destinationTag.label}</label>
+            <input
+              type="text"
+              inputMode="numeric"
+              placeholder="optional"
+              aria-label={adapter.destinationTag.label}
+              value={tagRaw}
+              onChange={(e) => setSendDestinationTag(e.target.value.replace(/[^0-9]/g, ""))}
+            />
+            <div
+              style={{
+                fontFamily: "var(--mono)",
+                fontSize: 9,
+                lineHeight: 1.5,
+                color: tagError ? "var(--warn)" : "var(--text-dim)",
+                marginTop: 4,
+              }}
+            >
+              {tagError ?? adapter.destinationTag.hint}
+            </div>
+          </div>
+        )}
         <div className="form-group">
           <label>Amount</label>
           <input
@@ -560,12 +598,18 @@ export function SendModal({
               // NATIVE send: the amount and the fee come out of one balance,
               // so the shortfall is about the total, and naming a second coin
               // would be nonsense ("you need ETH to send ETH").
+              // `gas.note` (XRP, 2026-09-29) replaces the fee sentence when the
+              // balance must also cover something else — XRP's account reserve,
+              // which is 100,000× the fee and the real reason a send is short.
               <>
                 {gas.required
-                  ? `This send needs about ${gas.required} ${gas.ticker} in total — the amount plus the network fee. This address has ${gas.available}.`
-                  : `This address has no ${gas.ticker} on ${gas.chainName}, so it cannot cover the amount and the network fee.`}
-                <div style={{ marginTop: 4, opacity: 0.85 }}>
-                  {`The fee comes out of the same balance as the amount, so sending the full balance always leaves it slightly short. Lower the amount by at least the fee shown above.`}
+                  ? `This send needs about ${gas.required} ${gas.ticker} in total${gas.note ? "" : " — the amount plus the network fee"}. This address has ${gas.available}.`
+                  : gas.note
+                    ? null
+                    : `This address has no ${gas.ticker} on ${gas.chainName}, so it cannot cover the amount and the network fee.`}
+                <div style={{ marginTop: gas.required || !gas.note ? 4 : 0, opacity: 0.85 }}>
+                  {gas.note ??
+                    `The fee comes out of the same balance as the amount, so sending the full balance always leaves it slightly short. Lower the amount by at least the fee shown above.`}
                 </div>
               </>
             ) : (
@@ -610,10 +654,18 @@ export function SendModal({
             // `null` — unestimable, non-zero balance — deliberately does not
             // block: refusing a send on a guess is its own bug.
             disabled={
-              sending || !sendTo || !sendAmount || !feeReady || gasShort || quoteBlocks
+              sending ||
+              !sendTo ||
+              !sendAmount ||
+              !feeReady ||
+              gasShort ||
+              quoteBlocks ||
+              !!tagError
             }
             title={
-              quoteBlocks
+              tagError
+                ? tagError
+                : quoteBlocks
                 ? priced.failure?.message
                 : gasShort
                   ? gas?.includesAmount

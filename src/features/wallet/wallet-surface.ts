@@ -24,7 +24,14 @@
  */
 import { ALL_CHAINS, getAdapter } from "../../wallets";
 import type { ChainType, WalletInfo } from "../../wallets";
-import { ZPH_UI_TICKER, type ZphAssetType } from "../../wallets/zph-rpc";
+import {
+  ZPH_ASSETS,
+  ZPH_ASSET_NAME,
+  ZPH_UI_TICKER,
+  atomicToZph,
+  type ZphAssetBalance,
+  type ZphAssetType,
+} from "../../wallets/zph-rpc";
 // Through swap's public barrel, not `../swap/asset-capabilities`: that file is
 // private to the swap folder (BOUNDARIES.md), the same rule `activity` follows.
 import { ASSET_CAPABILITIES } from "../swap";
@@ -125,16 +132,44 @@ export function importableChains(
   );
 }
 
+/** One Zephyr ecosystem asset as a row of the assets list. */
+export interface ZephyrAssetRow {
+  asset: ZphAssetType;
+  ticker: string;
+  name: string;
+  balanceStr: string;
+  usd: number | null;
+}
+
 /**
- * A held chain the collapsed portrait list must never hide.
+ * Zephyr's own assets — ZEPHUSD, ZEPHRSV, ZEPHYRS — as asset-list rows: all
+ * three, at 0 when nothing is held (2026-09-29).
  *
- * Replaces portrait's hand-kept `CANONICAL_DEFAULTS` ticker set. The chains
- * that list existed to keep reachable are exactly the independent-seed ones,
- * and the adapter already says which those are. Landscape never collapses, so
- * it shows every held chain regardless.
+ * Landscape listed only the held ones, so an asset never held had no row and
+ * so no panel to receive it from. Portrait's `ZephyrAssetsCard` has always
+ * listed all four. ZEPH itself is the `zephyr` chain row, so it is not
+ * repeated here.
+ *
+ * No rows until the Zephyr wallet has reported (`balances` null): three rows
+ * saying 0 before the first read would be a claim, not a reading.
  */
-export function isAlwaysListed(chain: ChainType): boolean {
-  return !!getAdapter(chain).usesIndependentSeed;
+export function zephyrAssetRowsFrom(
+  balances: readonly ZphAssetBalance[] | null | undefined,
+  priceOf: (asset: ZphAssetType) => number | null,
+): ZephyrAssetRow[] {
+  if (!balances) return [];
+  return ZPH_ASSETS.filter((asset) => asset !== "ZPH").map((asset) => {
+    const atomic = balances.find((b) => b.asset_type === asset)?.balance ?? 0;
+    const price = priceOf(asset);
+    return {
+      asset,
+      ticker: ZPH_UI_TICKER[asset],
+      name: ZPH_ASSET_NAME[asset],
+      balanceStr: atomicToZph(atomic),
+      // Zephyr atomic units are 1e12 per whole coin.
+      usd: price != null ? (atomic / 1e12) * price : null,
+    };
+  });
 }
 
 /* ── History ─────────────────────────────────────────────────────────── */

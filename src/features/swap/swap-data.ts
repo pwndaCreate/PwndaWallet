@@ -859,6 +859,8 @@ const PWNDA_INTENTS_SOURCE_TICKERS: readonly string[] = [
   // ids below were matched by contract.
   "USDT0-ARB",
   "USDT0-POL",
+  "USDC-MONAD",
+  "USDT0-MONAD",
   // Phase 3 (Monad): MON native + EVM-compatible signer (chainId 143).
   "MON",
   // Phase 4 (BSC + L2 surface): BNB native + ETH on Arbitrum/Base/Optimism.
@@ -939,6 +941,8 @@ const PWNDA_INTENTS_DESTINATION_TICKERS: readonly string[] = [
   // ids below were matched by contract.
   "USDT0-ARB",
   "USDT0-POL",
+  "USDC-MONAD",
+  "USDT0-MONAD",
   "MON",
   "BNB",
   "DASH",

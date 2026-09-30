@@ -1,6 +1,9 @@
 import { HederaSetupPanel } from "./HederaSetupPanel";
 import { isHederaAccountMissing } from "../../wallets/hbar-wallet";
-import { groupStablecoins, isStablecoinChain } from "../../wallets/stablecoins";
+import {
+  isStablecoinChain,
+  stablecoinRailGroups,
+} from "../../wallets/stablecoins";
 import { useMemo, useState } from "react";
 import { WalletTxHistorySubview } from "./WalletTxHistorySubview";
 import {
@@ -24,6 +27,7 @@ import { SolanaDerivationPanel } from "./SolanaDerivationPanel";
 import { LitecoinDerivationPanel } from "./LitecoinDerivationPanel";
 import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { DerivationInfoCard } from "./DerivationInfoCard";
+import { TokenLegsCard } from "./TokenLegsCard";
 
 import { Card, MiniSpark } from "../../components/PrimitivesV2";
 import {
@@ -35,8 +39,6 @@ import {
   assetUsdValue,
   displayedReceiveAddress,
   importableChains,
-  isAlwaysListed,
-  parseBalanceNumber,
   priceFor,
   receiveBlockedReason,
   sendBlockedReason,
@@ -600,6 +602,17 @@ export function DashboardView(props: {
             }
           />
 
+          {/* Token legs on this account / this token's other networks — the
+              only way to reach e.g. USDT on TRON before any USDT is held, and
+              in portrait at all while another network holds more. Same
+              component landscape mounts. */}
+          <TokenLegsCard
+            activeChain={activeChain}
+            walletsByChain={walletsByChain}
+            balancesByChain={balancesByChain}
+            onSelect={onSelectChain}
+          />
+
           {/* Derivation, for EVERY chain. Driven by the adapter's required
               `derivation` declaration, so a chain added later gets this with
               no wiring — which is the gap the per-chain panels below left:
@@ -1114,20 +1127,22 @@ function PortfolioHeader({
    highlighted with the chain's own colour.
    ────────────────────────────────────────────────────────────────── */
 /**
- * What stays portrait-only is the COLLAPSE: the narrow column shows held
- * chains with a balance, the active chain, and every independent-seed chain,
- * behind a "show all N chains" toggle (T3.4). Landscape's rail has the height
- * to list everything.
+ * Every row is listed, held or not (2026-09-29).
  *
- * The always-shown rule used to be a hand-kept ticker set,
- * `CANONICAL_DEFAULTS`. That set is what shipped Zano invisible on 2026-08-28:
- * Zano's import panel gates on `activeChain === "zano"`, this list is the only
- * way to make it active, and ZANO was not in the set. The chains the set
- * existed to keep reachable are exactly the independent-seed ones, which the
- * adapter already declares (`isAlwaysListed`); a not-yet-imported one is now an
- * `ImportableAssetRow`, never collapsed, exactly as in landscape
- * (2026-09-16). The set's other members (BTC/ETH/SOL/ADA) only padded a fresh
- * vault's list; they now sit behind "show all" like every other empty chain.
+ * Portrait used to COLLAPSE the column to chains with a balance, the active
+ * chain and the independent-seed chains, behind a "show all N chains" toggle
+ * (T3.4), while landscape's rail listed everything. The operator asked that no
+ * asset be hidden for having a zero balance ("show even if it has a 0
+ * balance"), and portrait inherits from landscape, so it lists what landscape
+ * lists.
+ *
+ * The collapse's always-shown rule had been a hand-kept ticker set,
+ * `CANONICAL_DEFAULTS`, which shipped Zano invisible on 2026-08-28 (Zano's
+ * import panel gates on `activeChain === "zano"`, and this list is the only way
+ * to make it active); on 2026-09-16 it became the adapter's
+ * `usesIndependentSeed` flag. With nothing collapsed, neither is needed. A
+ * not-yet-imported independent-seed chain is still an `ImportableAssetRow`,
+ * exactly as in landscape.
  */
 function AssetsList({
   activeChain,
@@ -1151,30 +1166,8 @@ function AssetsList({
 }) {
   // RAM plan 3.1: chains whose wallet sidecar is asleep show " · paused".
   const pausedChains = usePausedChains();
-  // T3.4 — collapsed by default; localStorage-persisted.
-  const [showAll, setShowAll] = useState<boolean>(() => {
-    try {
-      return localStorage.getItem("pwnda-wallet-chains-show-all") === "true";
-    } catch {
-      return false;
-    }
-  });
-  const toggleShowAll = () => {
-    setShowAll((prev) => {
-      const next = !prev;
-      try {
-        localStorage.setItem(
-          "pwnda-wallet-chains-show-all",
-          next ? "true" : "false"
-        );
-      } catch {
-        /* localStorage unavailable — non-fatal */
-      }
-      return next;
-    });
-  };
 
-  const allRows = useMemo(() => {
+  const rows = useMemo(() => {
     const list = ALL_CHAINS.filter(
       (chain) => !!walletsByChain[chain] && !isStablecoinChain(chain)
     ).map((chain) => {
@@ -1201,8 +1194,6 @@ function AssetsList({
         bal,
         usd: assetUsdValue(bal, priceFor(a.ticker, pricesByTicker)),
         delta24hPct,
-        positiveBalance: (parseBalanceNumber(bal) ?? 0) > 0,
-        alwaysListed: isAlwaysListed(chain),
       };
     });
 
@@ -1215,12 +1206,13 @@ function AssetsList({
     // lands on the network holding the most, with Send/Receive/Swap working
     // normally because that leg is a real chain. The breakdown itself lives in
     // landscape, which has the width for it.
-    for (const g of groupStablecoins(balancesByChain)) {
+    //
+    // Which families are listed is `stablecoinRailGroups`, the rule landscape
+    // uses: every family, held or not, with USD₮0 inside USDT.
+    for (const g of stablecoinRailGroups(balancesByChain)) {
       const best = [...g.rows].sort((x, y) => (y.amount ?? -1) - (x.amount ?? -1))[0];
       if (!best) continue;
-      const held = (g.total ?? 0) > 0;
       const isActiveFamily = g.rows.some((r) => r.chain === activeChain);
-      if (!held && !isActiveFamily) continue;
       const target = isActiveFamily
         ? g.rows.find((r) => r.chain === activeChain)!.chain
         : best.chain;
@@ -1234,8 +1226,6 @@ function AssetsList({
         bal: g.total == null ? undefined : String(g.total),
         usd: g.total != null && price != null ? g.total * price : null,
         delta24hPct: null,
-        positiveBalance: held,
-        alwaysListed: false,
       });
     }
     // "Smart" order: holdings value descending, then the canonical
@@ -1255,17 +1245,7 @@ function AssetsList({
 
   const importable = useMemo(() => importableChains(walletsByChain), [walletsByChain]);
 
-  const meaningfulRows = useMemo(
-    () =>
-      allRows.filter(
-        (r) => r.positiveBalance || r.chain === activeChain || r.alwaysListed
-      ),
-    [allRows, activeChain]
-  );
-  const rows = showAll ? allRows : meaningfulRows;
-  const hiddenCount = allRows.length - meaningfulRows.length;
-
-  if (allRows.length === 0 && importable.length === 0) return null;
+  if (rows.length === 0 && importable.length === 0) return null;
 
   return (
     <Card title="ASSETS">
@@ -1312,23 +1292,6 @@ function AssetsList({
             />
           );
         })}
-        {/* T3.4 — show-all toggle. Only render when there are hidden
-            chains to surface (or when already showing all and we have
-            extras to collapse). */}
-        {(hiddenCount > 0 || showAll) && (
-          <div style={{ marginTop: 4, textAlign: "center" }}>
-            <button
-              type="button"
-              className="btn-link"
-              onClick={toggleShowAll}
-              style={{ fontSize: 10, letterSpacing: 0.5 }}
-            >
-              {showAll
-                ? `▴ collapse to active chains`
-                : `▸ show all ${allRows.length} chains (${hiddenCount} hidden)`}
-            </button>
-          </div>
-        )}
       </div>
     </Card>
   );

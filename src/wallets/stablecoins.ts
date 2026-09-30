@@ -43,7 +43,7 @@
  * Verify first. `scripts/verify-stablecoins.mjs` reads symbol/name/decimals
  * from the chain and refuses anything that disagrees with the row.
  */
-import type { ChainType } from "./types";
+import type { ChainType, WalletInfo } from "./types";
 
 /** The three stablecoin families this wallet carries. */
 export type StablecoinSymbol = "USDC" | "USDT" | "USDT0";
@@ -92,6 +92,8 @@ export const STABLECOINS: StablecoinFamily[] = [
       // SPL mint, not an ERC-20 contract. Verified: owner = SPL Token program,
       // parsed account type = `mint`, decimals from `getTokenSupply`.
       { chain: "usdc-sol",  parent: "solana",    network: "Solana",          contract: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals: 6, nearIntents: true },
+      // Monad (2026-09-29), verified on chain: symbol() "USDC", decimals 6.
+      { chain: "usdc-monad", parent: "monad",   network: "Monad",           contract: "0x754704bc059f8c67012fed69bc8a327a5aafb603", decimals: 6, nearIntents: true },
     ],
   },
   {
@@ -124,8 +126,13 @@ export const STABLECOINS: StablecoinFamily[] = [
     networks: [
       // Arbitrum's USDT migrated to this contract; `symbol()` = "USD₮0".
       { chain: "usdt0-arb", parent: "arbitrum", network: "Arbitrum", contract: "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9", decimals: 6, nearIntents: true },
-      // Same migration on Polygon — verified `symbol()` = "USDT0".
-      { chain: "usdt0-pol", parent: "polygon",  network: "Polygon",  contract: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6, nearIntents: false },
+      // Same migration on Polygon — verified `symbol()` = "USDT0". Flipped to
+      // `nearIntents: true` on 2026-09-29: 1Click lists this contract (as
+      // "USDT" on pol) and `ASSET_CAPABILITIES["USDT0-POL"]` already routed it,
+      // so the wallet row alone was withholding its "swappable via NEAR" mark.
+      { chain: "usdt0-pol", parent: "polygon",  network: "Polygon",  contract: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6, nearIntents: true },
+      // Monad (2026-09-29), verified on chain: symbol() "USDT0", decimals 6.
+      { chain: "usdt0-monad", parent: "monad", network: "Monad",    contract: "0xe7cd86e13ac4309349f30b3435a9d337750fc82d", decimals: 6, nearIntents: true },
     ],
   },
 ];
@@ -153,6 +160,76 @@ export function stablecoinNetworkFor(
 
 export function familyFor(symbol: StablecoinSymbol): StablecoinFamily | undefined {
   return STABLECOINS.find((f) => f.symbol === symbol);
+}
+
+/**
+ * Families that FILE under another in the wallet, as they already do in the
+ * swap picker (`picker-rows.ts`): USD₮0 is the OFT that Arbitrum's and
+ * Polygon's USDT migrated to, so somebody looking for USDT on Arbitrum opens
+ * USDT and finds it there, still labelled USD₮0.
+ */
+const FILES_UNDER: Partial<Record<StablecoinSymbol, StablecoinSymbol>> = {
+  USDT0: "USDT",
+};
+
+/**
+ * The stablecoin rows the wallet lists — ONE rule for both layouts
+ * (portrait `DashboardView`, landscape `WalletLandscapeView`):
+ *  - every family, held or not, at 0 when nothing is held;
+ *  - USD₮0's networks inside USDT, labelled "Arbitrum · USD₮0".
+ *
+ * Both layouts used to list a family only once something was held ("a fresh
+ * wallet should not grow permanent $0.00 rows"). A wallet that had never held
+ * a stablecoin then had no row to receive one into — reported 2026-09-29 as
+ * "I don't see USDT or USDC anywhere, I don't see any UI for it". USDC and USDT
+ * were made always-listed that day; the operator then asked the same of every
+ * asset hidden until held ("show even if it has a 0 balance"), so no family is
+ * held back any more.
+ */
+export function stablecoinRailGroups(
+  balancesByChain: Partial<Record<ChainType, string>>,
+): StablecoinGroup[] {
+  const groups = new Map(groupStablecoins(balancesByChain).map((g) => [g.symbol, g]));
+  for (const [from, to] of Object.entries(FILES_UNDER) as Array<[StablecoinSymbol, StablecoinSymbol]>) {
+    const src = groups.get(from);
+    const dst = groups.get(to);
+    if (!src || !dst) continue;
+    dst.rows = [
+      ...dst.rows,
+      ...src.rows.map((r) => ({ ...r, network: `${r.network} · ${src.displayName}` })),
+    ];
+    if (src.total != null) dst.total = (dst.total ?? 0) + src.total;
+    groups.delete(from);
+  }
+  return [...groups.values()];
+}
+
+/**
+ * The wallet entries of every token leg held by `parent`'s account, pointed
+ * at that same account (2026-09-29).
+ *
+ * A token balance lives ON its owner's account: USDT on TRON is a TRC-20
+ * balance of the TRON address. Each leg's adapter derives by delegating to
+ * its parent adapter's DEFAULT derivation, which agrees with the parent only
+ * while the parent sits on its default path. When a derivation choice moves
+ * the parent (an Exodus/Atomic import puts TRX on `m/44'/195'/…`), the leg
+ * stayed behind: the dashboard showed USDT under one TRON address and TRX —
+ * the energy that pays for sending USDT — under another, and a swap paying
+ * out USDT landed on the account the user was not looking at.
+ *
+ * Callers apply this wherever they re-derive the parent from a choice. On the
+ * default path it returns entries identical to the adapters' own.
+ */
+export function tokenLegsHeldBy(
+  parent: ChainType,
+  parentInfo: WalletInfo | undefined,
+): Partial<Record<ChainType, WalletInfo>> {
+  const legs: Partial<Record<ChainType, WalletInfo>> = {};
+  if (!parentInfo) return legs;
+  for (const n of STABLECOIN_NETWORKS) {
+    if (n.parent === parent) legs[n.chain] = { ...parentInfo, chain: n.chain };
+  }
+  return legs;
 }
 
 /** One stacked row: the family plus its per-network balances and a total. */

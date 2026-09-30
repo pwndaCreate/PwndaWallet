@@ -30,6 +30,8 @@ import { describe, expect, it } from "vitest";
 
 import { PLACEHOLDER_ADDRESSES } from "./useSwapQuote";
 import { deriveDashAtPath } from "../../wallets/dash-wallet";
+import { deriveTrxAtPath, trxAdapter } from "../../wallets/trx-wallet";
+import { deriveXrpAtPath, xrpAdapter } from "../../wallets/xrp-wallet";
 
 /** The standard BIP-39 test vector. World-public; holds nothing. */
 const ABANDON =
@@ -42,6 +44,18 @@ describe("probe placeholder addresses", () => {
     // import would produce rather than a hand-written lookalike.
     const derived = deriveDashAtPath(ABANDON, "m/44'/5'/0'/0/0");
     expect(PLACEHOLDER_ADDRESSES.dash).toBe(derived.address);
+  });
+
+  it("uses the abandon mnemonic's real XRP and TRON addresses (2026-09-29)", () => {
+    // Both at the wallet's OWN default paths, read from the adapters rather
+    // than restated, so a change of default shows up here as a failure.
+    const pathOf = (d: typeof xrpAdapter.derivation) => (d?.kind === "bip39" ? d.path : "");
+    const xrp = deriveXrpAtPath(ABANDON, pathOf(xrpAdapter.derivation));
+    const tron = deriveTrxAtPath(ABANDON, pathOf(trxAdapter.derivation));
+    expect(PLACEHOLDER_ADDRESSES.xrp).toBe(xrp.address);
+    expect(PLACEHOLDER_ADDRESSES.tron).toBe(tron.address);
+    // USDT on TRON is held by the TRON account itself.
+    expect(PLACEHOLDER_ADDRESSES.usdtTron).toBe(tron.address);
   });
 
   it("rejects the 2026-09-09 lookalike by name", () => {
@@ -67,6 +81,9 @@ describe("probe placeholder addresses", () => {
       "near",
       "stellar",
       "sui",
+      "xrp",
+      "tron",
+      "usdtTron",
     ] as const) {
       expect(PLACEHOLDER_ADDRESSES[fam], `${fam} placeholder missing`)
         .toBeTruthy();

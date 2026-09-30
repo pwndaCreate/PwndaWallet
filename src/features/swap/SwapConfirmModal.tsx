@@ -16,6 +16,8 @@ import {
   extractActualReceivedFromSwapKit,
 } from "./swap-actual-received";
 import { SWAP_COIN_META } from "./swap-data";
+import { xrpPayoutBlockReason } from "./xrpPayoutGuard";
+import { xrpAccountActivation } from "../../wallets/xrp-wallet";
 import {
   MockSwapAttemptedError,
   SafetyInvariantError,
@@ -107,6 +109,10 @@ export function SwapConfirmModal({
   const [historyId, setHistoryId] = useState<string | null>(null);
   const [mockStop, setMockStop] = useState<MockSwapAttemptedError | null>(null);
   const [safetyError, setSafetyError] = useState<SafetyInvariantError | null>(null);
+  // Why this XRP payout must not be signed, or null (2026-09-29). See
+  // `xrpPayoutGuard.ts`: a first payment to an XRP account that does not
+  // exist yet is refused by the ledger below the base reserve.
+  const [xrpBlock, setXrpBlock] = useState<string | null>(null);
 
   // Reset state every time the modal opens (a stale "done" should not
   // persist between distinct swaps).
@@ -120,6 +126,27 @@ export function SwapConfirmModal({
     setMockStop(null);
     setSafetyError(null);
   }, [open]);
+
+  // Asked once per opened quote. Unknown (the ledger could not be reached)
+  // never blocks — `xrpPayoutBlockReason` returns null for it.
+  useEffect(() => {
+    setXrpBlock(null);
+    if (!open || toAsset.toUpperCase() !== "XRP" || quote.source !== "intents") return;
+    let live = true;
+    void xrpAccountActivation(destinationAddress).then((activation) => {
+      if (!live) return;
+      setXrpBlock(
+        xrpPayoutBlockReason({
+          activation,
+          minReceived: quote.minReceived,
+          destination: destinationAddress,
+        }),
+      );
+    });
+    return () => {
+      live = false;
+    };
+  }, [open, toAsset, quote.source, quote.minReceived, destinationAddress]);
 
   // Resolve effective metadata for each side. When the user picked a
   // multi-chain symbol via the NetworkPill, `fromBlockchain` carries
@@ -550,6 +577,23 @@ export function SwapConfirmModal({
           )}
         </div>
 
+        {xrpBlock && (
+          <div
+            data-xrp-payout-block
+            style={{
+              marginTop: 10,
+              padding: "8px 10px",
+              background: "rgba(255,80,80,0.08)",
+              border: "1px solid rgba(255,80,80,0.45)",
+              color: "var(--danger)",
+              fontSize: 10,
+              lineHeight: 1.5,
+            }}
+          >
+            ✗ {xrpBlock}
+          </div>
+        )}
+
         {/* Stage-specific footer */}
         <div style={{ marginTop: 16 }}>
           {stage === "review" && (
@@ -557,6 +601,7 @@ export function SwapConfirmModal({
               onCancel={onClose}
               onSign={() => setStage("password")}
               isMockMode={isMockMode}
+              blockedReason={xrpBlock}
             />
           )}
           {stage === "password" && (
@@ -691,10 +736,13 @@ function ReviewFooter({
   onCancel,
   onSign,
   isMockMode,
+  blockedReason,
 }: {
   onCancel: () => void;
   onSign: () => void;
   isMockMode: boolean;
+  /** Set when the swap must not be signed as quoted (the XRP payout guard). */
+  blockedReason?: string | null;
 }) {
   // Mock mode flips the button copy so the user can't accidentally
   // forget which upstream they're signing against. The button still
@@ -710,6 +758,8 @@ function ReviewFooter({
         full
         caret={false}
         onClick={onSign}
+        disabled={!!blockedReason}
+        title={blockedReason ?? undefined}
       >
         {label}
       </Btn>

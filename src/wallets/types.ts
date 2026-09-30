@@ -23,6 +23,9 @@ export type ChainType =
   // migrated to it, so these are the same money the old USDT rows held.
   | "usdt0-arb"
   | "usdt0-pol"
+  // Monad (2026-09-29): an EVM L1 NEAR Intents carries USDC and USD₮0 on.
+  | "usdc-monad"
+  | "usdt0-monad"
   // Non-EVM stablecoin legs (2026-09-02). SPL mints and the TRC-20 contract
   // were verified on chain the same way the ERC-20 rows were — see
   // `wallets/stablecoins.ts`. USDT-on-Tron is one of the most-held stablecoin
@@ -224,6 +227,27 @@ export interface GasBudget {
    * the UI warns on `false` and must not block on a guess.
    */
   sufficient: boolean | null;
+  /**
+   * One plain sentence about what else this balance must cover, when the
+   * generic "amount plus fee" wording would mislead. Added 2026-09-29 for
+   * XRP, where the binding constraint is the ledger's account RESERVE (1 XRP
+   * plus 0.2 per owned object, locked for as long as the account exists), not
+   * the 0.00001 XRP fee.
+   */
+  note?: string;
+}
+
+/**
+ * Per-send options beyond recipient and amount (2026-09-29).
+ *
+ * `destinationTag` is the XRP Ledger's 32-bit recipient tag. Exchanges and
+ * custodians receive every customer's XRP at ONE address and credit the
+ * right account by tag; a payment without the tag they asked for arrives at
+ * the exchange and is credited to nobody. Only adapters that declare
+ * `ChainAdapter.destinationTag` read it.
+ */
+export interface SendOptions {
+  destinationTag?: number;
 }
 
 /**
@@ -409,13 +433,24 @@ export interface ChainAdapter {
    * Zephyr (ZPH/ZSD/ZRS/ZYS); every other adapter ignores it and sends its one
    * native asset. For Zephyr, `assetType` is the RPC asset (`"ZSD"` etc.) and a
    * same-asset transfer is a plain send (no protocol conversion).
+   *
+   * `opts` carries per-send extras (`SendOptions`); adapters that do not
+   * declare the matching capability ignore them.
    */
   sendTransaction(
     privateKey: string,
     to: string,
     amount: string,
-    assetType?: string
+    assetType?: string,
+    opts?: SendOptions
   ): Promise<TxResult>;
+
+  /**
+   * Present when the chain has a recipient TAG the Send modal must offer (XRP,
+   * 2026-09-29). `label` and `hint` are the modal's copy. Absent everywhere
+   * else, so no other chain grows an input it would ignore.
+   */
+  destinationTag?: { label: string; hint: string };
 
   /**
    * Send from the WHOLE ACCOUNT rather than one derived address.
@@ -496,14 +531,16 @@ export interface ChainAdapter {
    * The coin that pays this adapter's fees, when it is NOT the coin being
    * sent.
    *
-   * Present only on ERC-20 adapters (`usdc-arb`, `usdt-op`, …), because they
-   * are the only ones where holding the full send amount still leaves you
-   * unable to send. On a native adapter the fee comes out of the same balance
-   * the amount does, the modal already shows it, and there is no second asset
-   * to warn about — so this stays `undefined` and callers skip the check.
+   * Present on token adapters — ERC-20 (`usdc-arb`, `usdt-op`, …) and, since
+   * 2026-09-29, TRC-20 (`usdt-tron`, fees in TRX) — because they are the ones
+   * where holding the full send amount still leaves you unable to send. On a
+   * native adapter the fee comes out of the same balance the amount does, the
+   * modal already shows it, and there is no second asset to warn about — so
+   * this stays `undefined` and callers skip the check.
    *
-   * Absent on every non-EVM adapter too. `undefined` means "no separate fee
-   * asset to reason about", never "unknown".
+   * `undefined` means "no separate fee asset to reason about", never
+   * "unknown". (The type is named for EVM, where it started; the shape — a
+   * fee coin and its chain's name — is chain-neutral.)
    */
   gasToken?: EvmGasToken;
 

@@ -32,12 +32,14 @@ describe("pickerRows", () => {
     expect(rows[0].legs).toEqual(["BTC"]);
   });
 
-  it("collapses USDC's eight legs into one expandable row", () => {
+  it("collapses USDC's nine legs into one expandable row", () => {
     const rows = pickerRows(getDropdownTickers({ sourceOnly: true, router: "intents" }));
     const usdc = rows.find((r) => r.symbol === "USDC")!;
     expect(usdc, "USDC row missing").toBeDefined();
     expect(isGrouped(usdc)).toBe(true);
-    expect(usdc.legs.length).toBe(8);
+    // Nine since 2026-09-29: Monad joined the eight EVM/Solana legs.
+    expect(usdc.legs.length).toBe(9);
+    expect(usdc.legs).toContain("USDC-MONAD");
     // Every leg resolves to a real registry entry — a row standing for a key
     // nothing can route is the LTC failure wearing a different hat.
     for (const key of usdc.legs) {
@@ -83,7 +85,9 @@ describe("USDT0 — grouped for findability, never disguised", () => {
     // added 2026-09-09 with the XRP/Tron source work; it groups here like
     // every other network rather than becoming its own row.
     expect(usdt.legs).toContain("USDT-TRON");
-    expect(usdt.legs.length).toBe(8);
+    // Plus Monad's USD₮0 since 2026-09-29.
+    expect(usdt.legs).toContain("USDT0-MONAD");
+    expect(usdt.legs.length).toBe(9);
   });
 
   it("still SAYS USDT0 on the network row", () => {

@@ -39,17 +39,18 @@ describe("getDropdownTickers — canonical market-cap order", () => {
     }
   });
 
-  it("places ADA (a native) before the stablecoins", () => {
-    const list = getDropdownTickers({ sourceOnly: true });
-    expect(list.indexOf("ADA")).toBeGreaterThanOrEqual(0);
-    // Since 2026-09-09 there is no bare "USDC" in the roster — stablecoins
-    // are per-(symbol, network) legs (`USDC-ARB`), so the assertion is about
-    // the first stablecoin leg rather than a symbol that no longer appears.
-    // `indexOf("USDC")` returned -1 and the old comparison passed vacuously
-    // in the wrong direction until it was corrected.
-    const firstStable = list.findIndex((x) => /^USDC|^USDT/.test(x));
-    expect(firstStable).toBeGreaterThanOrEqual(0);
-    expect(list.indexOf("ADA")).toBeLessThan(firstStable);
+  it("offers USDT and USDC near the top, not below every native", () => {
+    // Reversed 2026-09-29: stablecoins used to be last, which is where the
+    // operator did not find them. USDT legs now follow ETH, USDC legs follow
+    // XRP, and ADA comes after both. Legs, not bare symbols (since 2026-09-09).
+    const list = getDropdownTickers({ sourceOnly: true, router: "intents" });
+    const firstUsdt = list.findIndex((x) => /^USDT/.test(x));
+    const firstUsdc = list.findIndex((x) => /^USDC/.test(x));
+    expect(firstUsdt).toBeGreaterThanOrEqual(0);
+    expect(firstUsdc).toBeGreaterThanOrEqual(0);
+    expect(list.indexOf("ETH")).toBeLessThan(firstUsdt);
+    expect(firstUsdt).toBeLessThan(list.indexOf("SOL"));
+    expect(firstUsdc).toBeLessThan(list.indexOf("ADA"));
   });
 });
 

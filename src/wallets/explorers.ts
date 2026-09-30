@@ -26,6 +26,10 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
     case "usdt-eth":
     case "usdc-eth":
       return `https://eth.blockscout.com/tx/0x${h}`;
+    case "monad":
+    case "usdc-monad":
+    case "usdt0-monad":
+      return `https://explorer.monad.xyz/tx/0x${h}`;
     case "usdc-pol":
     case "usdt0-pol":
       return `https://polygon.blockscout.com/tx/0x${h}`;

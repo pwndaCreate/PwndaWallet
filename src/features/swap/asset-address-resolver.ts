@@ -18,6 +18,9 @@
  *   nep141:pol.omft.near       →    EVM hex         (Polygon)
  *   nep141:sol.omft.near       →    SOL base58
  *   nep141:wrap.near           →    NEAR account    (*.near or 64-hex)
+ *   nep141:xrp.omft.near       →    XRP classic     (r…)
+ *   nep141:tron.omft.near      →    TRON base58     (T…)  — the TRX entry
+ *   nep141:tron-<usdt>.omft.near →  TRON base58     (T…)  — the USDT-TRON entry
  *
  * Same mapping applies to `refundTo` based on `originAsset` when
  * `refundType: "ORIGIN_CHAIN"`.
@@ -34,6 +37,11 @@
  * endpoint")` so the user gets a clean message rather than a 5xx after
  * a wasted round trip.
  */
+
+import bs58check from "bs58check";
+// Re-exported by `xrpl` from `ripple-address-codec`, which is only a
+// transitive dependency; `xrpl` is the direct one (`xrp-wallet.ts`).
+import { isValidClassicAddress } from "xrpl";
 
 import { ASSET_CAPABILITIES } from "./asset-capabilities";
 import type { ChainType } from "../../wallets/types";
@@ -73,6 +81,16 @@ export interface WalletAddresses {
    *  `m/1852'/1815'/0'/2/0`, encoded as a 103-char bech32 base
    *  address. Destination-only in v1.x (no Rust source signer). */
   cardano?: string;
+  /** XRP Ledger classic address (`r…`). Filled by `xrpAdapter`. */
+  xrp?: string;
+  /** TRON base58check address (`T…`) that holds native TRX. Filled from
+   *  the `tron` wallet entry, at whatever path the vault chose for TRON. */
+  tron?: string;
+  /** TRON address that holds USDT (TRC-20). A TRC-20 balance lives on its
+   *  owner's TRON account, so this is normally the same string as `tron`,
+   *  but it is read from the `usdt-tron` wallet entry: a swap must deliver
+   *  USDT to exactly the address the dashboard shows USDT under. */
+  usdtTron?: string;
 }
 
 /** Thrown by the resolver and the format validators. The confirm modal
@@ -335,15 +353,48 @@ export function addressForAssetId(
     }
     return wallet.sui;
   }
+  // XRP, TRX and USDT on TRON (2026-09-29). Until this date these three
+  // branches threw unconditionally ("…supported but the wallet has no
+  // derived … address yet"), whatever the wallet held: there was no bundle
+  // field to read. The main quote path hid it by falling back to the view's
+  // own per-ticker address; every caller without that fallback — the MIN
+  // probe, the pair-change minimum probe, the Earn/convert estimates —
+  // failed on all three. See log.md 2026-09-29.
   if (body === "xrp.omft.near") {
-    throw new IntentsValidationError(
-      "XRP destination is supported but the wallet has no derived XRP address yet — open the XRP chain in the dashboard."
-    );
+    if (!wallet.xrp) {
+      throw new IntentsValidationError(
+        `No derived XRP address — open the XRP chain in the dashboard so the wallet derives one, then retry.`
+      );
+    }
+    assertValidXrpAddress(wallet.xrp);
+    return wallet.xrp;
   }
-  if (body === "tron.omft.near" || body.startsWith("tron-")) {
-    throw new IntentsValidationError(
-      "TRON destination is supported but the wallet has no derived TRON address yet — open the TRON chain in the dashboard."
-    );
+  if (body === "tron.omft.near") {
+    if (!wallet.tron) {
+      throw new IntentsValidationError(
+        `No derived TRON address — open the TRON chain in the dashboard so the wallet derives one, then retry.`
+      );
+    }
+    assertValidTronAddress(wallet.tron);
+    return wallet.tron;
+  }
+  if (body.startsWith("tron-")) {
+    // TRC-20 tokens. Only USDT has a wallet entry, so only USDT resolves:
+    // delivering any other token to the TRON account would land it where no
+    // balance row ever shows it.
+    const usdtTron = ASSET_CAPABILITIES["USDT-TRON"]?.nearIntentsAsset;
+    if (id !== usdtTron) {
+      throw new IntentsValidationError(
+        `"${assetId}" is a TRON token PwndaWallet has no wallet entry for — only USDT on TRON is supported.`
+      );
+    }
+    if (!wallet.usdtTron) {
+      throw new IntentsValidationError(
+        `No derived USDT (TRON) address — open the TRON chain in the dashboard so the wallet derives one, then retry.`
+      );
+    }
+    assertValidTronAddress(wallet.usdtTron);
+    return wallet.usdtTron;
   }
   if (body === "ton.omft.near") {
     throw new IntentsValidationError(
@@ -446,6 +497,43 @@ export function assertValidSuiAddress(addr: string): void {
   }
 }
 
+// TRON: base58check of 0x41 ‖ 20-byte account id. Always 34 characters and
+// always a leading "T". Unlike the shape-only checks above, this one verifies
+// the checksum and the version byte as well: it is two lines with `bs58check`
+// (already the codec `trx-wallet.ts` encodes with), and a well-shaped string
+// with a bad checksum is exactly what cost DASH its minimum hint on
+// 2026-09-09.
+const TRON_BASE58 = /^T[1-9A-HJ-NP-Za-km-z]{33}$/;
+
+export function assertValidTronAddress(addr: string): void {
+  let ok = TRON_BASE58.test(addr);
+  if (ok) {
+    try {
+      const raw = bs58check.decode(addr);
+      ok = raw.length === 21 && raw[0] === 0x41;
+    } catch {
+      ok = false;
+    }
+  }
+  if (!ok) {
+    throw new IntentsValidationError(
+      `"${addr}" is not a valid TRON mainnet address (expected T… base58check, 34 chars).`
+    );
+  }
+}
+
+// XRP classic address: "r" + 24–34 characters of the XRPL base58 alphabet
+// (Bitcoin's character set in a different order). `isValidClassicAddress`
+// also verifies the checksum. X-addresses (`X…`) are not accepted: the wallet never
+// produces one, and one would smuggle a destination tag into the recipient.
+export function assertValidXrpAddress(addr: string): void {
+  if (!/^r[1-9A-HJ-NP-Za-km-z]{24,34}$/.test(addr) || !isValidClassicAddress(addr)) {
+    throw new IntentsValidationError(
+      `"${addr}" is not a valid XRP Ledger classic address (expected r…).`
+    );
+  }
+}
+
 // Cardano mainnet CIP-19 base address: bech32-encoded, HRP `addr`,
 // starts with `addr1` (mainnet). A standard CIP-1852 base address
 // (payment + stake credentials) is 103 chars total = "addr1" + 98
@@ -504,6 +592,11 @@ const WALLETS_BY_CHAIN_KEY_TO_BUNDLE_FIELD: Partial<
   stellar: "stellar",
   sui: "sui",
   cardano: "cardano",
+  xrp: "xrp",
+  tron: "tron",
+  // Its own field, not `tron`: TRX and USDT-TRON are separate wallet
+  // entries, and each asset is delivered where the dashboard shows it.
+  "usdt-tron": "usdtTron",
   // Intentional `null`s — wallet chains the NEAR Intents resolver
   // never targets. Listed explicitly so a future reader sees the
   // omissions are deliberate, not a missing-row oversight.

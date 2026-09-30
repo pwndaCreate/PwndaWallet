@@ -3,7 +3,7 @@ import { usePausedChains } from "../../lib/sidecarIdle";
 import { HederaSetupPanel } from "./HederaSetupPanel";
 import { isHederaAccountMissing } from "../../wallets/hbar-wallet";
 import {
-  groupStablecoins,
+  stablecoinRailGroups,
   isStablecoinChain,
   stablecoinNetworkFor,
   type StablecoinGroup,
@@ -17,12 +17,7 @@ import { assetRank } from "../../wallets/coin-metadata";
 import type { XmrTransfer } from "../../wallets/xmr-wallet";
 import { piconeroToXmr } from "../../wallets/xmr-rpc";
 import type { ZphAssetBalance, ZphAssetType } from "../../wallets/zph-rpc";
-import {
-  ZPH_UI_TICKER,
-  ZPH_ASSET_NAME,
-  ZPH_ASSET_COLOR,
-  atomicToZph,
-} from "../../wallets/zph-rpc";
+import { ZPH_ASSET_COLOR } from "../../wallets/zph-rpc";
 import type { ChainTx } from "../../wallets/types";
 import { mergeChainTx } from "../activity/useTxHistory";
 import { txDisplayTicker } from "../../wallets/tx-display";
@@ -37,6 +32,7 @@ import { AdaLegacyPanel } from "./AdaLegacyPanel";
 import { CardanoDerivationPanel } from "./CardanoDerivationPanel";
 import { SolanaDerivationPanel } from "./SolanaDerivationPanel";
 import { DerivationInfoCard } from "./DerivationInfoCard";
+import { TokenLegsCard } from "./TokenLegsCard";
 import { LitecoinDerivationPanel } from "./LitecoinDerivationPanel";
 import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { placeholderSparkFor } from "./spark-fallback";
@@ -63,6 +59,7 @@ import {
   sendBlockedReason,
   swapAssetKeyFor,
   swapBlockedReason,
+  zephyrAssetRowsFrom,
 } from "./wallet-surface";
 import { AssetRow, ImportableAssetRow } from "./AssetRow";
 import { WalletActionRow } from "./WalletActionRow";
@@ -360,34 +357,15 @@ export function WalletLandscapeView({
   });
   const missingLabel = formatMissingLabel(missingNames);
 
-  // Held Zephyr ecosystem assets (ZSD / ZRS / ZYS) surfaced as their OWN rows
-  // in the assets list instead of being buried in a sub-card under ZEPH. ZPH
-  // itself is already the `zephyr` chain row, so it's excluded. Priced via the
-  // live reserve stats; rows are added to the portfolio total too.
-  const zephyrAssetRows = (() => {
-    const balances = zphSession?.assetBalances;
-    if (!balances) return [] as Array<{
-      asset: ZphAssetType;
-      ticker: string;
-      name: string;
-      balanceStr: string;
-      usd: number | null;
-    }>;
-    const stats = zphSession?.reserveStats ?? null;
-    return balances
-      .filter((b) => b.asset_type !== "ZPH" && b.balance > 0)
-      .map((b) => {
-        const price = zphAssetPrice(stats, b.asset_type);
-        const units = b.balance / 1e12; // Zephyr atomic = 1e12
-        return {
-          asset: b.asset_type,
-          ticker: ZPH_UI_TICKER[b.asset_type],
-          name: ZPH_ASSET_NAME[b.asset_type],
-          balanceStr: atomicToZph(b.balance),
-          usd: price != null ? units * price : null,
-        };
-      });
-  })();
+  // Zephyr ecosystem assets (ZSD / ZRS / ZYS) surfaced as their OWN rows in
+  // the assets list instead of being buried in a sub-card under ZEPH. All
+  // three once the Zephyr wallet has reported, at 0 when nothing is held
+  // (2026-09-29; only held ones were listed, so an asset never held had no
+  // panel to receive it from). ZPH itself is the `zephyr` chain row. Priced
+  // via the live reserve stats; rows are added to the portfolio total too.
+  const zephyrAssetRows = zephyrAssetRowsFrom(zphSession?.assetBalances, (asset) =>
+    zphAssetPrice(zphSession?.reserveStats ?? null, asset),
+  );
   for (const r of zephyrAssetRows) {
     if (r.usd != null) {
       totalUsd += r.usd;
@@ -396,11 +374,11 @@ export function WalletLandscapeView({
   }
 
   // Stablecoin families, each with its per-network breakdown and a total.
-  // Rows with nothing held anywhere are dropped: a fresh wallet should not
-  // grow three permanent $0.00 rows it never asked for.
-  const stablecoinGroups = groupStablecoins(balancesByChain).filter(
-    (g) => (g.total ?? 0) > 0 || g.rows.some((r) => r.chain === activeChain),
-  );
+  // Every family is listed, held or not (2026-09-29): hiding them until
+  // something was held left a wallet that never held one with no row to
+  // receive into ("I don't see USDT or USDC anywhere"). USD₮0 files under
+  // USDT. One rule, shared with portrait: `stablecoinRailGroups`.
+  const stablecoinGroups = stablecoinRailGroups(balancesByChain);
   const stablecoinUsd = (g: StablecoinGroup): number | null =>
     g.total == null ? null : getUsdFromAmount(g.symbol, g.total, pricesByTicker);
   for (const g of stablecoinGroups) {
@@ -482,11 +460,13 @@ export function WalletLandscapeView({
   // ZYS) is selected, override the focal display + actions with that asset so
   // it gets the standard panel (balance / address / Send / Receive / Swap).
   //
-  // The focused asset counts only while its row EXISTS. Rows are held assets
-  // (balance > 0), so sending a whole ZEPHUSD balance removes the row. Until
-  // 2026-09-15 `effectiveZphAsset` stayed "ZSD" regardless: the centre panel
-  // fell back to ZEPH and Quick send read "Send ZEPH" while opening a ZEPHUSD
-  // send. Both now derive from the row, so label and send agree by construction.
+  // The focused asset counts only while its row EXISTS. Until 2026-09-29 rows
+  // were held assets only, so sending a whole ZEPHUSD balance removed the row;
+  // before 2026-09-15 `effectiveZphAsset` stayed "ZSD" regardless, and the
+  // centre panel fell back to ZEPH while Quick send read "Send ZEPH" and opened
+  // a ZEPHUSD send. Both derive from the row, so label and send agree by
+  // construction. Rows now stay at 0, so a row is missing only while the
+  // Zephyr wallet has not reported.
   const focalZphRow =
     activeChain === "zephyr" && focusedZphAsset && focusedZphAsset !== "ZPH"
       ? zephyrAssetRows.find((r) => r.asset === focusedZphAsset) ?? null
@@ -1368,6 +1348,22 @@ export function WalletLandscapeView({
                 inline in the focal column. */}
             {activeChain === "xelis" && xelisCenterSlot}
 
+            {/* Token legs on this account / this token's other networks. The
+                family rows in the rail appear only once something is held, so
+                without this a fresh wallet has no way to reach USDT on TRON to
+                receive into. Same component portrait mounts. */}
+            {activeWallet && (
+              <TokenLegsCard
+                activeChain={activeChain}
+                walletsByChain={walletsByChain}
+                balancesByChain={balancesByChain}
+                onSelect={(c) => {
+                  setActiveChain(c);
+                  setFocusedZphAsset(null);
+                }}
+              />
+            )}
+
             {/* Derivation, for EVERY chain. Mounted here as well as in the
                 portrait dashboard — landscape is the DEFAULT layout, so a
                 surface that exists only in portrait effectively doesn't
@@ -1543,10 +1539,16 @@ export function WalletLandscapeView({
                     // The asset this row moved: a Zephyr row may be ZEPHUSD etc.
                     ticker: txDisplayTicker(tx, activeAdapter.ticker),
                     when: fmtRelative(tx.timestamp),
+                    // `undefined` is "no count", not 0 — see `ChainTx`. As
+                    // portrait's ChainTxCard: count, else block, else nothing.
                     peer:
                       tx.confirmations !== undefined && tx.confirmations > 0
                         ? `${tx.confirmations} conf`
-                        : "unconfirmed",
+                        : tx.confirmations === 0
+                          ? "unconfirmed"
+                          : tx.height
+                            ? `block ${tx.height.toLocaleString()}`
+                            : "",
                     hash: tx.hash,
                   }))}
                 />

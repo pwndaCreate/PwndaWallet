@@ -192,6 +192,34 @@ export const monadAdapter = createEvmAdapter({
 // `wallets/stablecoins.ts`, which is the registry these mirror. Decimals
 // are per-contract: BSC is 18, everywhere else 6.
 
+// Monad legs (2026-09-29). Verified on chain via rpc.monad.xyz: symbol()
+// "USDC" / "USDT0", decimals 6 each — the contracts 1Click lists for Monad.
+export const usdcMonadAdapter = createEvmAdapter({
+  chain: "usdc-monad",
+  displayName: "USDC (Monad)",
+  ticker: "USDC",
+  color: "#2775ca",
+  chainId: 143,
+  rpcUrl: monadRpcs[0],
+  rpcFallbacks: monadRpcs.slice(1),
+  tokenContract: "0x754704bc059f8c67012fed69bc8a327a5aafb603",
+  tokenDecimals: 6,
+  explorerApis: MONAD_EXPLORERS,
+});
+
+export const usdt0MonadAdapter = createEvmAdapter({
+  chain: "usdt0-monad",
+  displayName: "USD₮0 (Monad)",
+  ticker: "USDT0",
+  color: "#26a17b",
+  chainId: 143,
+  rpcUrl: monadRpcs[0],
+  rpcFallbacks: monadRpcs.slice(1),
+  tokenContract: "0xe7cd86e13ac4309349f30b3435a9d337750fc82d",
+  tokenDecimals: 6,
+  explorerApis: MONAD_EXPLORERS,
+});
+
 export const usdtEthAdapter = createEvmAdapter({
   chain: "usdt-eth",
   displayName: "USDT (Ethereum)",

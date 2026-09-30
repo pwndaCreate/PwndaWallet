@@ -58,6 +58,7 @@ import {
   bisectExactInputMinimum,
   FLOOR_PROBE_WAIT_MS,
   learnUsdLimitFromError,
+  probeBuildFault,
   probeExactInputFallback,
   probePairFloor,
   probePerPairMinimum,
@@ -211,10 +212,16 @@ export interface SwapQuoteState {
    * is higher — ADA → LTC on the day — reported no minimum and MIN sat
    * greyed out while a $200 quote was live. Resolves to the display amount
    * in the source coin, or null when nothing up to $400 filled.
+   *
+   * `local` is true when the search never reached NEAR because the request
+   * could not be built here (an `IntentsValidationError`: a missing or
+   * malformed address). `detail` is then OUR sentence, and the form must not
+   * present it as NEAR's answer (2026-09-29: "NEAR said: TRON destination is
+   * supported but…" was the resolver talking, and NEAR was never asked).
    */
   probeMinimumNow: (
     hiAmountDisplay?: string,
-  ) => Promise<{ amount: string | null; detail: string | null }>;
+  ) => Promise<{ amount: string | null; detail: string | null; local?: boolean }>;
   /**
    * Effective NEAR Intents minimum for the currently-selected source
    * asset + pair. Form renders this as the inline hint below YOU SEND
@@ -361,24 +368,29 @@ export const PLACEHOLDER_ADDRESSES = {
   near: "0000000000000000000000000000000000000000000000000000000000000000",
   stellar: "GBVHKLWRPAW7NZRKILYU7AHBZL3NVRNUCNDAVCGW2WLMOOOMSQI4UWE3",
   sui: "0x0000000000000000000000000000000000000000000000000000000000000001",
-} as const;
+  // Added 2026-09-29 with the resolver's XRP and TRON branches (which threw
+  // unconditionally before). Abandon mnemonic at the wallet's own paths:
+  // XRP m/44'/144'/0'/0/0, TRON m/44'/60'/0'/0/0 (Pwnda's TRON default reuses
+  // the EVM key). USDT on TRON is held by the same account.
+  xrp: "rHsMGQEkVNJmpGWs8XUBoTBiAAbwxZN5v3",
+  tron: "TPrkFhZ8LH8Mruco8vXyA496TaeFBrbmeU",
+  usdtTron: "TPrkFhZ8LH8Mruco8vXyA496TaeFBrbmeU",
+  // `satisfies Required<…>`: a bundle field with no placeholder is now a type
+  // error, not a pair whose minimum silently never loads (ADA on 2026-09-05,
+  // XRP and TRON until 2026-09-29).
+} as const satisfies Required<WalletAddresses>;
 
 function walletAddressesWithPlaceholders(
   user: WalletAddresses | undefined,
 ): WalletAddresses {
-  return {
-    evm: user?.evm ?? PLACEHOLDER_ADDRESSES.evm,
-    btc: user?.btc ?? PLACEHOLDER_ADDRESSES.btc,
-    ltc: user?.ltc ?? PLACEHOLDER_ADDRESSES.ltc,
-    doge: user?.doge ?? PLACEHOLDER_ADDRESSES.doge,
-    bch: user?.bch ?? PLACEHOLDER_ADDRESSES.bch,
-    dash: user?.dash ?? PLACEHOLDER_ADDRESSES.dash,
-    sol: user?.sol ?? PLACEHOLDER_ADDRESSES.sol,
-    cardano: user?.cardano ?? PLACEHOLDER_ADDRESSES.cardano,
-    near: user?.near ?? PLACEHOLDER_ADDRESSES.near,
-    stellar: user?.stellar ?? PLACEHOLDER_ADDRESSES.stellar,
-    sui: user?.sui ?? PLACEHOLDER_ADDRESSES.sui,
-  };
+  // Every field the resolver can ask for, the user's own where derived. Built
+  // from the placeholder table rather than a field list, so a new field
+  // cannot be forgotten here the way `xrp`/`tron` would have been.
+  const out: WalletAddresses = { ...PLACEHOLDER_ADDRESSES };
+  for (const [field, addr] of Object.entries(user ?? {})) {
+    if (addr) out[field as keyof WalletAddresses] = addr;
+  }
+  return out;
 }
 
 export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
@@ -877,22 +889,24 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
 
   const probeMinimumNow = useCallback(async (
     hiAmountDisplay?: string,
-  ): Promise<{ amount: string | null; detail: string | null }> => {
+  ): Promise<{ amount: string | null; detail: string | null; local?: boolean }> => {
     const none = (detail: string | null) => ({ amount: null, detail });
+    // Nothing was asked of NEAR's quote endpoint: `detail` is our sentence.
+    const local = (detail: string) => ({ amount: null, detail, local: true });
     const fromMeta =
       getSwapCoinMeta(from, fromBlockchain) ?? SWAP_COIN_META[from.toUpperCase()];
     const toMeta = getSwapCoinMeta(to, toBlockchain) ?? SWAP_COIN_META[to.toUpperCase()];
     if (!fromMeta?.nearIntentsAsset || !toMeta?.nearIntentsAsset) {
-      return none("this pair is not on NEAR Intents");
+      return local("this pair is not on NEAR Intents");
     }
     try {
       await getNearIntentsTokens();
     } catch (e) {
-      return none(`could not load NEAR's token list: ${(e as Error)?.message ?? String(e)}`);
+      return local(`could not load NEAR's token list: ${(e as Error)?.message ?? String(e)}`);
     }
     const fromToken = lookupTokenByAssetId(fromMeta.nearIntentsAsset);
     const toToken = lookupTokenByAssetId(toMeta.nearIntentsAsset);
-    if (!fromToken || !toToken) return none("NEAR's token list does not carry both assets");
+    if (!fromToken || !toToken) return local("NEAR's token list does not carry both assets");
     // Already learned for this pair (the pair-change probe usually has it):
     // answer with zero network calls. This is what makes MIN feel instant.
     const cached = getPairMinimum(fromToken.assetId, toToken.assetId);
@@ -903,6 +917,13 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       };
     }
     const probeWallet = walletAddressesWithPlaceholders(walletAddresses);
+    // Every rung of every search below resolves these same two addresses, so
+    // a fault here is ours and no amount of searching gets past it. Check once
+    // and say so. Before 2026-09-29 the first probe swallowed this, the next
+    // one threw it, and the form printed it as "NEAR said: …" after "did not
+    // quote at any size" — for a pair NEAR had never been asked about.
+    const buildFault = probeBuildFault(fromToken.assetId, toToken.assetId, probeWallet);
+    if (buildFault) return local(buildFault);
     let lastError: string | null = null;
     setProbingPair(true);
     try {
@@ -968,6 +989,10 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
       if (!result) return none(lastError);
       return { amount: formatAtomicForDisplay(result.minAtomicIn, fromMeta.decimals), detail: null };
     } catch (e) {
+      // The probes build their request bodies outside their own try blocks,
+      // so a request that cannot be built surfaces here. That is a local
+      // fault, never an answer from NEAR.
+      if (e instanceof IntentsValidationError) return local(e.message);
       return none((e as Error)?.message ?? String(e));
     } finally {
       setProbingPair(false);

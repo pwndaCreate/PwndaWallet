@@ -39,6 +39,7 @@ import type {
   ChainAdapter,
   ChainType,
   FeeEstimate,
+  GasBudget,
   NetworkInfo,
   TxHistoryPage,
   TxResult,
@@ -47,11 +48,20 @@ import {
   trxAdapter,
   tronFetch,
   ethAddressToTron,
+  isTronAddress,
   tronAddressToHex,
+  tronNodeMessage,
+  waitForTronExecution,
 } from "./trx-wallet";
+import { verifyTronTransaction } from "./tron-tx-verify";
 import { atomicToDecimalString, decimalStringToAtomic } from "./spl-token-wallet";
 
-/** Tron hex address (`41` + 20 bytes) → 32-byte ABI word. */
+/**
+ * Tron hex address (`41` + 20 bytes) → 32-byte ABI word. Throws on anything
+ * that is not a TRON address: the ABI word drops the version byte, so a
+ * Bitcoin `1…` address (also 21-byte base58check) used to encode into a
+ * transfer to a TRON account nobody controls (2026-09-29).
+ */
 export function addressToAbiWord(tronAddress: string): string {
   const hex = tronAddressToHex(tronAddress);
   const noPrefix = hex.startsWith("41") ? hex.slice(2) : hex;
@@ -60,6 +70,188 @@ export function addressToAbiWord(tronAddress: string): string {
 
 function uint256Word(v: bigint): string {
   return v.toString(16).padStart(64, "0");
+}
+
+// ─── What a transfer costs in TRX (2026-09-29) ────────────────────────────
+//
+// A TRC-20 transfer burns TRX for ENERGY (the contract's execution) and
+// BANDWIDTH (the transaction's bytes) unless the account has staked or free
+// resources to cover them. It is paid in TRX, not in the token, so an account
+// holding only USDT cannot send it — and before this date the wallet let it
+// try: the transfer was built, broadcast, and ran out of energy on chain.
+
+/** Energy for `transfer()` to an address that has never held the token: a
+ *  fresh storage slot, the dear case. Measured 2026-09-29 by constant call
+ *  from a live USDT holder: 130,285 to a new address, 64,285 to a holder
+ *  (both including the contract's dynamic-energy penalty). Used only while
+ *  there is no recipient to simulate. */
+const NEW_HOLDER_ENERGY = 131_000n;
+/** Bytes a signed TRC-20 transfer puts on the wire, for bandwidth (≈345). */
+const TRC20_TX_BYTES = 350n;
+
+const max0 = (v: bigint) => (v > 0n ? v : 0n);
+
+/** Sun as TRX, rounded UP to 0.01 — a requirement must not read smaller than it is. */
+function trxText(sun: bigint, roundUp = false): string {
+  const step = 10_000n;
+  const v = roundUp && sun % step !== 0n ? sun - (sun % step) + step : sun;
+  return ethers.formatUnits(v, 6);
+}
+
+interface TronPrices {
+  energySun: bigint;
+  bandwidthSun: bigint;
+}
+let pricesCache: { v: TronPrices; at: number } | null = null;
+
+/** Energy and bandwidth prices. Changed by governance vote, so cached 10 min. */
+async function tronPrices(): Promise<TronPrices> {
+  if (pricesCache && Date.now() - pricesCache.at < 10 * 60_000) return pricesCache.v;
+  const resp = await tronFetch(`/wallet/getchainparameters`);
+  const params: Array<{ key: string; value?: number }> =
+    (await resp.json())?.chainParameter ?? [];
+  const value = (k: string) => params.find((p) => p.key === k)?.value;
+  const energy = value("getEnergyFee");
+  const bandwidth = value("getTransactionFee");
+  if (!energy || !bandwidth) throw new Error("TRON chain parameters unavailable");
+  const v = { energySun: BigInt(energy), bandwidthSun: BigInt(bandwidth) };
+  pricesCache = { v, at: Date.now() };
+  return v;
+}
+
+interface TronAccountState {
+  balanceSun: bigint;
+  energyFree: bigint;
+  bandwidthFree: bigint;
+}
+const accountCache = new Map<string, { v: TronAccountState; at: number }>();
+
+/**
+ * TRX balance plus unspent energy and bandwidth. Cached 15 s per address:
+ * the Send modal asks on every keystroke, and TronGrid suspends a keyless
+ * client for 5 s past 3 requests a second.
+ */
+async function tronAccountState(address: string, fresh: boolean): Promise<TronAccountState> {
+  const hit = accountCache.get(address);
+  if (!fresh && hit && Date.now() - hit.at < 15_000) return hit.v;
+  const [acctResp, resResp] = await Promise.all([
+    tronFetch(`/v1/accounts/${address}`),
+    tronFetch(`/wallet/getaccountresource`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ address, visible: true }),
+    }),
+  ]);
+  const acct = await acctResp.json();
+  const res = await resResp.json();
+  if (!Array.isArray(acct?.data) || res?.Error) throw new Error("TRON account lookup failed");
+  const n = (x: unknown) => BigInt(typeof x === "number" ? Math.trunc(x) : 0);
+  const v: TronAccountState = {
+    balanceSun: n(acct.data[0]?.balance),
+    energyFree: max0(n(res.EnergyLimit) - n(res.EnergyUsed)),
+    bandwidthFree:
+      max0(n(res.freeNetLimit) - n(res.freeNetUsed)) + max0(n(res.NetLimit) - n(res.NetUsed)),
+  };
+  accountCache.set(address, { v, at: Date.now() });
+  return v;
+}
+
+const energyCache = new Map<string, { v: bigint | null; at: number }>();
+
+/**
+ * Energy this exact transfer would use, by constant call — nothing signed or
+ * broadcast. `null` when the call would revert (an amount above the token
+ * balance, say): a reverted simulation's energy is not the transfer's.
+ * Cached a minute per (token, sender, recipient); the amount barely moves it.
+ */
+async function simulateTransferEnergy(
+  contract: string,
+  owner: string,
+  to: string,
+  atomic: bigint,
+): Promise<bigint | null> {
+  const key = `${contract}|${owner}|${to}`;
+  const hit = energyCache.get(key);
+  if (hit && Date.now() - hit.at < 60_000) return hit.v;
+  const resp = await tronFetch(`/wallet/triggerconstantcontract`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      owner_address: owner,
+      contract_address: contract,
+      function_selector: "transfer(address,uint256)",
+      parameter: addressToAbiWord(to) + uint256Word(atomic > 0n ? atomic : 1n),
+      visible: true,
+    }),
+  });
+  const data = await resp.json();
+  const reverted =
+    !!data?.Error ||
+    data?.result?.result !== true ||
+    data?.transaction?.ret?.[0]?.ret === "FAILED";
+  const v = reverted || !data?.energy_used ? null : BigInt(data.energy_used);
+  energyCache.set(key, { v, at: Date.now() });
+  return v;
+}
+
+/**
+ * Can `address` pay, in TRX, for a TRC-20 transfer? `requiredSun` is what the
+ * transfer would burn after spending the account's free/staked energy and
+ * bandwidth; `null` when the prices or the account could not be read.
+ */
+async function trc20Budget(
+  contract: string,
+  decimals: number,
+  address: string,
+  opts: { to?: string; amount?: string } | undefined,
+  fresh: boolean,
+): Promise<{ budget: GasBudget; requiredSun: bigint | null }> {
+  const base = { ticker: "TRX", chainName: "TRON", includesAmount: false };
+  let state: TronAccountState;
+  try {
+    state = await tronAccountState(address, fresh);
+  } catch (e) {
+    // Unknown is not zero: say nothing rather than "you have no TRX".
+    console.warn("[trc20] account read failed:", e);
+    return { budget: { ...base, available: "0", required: null, sufficient: null }, requiredSun: null };
+  }
+  let requiredSun: bigint | null = null;
+  try {
+    const prices = await tronPrices();
+    let energy = NEW_HOLDER_ENERGY;
+    const to = opts?.to?.trim();
+    if (to && isTronAddress(to)) {
+      let atomic = 1n;
+      try {
+        if (opts?.amount?.trim()) atomic = decimalStringToAtomic(opts.amount.trim(), decimals);
+      } catch {
+        /* unparsable amount: size the simulation at one unit */
+      }
+      const simulated = await simulateTransferEnergy(contract, address, to, atomic);
+      if (simulated !== null) energy = simulated;
+    }
+    const energyBurn = max0(energy - state.energyFree) * prices.energySun;
+    const bandwidthBurn =
+      state.bandwidthFree >= TRC20_TX_BYTES ? 0n : TRC20_TX_BYTES * prices.bandwidthSun;
+    requiredSun = energyBurn + bandwidthBurn;
+  } catch (e) {
+    console.warn("[trc20] energy estimate failed:", e);
+  }
+  const sufficient =
+    requiredSun !== null
+      ? state.balanceSun >= requiredSun
+      : state.balanceSun === 0n
+        ? false
+        : null;
+  return {
+    budget: {
+      ...base,
+      available: trxText(state.balanceSun),
+      required: requiredSun !== null ? trxText(requiredSun, true) : null,
+      sufficient,
+    },
+    requiredSun,
+  };
 }
 
 function hexToBytes(hex: string): Uint8Array {
@@ -90,13 +282,22 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
     color: cfg.color,
     addressPlaceholder: "T...",
     // A TRC-20 leg is held by the TRX account itself, so the derivation that
-    // matters is Tron's — including its TronLink quirk of using ETH coin type
-    // 60 rather than TRX's own 195.
+    // matters is Tron's: Pwnda's default reuses the EVM key (coin type 60).
+    // Corrected 2026-09-29 — this called 60 a "TronLink quirk"; TronLink uses
+    // TRX's own 195. When a derivation choice moves TRON off the default, the
+    // vault moves this leg with it (`tokenLegsHeldBy`).
     derivation: {
       kind: "bip39",
       path: "m/44'/60'/0'/0/0",
-      standard: "TronLink convention: ETH coin type 60, not TRX's own 195",
+      standard: "the EVM key (ETH coin type 60), which Pwnda reuses for TRON. TronLink and Ledger use TRX's own coin type 195, so their seeds show a different TRON address here",
       hasAlternatives: true,
+    },
+
+    // Fees are paid in TRX (energy + bandwidth), never in the token.
+    gasToken: { ticker: "TRX", chainName: "TRON" },
+
+    async getGasBudget(address: string, opts?: { to?: string; amount?: string }) {
+      return (await trc20Budget(cfg.contract, cfg.decimals, address, opts, false)).budget;
     },
 
     importFromMnemonic: (m: string) => ({
@@ -147,8 +348,44 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
     ): Promise<TxResult> {
       const wallet = new ethers.Wallet(privateKey.trim());
       const from = ethAddressToTron(wallet.address);
+      const recipient = to.trim();
+      // Before anything else: the ABI word below drops the address's version
+      // byte, so a non-TRON address would encode into a transfer to a TRON
+      // account nobody controls.
+      if (!isTronAddress(recipient)) {
+        throw new Error(
+          `"${recipient}" is not a TRON address. ${cfg.ticker} on TRON can only be sent to a TRON address (T…).`,
+        );
+      }
       const atomic = decimalStringToAtomic(amount, cfg.decimals);
+      if (atomic <= 0n) throw new Error("Amount must be greater than zero.");
 
+      // Refuse before building when this account definitely cannot pay the
+      // TRX the transfer burns. Fresh read: this is the decision, not a hint.
+      const { budget, requiredSun } = await trc20Budget(
+        cfg.contract,
+        cfg.decimals,
+        from,
+        { to: recipient, amount },
+        true,
+      );
+      if (budget.sufficient === false) {
+        throw new Error(
+          budget.required
+            ? `Sending ${cfg.ticker} on TRON burns about ${budget.required} TRX for energy and bandwidth, ` +
+                `and this address has ${budget.available} TRX. Add TRX first — a transfer that runs out ` +
+                `of energy still burns what it used.`
+            : `This address has no TRX to pay for the transfer's energy. Add TRX first.`,
+        );
+      }
+      if (requiredSun !== null && requiredSun > BigInt(FEE_LIMIT_SUN)) {
+        throw new Error(
+          `This transfer would burn about ${trxText(requiredSun, true)} TRX, above the ` +
+            `${trxText(BigInt(FEE_LIMIT_SUN))} TRX fee limit — it would run out of energy. Try again later.`,
+        );
+      }
+
+      const parameter = addressToAbiWord(recipient) + uint256Word(atomic);
       const createResp = await tronFetch(`/wallet/triggersmartcontract`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -156,7 +393,7 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
           owner_address: from,
           contract_address: cfg.contract,
           function_selector: "transfer(address,uint256)",
-          parameter: addressToAbiWord(to) + uint256Word(atomic),
+          parameter,
           fee_limit: FEE_LIMIT_SUN,
           call_value: 0,
           visible: true,
@@ -165,15 +402,21 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
       if (!createResp.ok) throw new Error(`Failed to build ${cfg.ticker} transfer`);
       const built = await createResp.json();
       if (built?.result?.result !== true || !built?.transaction) {
-        const msg = built?.result?.message;
+        const msg = tronNodeMessage(built?.result?.message) || tronNodeMessage(built?.Error);
         throw new Error(
-          msg
-            ? `${cfg.ticker} transfer rejected: ${Buffer.from(msg, "hex").toString("utf8")}`
-            : `${cfg.ticker} transfer could not be built`,
+          msg ? `${cfg.ticker} transfer rejected: ${msg}` : `${cfg.ticker} transfer could not be built`,
         );
       }
 
       const txData = built.transaction;
+      // Sign only the transfer we asked for (see `tron-tx-verify.ts`).
+      verifyTronTransaction(txData, {
+        kind: "trc20",
+        ownerHex: tronAddressToHex(from),
+        contractHex: tronAddressToHex(cfg.contract),
+        data: "a9059cbb" + parameter,
+        maxFeeLimitSun: BigInt(FEE_LIMIT_SUN),
+      });
       const signingKey = new ethers.SigningKey(privateKey.trim());
       const signature = signingKey.sign(hexToBytes(txData.txID));
       txData.signature = [
@@ -190,8 +433,13 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
       if (!broadcast.ok) throw new Error(`Failed to broadcast ${cfg.ticker} transfer`);
       const result = await broadcast.json();
       if (!result.result) {
-        throw new Error(result.message || `${cfg.ticker} broadcast failed`);
+        throw new Error(tronNodeMessage(result.message) || result.code || `${cfg.ticker} broadcast failed`);
       }
+      // Accepted into a pool is not executed. Wait for the block and throw if
+      // the transfer failed in it (OUT_OF_ENERGY, REVERT); "pending" after the
+      // wait is not a failure, so the hash is returned as before.
+      accountCache.delete(from);
+      await waitForTronExecution(txData.txID);
       return { hash: txData.txID };
     },
 
@@ -201,24 +449,33 @@ export function createTrc20Adapter(cfg: Trc20AdapterConfig): ChainAdapter {
 
     async getTransactionHistory(
       address: string,
-      opts?: { limit?: number },
+      opts?: { limit?: number; cursor?: string },
     ): Promise<TxHistoryPage> {
       const limit = opts?.limit ?? 25;
+      const fingerprint = opts?.cursor ? `&fingerprint=${encodeURIComponent(opts.cursor)}` : "";
+      // `tronFetch` throws once every source has failed, which is the
+      // adapter contract. Until 2026-09-29 a failure became an empty list,
+      // indistinguishable on the Activity tab from "no transfers".
       const resp = await tronFetch(
-        `/v1/accounts/${address}/transactions/trc20?limit=${limit}&contract_address=${cfg.contract}`,
-      ).catch(() => null);
-      if (!resp || !resp.ok) return { items: [] };
-      const data = await resp.json().catch(() => null);
-      const rows: any[] = Array.isArray(data?.data) ? data.data : [];
+        `/v1/accounts/${address}/transactions/trc20?limit=${limit}&only_confirmed=true&contract_address=${cfg.contract}${fingerprint}`,
+      );
+      const data = await resp.json();
+      if (!Array.isArray(data?.data)) throw new Error(`${cfg.ticker} history: unexpected response`);
+      const rows: any[] = data.data;
       return {
-        items: rows.map((r) => ({
-          chain: cfg.chain,
-          hash: String(r.transaction_id ?? ""),
-          direction: String(r.to ?? "") === address ? ("in" as const) : ("out" as const),
-          amount: atomicToDecimalString(BigInt(String(r.value ?? "0")), cfg.decimals),
-          timestamp: r.block_timestamp ? Math.floor(r.block_timestamp / 1000) : undefined,
-          counterparty: String(r.to ?? "") === address ? r.from : r.to,
-        })),
+        items: rows.map((r) => {
+          const toMe = String(r.to ?? "") === address;
+          const fromMe = String(r.from ?? "") === address;
+          return {
+            chain: cfg.chain,
+            hash: String(r.transaction_id ?? ""),
+            direction: toMe && fromMe ? ("self" as const) : toMe ? ("in" as const) : ("out" as const),
+            amount: atomicToDecimalString(BigInt(String(r.value ?? "0")), cfg.decimals),
+            timestamp: r.block_timestamp ? Math.floor(r.block_timestamp / 1000) : undefined,
+            counterparty: toMe ? r.from : r.to,
+          };
+        }),
+        cursor: data.meta?.fingerprint,
       };
     },
 

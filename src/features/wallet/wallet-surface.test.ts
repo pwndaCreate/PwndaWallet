@@ -21,12 +21,13 @@ import {
   hasSwapVenue,
   historySurfaceFor,
   importableChains,
-  isAlwaysListed,
   receiveBlockedReason,
   sendBlockedReason,
   swapAssetKeyFor,
   swapBlockedReason,
+  zephyrAssetRowsFrom,
 } from "./wallet-surface";
+import { atomicToZph } from "../../wallets/zph-rpc";
 
 const wallet = (chain: ChainType, address: string): WalletInfo => ({
   chain,
@@ -104,14 +105,45 @@ describe("independent-seed chains: listed from the adapter flag, not a hand list
     expect(importableChains({})).not.toContain("bitcoin");
     expect(importableChains({})).not.toContain("ethereum");
   });
+});
 
-  it("keeps every held independent-seed chain in portrait's collapsed list, and only those", () => {
-    // 2026-08-28: ZANO missing from a hand-kept ticker set made the chain
-    // unreachable. The rule is now the flag itself.
-    for (const c of ALL_CHAINS as ChainType[]) {
-      expect(isAlwaysListed(c), c).toBe(!!getAdapter(c).usesIndependentSeed);
-    }
-    expect(isAlwaysListed("xelis")).toBe(true);
+/**
+ * 2026-09-29: landscape listed ZEPHUSD / ZEPHRSV / ZEPHYRS only while held,
+ * so an asset never held had no row to open. The operator: "show even if it
+ * has a 0 balance, let this be true for any other assets that might have the
+ * same or similar attribute".
+ */
+describe("Zephyr's own assets are listed at zero", () => {
+  const noPrice = () => null;
+
+  it("lists all three when only ZEPH is held", () => {
+    const rows = zephyrAssetRowsFrom(
+      [{ asset_type: "ZPH", balance: 5e12, unlocked_balance: 5e12 }],
+      noPrice,
+    );
+    expect(rows.map((r) => r.ticker)).toEqual(["ZEPHUSD", "ZEPHRSV", "ZEPHYRS"]);
+    for (const r of rows) expect(r.balanceStr).toBe(atomicToZph(0));
+  });
+
+  it("prices a zero at a known price as $0, and says unknown without one", () => {
+    const rows = zephyrAssetRowsFrom([], (a) => (a === "ZSD" ? 1 : null));
+    expect(rows.find((r) => r.asset === "ZSD")!.usd).toBe(0);
+    expect(rows.find((r) => r.asset === "ZRS")!.usd).toBeNull();
+  });
+
+  it("carries a held balance and its value through", () => {
+    const rows = zephyrAssetRowsFrom(
+      [{ asset_type: "ZYS", balance: 2_500_000_000_000, unlocked_balance: 0 }],
+      (a) => (a === "ZYS" ? 2 : null),
+    );
+    const zys = rows.find((r) => r.asset === "ZYS")!;
+    expect(zys.balanceStr).toBe(atomicToZph(2_500_000_000_000));
+    expect(zys.usd).toBe(5);
+  });
+
+  it("shows no rows before the Zephyr wallet has reported", () => {
+    expect(zephyrAssetRowsFrom(null, noPrice)).toEqual([]);
+    expect(zephyrAssetRowsFrom(undefined, noPrice)).toEqual([]);
   });
 });
 

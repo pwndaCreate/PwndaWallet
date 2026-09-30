@@ -42,7 +42,7 @@ import {
 } from "./intents-pair-min-cache";
 import type { NearIntentsToken } from "./near-intents-tokens";
 import type { WalletAddresses } from "./asset-address-resolver";
-import { addressForAssetId } from "./asset-address-resolver";
+import { addressForAssetId, IntentsValidationError } from "./asset-address-resolver";
 
 /**
  * Default USD probe schedule. Cheap-first to favor catching small
@@ -182,6 +182,32 @@ export function learnUsdLimitFromError(args: {
     usdFloor: usd,
   });
   return atomic;
+}
+
+/**
+ * Why a probe for this pair cannot even be BUILT, or null when it can.
+ *
+ * Every probe body resolves the same two addresses through
+ * `addressForAssetId`, so when one of them fails, no rung of any search can
+ * get past it and nothing is learned by trying. Callers check once, up front,
+ * and report the sentence as the wallet's own — it is not a reply from NEAR.
+ * That distinction is the whole point: on 2026-09-29 the MIN button printed
+ * the resolver's "TRON destination is supported but…" as "NEAR said: …",
+ * after "did not quote at any size", for a pair NEAR was never asked about.
+ */
+export function probeBuildFault(
+  fromAssetId: string,
+  toAssetId: string,
+  walletAddresses: WalletAddresses,
+): string | null {
+  try {
+    addressForAssetId(fromAssetId, walletAddresses);
+    addressForAssetId(toAssetId, walletAddresses);
+    return null;
+  } catch (e) {
+    if (e instanceof IntentsValidationError) return e.message;
+    throw e;
+  }
 }
 
 /**
