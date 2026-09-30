@@ -429,6 +429,20 @@ pub fn delete_pidfile(path: &PathBuf) {
     let _ = std::fs::remove_file(path);
 }
 
+/// Is the wallet-rpc listening on a port the one WE started?
+///
+/// Only when the PID in our pidfile is the PID holding the port. Nothing else
+/// proves it: a wallet-rpc started without `--rpc-login` obeys ANY request,
+/// authenticated or not, so holding our credentials proves nothing either.
+/// On 2026-09-13 the startup cleanup stopped two production wallet-rpcs of a
+/// mining pool on the same machine (its Zephyr payout wallet on 18082 and an
+/// XMR wallet on 18083 — the ports this app prefers, for the opposite coins).
+/// A process that is not provably ours is left alone; the port fallback takes
+/// an ephemeral port instead.
+pub fn port_holder_is_ours(pidfile_pid: Option<u32>, port_pid: Option<u32>) -> bool {
+    matches!((pidfile_pid, port_pid), (Some(ours), Some(holder)) if ours == holder)
+}
+
 /// Persist per-session wallet-rpc Digest credentials so the *next* session
 /// can gracefully stop an orphaned sidecar (Ctrl+C in `tauri dev`, app
 /// crash, OS hard-kill — anywhere the current session couldn't run its own
@@ -593,6 +607,17 @@ pub async fn probe_node(url: String, timeout_ms: u64) -> NodeProbeResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 2026-09-13: the startup cleanup stopped a mining pool's wallet-rpcs.
+    /// Ownership is the pidfile PID holding the port — nothing weaker.
+    #[test]
+    fn a_wallet_rpc_is_ours_only_when_the_port_pid_is_our_pidfile_pid() {
+        assert!(port_holder_is_ours(Some(4242), Some(4242)));
+        assert!(!port_holder_is_ours(Some(4242), Some(9999)), "a stranger on our port");
+        assert!(!port_holder_is_ours(None, Some(9999)), "no pidfile proves nothing");
+        assert!(!port_holder_is_ours(Some(4242), None), "holder unknown is not ours");
+        assert!(!port_holder_is_ours(None, None));
+    }
 
     /// RAM plan 3.3 capped this at 4; Phase 4's measurement found the idle
     /// pool costs no memory, so it is back at 16 (see the constant).

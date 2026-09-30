@@ -29,7 +29,7 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::wallet_rpc_common::{
     delete_creds_file, delete_pidfile, do_rpc_call_at, port_is_bound, probe_node, random_hex,
-    read_creds_file, read_log_tail, read_pidfile, write_creds_file,
+    port_holder_is_ours, read_creds_file, read_log_tail, read_pidfile, write_creds_file,
     write_pidfile, NodeProbeResult,
 };
 
@@ -526,45 +526,80 @@ pub async fn zph_start_rpc(
     let old_creds = read_creds_file(&credsfile);
 
     if port_is_bound(ZPH_RPC_PORT).await {
-        if let Some(creds) = old_creds.as_ref() {
-            let _ = do_rpc_call(
-                Some(creds),
-                "store",
-                serde_json::json!({}),
-                std::time::Duration::from_secs(10),
-            )
-            .await;
-            let _ = do_rpc_call(
-                Some(creds),
-                "close_wallet",
-                serde_json::json!({}),
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-            let _ = do_rpc_call(
-                Some(creds),
-                "stop_wallet",
-                serde_json::json!({}),
-                std::time::Duration::from_secs(5),
-            )
-            .await;
-            for _ in 0..15 {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                if !port_is_bound(ZPH_RPC_PORT).await {
-                    break;
+        // ONLY IF THE PROCESS ON THE PORT IS DEMONSTRABLY OURS — for EVERY call
+        // in this pass, authenticated or not.
+        //
+        // On 2026-09-13 this pass shut down two production wallet-rpcs of a
+        // mining pool on the same machine: the pool runs its Zephyr payout
+        // wallet on 18082 and an XMR wallet on 18083 — the same two ports this
+        // app prefers, for the opposite coins — and neither uses `--rpc-login`.
+        // Both stopped cleanly, mid-operation, on app start, and the pool could
+        // not pay miners until they were restarted.
+        //
+        // The first fix guarded only the unauthenticated `stop_wallet`. The
+        // graceful path above it was just as dangerous: a wallet-rpc without
+        // `--rpc-login` accepts an AUTHENTICATED `close_wallet`/`stop_wallet`
+        // too, so holding our credentials proves nothing about whose process
+        // is on the port (2026-09-29).
+        //
+        // Proof: the PID listening on the port is the PID in our pidfile
+        // (`port_holder_is_ours`). No pidfile, a dead pidfile PID, or a
+        // different PID all mean "not ours" — leave it alone; the port
+        // fallback below takes an ephemeral port instead.
+        //
+        // Zephyr side: the 2026-09-13 fix covered `xmr_rpc.rs` only, and this
+        // pass kept firing at 18083 — where that pool's XMR wallet lives.
+        let ours = port_holder_is_ours(
+            read_pidfile(&pidfile),
+            crate::platform::find_pid_holding_port(ZPH_RPC_PORT).await,
+        );
+        if !ours {
+            eprintln!(
+                "[zph_rpc] port {} is held by a process we did not start; \
+                 leaving it alone (will use an ephemeral port)",
+                ZPH_RPC_PORT
+            );
+        } else {
+            if let Some(creds) = old_creds.as_ref() {
+                let _ = do_rpc_call(
+                    Some(creds),
+                    "store",
+                    serde_json::json!({}),
+                    std::time::Duration::from_secs(10),
+                )
+                .await;
+                let _ = do_rpc_call(
+                    Some(creds),
+                    "close_wallet",
+                    serde_json::json!({}),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+                let _ = do_rpc_call(
+                    Some(creds),
+                    "stop_wallet",
+                    serde_json::json!({}),
+                    std::time::Duration::from_secs(5),
+                )
+                .await;
+                for _ in 0..15 {
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if !port_is_bound(ZPH_RPC_PORT).await {
+                        break;
+                    }
                 }
             }
-        }
 
-        if port_is_bound(ZPH_RPC_PORT).await {
-            let _ = do_rpc_call(
-                None,
-                "stop_wallet",
-                serde_json::json!({}),
-                std::time::Duration::from_secs(2),
-            )
-            .await;
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            if port_is_bound(ZPH_RPC_PORT).await {
+                let _ = do_rpc_call(
+                    None,
+                    "stop_wallet",
+                    serde_json::json!({}),
+                    std::time::Duration::from_secs(2),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            }
         }
     }
 
