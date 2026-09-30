@@ -607,24 +607,24 @@ describe("F6: the TS-signed XRP / Tron sources reach their adapters (2026-09-29 
 // ─────────────────────────────────────────────────────────────────────────
 
 describe("F7: the NEAR source roster offers only executable sources (2026-09-29 send-safety audit)", () => {
-  it("drops XLM and SUI, keeps DASH (now account-wide, F10)", () => {
-    expect(intentsSources).not.toContain("XLM");
-    expect(intentsSources).not.toContain("SUI");
+  // XLM and SUI were dropped here on 2026-09-29 because the executor had no
+  // deposit path for either. They are back since 2026-09-30, with one each;
+  // their deposits are driven through this same registry in
+  // `xlmSuiIntentsSource.test.ts`.
+  it("offers XLM and SUI (deposit paths since 2026-09-30) and DASH (account-wide, F10)", () => {
+    expect(intentsSources).toContain("XLM");
+    expect(intentsSources).toContain("SUI");
     expect(intentsSources).toContain("DASH");
-    // Still destinations.
     const dest = getDropdownTickers({ router: "intents" });
     expect(dest).toContain("XLM");
     expect(dest).toContain("SUI");
   });
 
-  it("every offered source reaches a deposit path in the executor", async () => {
-    // A source whose branch throws "call those directly" (the old
-    // DASH/STELLAR/SUI arm) would surface here as a non-refusal error.
-    for (const t of ["XLM", "SUI"]) {
-      const err = await executeIntentsTrade(
-        bound({ fromAsset: t, amountIn: "10000000", depositAddress: `D-${t}`, sourceAddress: "S" }),
-      ).catch((e) => e);
-      expect(String(err?.message)).toMatch(/cannot be a NEAR Intents source|no deposit path/);
+  it("no offered source lands on the executor's refusal arm", async () => {
+    // The arm that remains is XMR/ZEPH/ZANO's "out of scope". A roster entry
+    // of those kinds would be offered and then refused after the password.
+    for (const t of intentsSources) {
+      expect(["XMR", "ZEPH", "ZANO"], t).not.toContain(SWAP_COIN_META[t]?.chainKind);
     }
   });
 });

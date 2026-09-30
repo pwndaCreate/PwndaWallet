@@ -35,6 +35,7 @@
 import { getIntentsQuote } from "../../api/proxy";
 import type { IntentsQuoteRequest } from "../../lib/proxy-types";
 import { chainsForSymbol } from "./intents-dedup";
+import { depositModeField } from "./intents-deposit-memo";
 
 /** How long a quote is reused. Mid-point of the operator's 10-30 min range. */
 export const HOP2_TTL_MS = 20 * 60_000;
@@ -153,6 +154,9 @@ export async function quoteHop2(args: Hop2QuoteArgs): Promise<number | null> {
         refundTo: addressFor(from.assetId),
         deadline: new Date(Date.now() + 30 * 60_000).toISOString(),
         quoteWaitingTimeMs: 0,
+        // MEMO for a Stellar origin only (2026-09-30): 1Click refuses a
+        // Stellar-origin quote, dry or not, without it.
+        ...depositModeField(from.assetId),
       };
       const res = await getIntentsQuote(req);
       const outAtomic = res?.quote?.amountOut;

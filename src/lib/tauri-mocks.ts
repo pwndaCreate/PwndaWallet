@@ -2382,7 +2382,11 @@ function intentsQuote(args?: { req?: Record<string, unknown> }): unknown {
   return {
     quote: {
       depositAddress: "sandbox-deposit-not-a-real-address",
-      depositMemo: null,
+      // A MEMO-mode request (a Stellar origin, 2026-09-30) is answered with a
+      // memo, as 1Click answers one — so the sandbox shows the confirm modal's
+      // "Deposit memo … (attached automatically)" row instead of its
+      // missing-memo refusal. The digits are the lead's live test-seed quote.
+      depositMemo: req?.depositMode === "MEMO" ? "188711688" : null,
       amountIn: "1000000000000000000",
       minAmountIn: "990000000000000000",
       amountOut: "48612000",

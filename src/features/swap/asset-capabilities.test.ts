@@ -40,6 +40,7 @@ import { describe, expect, it } from "vitest";
 import type { WalletInfo } from "../../wallets/types";
 import {
   ASSET_CAPABILITIES,
+  INTENTS_EXECUTABLE_SOURCE_KINDS,
   addressForTicker,
   deskAmountsFor,
   deskCoinsFor,
@@ -240,9 +241,12 @@ describe("ASSET_CAPABILITIES registry — agreement with public predicates", () 
   it("isIntentsRoutable agrees with the registry's nearIntentsAsset fields", () => {
     // Updated deliberately on 2026-09-29 (send-safety audit, F7): the
     // predicate is `f.nearIntentsAsset && t.nearIntentsAsset` AND the source
-    // must be one the executor can deposit from. XLM and SUI carry asset ids
-    // but have no executor branch, so a quoted XLM/SUI swap threw at Confirm,
-    // after the password. They stay routable as DESTINATIONS.
+    // must be one the executor can deposit from. XLM and SUI carried asset ids
+    // but had no executor branch, so a quoted XLM/SUI swap threw at Confirm,
+    // after the password, and F7 made them destinations only. Updated again
+    // on 2026-09-30: the executor now deposits both (the dashboard Send's
+    // Stellar and Sui transfers, XLM with its MEMO-mode deposit memo), so
+    // both are routable as sources — `xlmSuiIntentsSource.test.ts`.
     const tickers = Object.keys(ASSET_CAPABILITIES);
     for (const from of tickers) {
       for (const to of tickers) {
@@ -254,10 +258,17 @@ describe("ASSET_CAPABILITIES registry — agreement with public predicates", () 
         expect(isIntentsRoutable(from, to)).toBe(expected);
       }
     }
-    expect(isIntentsRoutable("XLM", "BTC")).toBe(false);
-    expect(isIntentsRoutable("SUI", "BTC")).toBe(false);
+    expect(isIntentsRoutable("XLM", "BTC")).toBe(true);
+    expect(isIntentsRoutable("SUI", "BTC")).toBe(true);
     expect(isIntentsRoutable("BTC", "XLM")).toBe(true);
     expect(isIntentsRoutable("BTC", "SUI")).toBe(true);
+    // The predicate still bites: a kind with no executor branch is not
+    // executable. No registry entry with an asset id has such a kind today,
+    // so pin the rule on the set it reads.
+    expect(INTENTS_EXECUTABLE_SOURCE_KINDS.has("STELLAR")).toBe(true);
+    expect(INTENTS_EXECUTABLE_SOURCE_KINDS.has("SUI")).toBe(true);
+    expect(INTENTS_EXECUTABLE_SOURCE_KINDS.has("XMR")).toBe(false);
+    expect(INTENTS_EXECUTABLE_SOURCE_KINDS.has("ZANO")).toBe(false);
   });
 });
 

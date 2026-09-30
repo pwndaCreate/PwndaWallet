@@ -26,10 +26,22 @@
  * is now sized per origin chain, and a quote with too little of it left is
  * refused before signing.
  *
+ * # The deposit mode (2026-09-30, XLM as a source)
+ *
+ * A Stellar quote is requested with `depositMode: "MEMO"`, and its deposit
+ * is told apart from every other Stellar deposit by the memo 1Click returns
+ * (`intents-deposit-memo.ts`). The mode is part of what a quote is bound to:
+ * a Stellar deposit signed against a quote that was not made in MEMO mode, or
+ * a non-Stellar deposit against one that was, is refused like any other
+ * mismatch. The memo itself is checked where it is attached
+ * (`depositMemoToAttach`), against the quote the executor was handed.
+ *
  * This module is types and pure functions only, so the hook, the modal and the
  * executor can share it without loading the registry.
  */
 import type { SwapChainKind } from "./asset-capabilities";
+import type { IntentsDepositMode } from "../../lib/proxy-types";
+import { intentsDepositModeFor } from "./intents-deposit-memo";
 
 /** The fields of a 1Click quote request that decide where money goes. */
 export interface IntentsQuoteRequestEcho {
@@ -41,6 +53,9 @@ export interface IntentsQuoteRequestEcho {
   refundTo: string;
   /** ISO 8601, as sent. */
   deadline?: string;
+  /** `"MEMO"` when the request asked for a memo deposit (Stellar); absent
+   *  otherwise, which 1Click reads as SIMPLE (2026-09-30). */
+  depositMode?: IntentsDepositMode;
 }
 
 /**
@@ -131,6 +146,14 @@ export function quoteBindingMismatches(
   if (!sameAddress(sent.refundTo, expected.refundTo)) {
     out.push(`quoted refund address ${sent.refundTo}, sending from ${expected.refundTo}`);
   }
+  // The deposit mode the ORIGIN needs (2026-09-30): MEMO for a Stellar asset,
+  // SIMPLE for everything else. Derived from the asset about to be sent, so
+  // no caller can forget to state it.
+  const needs = intentsDepositModeFor(expected.originAsset) ?? "SIMPLE";
+  const quotedIn = sent.depositMode ?? "SIMPLE";
+  if (quotedIn !== needs) {
+    out.push(`quoted in ${quotedIn} deposit mode, and this deposit needs ${needs}`);
+  }
   return out;
 }
 
@@ -174,7 +197,48 @@ export function echoMismatches(
   if (echo.refundTo !== undefined && !sameAddress(echo.refundTo, sent.refundTo)) {
     out.push(`refundTo ${echo.refundTo} ≠ sent ${sent.refundTo}`);
   }
+  // 2026-09-30: an echo that names a mode must name the one we sent (absent
+  // means SIMPLE on both sides — 1Click's default).
+  if (echo.depositMode != null && echo.depositMode !== (sent.depositMode ?? "SIMPLE")) {
+    out.push(`depositMode ${echo.depositMode} ≠ sent ${sent.depositMode ?? "SIMPLE"}`);
+  }
   return out;
+}
+
+/**
+ * Does a 1Click status response describe THIS memo deposit (2026-09-30)?
+ *
+ * A Stellar deposit address is shared, so its status is only meaningful for
+ * the memo it was asked with. If the relay ever drops `depositMemo` from the
+ * status query, 1Click is left with an address that many swaps share; a
+ * status about another swap must not settle this one's history row.
+ *
+ * The echo read here is `quoteResponse.quote` — where the 1Click SDK's
+ * `GetExecutionStatusResponse` type carries the quote a status is for. That
+ * placement is taken from the SDK type, not from a live Stellar status
+ * response (none has been captured yet), so the check only refuses a response
+ * that echoes a DIFFERENT address or memo. One that echoes nothing is
+ * accepted: an absent echo is not evidence, the same rule as `echoMismatches`.
+ * Deposits without a memo are not checked at all, so no other chain's
+ * polling changes.
+ */
+export function statusDescribesDeposit(
+  resp: unknown,
+  deposit: { depositAddress: string; depositMemo?: string | null },
+): boolean {
+  const memo = deposit.depositMemo;
+  if (memo === undefined || memo === null || memo === "") return true;
+  const quote = (resp as { quoteResponse?: { quote?: unknown } } | null)?.quoteResponse?.quote;
+  if (!quote || typeof quote !== "object") return true;
+  const q = quote as { depositAddress?: unknown; depositMemo?: unknown };
+  if (
+    typeof q.depositAddress === "string" &&
+    !sameAddress(q.depositAddress, deposit.depositAddress)
+  ) {
+    return false;
+  }
+  if (q.depositMemo === undefined) return true;
+  return q.depositMemo !== null && String(q.depositMemo) === memo;
 }
 
 // ───────────────────────────────────────────────────────────────────────────
@@ -203,7 +267,9 @@ export const INTENTS_DEPOSIT_WINDOWS: Record<
   utxo: { requestMinutes: 60, landingMinutes: 30 },
   // Cardano: ~20 s blocks, but the Koios submit path adds a hop.
   cardano: { requestMinutes: 45, landingMinutes: 15 },
-  // Account chains (EVM, Solana, NEAR, XRP, Tron): seconds to a minute.
+  // Account chains (EVM, Solana, NEAR, XRP, Tron, Stellar, Sui): seconds to a
+  // minute. A Stellar submit that goes unanswered is settled by hash within
+  // its 180 s timebound plus a minute (`session-send.ts`), inside this margin.
   account: { requestMinutes: 30, landingMinutes: 10 },
 };
 

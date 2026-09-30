@@ -44,10 +44,14 @@ export interface ResumeDeps {
   update: (id: string, patch: Partial<SwapHistoryEntry>) => Promise<void>;
   poll: (args: {
     depositAddress: string;
+    /** Set for a memo deposit (Stellar, 2026-09-30). */
+    depositMemo?: string;
     deadline?: string;
     intervalMs?: number;
   }) => Promise<IntentsStatusResponse>;
-  isActive: (depositAddress: string) => boolean;
+  /** Is a poller already watching this deposit? Address plus memo: two XLM
+   *  swaps share an address (2026-09-30). */
+  isActive: (depositAddress: string, depositMemo?: string) => boolean;
   now: () => number;
 }
 
@@ -63,11 +67,13 @@ const defaultDeps: ResumeDeps = {
 export function rowsToResume(
   rows: SwapHistoryEntry[],
   nowMs: number,
-  isActive: (depositAddress: string) => boolean,
+  isActive: (depositAddress: string, depositMemo?: string) => boolean,
 ): SwapHistoryEntry[] {
   return rows.filter((r) => {
     if (r.status !== "pending" || !r.depositAddress) return false;
-    if (isActive(r.depositAddress)) return false;
+    // With the memo (2026-09-30): a poller for one XLM swap at the shared
+    // address is not a poller for the next.
+    if (isActive(r.depositAddress, r.depositMemo)) return false;
     const created = Date.parse(r.createdAt);
     return !Number.isFinite(created) || nowMs - created <= RESUME_MAX_AGE_MS;
   });
@@ -92,6 +98,9 @@ export async function resumePendingIntentsSwaps(
       try {
         const terminal = await deps.poll({
           depositAddress: row.depositAddress!,
+          // A memo deposit's status is asked with its memo (2026-09-30);
+          // rows without one poll exactly as before.
+          ...(row.depositMemo ? { depositMemo: row.depositMemo } : {}),
           deadline: row.depositDeadline,
           intervalMs: 30_000,
         });

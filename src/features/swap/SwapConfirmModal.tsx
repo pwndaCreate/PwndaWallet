@@ -46,6 +46,7 @@ import {
   assertQuoteBinding,
   depositWindowMinutesLeft,
 } from "./intents-quote-binding";
+import { depositMemoToAttach, quoteHasDepositMemo } from "./intents-deposit-memo";
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 import { withTimeout } from "./broadcast-outcome";
 
@@ -79,6 +80,12 @@ import { withTimeout } from "./broadcast-outcome";
  * mid-signature, writes the history row the moment a hash exists, shows an
  * ambiguous broadcast as "unknown — check the explorer" with the hash, and
  * never offers Retry on a NEAR Intents quote: a new attempt is a new quote.
+ *
+ * 2026-09-30 (XLM as a source): a Stellar quote's deposit memo is shown under
+ * the addresses ("attached automatically"), checked before the vault is
+ * unlocked, and carried into the attempt record, the history row and every
+ * status query — the Stellar deposit address is shared, and the memo is what
+ * names this swap's deposit.
  */
 export function SwapConfirmModal({
   open,
@@ -176,6 +183,37 @@ export function SwapConfirmModal({
     getSwapCoinMeta(toAsset, defaultBlockchainFor(toAsset) ?? undefined) ??
     SWAP_COIN_META[toAsset.toUpperCase()];
   const depositAddr = q.intentsQuote?.depositAddress;
+  // The quote's deposit memo (2026-09-30). A Stellar deposit goes to an
+  // address every Stellar depositor shares, and the memo is what makes it
+  // THIS swap's: it is shown, attached by the executor, and part of every
+  // attempt record, history row and status query below. `undefined` for
+  // every quote without one.
+  const depositMemo = quoteHasDepositMemo(q.intentsQuote?.depositMemo)
+    ? String(q.intentsQuote!.depositMemo)
+    : undefined;
+  const deposit = depositAddr
+    ? depositMemo === undefined
+      ? { depositAddress: depositAddr }
+      : { depositAddress: depositAddr, depositMemo }
+    : undefined;
+  // Why this quote's memo cannot be attached, if it cannot — the executor's
+  // own rule, asked at render so Sign is disabled with the reason instead of
+  // failing after the password. Null when fine, or when there is no Intents
+  // quote to ask about.
+  const memoProblem = (() => {
+    if (q.source !== "intents" || !q.intentsQuote || !fromMeta) return null;
+    try {
+      depositMemoToAttach({
+        depositMode: q.intentsRequest?.depositMode,
+        depositMemo: q.intentsQuote.depositMemo,
+        chainKind: fromMeta.chainKind,
+        ticker: fromMeta.ticker,
+      });
+      return null;
+    } catch (e) {
+      return String((e as Error)?.message ?? e);
+    }
+  })();
   const depositDeadline = q.intentsQuote?.deadline ?? q.intentsRequest?.deadline;
   const windowLeft =
     q.source === "intents"
@@ -208,7 +246,15 @@ export function SwapConfirmModal({
     setSafetyError(null);
     setUnknownOutcome(null);
     setNowMs(Date.now());
-    const prior = intentsDepositAttempt(snapRef.current.quote.intentsQuote?.depositAddress);
+    // By address AND memo (2026-09-30): a used XLM quote must not make the
+    // NEXT XLM quote — same shared address, new memo — open as "used".
+    const opened = snapRef.current.quote.intentsQuote;
+    const prior = opened?.depositAddress
+      ? intentsDepositAttempt({
+          depositAddress: opened.depositAddress,
+          depositMemo: opened.depositMemo,
+        })
+      : undefined;
     if (prior) {
       setUsedInfo({ hash: prior.txHash });
       setStage("used");
@@ -314,7 +360,7 @@ export function SwapConfirmModal({
     xrpBlock ??
     (windowClosed
       ? "This quote's deposit window has closed (or is too close to closing for this chain). Close this window and let the form fetch a new quote."
-      : null);
+      : memoProblem);
 
   const submitPassword = async () => {
     if (submittingRef.current) return;
@@ -340,6 +386,8 @@ export function SwapConfirmModal({
     const writeIntentsRow = async (r: {
       sourceTxHash: string;
       depositAddress: string;
+      /** The memo the deposit carried (Stellar, 2026-09-30). */
+      depositMemo?: string;
       outcomeUnknown?: boolean;
     }) => {
       const entry: SwapHistoryEntry = {
@@ -356,6 +404,9 @@ export function SwapConfirmModal({
         provider,
         createdAt,
         depositAddress: r.depositAddress,
+        // Without it a resumed XLM row could not ask 1Click which of the
+        // swaps at the shared address is this one.
+        ...(r.depositMemo ? { depositMemo: r.depositMemo } : {}),
         depositDeadline,
         ...(r.outcomeUnknown ? { outcomeUnknown: true } : {}),
       };
@@ -367,9 +418,11 @@ export function SwapConfirmModal({
       }
     };
 
-    const followIntents = (depositAddress: string) => {
+    const followIntents = (depositAddress: string, memo?: string) => {
       void pollIntentsToTerminal({
         depositAddress,
+        // A memo deposit is asked about with its memo (2026-09-30).
+        ...(memo ? { depositMemo: memo } : {}),
         deadline: depositDeadline,
         onUpdate: (resp) => {
           setExec((prev) => ({
@@ -563,9 +616,10 @@ export function SwapConfirmModal({
       );
       const destinationAsset = toMeta?.nearIntentsAsset ?? "";
 
-      // Refusals that need no key and sign nothing (F2/F3/F4/F9), run before
-      // the vault is unlocked. The executor repeats the first three.
-      const prior = intentsDepositAttempt(depositAddr);
+      // Refusals that need no key and sign nothing (F2/F3/F4/F9, and the
+      // deposit memo), run before the vault is unlocked. The executor
+      // repeats all but the XRP one.
+      const prior = intentsDepositAttempt(deposit);
       if (prior) {
         setUsedInfo({ hash: prior.txHash });
         setExec({ phase: "idle" });
@@ -583,6 +637,14 @@ export function SwapConfirmModal({
         deadline: depositDeadline,
         chainKind: fromMeta.chainKind,
         nowMs: Date.now(),
+        ticker: fromMeta.ticker,
+      });
+      // A Stellar quote without a usable memo, or another chain's quote
+      // with one (2026-09-30).
+      depositMemoToAttach({
+        depositMode: q.intentsRequest?.depositMode,
+        depositMemo: q.intentsQuote.depositMemo,
+        chainKind: fromMeta.chainKind,
         ticker: fromMeta.ticker,
       });
       if (toAsset.toUpperCase() === "XRP") {
@@ -624,31 +686,33 @@ export function SwapConfirmModal({
         destinationAddress,
         // F2: the history row exists the moment there is a hash — before
         // the notify, before anything else that could fail.
-        onBroadcast: async ({ sourceTxHash, depositAddress }) => {
+        onBroadcast: async ({ sourceTxHash, depositAddress, depositMemo: memo }) => {
           setExec((prev) => ({ ...prev, sourceTxHash }));
-          await writeIntentsRow({ sourceTxHash, depositAddress });
+          await writeIntentsRow({ sourceTxHash, depositAddress, depositMemo: memo });
         },
         onPhase: (s) => setExec(s),
       });
-      followIntents(result.depositAddress);
+      followIntents(result.depositAddress, result.depositMemo);
     } catch (e: any) {
       const msg = String(e?.message ?? e);
       if (isSendOutcomeUnknown(e)) {
         // The deposit may be on the network (F2). Record it, follow the
-        // deposit address (1Click's status settles the question), and tell
-        // the user to check the hash — no Retry, ever, on this quote.
-        if (depositAddr) {
-          recordIntentsDeposit(depositAddr, { state: "unknown", txHash: e.hash });
+        // deposit (1Click's status settles the question), and tell the user
+        // to check the hash — no Retry, ever, on this quote. The memo goes
+        // with it (2026-09-30): at a shared Stellar address it is the only
+        // thing that says which deposit this was.
+        if (deposit) {
+          recordIntentsDeposit(deposit, { state: "unknown", txHash: e.hash });
           try {
             await writeIntentsRow({
               sourceTxHash: e.hash ?? "",
-              depositAddress: depositAddr,
+              ...deposit,
               outcomeUnknown: true,
             });
           } catch {
             /* the on-screen hash is what matters now */
           }
-          followIntents(depositAddr);
+          followIntents(deposit.depositAddress, depositMemo);
         }
         setUnknownOutcome({ message: msg, hash: e.hash });
         setExec((prev) => ({ ...prev, phase: "idle", sourceTxHash: e.hash ?? prev.sourceTxHash }));
@@ -672,9 +736,10 @@ export function SwapConfirmModal({
         return;
       }
       // Any other failure retires the quote (F2): "try again" is a NEW quote
-      // with a new deposit address, fetched by the form once this closes.
-      if (q.source === "intents" && depositAddr) {
-        recordIntentsDeposit(depositAddr, { state: "retired" });
+      // with a new deposit address (for XLM: a new memo), fetched by the
+      // form once this closes.
+      if (q.source === "intents" && deposit) {
+        recordIntentsDeposit(deposit, { state: "retired" });
       }
       // SafetyInvariantError is a wallet-self-detected bug — surface a
       // dedicated red banner with copy-friendly details. NO retry button:
@@ -792,6 +857,17 @@ export function SwapConfirmModal({
           <Row label="From" value={truncate(sourceAddress)} fullValue={sourceAddress} />
         )}
         <Row label="To" value={truncate(destinationAddress)} fullValue={destinationAddress} />
+        {/* The deposit memo (2026-09-30). An XLM deposit goes to an address
+            every Stellar depositor shares; the memo is what credits it to
+            this swap. Shown only when the executor will attach it — a memo
+            it would refuse is reported by the Sign gate instead. */}
+        {q.source === "intents" && depositMemo !== undefined && !memoProblem && (
+          <Row
+            label="Deposit memo"
+            value={`${depositMemo} (attached automatically)`}
+            fullValue={depositMemo}
+          />
+        )}
 
         {/* Fees + ETA */}
         <div

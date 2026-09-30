@@ -80,6 +80,13 @@ const NATIVE_RESERVE_BY_TICKER: Record<string, number> = {
   ADA: 2, // fee + min-UTXO for the change output
   XRP: 1.5, // 1 XRP base reserve + fee + owner-reserve slack
   TRX: 2, // bandwidth burn + activating an unused deposit address
+  // XLM and SUI became NEAR Intents sources on 2026-09-30. XLM: the account's
+  // 1 XLM minimum balance (2 x 0.5 base reserve) can never be sent, plus the
+  // 0.01 XLM fee bid the send holds back, plus 0.5 for one trustline or other
+  // entry. An account with more entries is refused before signing by
+  // `executeStellarTransfer`, which names the exact amount it can send.
+  XLM: 1.51,
+  SUI: 0.01, // gas for a coin split + transfer (the source hint's own 0.01 SUI)
 };
 
 /**

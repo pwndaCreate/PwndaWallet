@@ -721,10 +721,10 @@ const REGISTRY_ENTRIES: Record<string, AssetCapability> = {
       "Your Sui account needs at least 0.01 SUI for gas (object refs + computation).",
     // fullnode.mainnet.sui.io deprecated its JSON-RPC surface 2026-08-22
     // (-32601 on every suix_* method) — matches src/wallets/sui-wallet.ts's
-    // fix. Currently unreachable in practice: the SUI/STELLAR/DASH cases in
-    // swap-execute.ts's generic dispatcher throw unconditionally (source-tx
-    // routing for these three isn't implemented), so nothing reads this at
-    // runtime today. Corrected anyway so it isn't stale if that changes.
+    // fix. Not what the SUI deposit uses: since 2026-09-30 the executor's
+    // SUI branch calls `session-send.ts::executeSuiTransfer`, which talks to
+    // the adapter's own `SUI_RPC`. Kept correct so it is not stale for
+    // anything else that reads it.
     defaultRpcUrl: "https://sui-rpc.publicnode.com",
     explorerTxUrl: (h) => `https://suivision.xyz/txblock/${h}`,
     explorerAddressUrl: (a) => `https://suivision.xyz/account/${a}`,
@@ -1217,11 +1217,15 @@ export const ASSET_CAPABILITIES: Record<string, AssetCapability> =
  * The source chain kinds `executeIntentsTrade` can build a NEAR Intents
  * deposit for (2026-09-29 send-safety audit, F7).
  *
- * STELLAR and SUI are deliberately absent although Rust signers exist for
- * them: the executor has no Stellar or Sui branch, so a quoted XLM or SUI
- * swap reached Confirm and threw after the password. XLM also needs
- * `depositMode: "MEMO"`, which the quote request cannot carry today. Add a
- * kind here in the same change that gives the executor a branch for it.
+ * STELLAR and SUI were taken out on 2026-09-29 (F7): Rust signers existed for
+ * both, but the executor had no branch for either, so a quoted XLM or SUI
+ * swap reached Confirm and threw after the password; XLM also needed
+ * `depositMode: "MEMO"`, which the quote request could not carry. Both are
+ * back since 2026-09-30, in the same change that gave the executor its
+ * Stellar and Sui branches (the dashboard Send's `executeStellarTransfer` /
+ * `executeSuiTransfer`) and carried the MEMO mode and the deposit memo end
+ * to end. Add a kind here only in the change that gives the executor a
+ * branch for it.
  *
  * DASH is present only because it deposits through the adapter's
  * account-wide send (F10); it has no Rust-path branch in the executor.
@@ -1239,6 +1243,8 @@ export const INTENTS_EXECUTABLE_SOURCE_KINDS: ReadonlySet<SwapChainKind> =
     "CARDANO",
     "XRP",
     "TRON",
+    "STELLAR",
+    "SUI",
   ]);
 
 /** True when a NEAR Intents deposit FROM `ticker` can actually be executed. */

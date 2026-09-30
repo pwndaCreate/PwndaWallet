@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getIntentsQuote, getSwapKitQuote } from "../../api/proxy";
 import type {
   IntentsQuote,
+  IntentsQuoteRequest,
   IntentsQuoteResponse,
   SwapKitQuoteResponse,
   SwapKitRoute,
@@ -132,7 +133,12 @@ import {
   depositWindowFor,
   type IntentsQuoteRequestEcho,
 } from "./intents-quote-binding";
-import { isIntentsDepositUsed } from "./intents-attempts";
+import { intentsDepositKey, isIntentsDepositUsed } from "./intents-attempts";
+import {
+  IntentsProxyMemoUnsupportedError,
+  depositModeField,
+  proxyMemoRefusal,
+} from "./intents-deposit-memo";
 
 export interface NormalizedQuote {
   /** Which upstream answered. `auto` mode resolves to one or the other. */
@@ -434,14 +440,16 @@ export function swapQuoteInputsKey(k: {
   ]);
 }
 
-/** The binding-relevant fields of an Intents request body (F3). */
-function echoOfRequest(req: {
+/** The binding-relevant fields of an Intents request body (F3). Exported
+ *  for tests (2026-09-30: it must keep `depositMode`). */
+export function echoOfRequest(req: {
   originAsset: string;
   destinationAsset: string;
   amount: string;
   recipient: string;
   refundTo: string;
   deadline: string;
+  depositMode?: IntentsQuoteRequestEcho["depositMode"];
 }): IntentsQuoteRequestEcho {
   return {
     originAsset: req.originAsset,
@@ -450,7 +458,31 @@ function echoOfRequest(req: {
     recipient: req.recipient,
     refundTo: req.refundTo,
     deadline: req.deadline,
+    // Part of what the quote is bound to (2026-09-30): only a MEMO-mode quote
+    // may be deposited with a memo, and only a Stellar deposit may use one.
+    ...(req.depositMode ? { depositMode: req.depositMode } : {}),
   };
+}
+
+/**
+ * Ask for an Intents quote, naming the wallet proxy when a MEMO-mode (Stellar)
+ * request is refused over `depositMode` (2026-09-30). The proxy's published
+ * contract does not list the field; whether it refuses it, or strips it and
+ * lets 1Click refuse the Stellar quote, the user sees one sentence that says
+ * the server needs an update — never a pair or amount error. Every other
+ * request, and every other failure, passes through untouched.
+ *
+ * Exported for tests.
+ */
+export async function requestIntentsQuote(
+  req: IntentsQuoteRequest,
+  quoteFn: (r: IntentsQuoteRequest) => Promise<IntentsQuoteResponse> = getIntentsQuote,
+): Promise<IntentsQuoteResponse> {
+  try {
+    return await quoteFn(req);
+  } catch (e) {
+    throw proxyMemoRefusal(e, req) ?? e;
+  }
 }
 
 function walletAddressesWithPlaceholders(
@@ -696,7 +728,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
           walletAddresses,
         });
         debugQuote("intents request body", { reqId, body: intentsReq });
-        const resp = await getIntentsQuote(intentsReq);
+        const resp = await requestIntentsQuote(intentsReq);
         nextRawIntents = resp;
         normalized = normalizeIntents(resp, slippage, toMeta, echoOfRequest(intentsReq));
         if (!normalized) firstErr = "No NEAR Intents quote returned.";
@@ -800,7 +832,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
             });
             debugQuote("intents request body (auto)", { reqId, body: intentsReq });
             autoIntentsReq = intentsReq;
-            calls.push(getIntentsQuote(intentsReq));
+            calls.push(requestIntentsQuote(intentsReq));
           } catch (e) {
             calls.push(Promise.reject(e as Error));
           }
@@ -1052,6 +1084,9 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
         toAsset: toToken,
         walletAddresses: probeWallet,
         seedAtomic: hiSeed && hiSeed > 0n ? hiSeed.toString() : undefined,
+        // An XLM probe refused over depositMode reports the proxy sentence,
+        // not the raw envelope (2026-09-30); every other error is untouched.
+        quoteFn: requestIntentsQuote,
         onError: (m) => {
           lastError = m;
         },
@@ -1087,6 +1122,7 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
             walletAddresses: probeWallet,
             hiAtomic: hiAtomic.toString(),
             quoteWaitingTimeMs: MIN_BUTTON_QUOTE_WAIT_MS,
+            quoteFn: requestIntentsQuote,
             onError: (m) => {
               lastError = m;
             },
@@ -1210,12 +1246,17 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
   // handed out again, and the form gets a new one as soon as no modal is
   // open — "try again" means a new quote and a new deposit address. Once per
   // address, so an upstream that repeated an address could not loop us.
+  // Address AND memo (2026-09-30): every XLM quote shares one deposit
+  // address, and a new XLM quote is a new memo — keyed by the address alone,
+  // the first XLM swap would have marked every later XLM quote as used.
   useEffect(() => {
     if (paused || !eligible) return;
     const dep = quote?.intentsQuote?.depositAddress;
-    if (!dep || !isIntentsDepositUsed(dep)) return;
-    if (refetchedForRef.current === dep) return;
-    refetchedForRef.current = dep;
+    const memo = quote?.intentsQuote?.depositMemo;
+    if (!dep || !isIntentsDepositUsed({ depositAddress: dep, depositMemo: memo })) return;
+    const key = intentsDepositKey(dep, memo);
+    if (refetchedForRef.current === key) return;
+    refetchedForRef.current = key;
     void fetchOnce();
   }, [paused, eligible, quote, fetchOnce]);
 
@@ -1461,7 +1502,8 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
     quote,
     quoteKey,
     currentKey,
-    isUsed: isIntentsDepositUsed,
+    isUsed: (depositAddress, depositMemo) =>
+      isIntentsDepositUsed({ depositAddress, depositMemo }),
   });
   if (!paused) {
     frozenQuoteRef.current = null;
@@ -1496,18 +1538,20 @@ export function useSwapQuote(args: UseSwapQuoteArgs): SwapQuoteState {
  *  - a quote fetched for different inputs than the form shows now → none
  *    (the 500 ms debounce used to leave the OLD pair's quote live);
  *  - an Intents quote whose deposit address was already claimed or retired
- *    → none (one quote, one deposit).
+ *    → none (one quote, one deposit). The quote's memo is passed along
+ *    (2026-09-30): on Stellar the address is shared and the memo is what
+ *    makes a deposit this quote's.
  */
 export function selectHandedOutQuote(args: {
   quote: NormalizedQuote | null;
   quoteKey: string | null;
   currentKey: string;
-  isUsed: (depositAddress: string) => boolean;
+  isUsed: (depositAddress: string, depositMemo?: string | null) => boolean;
 }): NormalizedQuote | null {
   const { quote } = args;
   if (!quote || args.quoteKey !== args.currentKey) return null;
   const dep = quote.intentsQuote?.depositAddress;
-  if (dep && args.isUsed(dep)) return null;
+  if (dep && args.isUsed(dep, quote.intentsQuote?.depositMemo)) return null;
   return quote;
 }
 
@@ -2110,6 +2154,17 @@ export function buildIntentsRequestSafely(args: {
     );
   }
 
+  // `depositMode: "MEMO"` for a Stellar origin ONLY (2026-09-30, XLM as a
+  // source). Stellar deposits go to one address shared by every depositor
+  // and are matched by memo; 1Click refuses a Stellar quote without the mode
+  // ("Incorrect depositMode for originAsset from stellar chain"). Every other
+  // origin gets no such key at all — its body is byte-identical to what it
+  // was — because the wallet proxy's published contract does not list the
+  // field, and a proxy that refuses unknown fields must not start refusing
+  // quotes that work today. Appended last, so the fields before it keep
+  // their order.
+  const depositMode = depositModeField(args.fromAsset);
+
   // Field order + types match the 1Click `/api/intents/quote` schema
   // verified against the server agent's 2026-05-06 known-good curl. If
   // any required field is missing or the wrong type, 1Click returns a
@@ -2131,6 +2186,7 @@ export function buildIntentsRequestSafely(args: {
     // The window the solver-relay holds the route open for execution.
     // Server agent's known-good = 5000 ms.
     quoteWaitingTimeMs: 5000,
+    ...depositMode,
   };
 }
 
@@ -2266,6 +2322,12 @@ export function humanizeError(
   // — open the Bitcoin chain in the dashboard…") and were thrown
   // BEFORE any proxy round-trip, so no rate-limit point was burned.
   if (e instanceof IntentsValidationError) {
+    return e.message;
+  }
+  // The wallet proxy refused (or dropped) `depositMode` on an XLM quote
+  // (2026-09-30). Already a finished sentence that names the proxy; the
+  // pattern table below would turn it back into "rejected by upstream".
+  if (e instanceof IntentsProxyMemoUnsupportedError) {
     return e.message;
   }
   // Same treatment for the BasicSwap route. Every `SidecarQuoteError` message

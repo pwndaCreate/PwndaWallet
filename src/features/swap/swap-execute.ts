@@ -134,14 +134,21 @@ import {
 } from "../../wallets/send-outcome";
 import { stablecoinNetworkFor } from "../../wallets/stablecoins";
 import type { ChainType } from "../../wallets/types";
+import { atomicToDecimal, decimalToAtomic } from "../../wallets/decimal-amount";
 import { lookupByAssetId } from "./intents-dedup";
-import { claimIntentsDeposit, recordIntentsDeposit } from "./intents-attempts";
+import {
+  claimIntentsDeposit,
+  intentsDepositKey,
+  recordIntentsDeposit,
+} from "./intents-attempts";
 import {
   assertDepositWindowOpen,
   assertQuoteBinding,
   echoMismatches,
+  statusDescribesDeposit,
   type IntentsQuoteRequestEcho,
 } from "./intents-quote-binding";
+import { depositMemoToAttach } from "./intents-deposit-memo";
 import {
   buildErc20BalanceOfCalldata,
   buildErc20TransferCalldata,
@@ -558,8 +565,47 @@ export interface ExecuteIntentsInput {
 export interface IntentsBroadcastInfo {
   sourceTxHash: string;
   depositAddress: string;
+  /**
+   * The memo the deposit carried, when the quote had one (Stellar,
+   * 2026-09-30). The Stellar deposit address is shared by every depositor, so
+   * the history row and every status query need this to name ONE swap.
+   */
+  depositMemo?: string;
   /** The network accepted it; the wallet has not seen it confirmed. */
   pending: boolean;
+}
+
+/** XLM's native precision: 1 XLM = 10^7 stroops. */
+const STELLAR_DECIMALS = 7;
+/** SUI's native precision: 1 SUI = 10^9 MIST. */
+const SUI_DECIMALS = 9;
+
+/**
+ * 1Click's atomic `amountIn` as the decimal string the dashboard-Send
+ * functions take (`executeStellarTransfer`, `executeSuiTransfer`), EXACTLY
+ * (2026-09-30). Those functions parse their `amount` at the chain's fixed
+ * precision, so the registry's decimals must be that precision — checked, not
+ * assumed — and the string is converted back and compared, so a conversion
+ * that lost or gained a unit refuses instead of sending it.
+ */
+function exactDepositAmount(atomic: bigint, decimals: number, meta: SwapCoinMeta): string {
+  if (meta.decimals !== decimals) {
+    throw new Error(
+      `${meta.ticker} is registered with ${meta.decimals} decimals, but a ` +
+        `${meta.chainKind} deposit is counted in units of 10^-${decimals}. Refusing ` +
+        `to convert the amount. Nothing was signed.`,
+    );
+  }
+  if (atomic <= 0n) {
+    throw new Error(`The ${meta.ticker} deposit amount must be positive. Nothing was signed.`);
+  }
+  const display = atomicToDecimal(atomic, decimals);
+  if (decimalToAtomic(display, decimals, `${meta.ticker} amount`) !== atomic) {
+    throw new Error(
+      `${atomic} does not convert exactly to a ${meta.ticker} amount. Nothing was signed.`,
+    );
+  }
+  return display;
 }
 
 /**
@@ -590,15 +636,22 @@ const TOKEN_DEPOSIT_KINDS: ReadonlySet<SwapChainKind> = new Set<SwapChainKind>([
  *     adapter's account scan does not cover the wallet.
  *   - ADA: `executeCardanoTransfer` (TS-signed).
  *   - XRP / TRX / USDT-TRON: `executeAdapterTransfer` (TS-signed).
+ *   - XLM: `session-send.ts::executeStellarTransfer`, with the quote's
+ *     deposit memo attached as MEMO_TEXT (2026-09-30).
+ *   - SUI: `session-send.ts::executeSuiTransfer` (2026-09-30).
+ *     Both sign in the Rust swap session, and both are the dashboard Send's
+ *     own code, so a swap deposit and a manual send cannot drift apart.
  *
  * Before anything is built (2026-09-29 send-safety audit):
  *   - F1: the source asset is checked against the 1Click catalog entry the
  *     quote names — native or token, which contract, which decimals;
- *   - F3: the quote must have been made for THIS asset, amount, recipient
- *     and refund address;
+ *   - F3: the quote must have been made for THIS asset, amount, recipient,
+ *     refund address and deposit mode;
  *   - F4: its deposit window must leave the origin chain time to land;
- *   - F2: the deposit address is claimed, and a second attempt for it is
- *     refused — one quote, one signature.
+ *   - the deposit memo (2026-09-30): a Stellar quote must carry one that
+ *     fits a MEMO_TEXT, and any other chain's quote must carry none;
+ *   - F2: the deposit (address, plus memo when there is one) is claimed, and
+ *     a second attempt for it is refused — one quote, one signature.
  *
  * After the broadcast: `onBroadcast` first, then a best-effort notify that
  * can no longer fail the call (F2). A broadcast whose outcome is unknown
@@ -606,7 +659,13 @@ const TOKEN_DEPOSIT_KINDS: ReadonlySet<SwapChainKind> = new Set<SwapChainKind>([
  */
 export async function executeIntentsTrade(
   input: ExecuteIntentsInput
-): Promise<{ sourceTxHash: string; depositAddress: string; pending: boolean }> {
+): Promise<{
+  sourceTxHash: string;
+  depositAddress: string;
+  /** The memo the deposit carried (Stellar only). */
+  depositMemo?: string;
+  pending: boolean;
+}> {
   const phase = (s: SwapExecutionStatus) => input.onPhase?.(s);
   const now = input.nowMs ?? (() => Date.now());
   // Effective source-chain metadata — when `fromBlockchain` is set, we
@@ -663,6 +722,8 @@ export async function executeIntentsTrade(
   }
 
   // ─── F3 ─ the quote answers THIS swap ─────────────────────────────
+  // Includes the deposit mode since 2026-09-30: MEMO for a Stellar origin,
+  // SIMPLE for every other (derived from `originAsset` inside the check).
   assertQuoteBinding(input.quoteRequest, {
     originAsset: fromMeta.nearIntentsAsset,
     destinationAsset: input.destinationAsset,
@@ -682,6 +743,23 @@ export async function executeIntentsTrade(
       });
     }, ctx("post-quote"));
   }
+
+  // ─── the deposit memo (2026-09-30, XLM as a source) ──────────────
+  // The Stellar deposit address is shared by every depositor; the quote's
+  // memo is what makes a payment THIS swap's deposit. Read once, here, from
+  // the quote being signed: the memo validated is the memo attached, the
+  // memo the attempt is keyed by, and the memo sent with the notify and
+  // every status query. Refused before anything is claimed or built: a
+  // Stellar quote without a usable memo, and any other chain's quote that
+  // carries one (the wallet could not attach it, and without it the deposit
+  // could not be matched).
+  const depositMemo = depositMemoToAttach({
+    depositMode: input.quoteRequest.depositMode,
+    depositMemo: input.intentsQuote.depositMemo,
+    chainKind: fromMeta.chainKind,
+    ticker: fromMeta.ticker,
+  });
+  const deposit = depositMemo === undefined ? { depositAddress } : { depositAddress, depositMemo };
 
   // ─── F4 ─ the deposit window is still open for this chain ────────
   assertDepositWindowOpen({
@@ -714,7 +792,9 @@ export async function executeIntentsTrade(
   // before anything is built: two overlapping submits cannot both pass, and
   // a Retry, a re-opened modal or a second click on the same quote is
   // refused here instead of signing a second deposit to the same address.
-  claimIntentsDeposit(depositAddress, now());
+  // Keyed by address AND memo when there is one (2026-09-30): two XLM quotes
+  // share an address and differ by memo, and both are separate swaps.
+  claimIntentsDeposit(deposit, now());
 
   phase({ phase: "building" });
 
@@ -868,14 +948,68 @@ export async function executeIntentsTrade(
         break;
       }
 
-      case "STELLAR":
-      case "SUI":
-        // No executor branch (F7). `isIntentsRoutableFromRegistry` no longer
-        // quotes these as sources; this is the backstop.
-        throw new Error(
-          `${fromMeta.ticker} cannot be a NEAR Intents source in this build — ` +
-            `the wallet has no deposit path for it. Nothing was sent.`,
-        );
+      case "STELLAR": {
+        // XLM (2026-09-30). Until now this arm threw (F7, 2026-09-29): Rust
+        // could sign, but nothing built the deposit, and a Stellar quote
+        // needs `depositMode: "MEMO"`, which the request could not carry.
+        //
+        // The deposit is the dashboard Send's own Stellar payment
+        // (`executeStellarTransfer`): signed in the Rust swap session after
+        // its wrong-key guard has checked that the session's Stellar account
+        // IS `sourceAddress`, submitted once, and settled by hash when the
+        // submit is uncertain (an unknown outcome throws
+        // `SendOutcomeUnknownError`, caught below). What it adds for a swap:
+        //  - the quote's memo, as MEMO_TEXT (text, not ID: see
+        //    `intents-deposit-memo.ts` for the ledger evidence);
+        //  - `destinationMustExist`: 1Click's deposit address is a live,
+        //    funded account. A missing one is refused rather than CREATED
+        //    with the deposit — a createAccount operation is not the payment
+        //    1Click matches deposits by.
+        if (depositMemo === undefined) {
+          // Unreachable — `depositMemoToAttach` refuses a Stellar quote
+          // without a memo — but the payment must never go out without one.
+          throw new Error(`${fromMeta.ticker} deposit has no memo. Nothing was signed.`);
+        }
+        const amount = exactDepositAmount(quoteAmountAtomic, STELLAR_DECIMALS, fromMeta);
+        const { executeStellarTransfer } = await import("./session-send");
+        phase({ phase: "signing" });
+        const r = await executeStellarTransfer({
+          sessionId: input.sessionId,
+          fromAddress: input.sourceAddress,
+          to: depositAddress,
+          amount,
+          memo: { type: "text", value: depositMemo },
+          destinationMustExist: true,
+        });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        break;
+      }
+
+      case "SUI": {
+        // SUI (2026-09-30). Same history as STELLAR above; Sui is SIMPLE
+        // mode, so no memo. The dashboard Send's own Sui transfer: the
+        // session's Sui address must be `sourceAddress` (its wrong-key
+        // guard), the recipient must be a full 0x + 64-hex address, the
+        // transaction is built once and signed once, and a submit that
+        // fails to answer is settled by digest — or thrown as
+        // `SendOutcomeUnknownError`, which is recorded below and never
+        // retried on this quote.
+        //
+        // `amountIn` is MIST; `executeSuiTransfer` takes decimal SUI.
+        const amount = exactDepositAmount(quoteAmountAtomic, SUI_DECIMALS, fromMeta);
+        const { executeSuiTransfer } = await import("./session-send");
+        phase({ phase: "signing" });
+        const r = await executeSuiTransfer({
+          sessionId: input.sessionId,
+          fromAddress: input.sourceAddress,
+          to: depositAddress,
+          amount,
+        });
+        phase({ phase: "broadcasting" });
+        sourceTxHash = r.txHash;
+        break;
+      }
 
       case "CARDANO": {
         // ADA source — signed in the TS Cardano stack, NOT the Rust core.
@@ -986,18 +1120,18 @@ export async function executeIntentsTrade(
     }
   } catch (e) {
     if (isSendOutcomeUnknown(e)) {
-      recordIntentsDeposit(depositAddress, { state: "unknown", txHash: e.hash });
+      recordIntentsDeposit(deposit, { state: "unknown", txHash: e.hash });
     }
     throw e;
   }
 
-  recordIntentsDeposit(depositAddress, { state: "broadcast", txHash: sourceTxHash });
+  recordIntentsDeposit(deposit, { state: "broadcast", txHash: sourceTxHash });
 
   // Persist first (F2). The deposit is on its way; nothing after this line
   // may turn that into a rejection the UI would read as "failed".
   if (input.onBroadcast) {
     try {
-      await input.onBroadcast({ sourceTxHash, depositAddress, pending });
+      await input.onBroadcast({ sourceTxHash, ...deposit, pending });
     } catch (e) {
       console.warn("[swap] onBroadcast handler failed after the deposit went out:", e);
     }
@@ -1008,10 +1142,16 @@ export async function executeIntentsTrade(
   // EFFORT (2026-09-29, F2): this used to be awaited bare, so a relay 503
   // AFTER the broadcast rejected the whole call — no hash, no history row,
   // and a Retry button that signed a second deposit to the same address.
-  // The scanner finds the deposit without it.
+  // The scanner finds the deposit without it. A memo deposit names its memo
+  // (2026-09-30): 1Click's deposit/submit takes `memo` "if deposit was
+  // submitted with one"; every other body is unchanged.
   try {
     await withTimeout(
-      notifyIntentsDeposit({ depositAddress, txHash: sourceTxHash }),
+      notifyIntentsDeposit({
+        depositAddress,
+        txHash: sourceTxHash,
+        ...(depositMemo !== undefined ? { memo: depositMemo } : {}),
+      }),
       15_000,
       "notifyIntentsDeposit",
     );
@@ -1023,7 +1163,7 @@ export async function executeIntentsTrade(
   }
 
   phase({ phase: "pending", sourceTxHash });
-  return { sourceTxHash, depositAddress, pending };
+  return { sourceTxHash, ...deposit, pending };
 }
 
 /**
@@ -1421,12 +1561,19 @@ const INTENTS_TERMINAL: ReadonlySet<string> = new Set([
   "FAILED",
 ] as const);
 
-/** Deposit addresses a poller in this session is already watching. */
+/**
+ * Deposits a poller in this session is already watching, keyed like the
+ * attempts: the address, plus the memo when there is one (2026-09-30). Two
+ * XLM swaps share one deposit address, and each needs its own poller.
+ */
 const activeIntentsPolls = new Set<string>();
 
-/** True while `pollIntentsToTerminal` is watching `depositAddress`. */
-export function isIntentsPollActive(depositAddress: string): boolean {
-  return activeIntentsPolls.has(depositAddress);
+/** True while `pollIntentsToTerminal` is watching this deposit. */
+export function isIntentsPollActive(
+  depositAddress: string,
+  depositMemo?: string | null,
+): boolean {
+  return activeIntentsPolls.has(intentsDepositKey(depositAddress, depositMemo));
 }
 
 /**
@@ -1438,9 +1585,15 @@ export function isIntentsPollActive(depositAddress: string): boolean {
  * refunded BY it), so a flat 30 minutes gave up on every BTC swap and on
  * every refund (F5). Default: whichever is later of 30 minutes and the
  * deadline plus an hour.
+ *
+ * `depositMemo` (2026-09-30) is set for a memo deposit (Stellar): 1Click
+ * needs it to say which of the swaps sharing the address this is, and a
+ * response that echoes a different deposit is ignored like a failed tick
+ * (`statusDescribesDeposit`). Without a memo, nothing here changed.
  */
 export async function pollIntentsToTerminal(args: {
   depositAddress: string;
+  depositMemo?: string | null;
   deadline?: string;
   intervalMs?: number;
   timeoutMs?: number;
@@ -1455,7 +1608,10 @@ export async function pollIntentsToTerminal(args: {
       Number.isFinite(deadlineMs) ? deadlineMs - Date.now() + 60 * 60_000 : 0,
     );
   const start = Date.now();
-  activeIntentsPolls.add(args.depositAddress);
+  const key = intentsDepositKey(args.depositAddress, args.depositMemo);
+  const memo = args.depositMemo || undefined;
+  let warnedForeign = false;
+  activeIntentsPolls.add(key);
   try {
     while (true) {
       if (Date.now() - start > timeout) {
@@ -1463,8 +1619,21 @@ export async function pollIntentsToTerminal(args: {
       }
       let resp: IntentsStatusResponse;
       try {
-        resp = await getIntentsStatus(args.depositAddress);
+        resp = memo
+          ? await getIntentsStatus(args.depositAddress, memo)
+          : await getIntentsStatus(args.depositAddress);
       } catch {
+        await sleep(interval);
+        continue;
+      }
+      if (!statusDescribesDeposit(resp, { depositAddress: args.depositAddress, depositMemo: memo })) {
+        if (!warnedForeign) {
+          warnedForeign = true;
+          console.warn(
+            "[swap] 1Click answered the status query about a different deposit at this shared " +
+              "address (was depositMemo dropped on the way?); ignoring those answers",
+          );
+        }
         await sleep(interval);
         continue;
       }
@@ -1475,7 +1644,7 @@ export async function pollIntentsToTerminal(args: {
       await sleep(interval);
     }
   } finally {
-    activeIntentsPolls.delete(args.depositAddress);
+    activeIntentsPolls.delete(key);
   }
 }
 

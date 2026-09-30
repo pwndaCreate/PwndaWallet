@@ -26,10 +26,33 @@
  * record of an attempt is the swap-history row, written with the deposit
  * address as soon as the broadcast returns a hash (or reports an unknown
  * outcome).
+ *
+ * # Address AND memo (2026-09-30, XLM as a source)
+ *
+ * "One deposit address, one swap" is true for every chain 1Click quotes in
+ * SIMPLE mode, and false for Stellar: its deposit address is SHARED by every
+ * Stellar depositor, and each quote is told apart by its `depositMemo`
+ * (`intents-deposit-memo.ts`). Keyed by the address alone, the first XLM swap
+ * would have claimed the shared address and refused every later XLM quote as
+ * "already used" — and the form would have hidden every later XLM quote. So
+ * an attempt is keyed by the address plus the memo when the quote carries
+ * one; a quote without a memo keys exactly as before.
  */
+
+/**
+ * Which deposit an attempt is about: the address alone (SIMPLE-mode quotes;
+ * every pre-2026-09-30 caller passes a bare string), or the address and the
+ * quote's memo. A caller holding a quote passes its memo — the same value the
+ * executor attaches.
+ */
+export type IntentsDepositRef =
+  | string
+  | { depositAddress: string; depositMemo?: string | null };
 
 export interface IntentsDepositAttempt {
   depositAddress: string;
+  /** The quote's deposit memo, when it has one (Stellar). */
+  depositMemo?: string;
   /** ms epoch of the claim (or of the retirement, for a quote never signed). */
   at: number;
   /** Source-chain hash, once known. */
@@ -50,6 +73,7 @@ export interface IntentsDepositAttempt {
 export class IntentsQuoteAlreadyUsedError extends Error {
   readonly name = "IntentsQuoteAlreadyUsedError";
   readonly depositAddress: string;
+  readonly depositMemo?: string;
   readonly attempt: IntentsDepositAttempt;
   constructor(attempt: IntentsDepositAttempt) {
     super(
@@ -61,6 +85,7 @@ export class IntentsQuoteAlreadyUsedError extends Error {
             `and let the form fetch a new quote.`,
     );
     this.depositAddress = attempt.depositAddress;
+    if (attempt.depositMemo !== undefined) this.depositMemo = attempt.depositMemo;
     this.attempt = attempt;
     Object.setPrototypeOf(this, IntentsQuoteAlreadyUsedError.prototype);
   }
@@ -68,42 +93,71 @@ export class IntentsQuoteAlreadyUsedError extends Error {
 
 const attempts = new Map<string, IntentsDepositAttempt>();
 
+/** A memo that is present: not `undefined`, `null` or `""`. */
+function memoOf(depositMemo: unknown): string | undefined {
+  return depositMemo === undefined || depositMemo === null || depositMemo === ""
+    ? undefined
+    : String(depositMemo);
+}
+
 /**
- * Deposit addresses compare case-insensitively when they are 0x-hex (EVM,
- * where checksum casing is display only) and exactly otherwise (base58,
- * bech32 and friends are case-sensitive or canonical-lowercase already).
+ * The key one deposit is recorded under. Addresses compare case-insensitively
+ * when they are 0x-hex (EVM, where checksum casing is display only) and
+ * exactly otherwise (base58, bech32 and friends are case-sensitive or
+ * canonical-lowercase already). A memo, when the quote carries one, is part
+ * of the key byte for byte (2026-09-30): on Stellar the address is shared and
+ * the memo IS the deposit. NUL cannot occur in any address, so an
+ * address-plus-memo key can never equal an address-only one.
  */
-function keyOf(depositAddress: string): string {
+export function intentsDepositKey(depositAddress: string, depositMemo?: string | null): string {
   const a = depositAddress.trim();
-  return /^0x[0-9a-fA-F]+$/.test(a) ? a.toLowerCase() : a;
+  const addr = /^0x[0-9a-fA-F]+$/.test(a) ? a.toLowerCase() : a;
+  const memo = memoOf(depositMemo);
+  return memo === undefined ? addr : `${addr}\u0000memo\u0000${memo}`;
 }
 
-/** The recorded attempt for `depositAddress`, if any. */
+function refOf(ref: IntentsDepositRef): { depositAddress: string; depositMemo?: string } {
+  if (typeof ref === "string") return { depositAddress: ref };
+  const depositMemo = memoOf(ref.depositMemo);
+  return depositMemo === undefined
+    ? { depositAddress: ref.depositAddress }
+    : { depositAddress: ref.depositAddress, depositMemo };
+}
+
+/** The recorded attempt for this deposit, if any. */
 export function intentsDepositAttempt(
-  depositAddress: string | null | undefined,
+  ref: IntentsDepositRef | null | undefined,
 ): IntentsDepositAttempt | undefined {
+  if (!ref) return undefined;
+  const { depositAddress, depositMemo } = refOf(ref);
   if (!depositAddress) return undefined;
-  return attempts.get(keyOf(depositAddress));
+  return attempts.get(intentsDepositKey(depositAddress, depositMemo));
 }
 
-/** True when `depositAddress` has been claimed or retired. */
-export function isIntentsDepositUsed(depositAddress: string | null | undefined): boolean {
-  return !!intentsDepositAttempt(depositAddress);
+/** True when this deposit has been claimed or retired. */
+export function isIntentsDepositUsed(ref: IntentsDepositRef | null | undefined): boolean {
+  return !!intentsDepositAttempt(ref);
 }
 
 /**
- * Claim `depositAddress` for ONE signing attempt. Throws
+ * Claim a deposit for ONE signing attempt. Throws
  * `IntentsQuoteAlreadyUsedError` if it was claimed or retired before.
  * Synchronous on purpose: two overlapping submits cannot both pass it.
  */
 export function claimIntentsDeposit(
-  depositAddress: string,
+  ref: IntentsDepositRef,
   now: number = Date.now(),
 ): IntentsDepositAttempt {
-  const key = keyOf(depositAddress);
+  const { depositAddress, depositMemo } = refOf(ref);
+  const key = intentsDepositKey(depositAddress, depositMemo);
   const prior = attempts.get(key);
   if (prior) throw new IntentsQuoteAlreadyUsedError(prior);
-  const rec: IntentsDepositAttempt = { depositAddress, at: now, state: "claimed" };
+  const rec: IntentsDepositAttempt = {
+    depositAddress,
+    ...(depositMemo !== undefined ? { depositMemo } : {}),
+    at: now,
+    state: "claimed",
+  };
   attempts.set(key, rec);
   return rec;
 }
@@ -114,14 +168,17 @@ export function claimIntentsDeposit(
  * A later state never downgrades a hash that is already known.
  */
 export function recordIntentsDeposit(
-  depositAddress: string,
+  ref: IntentsDepositRef,
   patch: { state: IntentsDepositAttempt["state"]; txHash?: string },
   now: number = Date.now(),
 ): IntentsDepositAttempt {
-  const key = keyOf(depositAddress);
+  const { depositAddress, depositMemo } = refOf(ref);
+  const key = intentsDepositKey(depositAddress, depositMemo);
   const prior = attempts.get(key);
+  const memo = prior?.depositMemo ?? depositMemo;
   const rec: IntentsDepositAttempt = {
     depositAddress: prior?.depositAddress ?? depositAddress,
+    ...(memo !== undefined ? { depositMemo: memo } : {}),
     at: prior?.at ?? now,
     txHash: patch.txHash ?? prior?.txHash,
     // A quote that broadcast (or may have) is never re-labelled "retired": the

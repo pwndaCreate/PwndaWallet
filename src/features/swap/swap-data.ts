@@ -909,13 +909,18 @@ const PWNDA_INTENTS_SOURCE_TICKERS: readonly string[] = [
   // 2026-09-29 (F10). Before that the executor had no DASH branch at all and
   // every DASH swap threw at Confirm.
   "DASH",
-  // XLM (Phase 6) and SUI (Phase 7) REMOVED as sources on 2026-09-29
-  // (send-safety audit, F7). Rust signers exist for both, but the executor
+  // XLM (Phase 6) and SUI (Phase 7). Removed as sources on 2026-09-29
+  // (send-safety audit, F7): Rust signers existed for both, but the executor
   // never had a branch for either, so a quoted XLM or SUI swap threw after
-  // the password; XLM additionally needs `depositMode: "MEMO"`, which the
-  // quote request cannot carry. Both stay DESTINATIONS. Re-add here in the
-  // same change that adds their executor branch and
-  // `INTENTS_EXECUTABLE_SOURCE_KINDS` entry.
+  // the password; XLM additionally needed `depositMode: "MEMO"`, which the
+  // quote request could not carry. Re-added 2026-09-30 with their executor
+  // branches (the dashboard Send's `executeStellarTransfer` /
+  // `executeSuiTransfer`), their `INTENTS_EXECUTABLE_SOURCE_KINDS` entries,
+  // and the MEMO mode + deposit memo carried end to end for XLM. An XLM
+  // quote still needs the wallet proxy to pass `depositMode` through; when
+  // it does not, the quote fails with a message that says so.
+  "XLM",
+  "SUI",
   // Native AVAX + POL: routed via HOT-Omni nep245 envelope (their OMFT
   // entries 400'd; nep245 form is live as of 2026-05-08). Both ride the
   // existing EVM signer + the chain's existing wallet adapter.

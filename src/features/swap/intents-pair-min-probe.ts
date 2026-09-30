@@ -43,6 +43,12 @@ import {
 import type { NearIntentsToken } from "./near-intents-tokens";
 import type { WalletAddresses } from "./asset-address-resolver";
 import { addressForAssetId, IntentsValidationError } from "./asset-address-resolver";
+// `depositMode: "MEMO"` on a Stellar-origin probe (2026-09-30). 1Click
+// refuses a Stellar-origin quote — dry or not — without it ("Incorrect
+// depositMode for originAsset from stellar chain"), so every XLM probe would
+// otherwise fail for a reason that has nothing to do with the pair's minimum.
+// Other probe bodies are unchanged.
+import { depositModeField } from "./intents-deposit-memo";
 
 /**
  * Default USD probe schedule. Cheap-first to favor catching small
@@ -249,6 +255,7 @@ export function buildExactOutputDryProbe(args: {
     refundTo: addressForAssetId(args.fromAsset.assetId, args.walletAddresses),
     deadline,
     quoteWaitingTimeMs: args.quoteWaitingTimeMs ?? 0,
+    ...depositModeField(args.fromAsset.assetId),
   };
 }
 
@@ -296,6 +303,7 @@ export function buildExactInputDryProbe(args: {
     refundTo: addressForAssetId(args.fromAsset.assetId, args.walletAddresses),
     deadline,
     quoteWaitingTimeMs: args.quoteWaitingTimeMs ?? 0,
+    ...depositModeField(args.fromAsset.assetId),
   };
 }
 

@@ -230,6 +230,45 @@ describe("buildIntentsRequestSafely — body shape (1Click /api/intents/quote)",
 
     expect(body.quoteWaitingTimeMs).toBe(5000);
     expect(typeof body.quoteWaitingTimeMs).toBe("number");
+
+    // No depositMode for a non-Stellar origin (2026-09-30): the key set above
+    // is exact, so its absence is already pinned; said here for the reader.
+    expect("depositMode" in body).toBe(false);
+  });
+
+  it("a Stellar origin adds depositMode MEMO, and nothing else (2026-09-30, XLM source)", () => {
+    // Lockstep partner: `proxy.rs::round_trip_keeps_deposit_mode_memo_for_a_stellar_origin`.
+    // The Rust mirror must carry every key listed here, or serde drops it
+    // between this body and the proxy POST (the May 6 `dry` failure shape).
+    const body = buildIntentsRequestSafely({
+      fromAsset: SWAP_COIN_META.XLM.nearIntentsAsset!,
+      toAsset: "nep141:btc.omft.near",
+      fromMeta: SWAP_COIN_META.XLM,
+      amount: "100",
+      slippage: 0.01,
+      walletAddresses: {
+        btc: ABANDON_BTC,
+        stellar: "GBVHKLWRPAW7NZRKILYU7AHBZL3NVRNUCNDAVCGW2WLMOOOMSQI4UWE3",
+      },
+    });
+    expect(Object.keys(body).sort()).toEqual([
+      "amount",
+      "deadline",
+      "depositMode",
+      "depositType",
+      "destinationAsset",
+      "dry",
+      "originAsset",
+      "quoteWaitingTimeMs",
+      "recipient",
+      "recipientType",
+      "refundTo",
+      "refundType",
+      "slippageTolerance",
+      "swapType",
+    ]);
+    expect(body.depositMode).toBe("MEMO");
+    expect(body.amount).toBe("1000000000"); // 100 XLM = 1e9 stroops
   });
 });
 

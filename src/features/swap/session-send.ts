@@ -32,6 +32,11 @@
  * the direction of dependency right: features may import wallets, wallets may
  * not import features.
  *
+ * Since 2026-09-30 `executeStellarTransfer` and `executeSuiTransfer` are ALSO
+ * the NEAR Intents deposit path for XLM and SUI (`swap-execute.ts`), so a
+ * swap deposit and a dashboard send are one piece of code. The Stellar
+ * deposit carries the quote's memo, and passes `destinationMustExist`.
+ *
  * # 2026-09-29 send-safety audit
  *
  * Every function here now follows the wallet-wide rule: validate everything
@@ -316,6 +321,14 @@ export async function executeStellarTransfer(args: {
   /** Decimal XLM as typed by the user. */
   amount: string;
   memo?: SendMemo;
+  /**
+   * Refuse, before signing, when the destination account does not exist,
+   * instead of creating it with the payment (2026-09-30). Set for a NEAR
+   * Intents deposit: 1Click's deposit address is a live account, and it
+   * matches deposits by PAYMENT and memo — a createAccount operation carrying
+   * the funds is not a deposit it is known to credit.
+   */
+  destinationMustExist?: boolean;
 }): Promise<{ txHash: string }> {
   const sb = await import("@stellar/stellar-base");
   const { Account, Asset, Networks, Operation, StrKey, TransactionBuilder, xdr } = sb;
@@ -353,6 +366,12 @@ export async function executeStellarTransfer(args: {
     throw new Error(`Horizon returned HTTP ${dst.status} for the destination.`);
   }
   const destExists = dst.ok;
+  if (!destExists && args.destinationMustExist) {
+    throw new Error(
+      "The deposit address has no Stellar account, so it cannot be receiving deposits. " +
+        "The wallet will not create an account with this payment. Nothing was sent.",
+    );
+  }
   if (!destExists && dest.muxed) {
     throw new Error(
       "The account behind this muxed (M…) address does not exist on Stellar, so it cannot receive. " +

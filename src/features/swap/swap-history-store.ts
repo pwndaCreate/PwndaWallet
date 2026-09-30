@@ -74,6 +74,13 @@ export interface SwapHistoryEntry {
    * resumed (`intents-status-resume.ts`).
    */
   depositAddress?: string;
+  /**
+   * NEAR Intents only: the deposit memo, for a memo deposit (Stellar,
+   * 2026-09-30). The Stellar deposit address is shared by every depositor, so
+   * the address alone does not name this swap: status is looked up by address
+   * AND memo, and a resumed row must carry both.
+   */
+  depositMemo?: string;
   /** NEAR Intents only: the quote's deposit deadline, ISO8601 (F5). A short
    *  or late deposit is refunded by it, so tracking runs at least that long. */
   depositDeadline?: string;
