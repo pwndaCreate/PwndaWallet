@@ -255,6 +255,10 @@ export async function getIntentsQuote(
   return invoke<IntentsQuoteResponse>("intents_quote", { req });
 }
 
+/**
+ * `req.memo` is set only for a memo deposit (Stellar, 2026-09-30); a request
+ * without it is sent exactly as before.
+ */
 export async function notifyIntentsDeposit(
   req: IntentsDepositSubmit
 ): Promise<unknown> {
@@ -262,9 +266,21 @@ export async function notifyIntentsDeposit(
   return invoke("intents_deposit_submit", { req });
 }
 
+/**
+ * Status of one deposit. `depositMemo` is required by 1Click for a memo
+ * deposit (Stellar, 2026-09-30), whose address is shared by every depositor;
+ * it is sent only when given, so a call for any other chain is unchanged.
+ */
 export async function getIntentsStatus(
-  depositAddress: string
+  depositAddress: string,
+  depositMemo?: string | null,
 ): Promise<IntentsStatusResponse> {
   ensure();
+  // Two literal call sites, not one conditional object, so
+  // `command-parity.test.ts` can check both key sets against the Rust
+  // `intents_status(deposit_address, deposit_memo: Option<String>)`.
+  if (depositMemo) {
+    return invoke<IntentsStatusResponse>("intents_status", { depositAddress, depositMemo });
+  }
   return invoke<IntentsStatusResponse>("intents_status", { depositAddress });
 }

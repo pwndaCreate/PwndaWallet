@@ -550,6 +550,16 @@ pub struct IntentsQuoteRequest {
     pub deadline: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub quote_waiting_time_ms: Option<u32>,
+    /// `"MEMO"` for an origin chain whose 1Click deposit address is SHARED by
+    /// every depositor and told apart only by a memo: Stellar (2026-09-30, XLM
+    /// as a NEAR Intents source). 1Click refuses a Stellar-origin quote
+    /// without it — HTTP 400 "Incorrect depositMode for originAsset from
+    /// stellar chain". The JS side sets it for Stellar origins ONLY, so every
+    /// other chain's body stays byte-identical: the wallet proxy's published
+    /// contract does not list this field, and sending it where it is not
+    /// needed could only break quotes that work today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deposit_mode: Option<String>,
 }
 
 pub async fn intents_quote(
@@ -634,6 +644,121 @@ mod intents_quote_tests {
             serialized.get("dry").and_then(Value::as_bool).is_some(),
             "dry must serialize as boolean, not string",
         );
+
+        // 2026-09-30 (XLM source): a body without `depositMode` must come back
+        // WITHOUT it — not as `"depositMode": null` — and otherwise unchanged.
+        // Every non-Stellar quote takes this path, through a proxy whose
+        // published contract does not list the field.
+        assert!(
+            serialized.get("depositMode").is_none(),
+            "an absent depositMode must stay absent: {serialized}",
+        );
+        assert_eq!(serialized, body, "a non-Stellar body must round-trip unchanged");
+    }
+
+    /// 2026-09-30 (XLM source): `depositMode` survives the IPC hop when it is
+    /// set. The JS body sets it for a Stellar origin; before this field
+    /// existed, serde dropped the unknown key on deserialize, so the proxy
+    /// would have received a Stellar quote WITHOUT it and 1Click answered
+    /// "Incorrect depositMode for originAsset from stellar chain".
+    #[test]
+    fn round_trip_keeps_deposit_mode_memo_for_a_stellar_origin() {
+        let body = serde_json::json!({
+            "dry": false,
+            "swapType": "EXACT_INPUT",
+            "slippageTolerance": 100,
+            "originAsset": "nep245:v2_1.omni.hot.tg:1100_111bzQBB5v7AhLyPMDwS8uJgQV24KaAPXtwyVWu2KXbbfQU6NXRCz",
+            "depositType": "ORIGIN_CHAIN",
+            "destinationAsset": "nep141:wrap.near",
+            "recipientType": "DESTINATION_CHAIN",
+            "amount": "1000000000",
+            "recipient": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            "refundType": "ORIGIN_CHAIN",
+            "refundTo": "GBVHKLWRPAW7NZRKILYU7AHBZL3NVRNUCNDAVCGW2WLMOOOMSQI4UWE3",
+            "deadline": "2026-09-30T12:00:00.000Z",
+            "quoteWaitingTimeMs": 5000,
+            "depositMode": "MEMO",
+        });
+        let parsed: IntentsQuoteRequest =
+            serde_json::from_value(body.clone()).expect("body should deserialize");
+        assert_eq!(parsed.deposit_mode.as_deref(), Some("MEMO"));
+        let serialized = serde_json::to_value(&parsed).expect("serialize back");
+        assert_eq!(
+            serialized.get("depositMode").and_then(Value::as_str),
+            Some("MEMO"),
+            "depositMode must reach the proxy as the camelCase key 1Click reads",
+        );
+        assert_eq!(serialized, body);
+    }
+}
+
+#[cfg(test)]
+mod intents_memo_tests {
+    use super::*;
+
+    /// 2026-09-30 (XLM source): the deposit notify carries the memo only when
+    /// the deposit has one. 1Click's `POST /v0/deposit/submit` takes `memo`
+    /// "if deposit was submitted with one"; every other chain's body stays
+    /// exactly `{depositAddress, txHash}`.
+    #[test]
+    fn deposit_submit_carries_memo_only_when_set() {
+        let plain = IntentsDepositSubmit {
+            deposit_address: "0xdep".into(),
+            tx_hash: "0xhash".into(),
+            memo: None,
+        };
+        assert_eq!(
+            serde_json::to_value(&plain).unwrap(),
+            serde_json::json!({ "depositAddress": "0xdep", "txHash": "0xhash" }),
+        );
+        let stellar = IntentsDepositSubmit {
+            deposit_address: "GDJ4JZXZELZD737NVFORH4PSSQDWFDZTKW3AIDKHYQG23ZXBPDGGQBJK".into(),
+            tx_hash: "ab".repeat(32),
+            memo: Some("188711688".into()),
+        };
+        let v = serde_json::to_value(&stellar).unwrap();
+        assert_eq!(v.get("memo").and_then(Value::as_str), Some("188711688"));
+        // And the JS shape without `memo` still deserializes (older callers).
+        let parsed: IntentsDepositSubmit = serde_json::from_value(
+            serde_json::json!({ "depositAddress": "0xdep", "txHash": "0xhash" }),
+        )
+        .unwrap();
+        assert!(parsed.memo.is_none());
+    }
+
+    /// 2026-09-30 (XLM source): the status query names the memo only for a
+    /// memo deposit, url-encoded. The Stellar deposit address is shared by
+    /// every depositor, so the address alone does not say whose swap it is —
+    /// 1Click's `GET /v0/status` requires `depositMemo` "if quote response
+    /// included deposit memo".
+    #[test]
+    fn status_path_appends_the_memo_only_when_present() {
+        // Unchanged for every chain without a memo.
+        assert_eq!(
+            intents_status_path("0xAbC", None),
+            "/api/intents/status?depositAddress=0xAbC",
+        );
+        assert_eq!(
+            intents_status_path("bitcoincash:qq a", None),
+            "/api/intents/status?depositAddress=bitcoincash%3Aqq+a",
+        );
+        // An empty memo is no memo.
+        assert_eq!(
+            intents_status_path("0xAbC", Some("")),
+            "/api/intents/status?depositAddress=0xAbC",
+        );
+        assert_eq!(
+            intents_status_path(
+                "GDJ4JZXZELZD737NVFORH4PSSQDWFDZTKW3AIDKHYQG23ZXBPDGGQBJK",
+                Some("188711688"),
+            ),
+            "/api/intents/status?depositAddress=GDJ4JZXZELZD737NVFORH4PSSQDWFDZTKW3AIDKHYQG23ZXBPDGGQBJK&depositMemo=188711688",
+        );
+        // A text memo is encoded, so it cannot inject another parameter.
+        assert_eq!(
+            intents_status_path("G1", Some("a b&depositAddress=G2")),
+            "/api/intents/status?depositAddress=G1&depositMemo=a+b%26depositAddress%3DG2",
+        );
     }
 }
 
@@ -642,6 +767,13 @@ mod intents_quote_tests {
 pub struct IntentsDepositSubmit {
     pub deposit_address: String,
     pub tx_hash: String,
+    /// The deposit memo, when the quote carried one — Stellar, whose 1Click
+    /// deposit address is shared (2026-09-30, XLM as a NEAR Intents source).
+    /// 1Click's `POST /v0/deposit/submit` takes `memo` "if deposit was
+    /// submitted with one". Absent otherwise, so every other chain's body is
+    /// unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub memo: Option<String>,
 }
 
 pub async fn intents_deposit_submit(
@@ -651,12 +783,29 @@ pub async fn intents_deposit_submit(
     post_signed(state, "/api/intents/deposit-submit", req).await
 }
 
-pub async fn intents_status(state: &SwapState, deposit_address: &str) -> Result<Value, ProxyError> {
-    let path = format!(
-        "/api/intents/status?depositAddress={}",
-        url::form_urlencoded::byte_serialize(deposit_address.as_bytes()).collect::<String>()
-    );
-    get_signed(state, &path).await
+/// `deposit_memo` is `Some` only for a memo deposit (Stellar). The address
+/// alone is shared by every Stellar depositor, so without the memo the status
+/// could not say whose swap it is; 1Click's `GET /v0/status` requires it "if
+/// quote response included deposit memo" (2026-09-30).
+pub async fn intents_status(
+    state: &SwapState,
+    deposit_address: &str,
+    deposit_memo: Option<&str>,
+) -> Result<Value, ProxyError> {
+    get_signed(state, &intents_status_path(deposit_address, deposit_memo)).await
+}
+
+/// The signed status path. Byte-identical to the pre-2026-09-30 path when
+/// there is no memo; `&depositMemo=` (url-encoded) is appended only when
+/// there is one.
+fn intents_status_path(deposit_address: &str, deposit_memo: Option<&str>) -> String {
+    let enc = |s: &str| url::form_urlencoded::byte_serialize(s.as_bytes()).collect::<String>();
+    let mut path = format!("/api/intents/status?depositAddress={}", enc(deposit_address));
+    if let Some(memo) = deposit_memo.filter(|m| !m.is_empty()) {
+        path.push_str("&depositMemo=");
+        path.push_str(&enc(memo));
+    }
+    path
 }
 
 #[cfg(test)]

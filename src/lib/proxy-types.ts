@@ -155,6 +155,13 @@ export type IntentsSwapType = "EXACT_INPUT" | "EXACT_OUTPUT" | "ANY_INPUT";
 export type IntentsDepositType = "ORIGIN_CHAIN" | "INTENTS";
 export type IntentsRecipientType = "DESTINATION_CHAIN" | "INTENTS";
 export type IntentsRefundType = "ORIGIN_CHAIN" | "INTENTS";
+/**
+ * 1Click's `depositMode` (one-click-sdk-typescript `QuoteRequest`): "most
+ * chain supports only SIMPLE and some (for example stellar) only MEMO —
+ * certain blockchains will REQUIRE the memo alongside address". Sent only
+ * for a Stellar origin (2026-09-30); absent means SIMPLE.
+ */
+export type IntentsDepositMode = "SIMPLE" | "MEMO";
 
 export interface IntentsQuoteRequest {
   swapType?: IntentsSwapType;
@@ -174,6 +181,15 @@ export interface IntentsQuoteRequest {
    *  minimums without committing solver liquidity. The response in dry
    *  mode omits `depositAddress`, `timeWhenInactive`, and `deadline`. */
   dry?: boolean;
+  /**
+   * `"MEMO"` for a Stellar origin, and absent for every other chain
+   * (2026-09-30). The Stellar deposit address is shared by every depositor
+   * and 1Click tells deposits apart by memo; a Stellar quote without this
+   * is refused with "Incorrect depositMode for originAsset from stellar
+   * chain". Kept off other chains' bodies because the wallet proxy's
+   * published contract does not list it.
+   */
+  depositMode?: IntentsDepositMode;
 }
 
 export interface IntentsQuote {
@@ -181,6 +197,11 @@ export interface IntentsQuote {
    *  going to deposit. Used by the form to validate the quote response
    *  shape before broadcasting. */
   depositAddress?: string;
+  /**
+   * Set for a MEMO-mode quote (Stellar): the deposit must carry it, because
+   * the address is shared (2026-09-30). The executor attaches it as a Stellar
+   * MEMO_TEXT, and refuses a quote whose memo it cannot attach.
+   */
   depositMemo?: string | null;
   amountIn?: string;
   minAmountIn?: string;
@@ -200,6 +221,9 @@ export interface IntentsQuoteResponse {
 export interface IntentsDepositSubmit {
   depositAddress: string;
   txHash: string;
+  /** The deposit memo, for a memo deposit only (Stellar, 2026-09-30). 1Click:
+   *  "use if deposit was submitted with one". */
+  memo?: string;
 }
 
 /**

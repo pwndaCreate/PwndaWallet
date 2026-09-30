@@ -701,13 +701,22 @@ pub async fn intents_deposit_submit(
     signed_call_with_reenroll(inner, || proxy::intents_deposit_submit(inner, &req)).await
 }
 
+/// `deposit_memo` (2026-09-30, XLM as a NEAR Intents source) is set only for
+/// a memo deposit: the Stellar deposit address is shared by every depositor,
+/// so the status of ONE swap needs the memo too. Optional so a caller passing
+/// only `depositAddress` keeps working — Tauri reads a missing key as `None`
+/// (tauri 2.11 `CommandItem::deserialize_option`).
 #[tauri::command]
 pub async fn intents_status(
     state: State<'_, SwapState>,
     deposit_address: String,
+    deposit_memo: Option<String>,
 ) -> Result<Value, String> {
     let inner = state.inner();
-    signed_call_with_reenroll(inner, || proxy::intents_status(inner, &deposit_address)).await
+    signed_call_with_reenroll(inner, || {
+        proxy::intents_status(inner, &deposit_address, deposit_memo.as_deref())
+    })
+    .await
 }
 
 // ----------------------------------------------------------------------
