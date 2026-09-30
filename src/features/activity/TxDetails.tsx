@@ -33,6 +33,7 @@ import { txDisplayTicker, txFeeTicker, txUsdPrice } from "../../wallets/tx-displ
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
+import { ModalBackdrop } from "../../components/ModalBackdrop";
 
 /** Confirmations at which a counted row reads "confirmed" (display only). */
 export const CONFIRMED_AT = 6;
@@ -456,7 +457,8 @@ export function TxDetails({ tx, ownAddress, pricesByTicker, zphStats }: TxDetail
 
 /**
  * Portrait: the same details over the list. Closes on the backdrop, the ✕
- * button, or Escape.
+ * button, or Escape. The backdrop is the shared `ModalBackdrop`, so moving
+ * the window never closes the sheet (the swap modals' 2026-09-30 fix).
  */
 export function TxDetailsSheet({ onClose, ...props }: TxDetailsProps & { onClose: () => void }) {
   useEffect(() => {
@@ -467,23 +469,10 @@ export function TxDetailsSheet({ onClose, ...props }: TxDetailsProps & { onClose
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: "fixed",
-        inset: 0,
-        background: "rgba(0,0,0,0.65)",
-        display: "flex",
-        alignItems: "flex-end",
-        justifyContent: "center",
-        zIndex: 60,
-        animation: "fade-in .15s ease",
-      }}
-    >
+    <ModalBackdrop onClick={onClose} align="end">
       <div
         role="dialog"
         aria-label="Transaction details"
-        onClick={(e) => e.stopPropagation()}
         style={{
           width: "100%",
           maxWidth: 460,
@@ -519,6 +508,6 @@ export function TxDetailsSheet({ onClose, ...props }: TxDetailsProps & { onClose
         </div>
         <TxDetails {...props} />
       </div>
-    </div>
+    </ModalBackdrop>
   );
 }
