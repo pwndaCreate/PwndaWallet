@@ -503,22 +503,36 @@ export const aptAdapter: ChainAdapter = {
       const [dest, value] = t?.payload?.arguments ?? [];
       const outgoing =
         normalizeAptosAddress(String(t.sender ?? "0x0")) === addr;
+      const intended = outgoing ? "out" : "in";
+      // A transaction that aborted is committed too — it paid gas — but it
+      // moved nothing. Corrected 2026-09-30: it was listed as a send of its
+      // full amount with `confirmations: 0`, which reads "unconfirmed" (0
+      // means waiting for a block, `ChainTx`), so the Activity details said
+      // "▲ sent … unconfirmed" for a week-old failure and the list pinned
+      // it above newer rows. Now `failed`, as XRP and the EVM chains do.
+      const failed = t.success === false;
       items.push({
         chain: "aptos",
         hash: String(t.hash ?? ""),
-        direction: outgoing ? "out" : "in",
+        direction: failed ? "failed" : intended,
         amount: atomicToDecimal(BigInt(value ?? 0), APT_DECIMALS),
-        fee: atomicToDecimal(
-          BigInt(t.gas_used ?? 0) * BigInt(t.gas_unit_price ?? 0),
-          APT_DECIMALS,
-        ),
+        // The gas is this wallet's only when it sent the transaction.
+        fee: outgoing
+          ? atomicToDecimal(BigInt(t.gas_used ?? 0) * BigInt(t.gas_unit_price ?? 0), APT_DECIMALS)
+          : undefined,
         // Aptos timestamps are MICROseconds since epoch, not milliseconds.
         timestamp: t.timestamp ? Math.floor(Number(t.timestamp) / 1_000_000) : undefined,
         height: t.version ? Number(t.version) : undefined,
-        // The chain is instantly final: a transaction that appears here is
-        // committed. Reported as 1 so the UI never labels it "unconfirmed".
-        confirmations: t.success === false ? 0 : 1,
+        // The chain is final on inclusion: a transaction listed here is
+        // committed, whether it succeeded or not. No count (`undefined`)
+        // with its version as the block reads "confirmed"; a count of 1
+        // read "confirming (1)" and "1 / 6 pending" in the details.
+        confirmations: undefined,
         counterparty: outgoing ? String(dest ?? "") : String(t.sender ?? ""),
+        meta: {
+          intended,
+          ...(failed ? { failure: String(t.vm_status ?? "aborted") } : {}),
+        },
       });
     }
     return { items };

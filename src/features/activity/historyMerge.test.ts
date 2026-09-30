@@ -136,6 +136,14 @@ describe("a transaction waiting for a block is listed first", () => {
     expect(rows.map((r) => r.hash)).toEqual(["a", "spl", "nt"]);
   });
 
+  it("a row already in a block is never pinned, whatever its count says", () => {
+    // Aptos reported its failed transactions as `confirmations: 0`
+    // (aptHistory.test.ts); a block height settles it.
+    const inBlock: ChainTx = { chain: "aptos", hash: "f", direction: "failed", amount: "1", confirmations: 0, height: 7, timestamp: 50 };
+    const rows = [inBlock, mined("new", 300)].sort(compareTxNewestFirst);
+    expect(rows.map((r) => r.hash)).toEqual(["new", "f"]);
+  });
+
   it("mergeChainTx and both mounted Activity views sort with it", () => {
     const pending: EsploraTx = {
       ...SEND,

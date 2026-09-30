@@ -173,8 +173,12 @@ export function compareTxNewestFirst(a: ChainTx, b: ChainTx): number {
 }
 
 function isUnmined(tx: ChainTx): boolean {
-  if (tx.confirmations === 0) return true;
-  return tx.direction === "pending" && !tx.height && tx.timestamp === undefined;
+  // A row the chain has already placed in a block (a slot, a ledger
+  // version) is not waiting for one, whatever its count says: Aptos
+  // reported its failed transactions as `confirmations: 0` and every one of
+  // them was pinned to the top of Activity.
+  if (tx.height) return false;
+  return tx.confirmations === 0 || (tx.direction === "pending" && tx.timestamp === undefined);
 }
 
 /**

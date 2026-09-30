@@ -169,35 +169,64 @@ interface HorizonOperation {
   asset_type?: string;
   to?: string;
   from?: string;
+  /** `create_account` names its parties and amount differently. */
+  funder?: string;
+  account?: string;
+  starting_balance?: string;
   transaction_hash: string;
 }
 
+/**
+ * The ledger an operation closed in. Horizon's operation id is a TOID:
+ * ledger sequence << 32 | transaction order << 12 | operation index.
+ */
+export function ledgerOfOperationId(id: string): number | undefined {
+  if (!/^\d+$/.test(id)) return undefined;
+  const ledger = Number(BigInt(id) >> 32n);
+  return ledger > 0 ? ledger : undefined;
+}
+
 async function fetchHistory(addr: string, limit = 25): Promise<ChainTx[]> {
+  let r: { _embedded: { records: HorizonOperation[] } };
   try {
-    const r = await proxyGetJson<{
-      _embedded: { records: HorizonOperation[] };
-    }>(`${HORIZON_BASE}/accounts/${addr}/operations?limit=${limit}&order=desc`);
-    const records = r._embedded?.records ?? [];
-    const items: ChainTx[] = [];
-    for (const op of records) {
-      if (op.type !== "payment" && op.type !== "create_account") continue;
-      if (op.asset_type && op.asset_type !== "native") continue;
-      const direction =
-        op.from && op.from.toUpperCase() === addr.toUpperCase() ? "out" : "in";
-      items.push({
-        chain: "stellar",
-        hash: op.transaction_hash,
-        direction,
-        amount: op.amount ?? "0",
-        timestamp: Math.floor(new Date(op.created_at).getTime() / 1000),
-        confirmations: 1,
-        counterparty: direction === "out" ? op.to : op.from,
-      });
-    }
-    return items;
-  } catch {
-    return [];
+    r = await proxyGetJson(`${HORIZON_BASE}/accounts/${addr}/operations?limit=${limit}&order=desc`);
+  } catch (e) {
+    // An account nobody has funded does not exist yet: Horizon answers
+    // 404, and that is an empty history. Any other failure is an error
+    // (2026-09-30): this caught everything and returned no rows, so a
+    // failed read looked like a wallet with no transactions.
+    if (e instanceof Error && /^HTTP 404\b/.test(e.message)) return [];
+    throw e;
   }
+  const records = r._embedded?.records ?? [];
+  const items: ChainTx[] = [];
+  const me = addr.toUpperCase();
+  for (const op of records) {
+    if (op.type !== "payment" && op.type !== "create_account") continue;
+    if (op.asset_type && op.asset_type !== "native") continue;
+    // An account's first funding is a `create_account`, whose parties and
+    // amount are `funder` / `account` / `starting_balance`. Read as a
+    // payment, it was "+0 XLM" received from nobody (2026-09-30).
+    const create = op.type === "create_account";
+    const from = create ? op.funder : op.from;
+    const to = create ? op.account : op.to;
+    const direction = from && from.toUpperCase() === me ? "out" : "in";
+    items.push({
+      chain: "stellar",
+      hash: op.transaction_hash,
+      direction,
+      amount: (create ? op.starting_balance : op.amount) ?? "0",
+      timestamp: Math.floor(new Date(op.created_at).getTime() / 1000),
+      // Horizon lists closed ledgers only, and a closed ledger is final:
+      // no count, the ledger as the block (a count of 1 read "1 / 6
+      // pending" in the details).
+      confirmations: undefined,
+      height: ledgerOfOperationId(op.id),
+      counterparty: direction === "out" ? to : from,
+      meta: { ...(from ? { from } : {}), ...(to ? { to } : {}) },
+    });
+  }
+  return items;
 }
 
 // =========================================================================

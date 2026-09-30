@@ -133,10 +133,15 @@ describe("getTransactionHistory", () => {
     expect(items.map((i) => i.hash)).toEqual(["digestA"]);
   });
 
-  it("returns an EMPTY (not thrown) result only when BOTH queries fail", async () => {
+  it("THROWS when BOTH queries fail — a failed read is not an empty history", async () => {
+    // Corrected 2026-09-30. This returned [] and was pinned here, so an
+    // unreadable Sui history showed as "no transactions" — the same
+    // coercion this file forbids for balances. `useTxHistory` keeps the
+    // last-known rows and names the failing chain in the status line.
     mockProxy.mockResolvedValue({ status: 500, body: "fail", headers: [] });
-    const { items } = await suiAdapter.getTransactionHistory!(ADDR, { limit: 10 });
-    expect(items).toEqual([]);
+    await expect(suiAdapter.getTransactionHistory!(ADDR, { limit: 10 })).rejects.toThrow(
+      /Sui history could not be read/,
+    );
   });
 
   it("respects the limit after merging", async () => {

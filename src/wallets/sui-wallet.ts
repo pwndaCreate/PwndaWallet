@@ -167,6 +167,10 @@ interface GraphQLResponse<T> {
 // Restored during the origin/main merge: the auto-merge kept origin/main's
 // GraphQL helper and dropped this one, while the adapter body below (taken from
 // the swap-desk side, which has the working send path) still calls it.
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
 async function suiRpcCall<T>(method: string, params: unknown[]): Promise<T> {
   const r = await httpProxyCall({
     method: "POST",
@@ -375,7 +379,10 @@ export const suiAdapter: ChainAdapter = {
       queryOne({ ToAddress: address }),
     ]);
     if (fromR.status === "rejected" && toR.status === "rejected") {
-      return { items: [] };
+      // An error, not an empty history (2026-09-30): an address with no
+      // transactions answers an empty list, so two rejections are a failed
+      // read, and "no transactions" would hide it (the SPL fix, same day).
+      throw new Error(`Sui history could not be read: ${errorText(fromR.reason)}`);
     }
     // Merge by digest -- a self-transfer, or a tx this address both sent and
     // received, would otherwise appear twice.
@@ -407,7 +414,10 @@ export const suiAdapter: ChainAdapter = {
           timestamp: tx.timestampMs
             ? Math.floor(parseInt(tx.timestampMs, 10) / 1000)
             : undefined,
-          confirmations: tx.checkpoint ? 1 : 0,
+          // A checkpointed transaction is final: no count, its checkpoint as
+          // the block (2026-09-30; a count of 1 read "1 / 6 pending").
+          confirmations: tx.checkpoint ? undefined : 0,
+          height: tx.checkpoint ? Number(tx.checkpoint) : undefined,
         };
       })
       // Each sub-query is independently sorted descending; the merge is not.
