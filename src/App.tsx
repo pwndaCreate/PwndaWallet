@@ -107,7 +107,11 @@ import {
   readMineDisplayCoin,
   writeMineDisplayCoin,
 } from "./features/swap/useMiningProjection";
-import { useTxHistory } from "./features/activity/useTxHistory";
+import {
+  displayedAddressByChain,
+  ownedChainsOf,
+  useTxHistory,
+} from "./features/activity/useTxHistory";
 import { XmrImportPanel } from "./features/monero/XmrImportPanel";
 import { ZphImportPanel } from "./features/zephyr/ZphImportPanel";
 import { AuthRouter, AUTH_VIEWS } from "./features/auth/AuthRouter";
@@ -617,15 +621,11 @@ function App() {
     // idle Mine tab and the commit stream behind the dev-build renderer leak.
     active: HISTORY_VIEWS.has(featureFocus),
   });
-  const ownedChains = useMemo(
-    () => txPairs.map((p) => p.chain),
-    [txPairs]
-  );
-  const addressByChain = useMemo(() => {
-    const o: Record<string, string> = {};
-    for (const p of txPairs) o[p.chain] = p.address;
-    return o;
-  }, [txPairs]);
+  // Each chain once, with its DISPLAYED address (2026-09-30): `txPairs` lists
+  // a UTXO chain once per account address, and reading it directly repeated
+  // the chain and kept the highest change index as "the" address.
+  const ownedChains = useMemo(() => ownedChainsOf(txPairs), [txPairs]);
+  const addressByChain = useMemo(() => displayedAddressByChain(txPairs), [txPairs]);
 
   /* ── Unified portfolio (Phase 4) ──────────────────────────────────────
    * The "All Wallets" view aggregates every wallet's holdings. We derive

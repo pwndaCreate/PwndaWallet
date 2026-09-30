@@ -116,10 +116,13 @@ describe("mergeChainTx — the wallet's net across its own addresses (2026-09-17
       "litecoin:ltc1qchange2": [send("ltc1qchange2", 232246115)],
     };
     const [row] = mergeChainTx({ txByChain }, "litecoin").txs;
-    // Was "-3.52247525" (the whole input) before netting.
+    // Was "-3.52247525" (the whole input) before netting, then
+    // "1.20001410" with the fee beside it (the fee counted twice) until
+    // 2026-09-30: the amount is what reached the recipient.
     expect(row.direction).toBe("out");
-    expect(row.amount).toBe("1.20001410");
+    expect(row.amount).toBe("1.20000000");
     expect(row.fee).toBe("0.00001410");
+    expect(row.meta?.netSat).toBe(-120001410);
     // The counterparty is the recipient, not our own change address.
     expect(row.counterparty).toBe("ltc1qrecipient");
   });
@@ -146,9 +149,12 @@ describe("mergeChainTx — the wallet's net across its own addresses (2026-09-17
     expect(mergeChainTx({ txByChain }, "litecoin").txs).toEqual([a]);
   });
 
-  it("a tx under one address only is returned as-is", () => {
+  it("a receipt under one address only keeps its amount and direction", () => {
     const payout = tx("0683dbe03a9d3255", { amount: "0.09999817", meta: { netSat: 9999817 } });
     const txByChain = { "litecoin:ltc1qrx8z2": [payout], "litecoin:other": [] };
-    expect(mergeChainTx({ txByChain }, "litecoin").txs).toEqual([payout]);
+    const rows = mergeChainTx({ txByChain }, "litecoin").txs;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ hash: payout.hash, direction: "in", amount: "0.09999817" });
+    expect(rows[0].fee).toBeUndefined();
   });
 });

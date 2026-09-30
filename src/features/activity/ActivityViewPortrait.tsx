@@ -9,6 +9,7 @@ import type { ChainTx, ChainType } from "../../wallets";
 import { TxDetailsSheet } from "./TxDetails";
 import { HistoryStatusLine } from "./HistoryStatusLine";
 import { chainHistoryStatuses, summarizeHistoryStatus } from "./historyStatus";
+import { chainAddresses, compareTxNewestFirst } from "./useTxHistory";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
 import { txIsMeaningful } from "./txFilters";
@@ -99,7 +100,7 @@ export function ActivityViewPortrait({
     // The swap row is the canonical representation of that hash in the
     // unified timeline; per-chain dashboards still surface it natively.
     const deduped = dedupChainTxsAgainstSwaps(out, swapHashes);
-    deduped.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+    deduped.sort(compareTxNewestFirst);
     return deduped;
   }, [statuses, swapHashes]);
 
@@ -276,6 +277,7 @@ export function ActivityViewPortrait({
         <TxDetailsSheet
           tx={selected}
           ownAddress={addressByChain[selected.chain]}
+          ownAddresses={chainAddresses(txByChain, selected.chain)}
           pricesByTicker={pricesByTicker}
           zphStats={zphStats}
           onClose={() => setSelected(null)}

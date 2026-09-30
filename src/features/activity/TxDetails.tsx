@@ -41,6 +41,9 @@ export const CONFIRMED_AT = 6;
 export interface TxDetailsContext {
   /** The wallet's address on this chain, so "you" can be marked. */
   ownAddress?: string;
+  /** Every address the wallet holds on this chain (a UTXO account has
+   *  change addresses besides the displayed one). All are "you". */
+  ownAddresses?: ReadonlyArray<string>;
   pricesByTicker?: Record<string, number>;
   /** Zephyr oracle prices for ZEPHUSD / ZEPHRSV / ZEPHYRS rows. */
   zphStats?: ZphLiveStats | null;
@@ -92,6 +95,12 @@ function sameAddress(a: string | undefined, b: string | undefined): boolean {
   if (!a || !b) return false;
   // Hex addresses (EVM) compare case-insensitively; everything else exactly.
   return /^0x[0-9a-f]+$/i.test(a) ? a.toLowerCase() === b.toLowerCase() : a === b;
+}
+
+/** A UTXO row's `meta.inputs` / `meta.outputs`: addresses, "" for none. */
+function metaAddresses(tx: ChainTx, key: "inputs" | "outputs"): string[] {
+  const v = tx.meta?.[key];
+  return Array.isArray(v) ? v.filter((a): a is string => typeof a === "string" && a !== "") : [];
 }
 
 function metaString(tx: ChainTx, key: string): string | undefined {
@@ -178,10 +187,24 @@ export function txDetailsModel(tx: ChainTx, ctx: TxDetailsContext = {}): TxDetai
   const fee = tx.fee ? (feeTicker ? `${tx.fee} ${feeTicker}` : `${tx.fee} (paid by the sender)`) : null;
 
   const own = ctx.ownAddress;
+  const owned = [own, ...(ctx.ownAddresses ?? [])].filter((a): a is string => !!a);
+  const isOwn = (a: string | undefined) => owned.some((o) => sameAddress(a, o));
   const received = tx.direction === "in" || (tx.direction === "failed" && intended === "in");
-  const fromAddr = metaString(tx, "from") ?? (received ? tx.counterparty : own);
-  const toAddr = metaString(tx, "to") ?? (received ? own : tx.counterparty);
-  const party = (a: string | undefined): TxParty | null => (a ? { address: a, you: sameAddress(a, own) } : null);
+  // A UTXO row names its inputs' and outputs' addresses (2026-09-30), so the
+  // wallet's side is the address that actually took part — a change address
+  // the account scan found, say — not assumed to be the displayed one, and
+  // a receipt's sender is the first input that is not the wallet's.
+  const inputs = metaAddresses(tx, "inputs");
+  const outputs = metaAddresses(tx, "outputs");
+  const ownInput = inputs.find(isOwn);
+  const ownOutput = outputs.find(isOwn);
+  const otherInput = inputs.find((a) => !isOwn(a));
+  const otherOutput = outputs.find((a) => !isOwn(a));
+  const fromAddr =
+    metaString(tx, "from") ?? (received ? (tx.counterparty ?? otherInput) : (ownInput ?? own));
+  const toAddr =
+    metaString(tx, "to") ?? (received ? (ownOutput ?? own) : (tx.counterparty ?? otherOutput));
+  const party = (a: string | undefined): TxParty | null => (a ? { address: a, you: isOwn(a) } : null);
 
   const amountApprox = tx.meta?.amountApprox === true;
   let note: string | null = null;
@@ -442,8 +465,8 @@ export interface TxDetailsProps extends TxDetailsContext {
  * portrait inside `TxDetailsSheet`. No hooks of its own, so a test can call
  * it and follow the explorer button to `openExternal`.
  */
-export function TxDetails({ tx, ownAddress, pricesByTicker, zphStats }: TxDetailsProps) {
-  const model = txDetailsModel(tx, { ownAddress, pricesByTicker, zphStats });
+export function TxDetails({ tx, ownAddress, ownAddresses, pricesByTicker, zphStats }: TxDetailsProps) {
+  const model = txDetailsModel(tx, { ownAddress, ownAddresses, pricesByTicker, zphStats });
   return (
     <TxDetailsView
       tx={tx}

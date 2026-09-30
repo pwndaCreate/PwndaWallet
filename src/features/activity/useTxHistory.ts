@@ -24,6 +24,7 @@ import { Store } from "@tauri-apps/plugin-store";
 import { getAdapterByChain } from "../../wallets";
 import type { ChainTx, ChainType } from "../../wallets";
 import { dedupeTxRows, normalizeTxHash, txAssetKey, txRowKey } from "../../wallets/tx-row-key";
+import { accountTxHistory } from "../../wallets/utxo-account-history";
 import {
   isDue,
   mergeHistoryPage,
@@ -82,6 +83,17 @@ export interface UseTxHistoryResult {
  * so rows now group by hash + asset (`txRowKey`'s parts) and a group is
  * netted only when it spans more than one address; within one address list
  * the rows stay as the adapter returned them, less exact duplicates.
+ *
+ * Corrected 2026-09-30, again. A chain whose adapter scans a UTXO ACCOUNT
+ * (`adapter.utxoAccounts`: BTC, LTC, BCH, DOGE, DASH, RVN) is merged by
+ * `accountTxHistory` (`wallets/utxo-account-history.ts`): one row per txid,
+ * and when the account paid the fee, `amount` is what reached addresses
+ * that are not the account's own, with the fee beside it. It read the
+ * account's whole balance change instead — "1.20001410 LTC" with
+ * "fee 0.00001410" next to it, the fee counted twice by anyone adding the
+ * two — and a send whose change returned to the same address read the
+ * same way. Every account-model chain already states `amount` without the
+ * fee, and so does the send form, so this is the one convention now.
  */
 export function mergeChainTx(
   result: {
@@ -111,14 +123,19 @@ export function mergeChainTx(
       }
     }
   }
-  const txs: ChainTx[] = [];
-  for (const id of order) {
-    const rows = groups.get(id)!;
-    const fromOneList = rows.every((r) => r.key === rows[0].key);
-    if (fromOneList) txs.push(...dedupeTxRows(rows.map((r) => r.tx)));
-    else txs.push(netAcrossAddresses(dedupeAcrossLists(rows), ownAddresses));
+  let txs: ChainTx[] = [];
+  if (getAdapterByChain(chain)?.utxoAccounts) {
+    // A UTXO account: the wallet layer's account rules (see above).
+    txs = accountTxHistory(result.txByChain, chain);
+  } else {
+    for (const id of order) {
+      const rows = groups.get(id)!;
+      const fromOneList = rows.every((r) => r.key === rows[0].key);
+      if (fromOneList) txs.push(...dedupeTxRows(rows.map((r) => r.tx)));
+      else txs.push(netAcrossAddresses(dedupeAcrossLists(rows), ownAddresses));
+    }
   }
-  txs.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+  txs.sort(compareTxNewestFirst);
 
   let loading = false;
   for (const k of Object.keys(loadingMap)) {
@@ -137,6 +154,62 @@ export function mergeChainTx(
   }
 
   return { txs, loading, error };
+}
+
+/**
+ * Newest first, with a transaction still waiting for a block on top
+ * (2026-09-30). Every history list sorted by `timestamp ?? 0`, and a mempool
+ * row has no timestamp, so a send the user had just made sank below every
+ * mined row — past the lists' 100-row cut, out of sight — at exactly the
+ * moment they were looking for it. A mined row with no timestamp still
+ * sorts last, as before. `pending` with a block height is an adapter that
+ * did not read the direction (SPL), not an unmined transaction.
+ */
+export function compareTxNewestFirst(a: ChainTx, b: ChainTx): number {
+  const ua = isUnmined(a);
+  const ub = isUnmined(b);
+  if (ua !== ub) return ua ? -1 : 1;
+  return (b.timestamp ?? 0) - (a.timestamp ?? 0);
+}
+
+function isUnmined(tx: ChainTx): boolean {
+  if (tx.confirmations === 0) return true;
+  return tx.direction === "pending" && !tx.height && tx.timestamp === undefined;
+}
+
+/**
+ * Every address the history holds for one chain — the displayed address and,
+ * for a UTXO account, each change or receive address the scan found. The
+ * details view marks any of them as "you" (2026-09-30).
+ */
+export function chainAddresses(txByChain: Record<string, unknown>, chain: ChainType): string[] {
+  const prefix = `${chain}:`;
+  return Object.keys(txByChain)
+    .filter((k) => k.startsWith(prefix))
+    .map((k) => k.slice(prefix.length));
+}
+
+/**
+ * The chains the wallet holds, each ONCE, and each chain's DISPLAYED
+ * address, from the `{chain, address}` pairs `useTxHistory` polls
+ * (2026-09-30).
+ *
+ * The pairs list a UTXO chain once per account address, the displayed
+ * address first. App built its chain list and address map straight from
+ * them: the chain repeated once per address, and the map kept the LAST
+ * pair's address — the highest change index — so Activity listed each LTC
+ * row once per address and the details marked change/20 as "you".
+ */
+export function ownedChainsOf(pairs: ReadonlyArray<ChainAddressPair>): ChainType[] {
+  return [...new Set(pairs.map((p) => p.chain))];
+}
+
+export function displayedAddressByChain(
+  pairs: ReadonlyArray<ChainAddressPair>,
+): Record<string, string> {
+  const o: Record<string, string> = {};
+  for (const p of pairs) if (!(p.chain in o)) o[p.chain] = p.address;
+  return o;
 }
 
 /**

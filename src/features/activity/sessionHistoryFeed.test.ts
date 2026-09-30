@@ -56,7 +56,9 @@ describe("App.tsx reads Zano and Xelis history from their sessions", () => {
   });
 
   it("still lists both chains as owned (Activity's chain list comes from txPairs)", () => {
-    expect(APP).toMatch(/ownedChains = useMemo\(\s*\(\) => txPairs\.map/);
+    // Each chain once since 2026-09-30 (`ownedChainsOf`), still from ALL
+    // pairs — not `polledTxPairs`, which leaves Zano and Xelis out.
+    expect(APP).toMatch(/ownedChains = useMemo\(\s*\(\) => ownedChainsOf\(txPairs\)/);
   });
 
   it("routes a post-send history refresh to the session that owns the chain", () => {

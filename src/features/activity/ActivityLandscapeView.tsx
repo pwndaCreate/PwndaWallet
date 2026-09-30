@@ -9,6 +9,7 @@ import type { ChainTx, ChainType } from "../../wallets";
 import { TxDetails } from "./TxDetails";
 import { HistoryStatusLine } from "./HistoryStatusLine";
 import { chainHistoryStatuses, summarizeHistoryStatus } from "./historyStatus";
+import { chainAddresses, compareTxNewestFirst } from "./useTxHistory";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
 import {
@@ -100,7 +101,7 @@ export function ActivityLandscapeView({
     const out: ChainTx[] = [];
     for (const s of statuses) out.push(...s.txs);
     const deduped = dedupChainTxsAgainstSwaps(out, swapHashes);
-    deduped.sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0));
+    deduped.sort(compareTxNewestFirst);
     return deduped;
   }, [statuses, swapHashes]);
 
@@ -505,6 +506,7 @@ export function ActivityLandscapeView({
           <TxDetails
             tx={detail}
             ownAddress={addressByChain[detail.chain]}
+            ownAddresses={chainAddresses(txByChain, detail.chain)}
             pricesByTicker={pricesByTicker}
             zphStats={zphStats}
           />
