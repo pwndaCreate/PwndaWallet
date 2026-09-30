@@ -33,10 +33,10 @@
  * 2026-09-29 send-safety audit: `getBalance` was hard-coded to "0" and
  * `getTransactionHistory` to an empty list, so a funded NEAR wallet read as
  * empty with "no transactions". The balance is now read with `view_account`
- * across the NEAR RPC list; history, which no public NEAR RPC serves (it needs
- * an indexer), now says it is unavailable instead of claiming there is none.
- * This file also holds the NEAR RPC helpers and the account-ID rules the send
- * path uses.
+ * across the NEAR RPC list. History, which no public NEAR RPC serves, said it
+ * was unavailable; since 2026-09-30 it is read from NearBlocks
+ * (`near-history.ts`). This file also holds the NEAR RPC helpers and the
+ * account-ID rules the send path uses.
  */
 
 import { mnemonicToSeedSync } from "@scure/bip39";
@@ -44,6 +44,7 @@ import { derivePath } from "ed25519-hd-key";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { atomicToDecimal } from "./decimal-amount";
 import { NEAR_RPCS } from "./chain-rpcs";
+import { fetchNearHistory } from "./near-history";
 import type {
   ChainAdapter,
   WalletInfo,
@@ -375,15 +376,19 @@ export const nearAdapter: ChainAdapter = {
   },
 
   /**
-   * Not implemented — and says so (2026-09-29 send-safety audit). NEAR's
-   * public RPC has no per-account history; it needs an indexer this wallet
-   * does not use yet. This returned `{ items: [] }`, which every history
-   * surface renders as "No transactions yet", right after a send.
+   * From NearBlocks' receipt list (`near-history.ts`), since 2026-09-30.
+   *
+   * NEAR's public RPC has no per-account history. Until 2026-09-29 this
+   * returned `{ items: [] }` ("No transactions yet", right after a send);
+   * then it threw "…not available in this wallet yet…", which the Activity
+   * header counted as an error (operator report 2026-09-30). A NearBlocks
+   * failure still throws — never an empty list.
    */
-  async getTransactionHistory(): Promise<TxHistoryPage> {
-    throw new Error(
-      "NEAR transaction history is not available in this wallet yet. Look the account up on a NEAR explorer.",
-    );
+  async getTransactionHistory(
+    address: string,
+    opts?: { limit?: number; cursor?: string },
+  ): Promise<TxHistoryPage> {
+    return fetchNearHistory(address.trim(), opts);
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

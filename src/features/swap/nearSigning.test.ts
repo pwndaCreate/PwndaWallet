@@ -418,7 +418,14 @@ describe("NEAR balance and history say what is true (#4)", () => {
     await expect(nearAdapter.getBalance(me.address)).rejects.toThrow(/HTTP 502/);
   });
 
-  it("history says it is unavailable instead of 'no transactions'", async () => {
-    await expect(nearAdapter.getTransactionHistory(me.address)).rejects.toThrow(/not available/);
+  // Was "history says it is unavailable": since 2026-09-30 history is read
+  // from NearBlocks (`near-history.ts`, covered in `nearHistory.test.ts`).
+  // The point this test made still holds: a read that fails throws, never an
+  // empty list read as "no transactions".
+  it("history that cannot be read throws instead of 'no transactions'", async () => {
+    await expect(nearAdapter.getTransactionHistory(me.address)).rejects.toThrow();
+    expect(net.requests.map((r) => r.url)).toEqual([
+      `https://api.nearblocks.io/v1/account/${me.address}/txns?per_page=25&order=desc`,
+    ]);
   });
 });
