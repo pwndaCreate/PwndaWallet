@@ -1629,7 +1629,10 @@ function addressFromScript(
  */
 export async function executeCardanoTransfer(args: {
   mnemonic: string;
-  /** User's addr1 base address (informational; the signer re-derives). */
+  /**
+   * The addr1 address the wallet shows for ADA — the one the deposit is spent
+   * from. Empty: CIP-1852 account 0 / index 0 of `mnemonic`.
+   */
   fromAddress: string;
   /** 1Click deposit address (addr1…). */
   depositAddress: string;
@@ -1638,23 +1641,40 @@ export async function executeCardanoTransfer(args: {
 }): Promise<{ txHash: string }> {
   const { sendAda } = await import("../../wallets/cardano-tx");
   const { deriveCardanoKeySet } = await import("../../wallets/cardano-cip1852");
+  const { cardanoSignerFor } = await import("../../wallets/ada-wallet");
 
   const lovelace = atomicStringToBigInt(args.amountAtomic);
   if (lovelace <= 0n) {
     throw new Error(`ADA amount must be positive (got ${args.amountAtomic}).`);
   }
-  // Re-derive the source address from the mnemonic so the signing key is
-  // guaranteed to own the inputs (mirror of adaAdapter.sendTransaction).
-  const ks = deriveCardanoKeySet(args.mnemonic);
-  if (args.fromAddress && args.fromAddress !== ks.address) {
-    // Caller's source address disagrees with the mnemonic-derived one.
-    // The mnemonic is authoritative (it owns the keys); proceed with the
-    // derived address but surface the mismatch for diagnostics.
-    console.warn(
-      `[swap:cardano] sourceAddress mismatch — signing for mnemonic-derived ` +
-        `${ks.address.slice(0, 12)}… not ${args.fromAddress.slice(0, 12)}…`
-    );
+  // Spend from the address the wallet SHOWS (2026-09-29 send-safety audit).
+  // This used to re-derive CIP-1852 account 0 / index 0 and spend that,
+  // logging a warning when it disagreed with the displayed address — so for a
+  // wallet imported on another derivation (an Exodus account, a later index,
+  // Pwnda's legacy key) the deposit came out of a different address than the
+  // one on screen, the same fault the dashboard Send had. `cardanoSignerFor`
+  // finds the key that controls the displayed address; if none of the
+  // derivations the wallet knows does, nothing is signed.
+  const fromAddress = args.fromAddress.trim();
+  if (fromAddress) {
+    const signer = cardanoSignerFor(args.mnemonic, fromAddress);
+    if (!signer) {
+      throw new Error(
+        `This wallet's recovery phrase does not control the ADA address it shows ` +
+          `(${fromAddress.slice(0, 16)}…) through any derivation the wallet knows, so ` +
+          `the deposit cannot be signed from it. Nothing was sent.`,
+      );
+    }
+    const result = await sendAda({
+      mnemonic: args.mnemonic,
+      fromAddress,
+      toAddress: args.depositAddress,
+      amountLovelace: lovelace,
+      signer,
+    });
+    return { txHash: result.txHash };
   }
+  const ks = deriveCardanoKeySet(args.mnemonic);
   const result = await sendAda({
     mnemonic: args.mnemonic,
     fromAddress: ks.address,
