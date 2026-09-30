@@ -1454,6 +1454,32 @@ function jsonRpcOne(url: string, req: any, funded: boolean, degraded: boolean): 
   // too: a sandbox that still returned a balance here would hide the exact
   // failure the adapter now has to survive. Live Sui data comes from the
   // GraphQL arm in `graphQlOne`.
+  //
+  // Corrected 2026-09-30: only Mysten's own host is dead. The adapter has
+  // read `SUI_RPC` (publicnode) since 2026-08-22, which still serves
+  // JSON-RPC — probed live that day: `suix_getBalance` and
+  // `suix_queryTransactionBlocks` answered 24 of 24. Answering -32601 for
+  // every host made the sandbox show Sui's balance and history as broken
+  // while the app worked. publicnode now gets the same data the GraphQL arm
+  // serves (60 SUI, one receipt), in the JSON-RPC shape.
+  if ((method.startsWith("suix_") || method.startsWith("sui_")) && !degraded && !url.includes("fullnode.mainnet.sui.io")) {
+    if (method === "suix_getBalance")
+      return ok({ coinType: "0x2::sui::SUI", coinObjectCount: funded ? 1 : 0, totalBalance: funded ? "60000000000" : "0", lockedBalance: {} });
+    if (method === "suix_queryTransactionBlocks") {
+      const filter = req?.params?.[0]?.filter ?? {};
+      const to = typeof filter.ToAddress === "string" ? filter.ToAddress : null;
+      const data = funded && to
+        ? [{
+            digest: "9jsBfj6ECyMwBDPVHMt9WPC3MFdbUWhT94KnTPod6Vbz",
+            timestampMs: String(Date.parse("2026-08-01T12:00:00.000Z")),
+            checkpoint: "310000000",
+            balanceChanges: [{ owner: { AddressOwner: to }, coinType: "0x2::sui::SUI", amount: "60000000000" }],
+          }]
+        : [];
+      return ok({ data, nextCursor: null, hasNextPage: false });
+    }
+    if (method === "sui_getLatestCheckpointSequenceNumber") return ok("328690360");
+  }
   if (method.startsWith("suix_") || method.startsWith("sui_")) {
     return {
       jsonrpc: "2.0",
