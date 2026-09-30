@@ -4,13 +4,20 @@ import {
   PublicKey,
   SystemProgram,
   Transaction,
-  sendAndConfirmTransaction,
   LAMPORTS_PER_SOL,
+  type AccountInfo,
+  type SignatureStatus,
+  type TransactionError,
+  type TransactionInstruction,
 } from "@solana/web3.js";
 import { mnemonicToSeedSync } from "@scure/bip39";
+import { base58 } from "@scure/base";
 import { derivePath } from "ed25519-hd-key";
 import { Buffer } from "buffer";
 import { invoke } from "../lib/tauri";
+import { errorText } from "../lib/errorText";
+import { atomicToDecimal, decimalToAtomic } from "./decimal-amount";
+import { SendOutcomeUnknownError } from "./send-outcome";
 import type {
   ChainAdapter,
   WalletInfo,
@@ -280,12 +287,22 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
  *  against endpoints this file already documents as easy to trip. */
 export { runOnAnyRpc as runOnAnySolanaRpc };
 
-async function runOnAnyRpc<T>(fn: (conn: Connection) => Promise<T>): Promise<T> {
-  // Build the try-order: sticky URL first (if known and still in the
-  // roster), then everything else in declared order.
-  const order = stickyUrl && RPC_URLS.includes(stickyUrl)
+/** The try-order: sticky URL first (if known and still in the roster), then
+ *  everything else in declared order. Shared by reads and by the send path. */
+function rpcOrder(): string[] {
+  return stickyUrl && RPC_URLS.includes(stickyUrl)
     ? [stickyUrl, ...RPC_URLS.filter((u) => u !== stickyUrl)]
     : [...RPC_URLS];
+}
+
+/**
+ * For READS only. Each endpoint gets `PER_RPC_TIMEOUT_MS`, and a timed-out
+ * attempt is abandoned, not cancelled — harmless for a read, and exactly why
+ * nothing that signs or broadcasts may run inside it (2026-09-29 send-safety
+ * audit; see `submitSolanaTransaction`).
+ */
+async function runOnAnyRpc<T>(fn: (conn: Connection) => Promise<T>): Promise<T> {
+  const order = rpcOrder();
 
   const failures: { url: string; error: string }[] = [];
   for (const url of order) {
@@ -318,6 +335,551 @@ async function runOnAnyRpc<T>(fn: (conn: Connection) => Promise<T>): Promise<T> 
   throw new Error(
     `All Solana RPC endpoints failed. Try again in a moment.\n${lines}`
   );
+}
+
+// ─── Sending (2026-09-29 send-safety audit) ──────────────────────────────
+//
+// # What was wrong
+//
+// `sendTransaction` here, and the SPL legs, ran blockhash → sign → broadcast
+// → confirm INSIDE `runOnAnyRpc`, which gives an endpoint 4 s and then moves
+// to the next one without cancelling the attempt it abandoned. web3.js's
+// `sendAndConfirmTransaction` fetches its own blockhash and signs on every
+// call, and confirms only through a WebSocket subscription (which
+// api.mainnet-beta.solana.com refuses with 403 for the app's origins) or at
+// block-height expiry 60-90 s later, never within 4 s. So every endpoint was
+// handed a NEW transaction: new blockhash, new signature, nothing for the
+// network to deduplicate. The audit drove the real adapters with only
+// `lib/tauri` stubbed (nothing signed) and counted 11 independent builds per
+// press, 4 s apart, all left running, ending in "All Solana RPC endpoints
+// failed. Try again in a moment." Where several endpoints answer, each build
+// is a real transfer.
+//
+// # What happens now
+//
+//  1. Everything decidable from the input or from a read is decided first —
+//     recipient, amount, balances, rent — outside any rotation, so a typo is
+//     reported as a typo and not as an outage.
+//  2. `submitSolanaTransaction` fetches ONE blockhash and signs ONCE.
+//  3. `deliverSignedTransaction` receives the serialized bytes and no key, so
+//     it cannot sign anything, by construction. It may hand those same bytes
+//     to every endpoint: a Solana transaction's identity is its signature,
+//     and the network lands it at most once.
+//  4. The outcome is read BY SIGNATURE over plain HTTP until the transaction
+//     is confirmed, fails on chain, or provably can no longer land.
+
+/** Solana's base fee: 5,000 lamports per signature. Every transaction this
+ *  wallet signs has exactly one signature and no compute-budget (priority
+ *  fee) instruction, so this is its whole fee. Used for the pre-checks and the
+ *  fee display; the node's preflight simulation stays the final word. */
+export const SOL_TX_FEE_LAMPORTS = 5_000n;
+
+/** The SPL Token programs. An account either one owns is a token account or
+ *  a mint — never a wallet. */
+export const TOKEN_PROGRAM_ID = new PublicKey("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+export const TOKEN_2022_PROGRAM_ID = new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
+
+export function isTokenProgram(owner: PublicKey): boolean {
+  return owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID);
+}
+
+/**
+ * How long one send waits, and on what.
+ *
+ * `budgetMs` has to outlast a blockhash. `lastValidBlockHeight` is 150 blocks
+ * past the blockhash (~60-70 s), and expiry is only proven once a FINALIZED
+ * block is past it (~13 s later again). 120 s leaves room for slow reads, so a
+ * transaction that never lands normally ends as "expired, safe to send again"
+ * instead of "unknown". Reads keep the short read timeout: a slow read is
+ * harmless, and a slow broadcast is never a reason to sign another.
+ */
+const SOL_SEND_TIMING = Object.freeze({
+  /** One `sendTransaction` call. An answer later than this counts as maybe-sent. */
+  broadcastTimeoutMs: 8_000,
+  /** One status or block-height read while waiting. */
+  readTimeoutMs: PER_RPC_TIMEOUT_MS,
+  pollIntervalMs: 2_000,
+  /** How often the SAME bytes are re-sent while no node reports them. */
+  rebroadcastEveryMs: 6_000,
+  /** From signing to giving up waiting. */
+  budgetMs: 120_000,
+});
+
+/**
+ * Without `searchTransactionHistory`, `getSignatureStatuses` consults only the
+ * node's status cache, which covers the last 300 rooted blocks. A transaction
+ * lands at most 150 blocks before `lastValidBlockHeight`, so a cache-only "not
+ * found" proves absence only while the finalized height is less than ~150
+ * blocks past it. 100 keeps a margin.
+ */
+const STATUS_CACHE_TRUSTED_BLOCKS = 100;
+
+/** Lamports as a SOL decimal string, e.g. `890880n` → "0.00089088". */
+export function lamportsToSol(lamports: bigint): string {
+  return atomicToDecimal(lamports, 9);
+}
+
+/** The keypair behind a stored Solana key: hex of the 64-byte secret key, or of a 32-byte seed. */
+export function solanaKeypairFromPrivateKey(privateKey: string): Keypair {
+  const bytes = hexToBytes(privateKey.trim());
+  if (bytes.length === 64) return Keypair.fromSecretKey(bytes);
+  if (bytes.length === 32) return Keypair.fromSeed(bytes);
+  throw new Error("Invalid Solana private key.");
+}
+
+/**
+ * The recipient as a Solana address, trimmed, or an error saying it is not
+ * one. A pasted address often carries a space or a newline. Until 2026-09-29
+ * the SOL send parsed it inside the RPC rotation, so the parse error was
+ * retried on all eleven endpoints and reported as an outage.
+ */
+export function parseSolanaAddress(to: string): PublicKey {
+  const t = String(to ?? "").trim();
+  try {
+    if (t === "") throw new Error("empty");
+    return new PublicKey(t);
+  } catch {
+    throw new Error(`${JSON.stringify(t)} is not a Solana address.`);
+  }
+}
+
+const rentCache = new Map<number, bigint>();
+
+/**
+ * Lamports an account of `dataLength` bytes must hold to exist: the
+ * rent-exempt minimum (890,880 for a plain wallet, 2,039,280 for a token
+ * account, as of 2026-09). Read from the chain rather than hardcoded, since it
+ * changes by feature gate; cached for the session.
+ */
+export async function rentExemptMinimum(dataLength: number): Promise<bigint> {
+  const hit = rentCache.get(dataLength);
+  if (hit !== undefined) return hit;
+  const v = BigInt(await runOnAnyRpc((c) => c.getMinimumBalanceForRentExemption(dataLength)));
+  rentCache.set(dataLength, v);
+  return v;
+}
+
+/**
+ * Would Solana let a system account holding `balance` lamports pay `fee` and
+ * then spend `extra` more? `null` if it would; otherwise the rule that refuses.
+ *
+ * The runtime refuses to move a rent-exempt account to "rent-paying" (above
+ * zero, below `rentMin`), and checks twice: once after taking the fee, once at
+ * the end of the transaction. Emptying an account completely is allowed;
+ * leaving dust is not. An account ALREADY below the minimum (a pre-2022
+ * leftover) may only shrink, which any spend does.
+ */
+export function solSpendProblem(
+  balance: bigint,
+  fee: bigint,
+  extra: bigint,
+  rentMin: bigint,
+): null | "insufficient" | "rent" {
+  if (balance < fee + extra) return "insufficient";
+  if (balance < rentMin) return null;
+  const afterFee = balance - fee;
+  if (afterFee !== 0n && afterFee < rentMin) return "rent";
+  const left = afterFee - extra;
+  if (left !== 0n && left < rentMin) return "rent";
+  return null;
+}
+
+/**
+ * What one `sendTransaction` answer says about whether the bytes went out.
+ *
+ * The line that matters runs between an endpoint that REFUSED the bytes (not
+ * forwarded, so nothing can land because of this attempt) and one whose
+ * answer cannot be trusted either way — a timeout, a 5xx, a body that is not
+ * JSON-RPC — where the node may have forwarded the transaction before the
+ * reply went missing. After one of those, only the signature can say.
+ */
+export type BroadcastOutcome =
+  /** The node returned the signature: preflight passed and it forwarded the transaction. */
+  | { kind: "accepted" }
+  /** The node has already processed this exact transaction. */
+  | { kind: "already-processed" }
+  /** Preflight simulated it and refused. Deterministic; not forwarded. */
+  | { kind: "rejected"; reason: string }
+  /** Refused before forwarding: rate limit, lagging node, unknown blockhash. */
+  | { kind: "unavailable"; reason: string }
+  /** No trustworthy answer: the node may have forwarded it. */
+  | { kind: "ambiguous"; reason: string };
+
+const GATE_REFUSAL =
+  /rate.?limit|too many requests|forbidden|unauthori[sz]ed|api.?key|not allowed|whitelist|method not found|not supported|quota|exceeded/i;
+
+/** Classify one `sendTransaction` reply (HTTP status and body). */
+export function classifyBroadcastResponse(httpStatus: number, body: string): BroadcastOutcome {
+  const gate = httpStatus >= 400 && httpStatus < 500;
+  let json: { result?: unknown; error?: { code?: unknown; message?: unknown; data?: { err?: unknown } } };
+  try {
+    json = JSON.parse(body);
+  } catch {
+    return gate
+      ? { kind: "unavailable", reason: `HTTP ${httpStatus}` }
+      : { kind: "ambiguous", reason: `HTTP ${httpStatus}, and the reply was not JSON` };
+  }
+  if (typeof json?.result === "string" && httpStatus >= 200 && httpStatus < 300) {
+    return { kind: "accepted" };
+  }
+  const err = json?.error;
+  if (!err || typeof err !== "object") {
+    return gate
+      ? { kind: "unavailable", reason: `HTTP ${httpStatus}` }
+      : { kind: "ambiguous", reason: `HTTP ${httpStatus}, with neither a signature nor an error` };
+  }
+  const code = Number(err.code);
+  const message = typeof err.message === "string" ? err.message : "";
+  const simulated = err.data?.err;
+  if (code === -32002) {
+    // Preflight: the node simulated the transaction before forwarding it.
+    if (simulated === "BlockhashNotFound" || /blockhash not found/i.test(message)) {
+      return { kind: "unavailable", reason: "this node does not know the blockhash yet" };
+    }
+    if (simulated === "AlreadyProcessed" || /already been processed/i.test(message)) {
+      return { kind: "already-processed" };
+    }
+    return { kind: "rejected", reason: preflightReason(simulated, message) };
+  }
+  const said = message || `JSON-RPC error ${String(err.code)}`;
+  // Signature verification, signature count, malformed transaction.
+  if (code === -32003 || code === -32013 || code === -32602) return { kind: "rejected", reason: said };
+  // Node unhealthy (behind), method not offered, or a gateway refusal.
+  if (code === -32005 || code === -32601 || code === 429 || code === -32429 || GATE_REFUSAL.test(message)) {
+    return { kind: "unavailable", reason: said };
+  }
+  return gate ? { kind: "unavailable", reason: said } : { kind: "ambiguous", reason: said };
+}
+
+function preflightReason(simulated: unknown, message: string): string {
+  if (simulated === "InsufficientFundsForFee" || simulated === "AccountNotFound") {
+    return "this address does not hold enough SOL to pay the network fee";
+  }
+  if (simulated && typeof simulated === "object" && "InsufficientFundsForRent" in simulated) {
+    return "it would leave an account holding less than Solana's rent-exempt minimum";
+  }
+  return message.replace(/^Transaction simulation failed:\s*/i, "").trim() || "the node gave no reason";
+}
+
+/** A failed transaction's error, in words. */
+function txErrorText(err: TransactionError): string {
+  if (typeof err === "string") return err;
+  const ie = (err as { InstructionError?: unknown }).InstructionError;
+  if (Array.isArray(ie)) {
+    const [index, detail] = ie as [number, unknown];
+    const what =
+      typeof detail === "string"
+        ? detail
+        : detail && typeof detail === "object" && "Custom" in detail
+          ? `custom program error ${String((detail as { Custom: unknown }).Custom)}`
+          : JSON.stringify(detail);
+    return `instruction ${index} failed: ${what}`;
+  }
+  if (err && typeof err === "object" && "InsufficientFundsForRent" in err) {
+    return "an account would have been left below Solana's rent-exempt minimum";
+  }
+  return JSON.stringify(err);
+}
+
+/** Send the signed bytes to one endpoint, with preflight. Never signs anything. */
+async function broadcastOnce(url: string, wire: string): Promise<BroadcastOutcome> {
+  const body = JSON.stringify({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "sendTransaction",
+    params: [wire, { encoding: "base64", skipPreflight: false, preflightCommitment: "confirmed" }],
+  });
+  let res: { status: number; body: string };
+  try {
+    res = await withTimeout(
+      invoke<{ status: number; body: string }>("sol_rpc_call", { url, body }),
+      SOL_SEND_TIMING.broadcastTimeoutMs,
+      url,
+    );
+  } catch (e) {
+    // A timeout does not cancel the request (the Rust proxy holds it for up
+    // to 30 s), and a transport error can come after the body left. Either
+    // way the node may have forwarded the transaction.
+    return { kind: "ambiguous", reason: errorText(e) };
+  }
+  return classifyBroadcastResponse(res.status, res.body);
+}
+
+type Verdict =
+  /** Confirmed or finalized — `err` says whether it succeeded. */
+  | { kind: "settled"; err: TransactionError | null }
+  /** In a block, not yet confirmed. */
+  | { kind: "in-block" }
+  /** Not seen, and its blockhash is still valid. */
+  | { kind: "pending" }
+  /** Its blockhash expired and it is in no block: it can never land. */
+  | { kind: "expired" }
+  /** Past expiry, but this endpoint could not prove it absent. */
+  | { kind: "inconclusive" };
+
+function statusVerdict(s: SignatureStatus): Verdict {
+  const settled =
+    s.confirmationStatus === "confirmed" ||
+    s.confirmationStatus === "finalized" ||
+    // Nodes that predate `confirmationStatus` report a rooted slot as null.
+    s.confirmations === null;
+  return settled ? { kind: "settled", err: s.err } : { kind: "in-block" };
+}
+
+/** One look at the transaction through one endpoint. Throws if it does not answer. */
+async function checkOnce(url: string, signature: string, lastValidBlockHeight: number): Promise<Verdict> {
+  const conn = makeConnection(url);
+  const ms = SOL_SEND_TIMING.readTimeoutMs;
+  const status = (await withTimeout(conn.getSignatureStatuses([signature]), ms, url)).value[0];
+  if (status) return statusVerdict(status);
+  // Not seen. A transaction can only be included at a block height up to its
+  // blockhash's lastValidBlockHeight. Measured on the FINALIZED chain, so a
+  // fork cannot un-expire it.
+  const epoch = await withTimeout(conn.getEpochInfo("finalized"), ms, url);
+  if (typeof epoch.blockHeight !== "number") throw new Error(`${url} reported no block height`);
+  if (epoch.blockHeight <= lastValidBlockHeight) return { kind: "pending" };
+  return proveAbsent(conn, url, signature, epoch.absoluteSlot, epoch.blockHeight - lastValidBlockHeight);
+}
+
+/**
+ * The finalized chain is past the last block that could include the
+ * transaction. Look for it once more — after that observation, and only
+ * believe "not found" from a node whose view reaches at least that far —
+ * before declaring it gone and the send safe to repeat.
+ */
+async function proveAbsent(
+  conn: Connection,
+  url: string,
+  signature: string,
+  finalizedSlot: number,
+  blocksPast: number,
+): Promise<Verdict> {
+  const ms = SOL_SEND_TIMING.readTimeoutMs;
+  const decide = (r: { context: { slot: number }; value: (SignatureStatus | null)[] }): Verdict => {
+    const s = r.value[0];
+    if (s) return statusVerdict(s);
+    // `context.slot` is the answering node's processed slot. Behind the
+    // finalized slot just read (another backend behind the same URL), its
+    // "not found" could predate the block that holds the transaction.
+    return r.context.slot >= finalizedSlot ? { kind: "expired" } : { kind: "inconclusive" };
+  };
+  try {
+    // A node that keeps transaction history answers for any age.
+    return decide(
+      await withTimeout(
+        conn.getSignatureStatuses([signature], { searchTransactionHistory: true }),
+        ms,
+        url,
+      ),
+    );
+  } catch {
+    // This node keeps no history ("Transaction history is not available from
+    // this node"), or did not answer. Fall back to its status cache.
+  }
+  if (blocksPast > STATUS_CACHE_TRUSTED_BLOCKS) return { kind: "inconclusive" };
+  return decide(await withTimeout(conn.getSignatureStatuses([signature]), ms, url));
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+interface SignedSolanaTransaction {
+  /** base64 of the signed, serialized transaction — the only thing ever broadcast. */
+  wire: string;
+  /** The fee payer's signature, base58: the transaction's id on chain. */
+  signature: string;
+  lastValidBlockHeight: number;
+}
+
+/**
+ * Deliver one signed transaction and find out what became of it.
+ *
+ * Takes bytes, not a key, so nothing in here can sign — which is the whole
+ * fix (see the section header). Every broadcast, first or repeated, is these
+ * exact bytes.
+ */
+async function deliverSignedTransaction(signed: SignedSolanaTransaction): Promise<TxResult> {
+  const { wire, signature, lastValidBlockHeight } = signed;
+  const deadline = Date.now() + SOL_SEND_TIMING.budgetMs;
+  const order = rpcOrder();
+
+  // ── 1. First delivery: the same bytes to each endpoint in turn. ──
+  let accepted = false; // a node took it: preflight passed, forwarded
+  let maybeSent = false; // an answer went missing: a node may have forwarded it
+  let acceptedAt = -1;
+  let lateRefusal: string | null = null;
+  const unavailable: string[] = [];
+  for (let i = 0; i < order.length && Date.now() < deadline; i++) {
+    const url = order[i];
+    const r = await broadcastOnce(url, wire);
+    if (r.kind === "accepted" || r.kind === "already-processed") {
+      accepted = true;
+      acceptedAt = i;
+      stickyUrl = url;
+      break;
+    }
+    if (url === stickyUrl) stickyUrl = null;
+    if (r.kind === "rejected") {
+      // Refused by simulation. With nothing possibly out yet, that is an
+      // ordinary failure and repeating the send is safe.
+      if (!maybeSent) {
+        throw new Error(`Solana refused this transaction before sending it: ${r.reason}. Nothing was sent.`);
+      }
+      // An earlier attempt may have delivered it, and this refusal may even
+      // be BECAUSE it landed (the funds have moved). Only the signature can say.
+      lateRefusal = r.reason;
+      break;
+    }
+    if (r.kind === "unavailable") unavailable.push(`  ${url}: ${r.reason}`);
+    else maybeSent = true;
+  }
+  if (!accepted && !maybeSent) {
+    console.warn("[sol-wallet] no endpoint took the transaction:", unavailable);
+    throw new Error(
+      `No Solana endpoint would take the transaction right now. Nothing was sent; try again in a moment.\n${unavailable.join("\n")}`,
+    );
+  }
+
+  // ── 2. The outcome, by signature. ──
+  let seen = false; // a node has reported it in a block
+  let cursor = acceptedAt >= 0 ? acceptedAt : 0;
+  let resendCursor = cursor + 1;
+  let resendAt = Date.now() + SOL_SEND_TIMING.rebroadcastEveryMs;
+  while (Date.now() < deadline) {
+    await sleep(Math.min(SOL_SEND_TIMING.pollIntervalMs, deadline - Date.now()));
+    let v: Verdict;
+    try {
+      v = await checkOnce(order[cursor % order.length], signature, lastValidBlockHeight);
+    } catch {
+      cursor++; // no answer from this endpoint; ask the next one next time
+      continue;
+    }
+    if (v.kind === "settled") {
+      if (v.err) {
+        throw new Error(
+          `The transaction was recorded on Solana but failed (${txErrorText(v.err)}). ` +
+            `The network fee was charged; nothing was transferred. Signature: ${signature}`,
+        );
+      }
+      return { hash: signature };
+    }
+    if (v.kind === "expired") {
+      throw new Error(
+        `Solana did not include this transaction before its blockhash expired, so it can no longer land. ` +
+          `Nothing moved and no fee was charged; it is safe to send again. Signature: ${signature}` +
+          (lateRefusal ? ` (An endpoint had refused it: ${lateRefusal}.)` : ""),
+      );
+    }
+    if (v.kind === "in-block") {
+      seen = true;
+      continue;
+    }
+    if (v.kind === "inconclusive") {
+      cursor++;
+      continue;
+    }
+    // Pending: unseen, still valid. Keep the SAME bytes moving — a public node
+    // may drop a transaction it accepted, and another may land it.
+    if (!seen && Date.now() >= resendAt) {
+      const r = await broadcastOnce(order[resendCursor++ % order.length], wire);
+      if (r.kind === "accepted" || r.kind === "already-processed") accepted = true;
+      resendAt = Date.now() + SOL_SEND_TIMING.rebroadcastEveryMs;
+    }
+  }
+
+  // ── 3. Out of time with no verdict. ──
+  // A node accepted it (or it is in a block): the network has it and it may
+  // still confirm — "submitted", with the form closed all the same.
+  if (accepted || seen) return { hash: signature, pending: true };
+  // Nothing ever answered for it: it may or may not be out there.
+  throw new SendOutcomeUnknownError(
+    "No Solana endpoint confirmed receiving this transaction, and its status could not be read before the wallet stopped waiting.",
+    signature,
+  );
+}
+
+/**
+ * Sign `instructions` ONCE, against one recent blockhash, and deliver that
+ * single transaction (2026-09-29 send-safety audit).
+ *
+ * Resolves `{ hash }` once confirmed, or `{ hash, pending: true }` when a node
+ * accepted it and the wait ran out. Throws an ordinary Error when it
+ * definitely moved nothing — refused before sending, failed on chain, or
+ * expired unseen — and `SendOutcomeUnknownError` (with the signature) when it
+ * may have gone out and nothing more could be learned.
+ */
+export async function submitSolanaTransaction(
+  keypair: Keypair,
+  instructions: TransactionInstruction[],
+): Promise<TxResult> {
+  // A read, so rotating is harmless. Its lastValidBlockHeight is what later
+  // proves the transaction can no longer land.
+  const { blockhash, lastValidBlockHeight } = await runOnAnyRpc((c) =>
+    c.getLatestBlockhash("confirmed"),
+  );
+  const tx = new Transaction({ feePayer: keypair.publicKey, blockhash, lastValidBlockHeight });
+  tx.add(...instructions);
+  tx.sign(keypair);
+  if (!tx.signature) throw new Error("Signing produced no signature.");
+  return deliverSignedTransaction({
+    wire: tx.serialize().toString("base64"),
+    signature: base58.encode(tx.signature),
+    lastValidBlockHeight,
+  });
+}
+
+/** Why the runtime would refuse this SOL transfer, in words; `null` if it would not. */
+function solTransferProblem(a: {
+  to: string;
+  self: boolean;
+  lamports: bigint;
+  balance: bigint;
+  recipient: AccountInfo<Buffer> | null;
+  rentMin: bigint;
+}): string | null {
+  const fee = SOL_TX_FEE_LAMPORTS;
+  if (a.recipient && isTokenProgram(a.recipient.owner)) {
+    // Lamports sent to a token account are not tokens: they come back only
+    // when the token account's owner empties and closes it (and a mint's,
+    // never). An inference from the Token program's CloseAccount rules; the
+    // audit did not strand any to prove it.
+    return (
+      `${a.to} is a token account or token mint, not a wallet. SOL sent to it could at best be ` +
+      `recovered by that account's owner closing it. Send to the recipient's wallet address instead.`
+    );
+  }
+  if (a.balance < a.lamports + fee) {
+    return (
+      `This address holds ${lamportsToSol(a.balance)} SOL. Sending ${lamportsToSol(a.lamports)} SOL ` +
+      `needs ${lamportsToSol(a.lamports + fee)} SOL, including the ${lamportsToSol(fee)} SOL network fee.`
+    );
+  }
+  if (!a.self) {
+    const has = BigInt(a.recipient?.lamports ?? 0);
+    if (has + a.lamports < a.rentMin) {
+      return has === 0n
+        ? `The recipient address holds no SOL yet, and Solana will not open an account with less than ` +
+            `${lamportsToSol(a.rentMin)} SOL (its rent-exempt minimum). Send at least that much.`
+        : `The recipient account holds less than Solana's rent-exempt minimum of ${lamportsToSol(a.rentMin)} SOL ` +
+            `and can only receive enough to reach it. Send at least ${lamportsToSol(a.rentMin - has)} SOL.`;
+    }
+  }
+  if (solSpendProblem(a.balance, fee, a.self ? 0n : a.lamports, a.rentMin) === "rent") {
+    const afterFee = a.balance - fee;
+    if (afterFee < a.rentMin) {
+      return (
+        `This address holds ${lamportsToSol(a.balance)} SOL, too little above Solana's rent-exempt minimum ` +
+        `(${lamportsToSol(a.rentMin)} SOL) to pay even the network fee. Add a little SOL first.`
+      );
+    }
+    const keepOpen = afterFee - a.rentMin;
+    return (
+      `Sending ${lamportsToSol(a.lamports)} SOL would leave ${lamportsToSol(afterFee - a.lamports)} SOL here, ` +
+      `less than Solana's rent-exempt minimum of ${lamportsToSol(a.rentMin)} SOL, and the network refuses that. ` +
+      (keepOpen > 0n ? `Send at most ${lamportsToSol(keepOpen)} SOL, or exactly ` : `Send exactly `) +
+      `${lamportsToSol(afterFee)} SOL to empty the address.`
+    );
+  }
+  return null;
 }
 
 function deriveKeypairFromMnemonic(mnemonic: string): Keypair {
@@ -400,27 +962,35 @@ export const solAdapter: ChainAdapter = {
   },
 
   async sendTransaction(privateKey: string, to: string, amount: string): Promise<TxResult> {
-    const secretKey = hexToBytes(privateKey);
-    let keypair: Keypair;
-    if (secretKey.length === 64) {
-      keypair = Keypair.fromSecretKey(secretKey);
-    } else {
-      keypair = Keypair.fromSeed(secretKey);
-    }
-    const lamports = Math.round(parseFloat(amount) * LAMPORTS_PER_SOL);
+    // The input first, outside any RPC rotation (2026-09-29 send-safety
+    // audit). Until then `new PublicKey(to)` ran inside it, so a trailing
+    // space was retried on eleven endpoints and reported as "All Solana RPC
+    // endpoints failed", and the amount went through `parseFloat`: "1,5" sent
+    // 1 SOL, "1e3" sent 1000, "0x10" sent 0.
+    const keypair = solanaKeypairFromPrivateKey(privateKey);
+    const from = keypair.publicKey;
+    const recipient = parseSolanaAddress(to);
+    const lamports = decimalToAtomic(amount, 9, "SOL amount");
+    if (lamports <= 0n) throw new Error("Amount must be greater than zero.");
 
-    const signature = await runOnAnyRpc(async (connection) => {
-      const transaction = new Transaction().add(
-        SystemProgram.transfer({
-          fromPubkey: keypair.publicKey,
-          toPubkey: new PublicKey(to),
-          lamports,
-        })
-      );
-      return sendAndConfirmTransaction(connection, transaction, [keypair]);
+    // Then the checks the runtime would otherwise make after the press, in
+    // words. Reads only — nothing is signed yet, so rotating is harmless.
+    const [fromInfo, toInfo] = await runOnAnyRpc((c) =>
+      c.getMultipleAccountsInfo([from, recipient], "confirmed"),
+    );
+    const problem = solTransferProblem({
+      to: recipient.toBase58(),
+      self: recipient.equals(from),
+      lamports,
+      balance: BigInt(fromInfo?.lamports ?? 0),
+      recipient: toInfo,
+      rentMin: await rentExemptMinimum(0),
     });
+    if (problem) throw new Error(problem);
 
-    return { hash: signature };
+    return submitSolanaTransaction(keypair, [
+      SystemProgram.transfer({ fromPubkey: from, toPubkey: recipient, lamports }),
+    ]);
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -512,29 +1082,18 @@ export const solAdapter: ChainAdapter = {
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {
-    // Solana base fee is a flat 5000 lamports per signature; the variable
-    // part is the priority fee. `getRecentPrioritizationFees` returns up
-    // to 150 recent samples. We use median for "normal" and p75/p90 for
-    // "fast"; "slow" is just the base fee (zero priority).
-    const samples = await runOnAnyRpc((c) =>
-      c.getRecentPrioritizationFees()
-    );
-    const fees = samples
-      .map((s) => s.prioritizationFee || 0)
-      .sort((a, b) => a - b);
-    const pick = (p: number) =>
-      fees.length === 0 ? 0 : fees[Math.min(fees.length - 1, Math.floor(fees.length * p))];
-    const baseFee = 5000; // micro-lamports per signature, in lamports
-    const slow = baseFee;
-    const normal = baseFee + pick(0.5);
-    const fast = baseFee + pick(0.9);
+    // The fee a send from here pays is fixed: one signature at 5,000 lamports,
+    // with no priority fee (no compute-budget instruction is ever attached).
+    // Until 2026-09-29 this read `getRecentPrioritizationFees` and offered
+    // slow/normal/fast tiers from it — tiers no send used (the modal hands a
+    // tier only to `sendFromAccount`, which Solana does not have), built by
+    // adding micro-lamports per compute unit to lamports. When that read
+    // failed, the Send modal disabled Send over a number the send does not
+    // depend on (2026-09-29 send-safety audit).
     return {
-      slow: { value: String(slow), eta: "best effort" },
-      normal: { value: String(normal), eta: "~ next block" },
-      fast: { value: String(fast), eta: "priority" },
-      unit: "lamports/sig",
+      normal: { value: lamportsToSol(SOL_TX_FEE_LAMPORTS), eta: "≈ 1 slot" },
+      unit: "SOL",
       fetchedAt: Date.now(),
-      raw: { samples },
     };
   },
 };
