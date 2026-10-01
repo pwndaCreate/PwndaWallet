@@ -47,7 +47,7 @@ describe("hide zero keeps rows whose amount is unknown", () => {
   });
 
   it("a parsed zero is still hidden, and an amount above zero is still shown", () => {
-    const row = (amount: string): ChainTx => ({ chain: "ripple", hash: "A1", direction: "in", amount });
+    const row = (amount: string): ChainTx => ({ chain: "xrp", hash: "A1", direction: "in", amount });
     expect(txIsMeaningful(row("0"))).toBe(false);
     expect(txIsMeaningful(row("0.000000000"))).toBe(false);
     expect(txIsMeaningful(row("0.00000001"))).toBe(true);
@@ -57,8 +57,8 @@ describe("hide zero keeps rows whose amount is unknown", () => {
   it("the hidden count reads the same rule: unknown amounts are not counted as zero-amount", () => {
     const rows: ChainTx[] = [
       splRow,
-      { chain: "ripple", hash: "A1", direction: "in", amount: "0" },
-      { chain: "ripple", hash: "A2", direction: "in", amount: "12.5" },
+      { chain: "xrp", hash: "A1", direction: "in", amount: "0" },
+      { chain: "xrp", hash: "A2", direction: "in", amount: "12.5" },
     ];
     // The portrait view's two expressions (`ActivityViewPortrait.tsx`).
     expect(rows.filter(txIsMeaningful).map((t) => t.hash)).toEqual([splRow.hash, "A2"]);
