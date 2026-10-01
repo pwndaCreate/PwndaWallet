@@ -58,12 +58,12 @@ const EXPECTED: Record<BidStage, BidStateName[]> = {
   // stage: it used to sit in `refunded` and told the user their funds were
   // already back while the tx was still confirming (live bid, 2026-09-06).
   refunding: ["XMR_SWAP_SCRIPT_TX_PREREFUND"],
-  refunded: [
-    "XMR_SWAP_FAILED_REFUNDED",
-    "XMR_SWAP_NOSCRIPT_TX_RECOVERED",
-    // v0.18.5: mercy USED means the scriptless leg came back to this side.
-    "XMR_SWAP_FAILED_SWIPED_USED_MERCY",
-  ],
+  refunded: ["XMR_SWAP_FAILED_REFUNDED", "XMR_SWAP_NOSCRIPT_TX_RECOVERED"],
+  // v0.18.5's mercy USED (36). It sat under `refunded` until 2026-10-01, on
+  // the belief that "the scriptless leg came back to this side". It is the
+  // SCRIPTED leg claiming the coin it was buying after the swipe took the
+  // coin it sold; see the leg-split block below.
+  "claimed-after-swipe": ["XMR_SWAP_FAILED_SWIPED_USED_MERCY"],
   "counterparty-recovered": [
     "XMR_SWAP_FAILED_SWIPED",
     "XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED",
@@ -246,10 +246,11 @@ describe("accepting whatever the endpoint reported", () => {
 });
 
 describe("isTerminal", () => {
-  it("is true for the four end-of-life stages", () => {
+  it("is true for the five end-of-life stages", () => {
     for (const stage of [
       "done",
       "refunded",
+      "claimed-after-swipe",
       "counterparty-recovered",
       "cancelled",
     ] as BidStage[]) {
@@ -474,6 +475,81 @@ describe("the same state means opposite things to the two legs", () => {
       expect(classifyBidState(name, "scriptless").stage).toBe(
         classifyBidState(name).stage,
       );
+    });
+  });
+
+  /**
+   * State 36 read as a refund (operator request, 2026-10-01, closing the open
+   * item of the P2P swap-history work the same day).
+   *
+   * In the deployed engine only the SCRIPTED leg reaches 36: the swiper (the
+   * scriptless leg) took that side's coin at the second deadline, then
+   * published its key share; `process_MERCY_tx` (run only for an output the
+   * scripted leg watches) sets 37 and queues `redeemXmrBidCoinBLockTx`
+   * ("Leader redeeming B lock tx", "Using keyshare from mercy tx"), which pays
+   * the chain-B coin to this node's own wallet; 37 becomes 36 when that spend
+   * confirms (`basicswap.py:10802-10816`, `:11044`, `:14147-14153`, `:9692`).
+   * So the scripted side ends holding the coin it was BUYING, and the coin it
+   * SOLD is the one the swipe took. The old table said "Refunded. The
+   * timelock returned your funds", naming the wrong coin.
+   *
+   * Which participant is that leg: the maker of a normal offer (it sells the
+   * scripted coin), or the taker of a reverse one (it sends the scripted coin
+   * to buy XMR). `swapLegOf` already turns either into "scripted".
+   */
+  describe("XMR_SWAP_FAILED_SWIPED_USED_MERCY (36): the scripted leg was paid, not refunded", () => {
+    const S = "XMR_SWAP_FAILED_SWIPED_USED_MERCY";
+    const makerOfNormalOffer = { was_sent: null, was_received: true, reverse_bid: false };
+    const takerOfReverseOffer = { was_sent: true, was_received: null, reverse_bid: true };
+
+    it("both participants who can reach it are the scripted leg", () => {
+      expect(swapLegOf(makerOfNormalOffer)).toBe("scripted");
+      expect(swapLegOf(takerOfReverseOffer)).toBe("scripted");
+    });
+
+    it("tells the scripted leg it claimed the coin it was buying, not that its coin came back", () => {
+      const c = classifyBidState(S, "scripted");
+      expect(c.stage).toBe("claimed-after-swipe");
+      expect(c.label).toBe("Settled by the timelock");
+      const copy = `${c.label} ${c.description}`.toLowerCase();
+      expect(copy).toContain("the coin you were buying");
+      expect(copy).toContain("in your wallet");
+      // The old reading, word for word.
+      expect(c.label).not.toBe("Refunded");
+      expect(copy).not.toContain("refund");
+      expect(copy).not.toContain("returned your funds");
+      expect(copy).not.toContain("no coins were lost");
+      expect(c.terminal).toBe(true);
+      expect(c.severity).toBe("normal");
+    });
+
+    it("is neither a refund nor the swiper's swipe, on any leg", () => {
+      for (const leg of ["scripted", "scriptless", "unknown"] as const) {
+        expect(isRefundOutcome(S, leg), leg).toBe(false);
+        expect(isSwipeOutcome(S, leg), leg).toBe(false);
+      }
+    });
+
+    it("reads the same with no leg: the scripted leg is the only one that reaches it", () => {
+      expect(classifyBidState(S).stage).toBe("claimed-after-swipe");
+      expect(classifyBidState(36).stage).toBe("claimed-after-swipe");
+      expect(classifyBidState("Failed, swiped, recovered").stage).toBe("claimed-after-swipe");
+    });
+
+    it("pairs with the swiper's own ending: both sides of one swap read 'Settled by the timelock'", () => {
+      expect(classifyBidState("XMR_SWAP_FAILED_SWIPED", "scriptless").label).toBe(
+        classifyBidState(S, "scripted").label,
+      );
+    });
+
+    it("the step into it (37) claims the coin being bought, not 'your funds'", () => {
+      const c = classifyBidState("XMR_SWAP_FAILED_SWIPED_USING_MERCY", "scripted");
+      expect(c.stage).toBe("recovering");
+      expect(c.label).not.toContain("your funds");
+      expect(c.description.toLowerCase()).toContain("the coin you were buying");
+      // Still moving: the claim has not confirmed.
+      expect(c.terminal).toBe(false);
+      expect(c.severity).toBe("progress");
     });
   });
 

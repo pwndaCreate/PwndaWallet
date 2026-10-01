@@ -77,6 +77,7 @@ import {
   backfillP2PHistory,
   bidTxnsFrom,
   createP2PHistorySink,
+  observeBidRead,
   p2pBidStateToHistoryStatus,
   p2pHistoryId,
   p2pLegTransactions,
@@ -226,8 +227,10 @@ const EXPECTED: Record<BidStateName, Triple> = {
   BID_AACCEPT_DELAY: ["pending", "pending", "pending"],
   BID_AACCEPT_FAIL: ["pending", "pending", "pending"],
   CONNECT_REQ_SENT: ["pending", "pending", "pending"],
-  // bidStates.ts reads "mercy used" as a refund; history follows the tracker.
-  XMR_SWAP_FAILED_SWIPED_USED_MERCY: ["refunded", "refunded", "refunded"],
+  // "Mercy used": the scripted leg (the only one that reaches it) claimed the
+  // coin it was buying with the swiper's key share. Delivered. It was
+  // ["refunded" x3] until 2026-10-01, following the tracker's old reading.
+  XMR_SWAP_FAILED_SWIPED_USED_MERCY: ["success", "success", "success"],
   XMR_SWAP_FAILED_SWIPED_USING_MERCY: ["pending", "pending", "pending"],
   XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED: ["failed", "failed", "failed"],
   XMR_SWAP_FAILED_SWIPED_SENDING_MERCY: ["pending", "pending", "pending"],
@@ -255,6 +258,54 @@ describe("p2pBidStateToHistoryStatus: every state the tracker knows", () => {
       expect(p2pBidStateToHistoryStatus(v)).toBe("pending");
       expect(p2pBidStateToHistoryStatus(v, "scriptless")).toBe("pending");
     }
+  });
+});
+
+/**
+ * State 36 on a row (operator request, 2026-10-01). The one taker who can
+ * reach it: on a REVERSE offer (the maker sells XMR), the taker sends the
+ * scripted coin and is the scripted leg. In 36 the swiper has its LTC and
+ * this taker claimed the XMR it was buying with the swiper's key share
+ * (deployed engine; see bidStates.test.ts). The row said "refunded" and the
+ * details "Refunded. The timelock returned your funds".
+ */
+describe("state 36 on the row of a taker who sent LTC for XMR", () => {
+  const reverseTaker = () =>
+    detail({
+      // The offer's frame: the maker sells XMR (coin_from) for LTC.
+      coin_from: "Monero",
+      coin_to: "Litecoin",
+      ticker_from: "XMR",
+      ticker_to: "LTC",
+      bid_state: "Failed, swiped, recovered",
+      bid_state_ind: 36,
+      state_description: "",
+      reverse_bid: true,
+    });
+  const ltcForXmr = () =>
+    handle({ sendCoin: "Litecoin", receiveCoin: "Monero", sendAmount: "0.20000000", receiveAmount: "0.019800000000" });
+
+  it("is read on the scripted leg, and finishes as a delivered swap", () => {
+    const obs = observeBidRead(ltcForXmr(), reverseTaker());
+    expect(obs.leg).toBe("scripted");
+    const row = applyP2PObservation(undefined, obs, new Date(CREATED * 1000).toISOString());
+    expect(row?.status).toBe("success");
+    expect(row?.bidLeg).toBe("scripted");
+  });
+
+  it("the details name the coin it bought, not a refund", () => {
+    const row = applyP2PObservation(
+      undefined,
+      observeBidRead(ltcForXmr(), reverseTaker()),
+      new Date(CREATED * 1000).toISOString(),
+    )!;
+    const view = p2pStageView(row);
+    expect(view.key).toBe("claimed-after-swipe");
+    expect(view.label).toBe("Settled by the timelock");
+    expect(view.label).not.toBe("Refunded");
+    expect(view.description).toContain("the coin you were buying");
+    expect(view.description.toLowerCase()).not.toContain("refund");
+    expect(view.terminal).toBe(true);
   });
 });
 

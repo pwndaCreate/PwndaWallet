@@ -246,6 +246,7 @@ export type BidStage =
   | "timelock-unwinding"
   | "swiped-settling"
   | "swiped"
+  | "claimed-after-swipe"
   | "counterparty-recovered"
   | "recovering"
   | "cancelled"
@@ -449,6 +450,26 @@ export const BID_STAGES: Readonly<Record<BidStage, BidStageInfo>> = {
     terminal: false,
     surface: true,
   },
+  // The SCRIPTED leg's ending of the same swap (XMR_SWAP_FAILED_SWIPED_USED_MERCY,
+  // 36). Only the scripted leg reaches it: the other user swiped this side's
+  // coin at the second deadline, then published its key share (the "mercy"
+  // tx), and this node used that share to claim the scriptless coin it was
+  // buying. Deployed engine: `process_MERCY_tx` sets 37 and queues
+  // `redeemXmrBidCoinBLockTx` ("Leader redeeming B lock tx", "Using keyshare
+  // from mercy tx"), which pays this node's own wallet; 37 becomes 36 once that
+  // spend confirms (`basicswap.py:11044`, `:14147-14153`, `:9692`). So the coin
+  // bought arrived and the coin sold is gone: a late completion. It mapped to
+  // `refunded` ("The timelock returned your funds") until 2026-10-01, which
+  // told the user to expect back the coin that the swipe had taken.
+  "claimed-after-swipe": {
+    stage: "claimed-after-swipe",
+    label: "Settled by the timelock",
+    description:
+      "The deadline passed before your coin came back, so the other user took it. They handed back their key share, and your node used it to claim the coin you were buying. It is in your wallet.",
+    severity: "normal",
+    terminal: true,
+    surface: true,
+  },
   "counterparty-recovered": {
     stage: "counterparty-recovered",
     label: "Recovered by the other user",
@@ -458,11 +479,16 @@ export const BID_STAGES: Readonly<Record<BidStage, BidStageInfo>> = {
     terminal: true,
     surface: true,
   },
+  // XMR_SWAP_FAILED_SWIPED_USING_MERCY (37): the way into 36 above, so it says
+  // the same thing in the present tense. It read "Recovering your funds" until
+  // 2026-10-01; the coin being claimed is the one this side was BUYING, and its
+  // own coin is the one the swipe took. Also the neutral (no leg) reading of
+  // 39, a swiper-only state, which is the other leg's story there as before.
   recovering: {
     stage: "recovering",
-    label: "Recovering your funds",
+    label: "Settling by the timelock",
     description:
-      "The other user took the recovery path but released the key share that lets your side recover too. In progress, not finished.",
+      "The other user took your coin at the deadline, then handed back their key share. Your node is using it to claim the coin you were buying. In progress, not finished.",
     severity: "progress",
     terminal: false,
     surface: true,
@@ -544,16 +570,21 @@ export const BID_STATE_STAGES: Readonly<Record<BidStateName, BidStage>> = {
   XMR_SWAP_FAILED_SWIPED_MERCY_UNUSED: "counterparty-recovered",
 
   // Mercy path IN FLIGHT — deliberately NOT terminal. A swipe with a mercy tx
-  // coming is not a finished swap: the scriptless leg can still come back, and
-  // calling it terminal would both mislead the user and (once the fee watcher
-  // exists) risk settling against a bid that is still moving.
+  // coming is not a finished swap: the scripted leg is still claiming the
+  // scriptless coin with the key share, and calling it terminal would both
+  // mislead the user and (once the fee watcher exists) risk settling against
+  // a bid that is still moving. (SENDING_MERCY is the swiper's, overridden for
+  // the scriptless leg below; here it is only the no-leg reading.)
   XMR_SWAP_FAILED_SWIPED_SENDING_MERCY: "recovering",
   XMR_SWAP_FAILED_SWIPED_USING_MERCY: "recovering",
 
-  // Mercy USED — the funds came back to this side. That is a refund in
-  // everything but name, so it reads as one rather than as "recovered by the
-  // other user", which would tell the user they lost the leg they just got back.
-  XMR_SWAP_FAILED_SWIPED_USED_MERCY: "refunded",
+  // Mercy USED — the scripted leg claimed the coin it was BUYING with the key
+  // share, after the swipe took the coin it was selling. Not a refund: nothing
+  // of this side's came back. Corrected 2026-10-01 (operator request); it read
+  // "the funds came back to this side. That is a refund in everything but
+  // name" and mapped to `refunded`. Only the scripted leg reaches 36, so this
+  // neutral entry IS that leg's reading. See `claimed-after-swipe` above.
+  XMR_SWAP_FAILED_SWIPED_USED_MERCY: "claimed-after-swipe",
   // Cancelled / expired
   BID_ABANDONED: "cancelled",
   BID_EXPIRED: "cancelled",
@@ -584,9 +615,15 @@ export const BID_STATE_STAGES: Readonly<Record<BidStateName, BidStage>> = {
  * | `FAILED_SWIPED_SENDING_MERCY` | set at `basicswap.py:10583`, on the swiper, once its own mercy tx is queued. Nothing of this side's is being recovered. |
  *
  * `USING_MERCY`, `USED_MERCY` and `MERCY_UNUSED` are deliberately absent: all
- * three are set on the *victim* (`basicswap.py:10557`, `:9501`, `:10545`), so
- * the base table is already their correct reading and the scriptless leg does
- * not reach them.
+ * three are set on the *victim*, the scripted leg (deployed engine, read
+ * 2026-10-01: `process_MERCY_tx` sets 37 and 38 at `basicswap.py:11044`,
+ * `:11015`, `:11040`, and it only ever runs for an output the scripted leg
+ * watches, `:10802-10816`, `:13352-13373`; 37 becomes 36 at `:9692`, or at
+ * `:14265` when the claim pays an address the node does not own). So the base
+ * table is already their correct reading and the scriptless leg does not
+ * reach them. (The line numbers in the table above are from an older engine;
+ * in the deployed one the same branches are the swipe under `if was_sent:` at
+ * `:9030`/`:9073` and SENDING_MERCY at `:10828`.)
  *
  * The scripted leg needs no overrides — the base table was written from its
  * point of view, which is precisely how the asymmetry went unnoticed.
@@ -727,7 +764,8 @@ export const isTerminalBidState = isTerminal;
  * of the refund vocabulary and into whatever the `else` branch says.
  * `swiped` is NOT: nothing was returned there, the timelock paid out the coin
  * being bought, and calling that a refund is the mirror image of the mistake
- * this whole leg split exists to fix.
+ * this whole leg split exists to fix. Nor is `claimed-after-swipe` (state 36,
+ * the other side of that same ending), which was `refunded` until 2026-10-01.
  */
 export function isRefundOutcome(
   state: BidStateInput,

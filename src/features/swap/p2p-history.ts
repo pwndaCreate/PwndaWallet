@@ -50,6 +50,16 @@
  * History is DISPLAY ONLY, as for desk rows: nothing reads it back to decide a
  * protocol step. The node, and `useSidecarSwap` in front of it, stay the
  * authority on what a swap is doing.
+ *
+ * # No `actualReceived`
+ *
+ * A P2P row never gets one, on purpose (checked 2026-10-01). The bid's own
+ * record (`describeBid`, deployed `ui/util.py:353-402`) states the agreed
+ * amounts, `amt_from` / `amt_to`, and no output value; with `show_extra` it
+ * adds txids, still no amounts (`:412-486`). What arrives is less than the
+ * agreed amount by the claim fee (`createSCLockSpendTx` pays `locked_coin -
+ * pay_fee`), and after a swipe by more. Writing the agreed amount as
+ * "received" would show a 0% drift chip for an amount nobody measured.
  */
 import {
   fetchBid,
@@ -121,6 +131,11 @@ const STAGE_HISTORY: Readonly<Record<BidStage, SwapHistoryStatus>> = {
   // The timelock paid this side the coin it was buying. Not a refund: nothing
   // came back, the swap delivered (bidStates.ts, `isRefundOutcome`).
   swiped: "success",
+  // The other side of that ending (state 36, scripted leg only): the swipe
+  // took the coin this side sold, the key share let it claim the coin it was
+  // buying. Delivered, so "success". It was "refunded" until 2026-10-01,
+  // through the tracker's old reading of 36 (operator request).
+  "claimed-after-swipe": "success",
   // The other user took this side's locked coin after the deadline.
   "counterparty-recovered": "failed",
   recovering: "pending",
@@ -542,7 +557,7 @@ export function applyP2PObservation(
     // in-progress list and each bid on separate timers, so an answer read
     // just before the swap ended can be processed just after one read after
     // it. Finished to finished is allowed: that is the node changing its mind
-    // with evidence (a refund the mercy key share turned around).
+    // with evidence.
     if (!(row.status !== "pending" && next === "pending")) {
       if (obs.bidState != null) {
         // Keep the stored form when it is the same state, preferring the
