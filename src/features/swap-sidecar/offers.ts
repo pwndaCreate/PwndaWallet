@@ -131,6 +131,13 @@ export interface TakerOffer {
   tradable: boolean;
   /** Derived — see {@link deriveBidReversed}. Affects the legs, not the direction. */
   bidReversed: boolean;
+  /**
+   * The maker's address (`offer.addr_from`): the key of a maker cool-down
+   * (`offerCooldown.ts`). Without it the quote pools' `applyCooldown` matched
+   * offer ids only, so a maker who let a bid expire was offered again under
+   * their next offer id (2026-10-01).
+   */
+  makerAddress?: string | null;
   createdAt: number;
   expireAt: number;
   raw: BasicSwapOffer;
@@ -238,6 +245,7 @@ export function toTakerOffer(
     isRevoked,
     tradable: !isExpired && !isOwnOffer && !isRevoked,
     bidReversed: deriveBidReversed(offer),
+    makerAddress: offer.addr_from ?? null,
     createdAt: offer.created_at,
     expireAt: offer.expire_at,
     raw: offer,

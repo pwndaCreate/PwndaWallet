@@ -233,6 +233,9 @@ export function SidecarConfirmModal({
         // Carried so an automatic re-bid pays the address the user reviewed
         // on THIS screen rather than re-deriving one later.
         payoutAddress,
+        // The offer's maker, so an unanswered bid cools down the maker and
+        // not this node's own bid address (2026-10-01).
+        makerAddress: book.offer.makerAddress ?? null,
       });
       onClose();
       return;

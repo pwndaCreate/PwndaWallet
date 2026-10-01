@@ -109,6 +109,7 @@ import {
   coolDown,
   loadCooldowns,
   COOLDOWN_REASON_EXPIRED,
+  type CooldownTarget,
 } from "./offerCooldown";
 import { activeSwapToTracked, mergeActiveSwaps } from "./activeSwaps";
 import { AUTO_RETRY_MAX_ATTEMPTS, shouldAutoRetry } from "./autoRetry";
@@ -1260,12 +1261,41 @@ export interface SidecarSwapHandle {
    */
   payoutAddress?: string;
   /**
+   * The maker of the offer this bid was placed on (the offer's `addr_from`),
+   * so a bid that expires unanswered cools down the MAKER. Carried from the
+   * offer at bid time because the bid's own record names this node's address
+   * there (see {@link cooldownTargetForUnansweredBid}). Absent on a swap this
+   * session did not place.
+   */
+  makerAddress?: string | null;
+  /**
    * `bidId` of the ORIGINAL user-approved bid this one descends from, and how
    * many automatic re-bids that original has produced. Both absent on a bid
    * the user placed themselves.
    */
   retryOf?: string;
   retryAttempt?: number;
+}
+
+/**
+ * What a bid that ended unanswered cools down: its offer, and the maker who
+ * posted it.
+ *
+ * The maker is the OFFER's `addr_from`, carried on the handle as
+ * `makerAddress`. It used to be read from the bid's own record,
+ * `detail.addr_from`, and on a bid this node sent that is this node's own
+ * address: the engine's `describeBid` reports `bid.bid_addr` there
+ * (`ui/util.py:367`), which `postXmrBid` takes from `prepareSMSGAddress`
+ * (`basicswap.py:6965`; both read in the deployed runtime). So the maker half
+ * of the cool-down never named a maker (2026-10-01). A swap this session did
+ * not place (rehydrated from the node) carries no maker and cools its offer
+ * alone, which is all the old key ever achieved.
+ */
+export function cooldownTargetForUnansweredBid(
+  swap: Pick<SidecarSwapHandle, "offerId" | "makerAddress">,
+): CooldownTarget {
+  const maker = swap.makerAddress?.trim();
+  return { offerId: swap.offerId, makerAddress: maker ? maker : null };
 }
 
 /** One tracked swap: the handle plus whatever the last poll learned. */
@@ -1757,10 +1787,9 @@ export function useSidecarSwap(opts: {
     if (dead.length === 0) return;
     for (const swap of dead) {
       retriedRef.current.add(swap.bidId);
-      coolDown(
-        { offerId: swap.offerId, makerAddress: swap.detail?.addr_from ?? null },
-        COOLDOWN_REASON_EXPIRED,
-      );
+      // The maker is the offer's, never `swap.detail?.addr_from`: on a bid
+      // this node sent that field is its own address (2026-10-01).
+      coolDown(cooldownTargetForUnansweredBid(swap), COOLDOWN_REASON_EXPIRED);
       void attemptAutoRetry(swap);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1831,6 +1860,7 @@ export function useSidecarSwap(opts: {
       receiveAmount: formatAmount(quote.receiveAmount, quote.receiveDecimals),
       createdAt: Math.floor(Date.now() / 1000),
       payoutAddress: payout,
+      makerAddress: quote.offer.makerAddress ?? null,
       retryOf: origin,
       retryAttempt: attempt,
     });
