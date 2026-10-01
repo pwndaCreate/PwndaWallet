@@ -69,7 +69,7 @@ import { useXelisSession, useXelisNodes } from "./features/xelis";
 import { useMiner } from "./features/mining/useMiner";
 import { useMiningOptIn } from "./features/mining/miningOptIn";
 import { useMemoryTracker, usePeriodicGc } from "./features/mining/useMemoryTrace";
-import { useDeskTracker, resumePendingIntentsSwapsOnce } from "./features/swap";
+import { useDeskTracker, resumePendingIntentsSwapsOnce, p2pSwapHistory } from "./features/swap";
 import {
   applySharedCoinBalances,
   fetchSharedCoinOverrides,
@@ -1954,7 +1954,10 @@ function App() {
   // The opt-in gate is enforced INSIDE the hook, not here: the fresh-install
   // contract is that no `swap_sidecar_*` command is invoked until the user has
   // accepted the setup screen, and `isLoggedIn` alone would not honour that.
-  const sidecarTracker = useSidecarSwap({ enabled: isLoggedIn });
+  //
+  // `history`: P2P swaps in the swap lists (operator request, 2026-10-01). The
+  // tracker reports placements and reads; swap history writes the rows.
+  const sidecarTracker = useSidecarSwap({ enabled: isLoggedIn, history: p2pSwapHistory });
   /**
    * The convert pipeline (EARN tab / portrait CONVERT mode).
    *

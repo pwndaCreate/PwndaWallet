@@ -15,6 +15,10 @@
 
 export {
   loadSwapHistory,
+  // So Activity's swap list follows background writes too (2026-10-01): a
+  // P2P swap's status is written by the tracker's poll, not by anything the
+  // user does on the Activity tab.
+  onSwapHistoryChange,
   computeDriftFraction,
   driftTone,
   formatDriftPercent,
@@ -48,6 +52,16 @@ export { resumePendingIntentsSwapsOnce } from "./intents-status-resume";
 // read it without a BOUNDARIES.md amendment.
 export { useDeskTracker, type DeskTrackerState } from "./useDeskTracker";
 export { DeskSwapTrackerModal } from "./DeskSwapTrackerModal";
+
+// Peer-to-peer (BasicSwap) swaps in history (operator request, 2026-10-01).
+// `p2pSwapHistory` is the sink App.tsx hands to `useSidecarSwap`: the tracker
+// reports, and the writing happens here, in the swap folder, like the desk's.
+// The status mapping sits beside `deskStateToHistoryStatus` in spirit.
+export {
+  p2pSwapHistory,
+  p2pBidStateToHistoryStatus,
+  P2P_HISTORY_PROVIDER,
+} from "./p2p-history";
 
 // The swap registry, read-only, so the wallet can tell whether ANY router
 // carries a ticker before it enables a Swap button (`wallet/wallet-surface.ts`,

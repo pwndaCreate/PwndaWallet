@@ -17,14 +17,21 @@
  */
 import { useEffect, useState } from "react";
 import type { ChainTx } from "../../wallets/types";
-import { loadSwapHistory, type SwapHistoryEntry } from "../swap";
+import { loadSwapHistory, onSwapHistoryChange, type SwapHistoryEntry } from "../swap";
 
 /**
- * Load swap history once on mount + provide a manual reload. The
- * swap store is small (capped at 200 entries) so a single read is
- * cheap; we don't pre-emptively poll because mutations only happen
- * in the swap confirm modal, which closes before the user navigates
- * back to Activity.
+ * Load swap history on mount, again after every committed history write,
+ * and on a manual reload. The swap store is small (capped at 200 entries)
+ * so a read is cheap.
+ *
+ * It used to read once, on the reasoning that "mutations only happen in the
+ * swap confirm modal, which closes before the user navigates back to
+ * Activity". No longer true, and the cost was a list stuck on "pending":
+ * since 2026-09-30 a NEAR Intents status is written by the resume pass and
+ * the details modal, a desk one by its tracker, and since 2026-10-01 a P2P
+ * swap's every step by `useSidecarSwap`'s poll, all while the user may be
+ * looking at this list. The Swap tab's lists subscribed on 2026-09-30; this
+ * one did not, until P2P swaps made it the list people watch a long swap in.
  *
  * Returns `[entries, reload]` so a future caller can refresh after
  * an in-tab broadcast.
@@ -32,6 +39,7 @@ import { loadSwapHistory, type SwapHistoryEntry } from "../swap";
 export function useSwapHistory(): [SwapHistoryEntry[], () => void] {
   const [entries, setEntries] = useState<SwapHistoryEntry[]>([]);
   const [tick, setTick] = useState(0);
+  useEffect(() => onSwapHistoryChange(() => setTick((n) => n + 1)), []);
   useEffect(() => {
     let cancel = false;
     loadSwapHistory()

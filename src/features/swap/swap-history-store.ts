@@ -114,6 +114,38 @@ export interface SwapHistoryEntry {
    */
   recipient?: string;
   refundTo?: string;
+  /**
+   * BasicSwap peer-to-peer swaps only (operator request, 2026-10-01: "Is it
+   * possible to have the p2p swaps also tracked inside the swaps and recent
+   * swaps sections?"). The bid's id on the local swap node, 56 hex
+   * characters. The row's `id` is derived from it (`p2p-history.ts`,
+   * `p2pHistoryId`), so the row written when the bid is placed, the one
+   * adopted from the node's in-progress list and the one backfilled from its
+   * sent bids are the same row, never three.
+   */
+  bidId?: string;
+  /** P2P only: the offer the bid was placed on. The bid record names the
+   *  other user by nothing else. */
+  offerId?: string;
+  /**
+   * P2P only: the last bid state the swap node reported, in whatever form it
+   * came: `bid_state_ind` (an int) from a read of the bid itself, upstream's
+   * display string ("Scriptless coin locked") from a list row, or the
+   * protocol name the tracker uses when a bid has just been placed
+   * ("BID_SENT"). `bidStates.ts::classifyBidState` reads all three.
+   */
+  bidState?: number | string;
+  /** P2P only: which coin this node locked, when a read of the bid said
+   *  (`swapLegOf`). Four states mean opposite things to the two sides. */
+  bidLeg?: "scriptless" | "scripted";
+  /**
+   * P2P only: the swap's transactions as the swap node reported them, each
+   * under the engine's own name ("Chain A Lock", "Chain B Lock Spend", …, or
+   * "Initiate Tx"/"Participate Tx" with the chain's ticker on a
+   * scripted-to-scripted swap). Which one was "what you sent" and which
+   * "what you received" is worked out from these in `p2p-history.ts`.
+   */
+  bidTxns?: { type: string; txid: string; ticker?: string }[];
 }
 
 // ─── Drift helpers ────────────────────────────────────────────────────
@@ -267,10 +299,17 @@ export function deskStateToHistoryStatus(state: string): SwapHistoryStatus {
  * the first one's write.
  */
 let writeQueue: Promise<void> = Promise.resolve();
-function enqueueWrite(fn: () => Promise<void>): Promise<void> {
+function enqueueWrite(fn: () => Promise<void | false>): Promise<void> {
   // Listeners hear about a write only once it is committed; a write that
-  // rejects changes nothing, so it notifies nobody.
-  const next = writeQueue.then(fn, fn).then(notifySwapHistoryChange);
+  // rejects changes nothing, so it notifies nobody. Nor does one that decided
+  // there was nothing to write (`false`, from `modifySwapHistory`): the P2P
+  // tracker asks every 15 seconds, and a list re-reading the store on every
+  // unchanged answer is work for nothing.
+  const next = writeQueue
+    .then(fn, fn)
+    .then((wrote) => {
+      if (wrote !== false) notifySwapHistoryChange();
+    });
   // Keep the chain alive even if one write rejects.
   writeQueue = next.catch(() => undefined);
   return next;
@@ -332,6 +371,30 @@ export async function upsertSwapHistoryEntry(
   });
 }
 
+/**
+ * The whole list, read, changed and written back in ONE serialized step
+ * (P2P swap history, 2026-10-01). `fn` gets the stored rows and returns the
+ * rows to store, or `null` when nothing changes: then nothing is written and
+ * no listener is told.
+ *
+ * For writers whose merge depends on the stored row, which a plain upsert
+ * cannot express: a P2P row must never go back from a finished status to
+ * "pending" on an answer that was read before the swap ended, and a backfill
+ * writes many rows at once (one save of the wallet file, not one per row).
+ * The 200-row cap applies to what `fn` returns.
+ */
+export async function modifySwapHistory(
+  fn: (rows: SwapHistoryEntry[]) => SwapHistoryEntry[] | null
+): Promise<void> {
+  return enqueueWrite(async () => {
+    const store = await getStore();
+    const existing = (await store.get<SwapHistoryEntry[]>(STORE_KEY)) ?? [];
+    const next = fn([...existing]);
+    if (!next) return false;
+    await store.set(STORE_KEY, next.slice(0, 200));
+    await store.save();
+  });
+}
 
 /** Best-effort UUID without bringing in a dep. Good enough for keying rows. */
 export function newSwapId(): string {

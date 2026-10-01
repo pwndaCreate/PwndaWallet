@@ -3995,6 +3995,101 @@ function sidecarBidDetail(bidId: string): unknown {
   };
 }
 
+// ---------------------------------------------------------------------------
+// P2P swap history backfill (operator request, 2026-10-01)
+// ---------------------------------------------------------------------------
+//
+// `/json/sentbids` lists every bid this node SENT, finished ones included, and
+// the wallet's swap history backfills from it (`swap/p2p-history.ts`) on the
+// node's first answer of a session. The scenario's in-flight bid is already on
+// that list (and in `/json/active`, which makes its row too); this block adds
+// ONE swap that finished two days ago and that no tracker follows any more, so
+// the sandbox shows a BACKFILLED row in Activity -> Swaps and in the Swap tab's
+// RECENT SWAPS / HISTORY. Its own record (`/json/bids/<id>`) answers
+// "Completed", as `describeBid` does. Invented ids and amounts.
+//
+// Only the unfiltered list carries it: the shared-coin send guard counts
+// in-flight bids with `with_available_or_active`, and a finished swap must not
+// count there.
+
+const P2P_HISTORY_BID_SEED = "bid-history-completed";
+
+function p2pHistorySentBids(body: any): unknown[] {
+  if (body?.with_available_or_active) return [];
+  const created = Math.floor(Date.now() / 1000) - 2 * 86_400 - 3 * 3_600;
+  return [
+    {
+      bid_id: sidecarId(P2P_HISTORY_BID_SEED),
+      offer_id: sidecarId("offer-history-completed"),
+      created_at: created,
+      expire_at: created + 3_600,
+      // A taker's sent bid, in the OFFER's frame: it sent 0.025 XMR
+      // (`coin_to`) and received 0.2465 LTC (`coin_from`).
+      coin_from: "Litecoin",
+      coin_to: "Monero",
+      amount_from: "0.24650000",
+      amount_to: "0.025000000000",
+      bid_rate: "0.101419878296",
+      bid_state: "Completed",
+      addr_from: "pwndaSandboxBidderAddrXXXXXXXXXXXXX",
+      addr_to: "pwndaSandboxNetworkAddrXXXXXXXXXXXXX",
+      tx_state_a: "Redeemed",
+      tx_state_b: "Redeemed",
+    },
+  ];
+}
+
+/** `describeBid(..., for_api=True)` for the finished bid above; null for
+ *  any other id, which falls through to the scenario's in-flight detail. */
+function p2pHistoryBidDetail(bidId: string): unknown | null {
+  if (bidId !== sidecarId(P2P_HISTORY_BID_SEED)) return null;
+  const row = p2pHistorySentBids(undefined)[0] as Record<string, any>;
+  return {
+    coin_from: "Litecoin",
+    coin_to: "Monero",
+    amt_from: row.amount_from,
+    amt_to: row.amount_to,
+    bid_rate: row.bid_rate,
+    ticker_from: "LTC",
+    ticker_to: "XMR",
+    bid_state: "Completed",
+    bid_state_ind: 8,
+    state_description: "Swap completed successfully",
+    itx_state: "None",
+    ptx_state: "None",
+    offer_id: row.offer_id,
+    addr_from: row.addr_from,
+    addr_from_label: "",
+    addr_fund_proof: null,
+    created_at: row.created_at,
+    created_at_timestamp: row.created_at,
+    state_time_timestamp: row.created_at + 41 * 60,
+    expired_at: row.expire_at,
+    was_sent: true,
+    was_received: null,
+    initiate_tx: "None",
+    initiate_conf: "None",
+    participate_tx: "None",
+    participate_conf: "None",
+    // A GET read: upstream lists `txns` only for a POST carrying `show_extra`.
+    show_txns: false,
+    can_abandon: false,
+    coin_a_lock_refund_tx_est_final: null,
+    coin_a_lock_refund_swipe_tx_est_final: null,
+    coin_a_last_median_time: null,
+    events: [
+      { at: row.created_at + 4 * 60, desc: "Lock tx A confirmed in chain" },
+      { at: row.created_at + 12 * 60, desc: "Lock tx B confirmed in chain" },
+      { at: row.created_at + 33 * 60, desc: "Lock tx A spend tx published" },
+      { at: row.created_at + 41 * 60, desc: "Lock tx B spend tx published" },
+    ],
+    debug_ui: false,
+    reverse_bid: false,
+    message_nets: ["smsg"],
+    bid_id: bidId,
+  };
+}
+
 /** `/json/coins` (js_coins, js_server.py:103-131). Ids are upstream's `Coins`
  *  IntEnum (PART=1, LTC=3, XMR=6); ZEPH carries a placeholder id from the
  *  900+ fork band the execution plan reserves (§ Phase 0 "Coin-id band" — the
@@ -4227,8 +4322,13 @@ function sidecarApi(method: "GET" | "POST", rawPath: unknown, body: any): unknow
     case "bids":
     case "sentbids": {
       if (tail.length === 0 && (method === "GET" || method === "POST"))
-        return sidecarBids();
-      if (tail.length === 1 && method === "GET") return sidecarBidDetail(tail[0]);
+        // `sentbids` also lists FINISHED bids: see "P2P swap history
+        // backfill" above `sidecarCoins`.
+        return name === "sentbids"
+          ? [...sidecarBids(), ...p2pHistorySentBids(body)]
+          : sidecarBids();
+      if (tail.length === 1 && method === "GET")
+        return p2pHistoryBidDetail(tail[0]) ?? sidecarBidDetail(tail[0]);
       if (tail.length === 2 && tail[1] === "states" && method === "GET") {
         const now = Math.floor(Date.now() / 1000);
         return [

@@ -58,15 +58,17 @@ export const DETAILS_POLL_MS = 12_000;
 
 // ─── Which route a row came from ────────────────────────────────────────
 
-export type SwapRouteKind = "intents" | "desk" | "other";
+export type SwapRouteKind = "intents" | "desk" | "p2p" | "other";
 
 /**
  * The route a history row came from. A deposit address means NEAR Intents
  * (only that path records one). Older Intents rows have none, so the provider
  * tag is the fallback: the confirm modal writes `"<router label> · <provider>"`
- * and the desk tracker `"<desk label> - atomic"`.
+ * and the desk tracker `"<desk label> - atomic"`. A bid id means a BasicSwap
+ * peer-to-peer swap: only `p2p-history.ts` writes one (2026-10-01).
  */
 export function swapRouteOf(row: SwapHistoryEntry): SwapRouteKind {
+  if (row.bidId) return "p2p";
   if (row.depositAddress) return "intents";
   const provider = row.provider ?? "";
   if (provider.startsWith(ROUTER_MODES.intents.label)) return "intents";

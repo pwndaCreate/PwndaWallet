@@ -97,6 +97,7 @@ import {
   isApiError,
   swapSidecarPlaceBid,
   swapSidecarStatus,
+  type BasicSwapActiveSwap,
   type BasicSwapBidDetail,
   type BasicSwapCoin,
   type BasicSwapFeeEstimate,
@@ -1296,6 +1297,79 @@ export interface SidecarSwapState {
   refresh: () => void;
 }
 
+/**
+ * Where the tracker reports what it learns, for the wallet's swap history
+ * (operator request, 2026-10-01: "Is it possible to have the p2p swaps also
+ * tracked inside the swaps and recent swaps sections?").
+ *
+ * The swap feature owns that history and implements this
+ * (`swap/p2p-history.ts`); `App.tsx` hands it in. So this folder imports
+ * nothing of swap's to write it, and swap's history writers stay private to
+ * swap. Every method is fire-and-forget: a history write never delays, fails
+ * or changes a swap.
+ */
+export interface SidecarHistorySink {
+  /** The node accepted a bid this wallet placed. Called from `adopt`, which
+   *  both placing paths go through (the confirm modal and the auto re-bid). */
+  placed(handle: SidecarSwapHandle): void;
+  /** One successful `/json/bids/<id>` read of a tracked bid. */
+  bidRead(swap: SidecarSwapHandle, detail: BasicSwapBidDetail): void;
+  /** One successful `/json/active` read: the user opted in and the node is
+   *  answering, the moment to backfill what it already knows. */
+  activeRead(rows: BasicSwapActiveSwap[]): void;
+  /** The tracker was switched off (the wallet locked): forget per-session
+   *  state, so the next session backfills again. */
+  reset?(): void;
+}
+
+/**
+ * Ask the app-level tracker to show one bid (2026-10-01). The swap details
+ * of a P2P history row offer "Open live tracker", and those details are
+ * mounted by four lists, none of which holds the tracker. A window event
+ * reaches the one `useSidecarSwap` without threading a callback through all
+ * four and their parents.
+ */
+export const OPEN_SIDECAR_TRACKER_EVENT = "pwnda-sidecar-open-tracker";
+
+/** `not-enabled`: the user has not opted in to the swap node (or turned it
+ *  off), so nothing may be asked of it. `not-tracked`: the tracker does not
+ *  know the bid and the request carried nothing to follow it with. */
+export type SidecarTrackerOutcome = "opened" | "not-enabled" | "not-tracked";
+
+export interface SidecarTrackerRequest {
+  bidId: string;
+  /** What to track the bid with when the tracker does not know it (the node
+   *  was not reporting it, or it finished before this session). */
+  handle?: SidecarSwapHandle;
+  /** The last state recorded for it, shown until the first read lands. */
+  stateHint?: number | string;
+  /** Told what happened. Called at most once. */
+  respond?: (outcome: SidecarTrackerOutcome) => void;
+  /** Set by the tracker while the event is dispatched (dispatch is
+   *  synchronous), so the sender knows somebody is listening. */
+  received?: boolean;
+}
+
+/**
+ * Send a {@link SidecarTrackerRequest}. Returns whether the tracker heard it:
+ * false when nothing is listening (no window, or the tracker is not mounted).
+ */
+export function requestSidecarTracker(
+  req: SidecarTrackerRequest,
+  target: EventTarget | null = typeof window !== "undefined" ? window : null,
+): boolean {
+  if (!target || !req.bidId) return false;
+  req.received = false;
+  target.dispatchEvent(new CustomEvent(OPEN_SIDECAR_TRACKER_EVENT, { detail: req }));
+  // Read back through a function: the listener sets the flag DURING the
+  // dispatch above, which the type checker's narrowing cannot see.
+  return wasReceived(req);
+}
+
+function wasReceived(req: SidecarTrackerRequest): boolean {
+  return req.received === true;
+}
+
 /** Poll cadence. Deliberately slow — a swap leg is 30-90 minutes. */
 const POLL_MS = 15_000;
 /**
@@ -1361,8 +1435,27 @@ export function needsRead(s: SidecarTrackedSwap): boolean {
  * browser-only sandbox. Treating it as a hint means a dead socket costs
  * latency and nothing else, and there is exactly one parsing path to get wrong.
  */
-export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
+export function useSidecarSwap(opts: {
+  enabled: boolean;
+  /** Swap history's listener (2026-10-01). See {@link SidecarHistorySink}. */
+  history?: SidecarHistorySink;
+}): SidecarSwapState {
   const { enabled } = opts;
+  // A ref, so a new sink object from the caller never re-creates the poll
+  // callbacks below (and never restarts their intervals).
+  const historyRef = useRef<SidecarHistorySink | undefined>(opts.history);
+  historyRef.current = opts.history;
+  /** Tell history, and never let it break tracking: a sink that throws is the
+   *  sink's problem, not the swap's. */
+  const tellHistory = useCallback((fn: (sink: SidecarHistorySink) => void) => {
+    const sink = historyRef.current;
+    if (!sink) return;
+    try {
+      fn(sink);
+    } catch (e) {
+      console.warn("[useSidecarSwap] swap history listener failed", e);
+    }
+  }, []);
   const [swaps, setSwaps] = useState<SidecarTrackedSwap[]>([]);
   // `pollAll` used to learn the live ids by calling `setSwaps` with an
   // updater that returned `prev` unchanged. React may run such an updater
@@ -1419,6 +1512,7 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
     if (!enabled) {
       setSwaps([]);
       rehydratedOnce.current = false;
+      tellHistory((h) => h.reset?.());
       return;
     }
     let cancelled = false;
@@ -1445,6 +1539,12 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
         return;
       }
       if (cancelled || isApiError(rows) || !Array.isArray(rows)) return;
+      // Swap history (2026-10-01): rows for the bids this node sent, and, on
+      // the first answer of a session, the backfill of the ones it already
+      // finished. Here because this is the one read that proves both the
+      // opt-in and a node that answers.
+      const answered = rows;
+      tellHistory((h) => h.activeRead(answered));
       const fromNode = rows.map(activeSwapToTracked);
       // Merge even when the node lists NOTHING. This used to return early on
       // an empty list, which meant the one event that should clear a finished
@@ -1469,7 +1569,7 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
       cancelled = true;
       clearInterval(handle);
     };
-  }, [enabled, nonce]);
+  }, [enabled, nonce, tellHistory]);
 
   // ── poll every non-terminal swap ──────────────────────────────────────
   const pollIds = useCallback(async (ids: string[]) => {
@@ -1484,6 +1584,10 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
           );
           continue;
         }
+        // Swap history follows the same read the tracker does (2026-10-01):
+        // the status, the leg and any transaction ids the node reported.
+        const known = swapsRef.current.find((s) => s.bidId === bidId);
+        if (known) tellHistory((h) => h.bidRead(known, rv));
         setSwaps((prev) =>
           prev.map((s) => {
             if (s.bidId !== bidId) return s;
@@ -1524,7 +1628,7 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
         );
       }
     }
-  }, []);
+  }, [tellHistory]);
 
   const pollAll = useCallback(async () => {
     const ids = swapsRef.current.filter(needsRead).map((s) => s.bidId);
@@ -1624,9 +1728,15 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
       },
       ...prev.filter((p) => p.bidId !== handle.bidId),
     ]);
+    // The history row is written HERE, when the node has just returned the
+    // bid id (operator request, 2026-10-01). Every bid this wallet places
+    // passes through `adopt`: the confirm modal's `onSubmitted` and the
+    // automatic re-bid below both call it right after `submitSidecarBid`
+    // answers `{ ok: true, bidId }`.
+    tellHistory((h) => h.placed(handle));
     setTrackedId(handle.bidId);
     setTrackerOpen(true);
-  }, []);
+  }, [tellHistory]);
 
   // ── a bid nobody answered: cool the maker, then re-bid if it is free ──
   //
@@ -1733,6 +1843,66 @@ export function useSidecarSwap(opts: { enabled: boolean }): SidecarSwapState {
   }, []);
 
   const closeTracker = useCallback(() => setTrackerOpen(false), []);
+
+  // ── "Open live tracker" from a swap's details (2026-10-01) ────────────
+  //
+  // A bid this tracker already follows just opens. One it does not (the node
+  // was not reporting it, or the app started after it fell off the node's
+  // in-progress list) is followed from the history row's handle: read once at
+  // once, like any bid with no detail yet (`needsRead`).
+  //
+  // Following it is a `swap_sidecar_*` read, so it waits on the same opt-in
+  // check as the rehydrate. And it never counts as a bid this session placed:
+  // marked as already retried, so if it turns out to have expired unanswered
+  // nobody cools its maker down or re-bids it.
+  const openOrWatch = useCallback(
+    async (req: SidecarTrackerRequest): Promise<SidecarTrackerOutcome> => {
+      if (!swapsRef.current.some((s) => s.bidId === req.bidId)) {
+        if (!req.handle) return "not-tracked";
+        try {
+          await assertOptedIn();
+        } catch {
+          return "not-enabled";
+        }
+        const handle = req.handle;
+        retriedRef.current.add(req.bidId);
+        setSwaps((prev) =>
+          prev.some((p) => p.bidId === req.bidId)
+            ? prev
+            : [
+                {
+                  ...handle,
+                  bidId: req.bidId,
+                  detail: null,
+                  stage: classifyBidState(req.stateHint ?? "BID_SENT"),
+                  lastPolledAt: null,
+                  error: null,
+                },
+                ...prev,
+              ],
+        );
+      }
+      setTrackedId(req.bidId);
+      setTrackerOpen(true);
+      return "opened";
+    },
+    [],
+  );
+
+  useEffect(() => {
+    if (!enabled || typeof window === "undefined") return;
+    const onRequest = (e: Event) => {
+      const req = (e as CustomEvent<SidecarTrackerRequest>).detail;
+      if (!req || typeof req.bidId !== "string" || !req.bidId) return;
+      req.received = true;
+      void openOrWatch(req).then(
+        (outcome) => req.respond?.(outcome),
+        () => req.respond?.("not-tracked"),
+      );
+    };
+    window.addEventListener(OPEN_SIDECAR_TRACKER_EVENT, onRequest);
+    return () => window.removeEventListener(OPEN_SIDECAR_TRACKER_EVENT, onRequest);
+  }, [enabled, openOrWatch]);
 
   const tracked = useMemo(
     () => swaps.find((s) => s.bidId === trackedId) ?? null,

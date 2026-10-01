@@ -36,7 +36,21 @@ export {
   type SidecarQuote,
   type BasicswapLegs,
   type MinFillableAmount,
+  // Swap history's view of P2P swaps (operator request, 2026-10-01). The
+  // swap feature implements the sink and App.tsx hands it in; the request
+  // bridge lets a P2P row's details open this tracker.
+  type SidecarHistorySink,
+  OPEN_SIDECAR_TRACKER_EVENT,
+  requestSidecarTracker,
+  type SidecarTrackerRequest,
+  type SidecarTrackerOutcome,
 } from "./useSidecarSwap";
+// The node's in-progress row -> the tracker's shape (which leg is sent), so
+// swap history reads a `/json/active` row exactly the way the tracker does.
+export { activeSwapToTracked } from "./activeSwaps";
+// Coin naming: the node names coins ("Monero"); history rows hold tickers.
+// And which tickers are the scriptless leg ("Chain B" of an adaptor swap).
+export { tickerForCoin, SIDECAR_SCRIPTLESS_TICKERS } from "./types";
 
 // ── Swap-node balances (C0.1) ───────────────────────────────────────
 // The hook polls; the card is props-only. Mount sites own the hook and

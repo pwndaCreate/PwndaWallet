@@ -45,6 +45,7 @@ import {
 } from "./swap-history-store";
 import { ownAddressesOnSource, patchForVerdict, staleVerdict } from "./intents-stale-rows";
 import { formatActualReceived } from "./swap-actual-received";
+import { P2PSwapDetails } from "./P2PSwapDetails";
 import {
   DETAILS_POLL_MS,
   depositMemoOf,
@@ -437,6 +438,10 @@ export function SwapDetailsModal({
             </div>
           )}
         </div>
+
+        {/* A peer-to-peer swap's stage, both legs and the way to its live
+            tracker (operator request, 2026-10-01). */}
+        {route === "p2p" && <P2PSwapDetails row={shown} onClose={onClose} />}
 
         <div
           style={{
