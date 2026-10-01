@@ -485,6 +485,20 @@ async function dogeSatPerKb(): Promise<{ satPerKb: number; oracle: number | null
 // listed by when they were created, not spent: a coin older than the newest
 // BITCORE_DOGE_COINS could hide a recent spend of it — a limit of this
 // fallback, for an address with that many coins.
+//
+// Why it does not page past them (checked 2026-10-01, operator request: page
+// further if a cheap, keyless way exists). The route sorts the coins by
+// Bitcore's database id, newest first, and pages by it: `since=<ObjectId>`
+// returns the coins below one (`streamAddressTransactions` passes
+// `{ limit, since, paging: '_id' }` to `apiStreamingFind`, bitcore-node
+// master). But a coin's JSON carries no id (`CoinModel._apiTransform`) and no
+// header names one, so a client cannot say where the next page starts. Live,
+// the public test seed's 7 coins came back with no `_id` and the same order
+// with `paging=mintHeight&direction=1`, which the route ignores. An id built
+// from a time does work (`since` at 2024-01-01 returned the test seed's 2
+// older coins), but that time is when Bitcore STORED a coin, which is its
+// block's time only while its indexer keeps up; paging by block time could
+// skip coins. So the limit stands. With Blockchair answering it never applies.
 
 const BITCORE_DOGE = "https://api.bitcore.io/api/DOGE/mainnet";
 /** Coins read per history read from Bitcore. */
