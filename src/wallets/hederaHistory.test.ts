@@ -31,6 +31,7 @@ vi.mock("../lib/tauri", () => ({
   }),
 }));
 
+import * as hbarWallet from "./hbar-wallet";
 import { HEDERA_HISTORY_MAX_PAGES, hbarAdapter } from "./hbar-wallet";
 
 const BASE = "https://mainnet-public.mirrornode.hedera.com";
@@ -42,6 +43,10 @@ const json = (status: number, body: unknown) => ({ status, body: JSON.stringify(
 beforeEach(() => {
   proxy.handler = null;
   proxy.calls = [];
+  // Each test starts a session (what a read remembers, 2026-10-01). These
+  // answers carry no `Date`, so nothing is remembered between reads anyway;
+  // `hederaHistoryMemo.test.ts` covers what is.
+  (hbarWallet as { clearHederaHistoryCache?: () => void }).clearHederaHistoryCache?.();
 });
 afterEach(() => vi.clearAllMocks());
 

@@ -11,7 +11,7 @@ import type {
   FeeEstimate,
   TxParties,
 } from "./types";
-import { proxyGetJson } from "./_proxy";
+import { httpProxyCall, proxyGetJson } from "./_proxy";
 import { condenseHttpError } from "./tx-history-errors";
 import { uniqueAddresses, urlHost } from "./parties-b-common";
 
@@ -51,8 +51,251 @@ function tinybarsFixed8(t: bigint): string {
  * made one request, so an account idle for more than ~60 days read "no
  * transactions". Following five windows reaches back about 300 days; an
  * account idle longer still reads empty, with the cursor to go further.
+ *
+ * Since later on 2026-10-01 this bounds the requests of ONE read; what a read
+ * found is remembered for the session and the next read asks only what is
+ * newer (see the section below), so an idle account costs this once.
  */
 export const HEDERA_HISTORY_MAX_PAGES = 5;
+
+// =========================================================================
+// What the mirror already said, per account, for the session (2026-10-01)
+// =========================================================================
+//
+// Operator request, 2026-10-01. An account idle for more than a window cost
+// up to five mirror requests per history read (10.9 s live for the public
+// test seed), plus the account lookup, and every poll read it all again.
+// Windows that answered "nothing" stay nothing, and rows the mirror listed do
+// not change (consensus is final), so each read is remembered: the rows, how
+// far back they are complete, and the mirror's time when it was asked. A
+// later read asks only for what is newer (`timestamp=gt:`, one request for
+// anything up to a window, 60 days, long) and adds it on top. It walks
+// further back only when it needs more rows than were kept and the earlier
+// read stopped for having enough, never just because an earlier read ran out
+// of windows: an idle account's poll is one request. A read with a cursor
+// (paging older) is not remembered.
+//
+// The time: `Date` of the mirror's answer, less HEDERA_MEMO_MARGIN_S. The
+// mirror's windows end at its own clock, while it ingests record files a few
+// seconds behind it (live, 2026-10-01: a window's end 1.8 s past the newest
+// block the mirror had), so a transaction from just before an answer can
+// appear after it. The margin is re-read each time, which costs nothing: it
+// is inside the one request. The client's clock is never used. An answer with
+// no `Date` (the browser sandbox's mock) remembers nothing, as before.
+
+/** How far behind the mirror's clock a remembered read is trusted. */
+export const HEDERA_MEMO_MARGIN_S = 3600;
+/** The most rows remembered per account; the oldest are let go. */
+const HEDERA_MEMO_MAX_ROWS = 100;
+
+interface HederaHistoryMemo {
+  /** The mirror's transactions read, newest first. */
+  raw: any[];
+  /** Nanoseconds: every transaction of the account at or below this, down
+   *  to `olderThan`, is in `raw`. */
+  top: bigint;
+  /** The `lt:` timestamp below which nothing was read, as the mirror wrote
+   *  it; `undefined` when the account's history ended there. */
+  olderThan?: string;
+  /** The read stopped on the window budget with fewer rows than it asked
+   *  for: later reads do not walk further back on their own. */
+  budgetSpent: boolean;
+}
+
+const hederaHistoryMemo = new Map<string, HederaHistoryMemo>();
+/** Account ids found for public keys (a lookup that finds none is asked again). */
+const hederaAccountIds = new Map<string, string>();
+
+/** For tests: forget what this session read. */
+export function clearHederaHistoryCache(): void {
+  hederaHistoryMemo.clear();
+  hederaAccountIds.clear();
+}
+
+/** A consensus timestamp (`secs.nanos`) as nanoseconds, or null. */
+function consensusNs(ts: unknown): bigint | null {
+  const m = typeof ts === "string" ? /^(\d+)(?:\.(\d{1,9}))?$/.exec(ts) : null;
+  return m ? BigInt(m[1]) * 1_000_000_000n + BigInt((m[2] ?? "").padEnd(9, "0")) : null;
+}
+
+/** Nanoseconds as the mirror writes a timestamp (`secs.nanos`). */
+function consensusTs(ns: bigint): string {
+  return `${ns / 1_000_000_000n}.${(ns % 1_000_000_000n).toString().padStart(9, "0")}`;
+}
+
+/** The `lt:` timestamp of a mirror link, or undefined. */
+function linkOlderThan(link: string | undefined): string | undefined {
+  return link ? /timestamp=lt:([\d.]+)/.exec(link)?.[1] : undefined;
+}
+
+/** Newer rows first, then older ones, each transaction once, newest first. */
+function mergeMirrorRows(newer: readonly any[], older: readonly any[]): any[] {
+  const seen = new Set<string>();
+  const out: any[] = [];
+  for (const t of [...newer, ...older]) {
+    const k = `${t?.consensus_timestamp}|${t?.transaction_id}|${t?.nonce ?? 0}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(t);
+  }
+  const at = (t: any) => consensusNs(t?.consensus_timestamp) ?? 0n;
+  return out.sort((a, b) => (at(b) > at(a) ? 1 : at(b) < at(a) ? -1 : 0));
+}
+
+interface MirrorWalk {
+  raw: any[];
+  /** The link not followed (where the walk stopped), or undefined when the
+   *  mirror's list ended. A page that failed after rows were read is it. */
+  next?: string;
+  /** Requests made. */
+  pages: number;
+  /** Stopped on `maxPages` with fewer than `want` rows. */
+  budgetSpent: boolean;
+  /** The first answer's `Date`, in nanoseconds. */
+  servedAt?: bigint;
+}
+
+/**
+ * Read `/transactions` pages from `path`, following the mirror's own
+ * relative `links.next`, until `want` rows or `maxPages` requests. A failure
+ * after rows were read keeps them (the failed page is `next`); with nothing
+ * read it throws.
+ */
+async function walkMirror(path: string, want: number, maxPages: number): Promise<MirrorWalk> {
+  const raw: any[] = [];
+  let next: string | undefined;
+  let servedAt: bigint | undefined;
+  let p: string | null = path;
+  let pages = 0;
+  let failed = false;
+  while (p && pages < maxPages) {
+    const url = `${MIRROR_BASE}${p}`;
+    pages++;
+    let data: { transactions?: any[]; links?: { next?: string | null } };
+    try {
+      // `httpProxyCall`, not `proxyGetJson`, for the answer's `Date`; the
+      // error is `proxyGetJson`'s, word for word.
+      const r = await httpProxyCall({ method: "GET", url });
+      if (r.status < 200 || r.status >= 300) throw new Error(`HTTP ${r.status} from ${url}: ${r.body.slice(0, 200)}`);
+      data = JSON.parse(r.body);
+      if (pages === 1) {
+        const date = r.headers?.find(([k]) => k.toLowerCase() === "date")?.[1];
+        const ms = date ? Date.parse(date) : NaN;
+        if (Number.isFinite(ms)) servedAt = BigInt(ms) * 1_000_000n;
+      }
+    } catch (e) {
+      if (raw.length === 0) throw e;
+      next = p;
+      failed = true;
+      break;
+    }
+    raw.push(...(Array.isArray(data.transactions) ? data.transactions : []));
+    next = typeof data.links?.next === "string" ? data.links.next : undefined;
+    // Only the mirror's own relative links are followed; any other ends the
+    // list, as before.
+    if (next && !/^\/api\/v1\/transactions\?/.test(next)) next = undefined;
+    p = next ?? null;
+    if (raw.length >= want) break;
+  }
+  const budgetSpent = !failed && !!p && pages >= maxPages && raw.length < want;
+  return { raw, next, pages, budgetSpent, servedAt };
+}
+
+/** Remember a read; an answer with no `Date` forgets the account instead. */
+function rememberHederaRead(
+  accountId: string,
+  raw: any[],
+  servedAt: bigint | undefined,
+  olderThan: string | undefined,
+  budgetSpent: boolean,
+  previousTop?: bigint,
+): void {
+  if (servedAt === undefined) {
+    hederaHistoryMemo.delete(accountId);
+    return;
+  }
+  let top = servedAt - BigInt(HEDERA_MEMO_MARGIN_S) * 1_000_000_000n;
+  if (previousTop !== undefined && previousTop > top) top = previousTop;
+  let rows = raw;
+  let older = olderThan;
+  let spent = budgetSpent;
+  if (rows.length > HEDERA_MEMO_MAX_ROWS) {
+    rows = rows.slice(0, HEDERA_MEMO_MAX_ROWS);
+    const last = rows[rows.length - 1]?.consensus_timestamp;
+    if (consensusNs(last) === null) {
+      hederaHistoryMemo.delete(accountId);
+      return;
+    }
+    older = last;
+    spent = false;
+  }
+  hederaHistoryMemo.set(accountId, { raw: rows, top, olderThan: older, budgetSpent: spent });
+}
+
+/**
+ * The newest `limit` transactions of `accountId` (and the link where the read
+ * stopped), from what this session already read plus what is newer. See the
+ * section note.
+ */
+async function readRecentHedera(accountId: string, limit: number): Promise<{ raw: any[]; next?: string }> {
+  const base = `/api/v1/transactions?account.id=${accountId}&order=desc&limit=${limit}`;
+  const memo = hederaHistoryMemo.get(accountId);
+  if (!memo) {
+    const w = await walkMirror(base, limit, HEDERA_HISTORY_MAX_PAGES);
+    rememberHederaRead(accountId, w.raw, w.servedAt, linkOlderThan(w.next), w.budgetSpent);
+    return { raw: w.raw, next: w.next };
+  }
+  const olderLink = (lt: string | undefined) => (lt ? `${base}&timestamp=lt:${lt}` : undefined);
+  // Only what is newer than the remembered read (and its margin).
+  const span = await walkMirror(`${base}&timestamp=gt:${consensusTs(memo.top)}`, limit, HEDERA_HISTORY_MAX_PAGES);
+  if (span.next !== undefined) {
+    // More new rows than one read holds (or a page of them failed): they are
+    // the newest, and below them may lie rows not read. Start over from them.
+    rememberHederaRead(accountId, span.raw, span.servedAt, linkOlderThan(span.next), span.budgetSpent);
+    return { raw: span.raw, next: span.next };
+  }
+  const known = mergeMirrorRows(span.raw, memo.raw);
+  if (known.length >= limit || memo.olderThan === undefined || memo.budgetSpent) {
+    rememberHederaRead(accountId, known, span.servedAt, memo.olderThan, memo.budgetSpent, memo.top);
+    return { raw: known, next: olderLink(memo.olderThan) };
+  }
+  // The remembered read stopped for having enough for a smaller page: read
+  // on below it, with what is left of this read's budget.
+  const below = olderLink(memo.olderThan)!;
+  const budget = HEDERA_HISTORY_MAX_PAGES - span.pages;
+  let older: MirrorWalk;
+  try {
+    if (budget <= 0) throw new Error("no window budget left");
+    older = await walkMirror(below, limit - known.length, budget);
+  } catch (e) {
+    if (known.length === 0) throw e;
+    rememberHederaRead(accountId, known, span.servedAt, memo.olderThan, false, memo.top);
+    return { raw: known, next: below };
+  }
+  const all = mergeMirrorRows(known, older.raw);
+  rememberHederaRead(accountId, all, span.servedAt, linkOlderThan(older.next), older.budgetSpent, memo.top);
+  return { raw: all, next: older.next };
+}
+
+/**
+ * The account id (`0.0.x`) for a public key, remembered once found. `null`
+ * when the mirror answered and has none: the account is not created yet.
+ * Throws when the mirror could not be asked (2026-10-01; it read as "no
+ * account", so a failed lookup was an empty history).
+ */
+async function hederaAccountIdForKey(pubKeyHex: string): Promise<string | null> {
+  const known = hederaAccountIds.get(pubKeyHex);
+  if (known) return known;
+  let r: { accounts?: Array<{ account?: string }> };
+  try {
+    r = await proxyGetJson(`${MIRROR_API}/accounts?account.publickey=${pubKeyHex}&limit=1`);
+  } catch (e) {
+    throw new Error(`${urlHost(MIRROR_BASE)} could not look up this key's account: ${condenseHttpError(e)}`);
+  }
+  const id = r.accounts?.[0]?.account ?? null;
+  if (id) hederaAccountIds.set(pubKeyHex, id);
+  return id;
+}
 
 /** The paying account of a transaction id (`0.0.1234-1790788932-436079025` → `0.0.1234`). */
 function hederaPayerOf(transactionId: unknown): string | undefined {
@@ -258,43 +501,26 @@ export const hbarAdapter: ChainAdapter = {
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
     // Resolve the public-key "address" (our display form) to a Hedera
-    // account id via mirror. Then pull recent CRYPTOTRANSFER txs.
+    // account id via mirror, once per session (`hederaAccountIdForKey`).
+    // Then pull recent CRYPTOTRANSFER txs.
     const pubKeyHex = address.replace(/^0x/, "");
-    let accountId: string | null = null;
-    try {
-      const r = await proxyGetJson<{ accounts: { account: string }[] }>(
-        `${MIRROR_API}/accounts?account.publickey=${pubKeyHex}&limit=1`
-      );
-      accountId = r.accounts?.[0]?.account ?? null;
-    } catch {
-      /* no account on network yet */
-    }
+    const accountId = await hederaAccountIdForKey(pubKeyHex);
     if (!accountId) return { items: [] };
 
-    // Window after window until `limit` rows (see HEDERA_HISTORY_MAX_PAGES).
-    // Only the mirror's own relative `/api/v1/transactions?…` links are
-    // followed. A failure after the first page keeps what was read when that
-    // is something; when it is nothing it throws, since an empty answer
-    // built from a failure is not "no transactions".
-    const cursorPart = opts?.cursor ? `&timestamp=lt:${opts.cursor}` : "";
-    let path: string | null =
-      `/api/v1/transactions?account.id=${accountId}&order=desc&limit=${limit}${cursorPart}`;
-    const raw: any[] = [];
-    let next: string | undefined;
-    for (let page = 0; page < HEDERA_HISTORY_MAX_PAGES && path; page++) {
-      let data: { transactions?: any[]; links?: { next?: string | null } };
-      try {
-        data = await proxyGetJson(`${MIRROR_BASE}${path}`);
-      } catch (e) {
-        if (raw.length === 0) throw e;
-        next = path;
-        break;
-      }
-      raw.push(...(Array.isArray(data.transactions) ? data.transactions : []));
-      next = typeof data.links?.next === "string" ? data.links.next : undefined;
-      path = next && /^\/api\/v1\/transactions\?/.test(next) ? next : null;
-      if (raw.length >= limit) break;
-    }
+    // Window after window until `limit` rows (see HEDERA_HISTORY_MAX_PAGES),
+    // starting from what this session already read (`readRecentHedera`,
+    // 2026-10-01). Only the mirror's own relative `/api/v1/transactions?…`
+    // links are followed. A failure after the first page keeps what was read
+    // when that is something; when it is nothing it throws, since an empty
+    // answer built from a failure is not "no transactions". Paging older
+    // with a cursor walks from the cursor and is not remembered.
+    const { raw, next } = opts?.cursor
+      ? await walkMirror(
+          `/api/v1/transactions?account.id=${accountId}&order=desc&limit=${limit}&timestamp=lt:${opts.cursor}`,
+          limit,
+          HEDERA_HISTORY_MAX_PAGES,
+        )
+      : await readRecentHedera(accountId, limit);
     const kept = raw.slice(0, limit);
     const items: ChainTx[] = kept.map((tx) => {
       // `transfers` lists every account's hbar delta within the tx, fee
