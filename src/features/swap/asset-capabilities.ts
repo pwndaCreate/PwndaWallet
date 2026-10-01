@@ -719,12 +719,16 @@ const REGISTRY_ENTRIES: Record<string, AssetCapability> = {
     nearIntentsAsset: "nep141:sui.omft.near",
     sourcePrerequisiteHint:
       "Your Sui account needs at least 0.01 SUI for gas (object refs + computation).",
-    // fullnode.mainnet.sui.io deprecated its JSON-RPC surface 2026-08-22
-    // (-32601 on every suix_* method) — matches src/wallets/sui-wallet.ts's
-    // fix. Not what the SUI deposit uses: since 2026-09-30 the executor's
-    // SUI branch calls `session-send.ts::executeSuiTransfer`, which talks to
-    // the adapter's own `SUI_RPC`. Kept correct so it is not stale for
-    // anything else that reads it.
+    // Not what the SUI deposit uses, and nothing reads it for SUI; it keeps
+    // `rpcsAvailable` true (corrected 2026-10-01). The executor's SUI branch
+    // calls `session-send.ts::executeSuiTransfer` (since 2026-09-30), which
+    // since 2026-10-01 reads, dry-runs, submits and looks up over Sui's
+    // GraphQL (`graphql.mainnet.sui.io`), and asks this host, the adapter's
+    // `SUI_RPC`, only to build a send that spends an address balance. It is
+    // publicnode because `fullnode.mainnet.sui.io` answers every JSON-RPC
+    // method with -32601: Sui turned JSON-RPC off on its own full nodes the
+    // week of 2026-07-27; the wallet noticed on 2026-08-22, the date this
+    // comment gave as the deprecation's.
     defaultRpcUrl: "https://sui-rpc.publicnode.com",
     explorerTxUrl: (h) => `https://suivision.xyz/txblock/${h}`,
     explorerAddressUrl: (a) => `https://suivision.xyz/account/${a}`,

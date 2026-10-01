@@ -533,11 +533,19 @@ export function getRpcUrlsForBlockchain(blockchain: IntentsBlockchain): string[]
         "https://horizon.stellar.lobstr.co",
       ];
     case "sui":
-      // Sui RPC mainnet via the official endpoint.
-      return [
-        "https://fullnode.mainnet.sui.io:443",
-        "https://sui-mainnet-rpc.nodereal.io",
-      ];
+      // Nothing reads Sui through this list (corrected 2026-10-01; it named
+      // two hosts that serve no Sui JSON-RPC). A SUI deposit is
+      // `session-send.ts::executeSuiTransfer`, which reads, dry-runs,
+      // submits and looks up over Sui's GraphQL (`graphql.mainnet.sui.io`,
+      // `chain-rpcs.ts`) and asks publicnode's JSON-RPC (`SUI_RPC`) only to
+      // build a send that spends an address balance; the Rust broadcaster has
+      // no Sui arm. Checked live that day: `fullnode.mainnet.sui.io` answers
+      // every JSON-RPC method with -32601 "JSON-RPC on public fullnodes has
+      // been deprecated" (Sui turned it off on its own full nodes the week of
+      // 2026-07-27), and `sui-mainnet-rpc.nodereal.io` no longer resolves.
+      // Empty, so a meta synthesized for a Sui asset carries no RPC that
+      // cannot work.
+      return [];
     case "xrp":
     case "tron":
     case "ton":

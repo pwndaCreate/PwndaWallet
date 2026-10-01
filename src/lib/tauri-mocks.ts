@@ -109,6 +109,12 @@
  *        needed it and it was actually built. Checked, not just extended:
  *        grep the URLs below before trusting this claim again.
  *      - EVM Activity (Etherscan-v1 txlist) when wallet_populated.
+ *      - Sui over GraphQL (2026-10-01): the balance, the history (a receipt
+ *        and a send whose gas is its fee), the details' by-hash read, and the
+ *        whole send: its state read, dry run, submit (answering the
+ *        transaction's own digest) and status lookup. `swap_get_sui_address`
+ *        and `swap_sign_sui_tx` answer as the bypass's account, so a sandbox
+ *        Sui send runs to "sent". `degraded`: every Sui call 503s.
  *      - XMR/ZPH wallet RPC (xmr_rpc_call/zph_rpc_call: get_balance /
  *        get_address / get_transfers) when wallet_populated / degraded.
  *      - Xelis sidecar LIFECYCLE (xelis_binary_status, _rpc_is_running,
@@ -168,6 +174,11 @@
  *
  * Add to the matrix above whenever you extend the MOCKS dispatcher.
  */
+
+// The one import (2026-10-01): the Sui mock's submit answers with the
+// transaction's own digest, a BLAKE2b-256 hash (`sandboxSuiDigest`). Already
+// in the app through `wallets/sui-wallet.ts`.
+import { blake2b } from "@noble/hashes/blake2.js";
 
 type MockScenario =
   | "idle"
@@ -1359,16 +1370,114 @@ function esploraTxs(addr: string): unknown[] {
 }
 
 /** Single JSON-RPC request → envelope (handles EVM + Sui). */
+// ---------------------------------------------------------------------------
+// Sui over GraphQL (rewritten 2026-10-01, operator request)
+// ---------------------------------------------------------------------------
+//
+// Since 2026-10-01 every Sui read and the whole send go over Sui's GraphQL
+// (`src/wallets/sui-wallet.ts`). This mock answered only the balance and the
+// gas price; the history in a typed layout the adapter stopped reading (so
+// the sandbox's one Sui row had no amount), and the by-hash read, the send's
+// state read, dry run, submit and status lookup not at all (503 "no mock").
+// It now answers each query in the layout mainnet returned for the public
+// test seed that day: `balanceChangesJson` as `[{ address, coinType (fully
+// expanded), amount }]`, gas costs as numbers, `timestamp` ISO-8601. Amounts
+// and addresses not taken from the test seed are invented. `degraded` is a
+// total outage (Sui has one GraphQL host), so every call 503s and the UI must
+// show its data-absent states. A send's signer answers as the bypass's
+// account (`swap_get_sui_address`, `swap_sign_sui_tx`), so a sandbox Sui send
+// runs through every call; nothing leaves the sandbox: `http_proxy_call` is
+// always this mock here.
+
+/** The public BIP39 test seed's Sui account (m/44'/784'/0'/0'/0'), the one the
+ *  sandbox bypass derives; its public key, base64. Public data. */
+const SANDBOX_SUI_ADDRESS = "0x5e93a736d04fbb25737aa40bee40171ef79f65fae833749e3c089fe7cc2161f1";
+const SANDBOX_SUI_PUBKEY_B64 = "kAtNge7Oo98vdLFCAMT0zz9Jr6ynpjT/0s9v+Cva7PI=";
+/** Invented: the account that paid the sandbox wallet, and one it paid. */
+const SANDBOX_SUI_PAYER = "0x" + "c1".repeat(32);
+const SANDBOX_SUI_PAYEE = "0x" + "d2".repeat(32);
+const SUI_TYPE_FULL = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
+
+const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
+function sandboxBase58(bytes: Uint8Array): string {
+  let n = 0n;
+  for (const b of bytes) n = (n << 8n) | BigInt(b);
+  let out = "";
+  while (n > 0n) {
+    out = B58_ALPHABET[Number(n % 58n)] + out;
+    n /= 58n;
+  }
+  for (const b of bytes) {
+    if (b !== 0) break;
+    out = "1" + out;
+  }
+  return out;
+}
+
 /**
- * GraphQL mock — currently Sui only.
- *
- * Shapes mirror what mainnet actually returns (verified 2026-08-14), including
- * the two traps the adapter has to handle: `coinType.repr` comes back fully
- * expanded rather than as `0x2::sui::SUI`, and `timestamp` is ISO-8601 rather
- * than epoch milliseconds. Mocking the tidied-up versions would let a bug that
- * breaks against the real chain pass here.
- *
- * Returns null for an unmatched URL so the caller falls through.
+ * A transaction's digest as Sui and `@mysten/sui` compute it
+ * (`TransactionDataBuilder.getDigestFromBytes`): base58 of BLAKE2b-256 over
+ * "TransactionData::" and the BCS bytes. So the mocked submit answers with
+ * the digest the send computed, as the network does.
+ */
+function sandboxSuiDigest(txBase64: string): string {
+  const tx = Uint8Array.from(atob(txBase64), (c) => c.charCodeAt(0));
+  const tag = new TextEncoder().encode("TransactionData::");
+  const msg = new Uint8Array(tag.length + tx.length);
+  msg.set(tag);
+  msg.set(tx, tag.length);
+  return sandboxBase58(blake2b(msg, { dkLen: 32 }));
+}
+
+/** One balance change, in `balanceChangesJson`'s layout. */
+const suiChange = (address: string, amount: string) => ({ address, coinType: SUI_TYPE_FULL, amount });
+
+/**
+ * The sandbox wallet's two Sui transactions, oldest first as `last: N` lists
+ * them: 60.5 SUI received, then 0.5 SUI sent with the wallet paying the gas,
+ * which leaves the 60 SUI the balance reads. The send's numbers are the test
+ * seed's own send of 2026-05-11 (6pAfmULA…): its recipient got 0.49988012,
+ * and 110,000 + 988,000 − 978,120 = 119,880 MIST went to gas, so the row
+ * reads "0.49988012 SUI, fee 0.00011988". The receipt's gas sums to a live
+ * transfer's 1,097,880 MIST.
+ */
+function sandboxSuiHistory(addr: string) {
+  return [
+    {
+      digest: "9jsBfj6ECyMwBDPVHMt9WPC3MFdbUWhT94KnTPod6Vbz",
+      sender: { address: SANDBOX_SUI_PAYER },
+      gasInput: { gasSponsor: { address: SANDBOX_SUI_PAYER } },
+      effects: {
+        status: "SUCCESS",
+        timestamp: "2026-08-01T12:00:00.000Z",
+        checkpoint: { sequenceNumber: 310_000_000 },
+        executionError: null,
+        balanceChangesJson: [suiChange(SANDBOX_SUI_PAYER, "-60501097880"), suiChange(addr, "60500000000")],
+        gasEffects: { gasSummary: { computationCost: 1_000_000, storageCost: 1_976_000, storageRebate: 1_878_120 } },
+      },
+    },
+    {
+      digest: "548jb4wcUtpbNS1TAva8TXJmeXd5QpCCXUzNVogwpzMR",
+      sender: { address: addr },
+      gasInput: { gasSponsor: { address: addr } },
+      effects: {
+        status: "SUCCESS",
+        timestamp: "2026-09-20T09:30:00.000Z",
+        checkpoint: { sequenceNumber: 330_000_000 },
+        executionError: null,
+        balanceChangesJson: [suiChange(SANDBOX_SUI_PAYEE, "499880120"), suiChange(addr, "-500000000")],
+        gasEffects: { gasSummary: { computationCost: 110_000, storageCost: 988_000, storageRebate: 978_120 } },
+      },
+    },
+  ];
+}
+
+/** Digests the mocked submit accepted this session: the status lookup knows them. */
+const sandboxSuiExecuted = new Set<string>();
+
+/**
+ * GraphQL mock — currently Sui only. Returns null for an unmatched URL or
+ * query so the caller falls through (and 503s "no mock").
  */
 function graphQlOne(
   url: string,
@@ -1383,62 +1492,95 @@ function graphQlOne(
   if (degraded) return { status: 503, text: "sandbox-degraded" };
 
   const q = body.query;
-  const addr =
-    typeof body.variables?.addr === "string" ? body.variables.addr : "0x0";
+  const v = body.variables ?? {};
+  const addr = typeof v.address === "string" ? v.address : SANDBOX_SUI_ADDRESS;
+  const data = (d: unknown) => ({ status: 200, json: { data: d } });
 
-  if (q.includes("referenceGasPrice"))
-    return { status: 200, json: { data: { epoch: { referenceGasPrice: "100" } } } };
-
-  if (q.includes("balance(coinType"))
-    return {
-      status: 200,
-      json: {
-        data: {
-          address: { balance: { totalBalance: funded ? "60000000000" : "0" } },
-        },
-      },
-    };
-
-  if (q.includes("transactions(")) {
-    const SUI_FULL =
-      "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
-    const nodes = funded
-      ? [
-          {
-            digest: "9jsBfj6ECyMwBDPVHMt9WPC3MFdbUWhT94KnTPod6Vbz",
-            effects: {
-              timestamp: "2026-08-01T12:00:00.000Z",
-              status: "SUCCESS",
-              checkpoint: { sequenceNumber: 310_000_000 },
-              balanceChanges: {
-                nodes: [
-                  { owner: { address: addr }, coinType: { repr: SUI_FULL }, amount: "60000000000" },
-                ],
-              },
-            },
-          },
-        ]
-      : [];
-    return {
-      status: 200,
-      json: {
-        data: {
-          address: {
-            transactions: {
-              pageInfo: { hasPreviousPage: false, startCursor: null },
-              nodes,
-            },
-          },
-        },
-      },
-    };
+  // The send's submit (`executeSuiTransaction`).
+  if (q.includes("executeTransaction(")) {
+    const digest = sandboxSuiDigest(typeof v.tx === "string" ? v.tx : "");
+    sandboxSuiExecuted.add(digest);
+    return data({ executeTransaction: { effects: { digest, status: "SUCCESS", executionError: null } } });
   }
 
+  // The send's dry run (`simulateSuiGas`): the live answer for a transfer
+  // from the test seed, 2026-10-01, on Sui's stand-in gas coin.
+  if (q.includes("simulateTransaction("))
+    return data({
+      simulateTransaction: {
+        effects: {
+          status: "SUCCESS",
+          executionError: null,
+          gasEffects: {
+            gasObject: {
+              address: "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+              version: 2,
+              digest: "DUV9vWYeJp8hVGGiswV8patPLWow95bVpj5GmEvYZwNv",
+            },
+            gasSummary: { computationCost: 100000, storageCost: 1976000, storageRebate: 0, nonRefundableStorageFee: 0 },
+          },
+        },
+      },
+    });
+
+  // The status lookup that settles an uncertain submit (`suiTransactionStatus`).
+  if (q.includes("transactionEffects(")) {
+    const known = typeof v.digest === "string" && sandboxSuiExecuted.has(v.digest);
+    return data({ transactionEffects: known ? { status: "SUCCESS", executionError: null } : null });
+  }
+
+  // The details' by-hash read (`getTransactionParties`). A digest this
+  // session submitted reads `null`, as a fresh one can on mainnet.
+  if (/\btransaction\(digest/.test(q)) {
+    const node = funded ? sandboxSuiHistory(SANDBOX_SUI_ADDRESS).find((n) => n.digest === v.digest) : undefined;
+    return data({
+      transaction: node ? { sender: node.sender, effects: { balanceChangesJson: node.effects.balanceChangesJson } } : null,
+    });
+  }
+
+  // The history (`getTransactionHistory`, `relation: AFFECTED`).
+  if (q.includes("transactions("))
+    return data({
+      address: {
+        transactions: {
+          pageInfo: { hasPreviousPage: false, startCursor: funded ? "sandboxSuiCursor0" : null },
+          nodes: funded ? sandboxSuiHistory(addr) : [],
+        },
+      },
+    });
+
+  // The send's state read (`readSuiSendState`): the gas price, both halves
+  // of the balance and the coins, in one request. One coin holds it all; the
+  // test seed's live answer, unfunded, is no coins and both halves 0.
+  if (q.includes("objects(")) {
+    const coinId = "0x" + "5a".repeat(32);
+    return data({
+      epoch: { referenceGasPrice: "100" },
+      address: {
+        balance: { coinBalance: funded ? "60000000000" : "0", addressBalance: "0" },
+        objects: {
+          nodes: funded
+            ? [
+                {
+                  address: coinId,
+                  version: 872783653,
+                  digest: "75hbt6uvDqjPZ9WgFtMhBnTeyHw7cinoHiz4FD2vEz2d",
+                  contents: { json: { id: coinId, balance: "60000000000" } },
+                },
+              ]
+            : [],
+        },
+      },
+    });
+  }
+
+  if (q.includes("balance(coinType"))
+    return data({ address: { balance: { totalBalance: funded ? "60000000000" : "0" } } });
+
+  if (q.includes("referenceGasPrice")) return data({ epoch: { referenceGasPrice: "100" } });
+
   if (q.includes("chainIdentifier"))
-    return {
-      status: 200,
-      json: { data: { chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S" } },
-    };
+    return data({ chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S" });
 
   return null;
 }
@@ -1462,6 +1604,12 @@ function jsonRpcOne(url: string, req: any, funded: boolean, degraded: boolean): 
   // every host made the sandbox show Sui's balance and history as broken
   // while the app worked. publicnode now gets the same data the GraphQL arm
   // serves (60 SUI, one receipt), in the JSON-RPC shape.
+  //
+  // 2026-10-01: the wallet no longer asks publicnode for either (its reads
+  // and its send moved to GraphQL; only a send that spends an address balance
+  // builds through publicnode, and the GraphQL mock reports none). Since then
+  // the GraphQL arm's history is two rows, so this one is out of date as a
+  // copy; it is kept for anything that still calls these methods.
   if ((method.startsWith("suix_") || method.startsWith("sui_")) && !degraded && !url.includes("fullnode.mainnet.sui.io")) {
     if (method === "suix_getBalance")
       return ok({ coinType: "0x2::sui::SUI", coinObjectCount: funded ? 1 : 0, totalBalance: funded ? "60000000000" : "0", lockedBalance: {} });
@@ -4512,7 +4660,11 @@ const MOCKS: Record<string, (args: any) => unknown> = {
     publicKey: FAKE_ADDRESSES.near,
   }),
   swap_get_stellar_address: () => "GSANDBOXSTELLARADDRESSNOTREALXXXXXXXXXXXXXXXXXXXXXX",
-  swap_get_sui_address: () => "0xsandboxsuiaddressnotrealxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  // The bypass's own Sui account (2026-10-01), as `eth` above is its ETH
+  // account: the send's wrong-key guard compares it with the wallet's address,
+  // and a placeholder here stopped every sandbox Sui send before the GraphQL
+  // mock (see "Sui over GraphQL") was ever asked.
+  swap_get_sui_address: () => SANDBOX_SUI_ADDRESS,
 
   swap_get_quote: () => swapKitQuote(),
   swap_build_tx: () => swapKitBuildTx(),
@@ -4542,7 +4694,14 @@ const MOCKS: Record<string, (args: any) => unknown> = {
     signature: "1111111111111111111111111111111111111111111111111111111111111111",
   }),
   swap_sign_stellar_tx: () => ({ rawTx: "AAAAAAAA" }),
-  swap_sign_sui_tx: () => ({ rawTx: "0x00" }),
+  // Rust's `SignedSui` shape (2026-10-01; this answered `{ rawTx }`, which the
+  // send cannot read): the bypass account's public key, so the send's
+  // after-signing key check passes, and a signature of zeros, which only the
+  // mocked submit ever sees.
+  swap_sign_sui_tx: () => ({
+    signatureBase64: "A".repeat(86) + "==",
+    publicKeyBase64: SANDBOX_SUI_PUBKEY_B64,
+  }),
 
   swap_broadcast: () => "0xsandboxtxhashnotrealxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
   swap_evm_broadcast_verified: () => ({
