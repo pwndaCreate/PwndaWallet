@@ -183,6 +183,11 @@ export interface P2PObservation {
   leg?: "scriptless" | "scripted";
   txns?: P2PBidTx[];
   offerId?: string;
+  /** When the node says the bid reached its current state (ISO), from the
+   *  bid's own record. A finished row is dated by this, not by when the
+   *  wallet first read it: a backfilled swap that ended two days ago read
+   *  "just now" in the lists (sandbox, 2026-10-01). */
+  stateAt?: string;
   /** A bid this node sent: a missing row may be created. */
   mayCreate: boolean;
 }
@@ -237,9 +242,13 @@ export function withBidDetail(obs: P2PObservation, d: BasicSwapBidDetail): P2POb
   const leg = swapLegOf(d);
   const raw = d.bid_state_ind ?? d.bid_state;
   const txns = bidTxnsFrom(d);
+  const stateSec = d.state_time_timestamp;
   return {
     ...obs,
     ...(usableState(raw) ? { bidState: raw } : {}),
+    ...(typeof stateSec === "number" && stateSec > 0
+      ? { stateAt: isoFromUnixSeconds(stateSec) }
+      : {}),
     ...(leg !== "unknown" ? { leg } : {}),
     ...(txns.length > 0 ? { txns: mergeTxns(obs.txns, txns) } : {}),
     ...(obs.offerId || !d.offer_id ? {} : { offerId: d.offer_id }),
@@ -549,7 +558,8 @@ export function applyP2PObservation(
       row.status = next;
     }
   }
-  if (row.status !== "pending" && !row.completedAt) row.completedAt = nowIso;
+  // Dated by the node's own time for the state, when the read carried it.
+  if (row.status !== "pending" && !row.completedAt) row.completedAt = obs.stateAt ?? nowIso;
 
   if (obs.txns && obs.txns.length > 0) row.bidTxns = mergeTxns(row.bidTxns, obs.txns);
 

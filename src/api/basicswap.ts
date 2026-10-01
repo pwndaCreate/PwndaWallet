@@ -457,6 +457,14 @@ export interface BasicSwapBidDetail {
   ptx_state: string;
   addr_from: string;
   created_at_timestamp: number;
+  /**
+   * Unix seconds of the bid's LAST state change, or null before its first
+   * (`getLastStateTimestamp`, basicswap `ui/util.py:376` in the deployed
+   * runtime). For a finished bid, when it finished: the swap history's
+   * backfill dates a swap that ended while nothing was watching by this,
+   * not by when the wallet first read it (2026-10-01).
+   */
+  state_time_timestamp?: number | null;
   expired_at: number | string;
   was_sent: boolean;
   was_received: boolean;

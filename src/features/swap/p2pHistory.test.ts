@@ -438,6 +438,27 @@ describe("backfill", () => {
     expect(stored.map((r) => r.createdAt)).toEqual([...stored.map((r) => r.createdAt)].sort().reverse());
   });
 
+  it("a swap that ended unwatched is dated by the node's state time, not by the read", async () => {
+    // Sandbox, 2026-10-01: a backfilled swap that finished two days earlier
+    // read "just now" in the lists, because `completedAt` was the time the
+    // wallet first saw it finished. The bid's own record says when it
+    // reached that state (`state_time_timestamp`, basicswap ui/util.py:376).
+    const finishedAt = CREATED - 14 * 86400 + 41 * 60;
+    const d = deps();
+    d.fetchBid.mockImplementation(async (id: string) => {
+      if (id === BID_2) {
+        return detail({ bid_state: "Completed", bid_state_ind: 8, state_time_timestamp: finishedAt });
+      }
+      if (id === BID) return detail();
+      throw new Error("the swap node is not running");
+    });
+    await backfillP2PHistory(d);
+    const all = await rows();
+    expect(all.find((r) => r.bidId === BID_2)!.completedAt).toBe(new Date(finishedAt * 1000).toISOString());
+    // A read with no state time (the list row only) still gets a date.
+    expect(all.find((r) => r.bidId === BID_3)!.completedAt).toBeTruthy();
+  });
+
   it("a second pass adds nothing, re-reads only the unfinished, and writes nothing", async () => {
     const d = deps();
     await backfillP2PHistory(d);
