@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Panel, Mono } from "../../components/Primitives";
+import { ModalBackdrop } from "../../components/ModalBackdrop";
 import type { HashrateFixPlan, HashrateFixStatus } from "../../types/mining";
 
 /**
@@ -378,19 +379,13 @@ function PanelButton({
 
 function WhyMsrModal({ plan, onClose }: { plan: HashrateFixPlan; onClose: () => void }) {
   return (
-    <div
-      onClick={onClose}
-      style={{
-        position: "fixed", inset: 0,
-        background: "rgba(0,0,0,0.7)",
-        display: "flex", alignItems: "center", justifyContent: "center",
-        zIndex: 1000,
-      }}
-    >
+    // The shared backdrop (2026-10-01): above the portrait bottom nav.
+    <ModalBackdrop onClick={onClose}>
       <div
         onClick={(e) => e.stopPropagation()}
         style={{
           maxWidth: 520, width: "calc(100% - 40px)",
+          maxHeight: "calc(100vh - 32px)", overflowY: "auto",
           background: "var(--bg-1)",
           border: "1px solid rgba(255,255,255,0.18)",
           padding: "18px 22px",
@@ -446,7 +441,7 @@ function WhyMsrModal({ plan, onClose }: { plan: HashrateFixPlan; onClose: () => 
           Close
         </button>
       </div>
-    </div>
+    </ModalBackdrop>
   );
 }
 

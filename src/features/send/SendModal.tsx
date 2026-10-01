@@ -12,6 +12,7 @@ import { errorText } from "../../lib/errorText";
 import { sendAssetTicker, sendAssetUsdPrice } from "../../wallets/tx-display";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { useSendQuote } from "./useSendQuote";
+import { ModalBackdrop } from "../../components/ModalBackdrop";
 import {
   parseDestinationTag,
   parseSendMemo,
@@ -351,7 +352,10 @@ export function SendModal({
           : undefined;
 
   return (
-    <div className="modal-overlay" onClick={onClose}>
+    // The shared backdrop (2026-10-01): rendered into document.body, so the
+    // portrait bottom nav no longer paints over this modal or stays clickable
+    // behind it, and moving the window no longer closes it.
+    <ModalBackdrop onClick={onClose}>
       <div className="modal-dialog send-modal" onClick={(e) => e.stopPropagation()}>
         <h3>Send {sendTicker}</h3>
         <div className="form-group">
@@ -785,7 +789,7 @@ export function SendModal({
           </button>
         </div>
       </div>
-    </div>
+    </ModalBackdrop>
   );
 }
 

@@ -34,6 +34,7 @@ import {
 import { ST, Dot } from "../../components/Primitives";
 import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
+import { ModalBackdrop } from "../../components/ModalBackdrop";
 import { decoratePoolLabel, poolHostPort } from "./pools";
 import { ProxyModePanel } from "./ProxyModePanel";
 import { PoolStatsPanel, getStatsAdapter } from "./pool-stats";
@@ -1030,7 +1031,8 @@ export function MiningView({
       <XmrigHashrateFix miner={miner} />
 
       {showFixMsrDialog && (
-        <div className="modal-overlay" onClick={() => setShowFixMsrDialog(false)}>
+        // The shared backdrop (2026-10-01): above the portrait bottom nav.
+        <ModalBackdrop onClick={() => setShowFixMsrDialog(false)}>
           <div className="modal-dialog fix-msr-dialog" onClick={(e) => e.stopPropagation()}>
             <h3>Fix MSR optimization</h3>
             <p>If you see &quot;FAILED TO APPLY MSR MOD&quot; or low hashrate:</p>
@@ -1045,7 +1047,7 @@ export function MiningView({
             </p>
             <button type="button" className="btn-primary" onClick={() => setShowFixMsrDialog(false)}>OK</button>
           </div>
-        </div>
+        </ModalBackdrop>
       )}
     </div>
   );

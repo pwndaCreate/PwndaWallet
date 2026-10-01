@@ -109,11 +109,14 @@ describe("both layouts show send failures above the modal backdrop", () => {
     expect(portrait).not.toContain('{error && <div className="alert alert-error">{error}</div>}');
   });
 
-  it("the component sits above .modal-overlay (z-index 2000)", () => {
+  // `.modal-overlay` (2000) was retired on 2026-10-01; every modal sits on
+  // `ModalBackdrop` now. modalBackdrop.test.ts pins the alerts above it.
+  it("the component sits above every modal backdrop", () => {
     const comp = read("../../components/AppAlerts.tsx");
     const z = /zIndex:\s*(\d+)/.exec(comp);
     expect(z).not.toBeNull();
     expect(Number(z![1])).toBeGreaterThan(2000);
     expect(comp).toContain('position: "fixed"');
+    expect(comp).toContain("createPortal(lines, document.body)");
   });
 });

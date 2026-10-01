@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import type { ProxyApi } from "./useProxyPool";
+import { ModalBackdrop } from "../../components/ModalBackdrop";
 
 /**
  * Braille-character spinner animation. Tiny inline component that cycles
@@ -392,23 +393,14 @@ export function ProxyModePanel({
       )}
 
       {showWarning && (
-        <div
-          className="modal-overlay"
-          onClick={() => setShowWarning(false)}
-          style={{
-            position: "fixed",
-            inset: 0,
-            background: "rgba(0,0,0,0.7)",
-            display: "flex",
-            alignItems: "center",
-            justifyContent: "center",
-            zIndex: 1000,
-          }}
-        >
+        // The shared backdrop (2026-10-01): above the portrait bottom nav.
+        <ModalBackdrop onClick={() => setShowWarning(false)}>
           <div
             onClick={(e) => e.stopPropagation()}
             style={{
               maxWidth: 460,
+              maxHeight: "calc(100vh - 32px)",
+              overflowY: "auto",
               padding: 18,
               background: "var(--bg, #0a0a0a)",
               border: "1px solid var(--warn, #ffb547)",
@@ -496,7 +488,7 @@ export function ProxyModePanel({
               </button>
             </div>
           </div>
-        </div>
+        </ModalBackdrop>
       )}
     </div>
   );

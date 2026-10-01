@@ -949,10 +949,10 @@ export function LandscapeRoot(props: {
         </div>
       )}
 
-      {/* App-wide error / success lines: the shared `AppAlerts`, fixed above
-          `.modal-overlay` because a send that fails does so with its modal
-          still open (the 2026-09-12 "Send does nothing" report). Portrait
-          mounts the same component (2026-09-29). */}
+      {/* App-wide error / success lines: the shared `AppAlerts`, rendered at
+          the page root above every modal backdrop, because a send that fails
+          does so with its modal still open (the 2026-09-12 "Send does
+          nothing" report). Portrait mounts the same component (2026-09-29). */}
       <AppAlerts
         error={error}
         success={success}

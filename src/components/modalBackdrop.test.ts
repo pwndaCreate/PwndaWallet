@@ -13,10 +13,11 @@
  * layers, so moving one of them fails here rather than on screen.
  */
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { createElement, isValidElement } from "react";
 import { MODAL_BACKDROP_Z, ModalBackdrop } from "./ModalBackdrop";
+import { AppAlerts } from "./AppAlerts";
 
 const read = (rel: string) => readFileSync(resolve(__dirname, rel), "utf8").replace(/\r\n/g, "\n");
 
@@ -56,5 +57,43 @@ describe("the modal backdrop's layer", () => {
   it("renders in place without one (so the unit tests can drive its handlers)", () => {
     const out = ModalBackdrop({ children: null });
     expect(isValidElement(out)).toBe(true);
+  });
+});
+
+/**
+ * 2026-10-01. The app's error lines rendered inside `.app` in portrait, so an
+ * error raised with a backdrop modal open sat behind it; they render at the
+ * page root now, above every backdrop. And the last `.modal-overlay` popups
+ * (Send, the Zephyr conversion, three Mine-tab dialogs) were the ones the
+ * bottom nav still painted over: none may come back.
+ */
+describe("what sits above and below the backdrop", () => {
+  it("the app's error lines render into document.body, above the backdrop", () => {
+    const body = { nodeType: 1, nodeName: "BODY" };
+    vi.stubGlobal("document", { body });
+    const out = AppAlerts({ error: "boom", success: "", setError: () => {} }) as unknown as {
+      $$typeof: symbol;
+      containerInfo: unknown;
+      children: { props: { style: { zIndex: number } } };
+    };
+    expect(out.$$typeof).toBe(Symbol.for("react.portal"));
+    expect(out.containerInfo).toBe(body);
+    expect(out.children.props.style.zIndex).toBeGreaterThan(MODAL_BACKDROP_Z);
+  });
+
+  it("no component renders the retired .modal-overlay class", () => {
+    const root = resolve(__dirname, "..");
+    const offenders: string[] = [];
+    const walk = (dir: string) => {
+      for (const name of readdirSync(dir)) {
+        const p = resolve(dir, name);
+        if (statSync(p).isDirectory()) walk(p);
+        else if (/\.tsx$/.test(name) && /className="modal-overlay"/.test(readFileSync(p, "utf8"))) {
+          offenders.push(p);
+        }
+      }
+    };
+    walk(root);
+    expect(offenders).toEqual([]);
   });
 });

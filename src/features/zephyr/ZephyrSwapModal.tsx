@@ -20,6 +20,7 @@ import type { TxResult } from "../../wallets/types";
 import { errorText } from "../../lib/errorText";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { CoinIcon } from "../../components/CoinIcon";
+import { ModalBackdrop } from "../../components/ModalBackdrop";
 
 /**
  * Zephyr four-asset swap modal.
@@ -1265,10 +1266,8 @@ export function ZephyrSwapModal({
 
   return (
     // No click-away while a relay runs: its outcome would be lost with the modal.
-    <div
-      className="modal-overlay"
-      onClick={state.kind === "submitting" ? undefined : onClose}
-    >
+    // The shared backdrop (2026-10-01): above the portrait bottom nav.
+    <ModalBackdrop onClick={state.kind === "submitting" ? undefined : onClose}>
       <div
         className="modal-dialog send-modal"
         onClick={(e) => e.stopPropagation()}
@@ -1298,6 +1297,6 @@ export function ZephyrSwapModal({
         </div>
         {body()}
       </div>
-    </div>
+    </ModalBackdrop>
   );
 }

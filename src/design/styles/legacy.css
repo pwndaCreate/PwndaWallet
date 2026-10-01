@@ -16,7 +16,8 @@
  *   .alert / .alert-*            → use semantic tokens + <Card> compositions
  *   .tab / .tab-row              → no primitive yet; consider adding <TabRow>
  *   .chain-dropdown              → no primitive yet; consider <Select>
- *   .modal-overlay / .modal-dialog → no primitive yet; consider <Modal>
+ *   .modal-overlay               → <ModalBackdrop> (src/components), migrated 2026-10-01
+ *   .modal-dialog                → no primitive yet; consider <Modal>
  *   .mining-*, .mine-*, .miner-* → mining-feature-specific; keep until migrated
  */
 
@@ -1303,16 +1304,9 @@ input[type="password"] { resize: none; }
 .send-modal .button-row { margin-top: 8px; }
 
 
-/* Modal overlay and Fix MSR dialog */
-.modal-overlay {
-  position: fixed;
-  inset: 0;
-  background: rgba(0,0,0,0.7);
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 2000;
-}
+/* Modal dialog and Fix MSR dialog. `.modal-overlay` was retired on
+   2026-10-01: inside `.app` no z-index lifted it over the portrait bottom
+   nav. Every modal now sits on <ModalBackdrop>, rendered at the page root. */
 
 .modal-dialog {
   background: var(--surface-2);
@@ -1320,6 +1314,11 @@ input[type="password"] { resize: none; }
   padding: 20px;
   max-width: 420px;
   width: 90%;
+  /* A dialog taller than the window scrolls inside itself (2026-10-01): a
+     centred box with no limit was cut off at both ends, title and buttons
+     out of reach, once the window was shorter than the Send form. */
+  max-height: calc(100vh - 32px);
+  overflow-y: auto;
 }
 
 .modal-dialog h3 {
