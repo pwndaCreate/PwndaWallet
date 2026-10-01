@@ -9,10 +9,20 @@ import type { ChainTx } from "../../wallets";
  * byte-identical copies in `ActivityViewPortrait.tsx` and
  * `ActivityView.tsx`. Lives in the activity slice (not `src/utils/`)
  * because it's only consumed within this feature.
+ *
+ * An amount the row does not know is not a zero (operator request,
+ * 2026-10-01). Only an amount that reads as a number is judged: a row with
+ * no amount stays visible, as "—". The rule took `parseFloat("")` (NaN) for
+ * "not more than 0", so portrait Activity's default "hide zero" hid every
+ * Solana token row (their list amount is empty by design: the direction and
+ * amount are read when the details open) and every Zano transfer the wallet
+ * could not read an amount for (`amount: ""` since 2026-10-01), and counted
+ * them as "zero-amount hidden". A parsed 0 is still hidden.
  */
 export function txIsMeaningful(tx: ChainTx): boolean {
   const n = parseFloat(tx.amount);
-  return Number.isFinite(n) && n > 0;
+  if (!Number.isFinite(n)) return true;
+  return n > 0;
 }
 
 /**
