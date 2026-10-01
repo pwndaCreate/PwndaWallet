@@ -381,10 +381,17 @@ export function zanoTransfersToChainTx(
     chain: "zano",
     hash: e.txHash ?? "",
     direction: e.isIncome ? "in" : "out",
-    amount: atomicToZano(
-      e.amount,
-      e.assetId === ZANO_NATIVE_ASSET_ID ? ZANO_NATIVE_DECIMALS : 12
-    ),
+    // A transfer the RPC gave no readable amount for has none here either
+    // (2026-10-01): "0" read as a fact in Activity and in the details the
+    // wallet's history now opens, where `ZanoTxHistoryCard` has said
+    // "amount unavailable" since 2026-09-04. Empty is "no amount" to every
+    // renderer, and lets the details ask the wallet for it.
+    amount: e.amountUnknown
+      ? ""
+      : atomicToZano(
+          e.amount,
+          e.assetId === ZANO_NATIVE_ASSET_ID ? ZANO_NATIVE_DECIMALS : 12
+        ),
     timestamp: e.timestamp,
     height: e.height,
     meta: { assetId: e.assetId },

@@ -51,6 +51,7 @@ import { SettingsView } from "./features/settings/SettingsView";
 import { DashboardView } from "./features/wallet/DashboardView";
 import { WalletDetailsCard } from "./features/wallet/WalletDetailsCard";
 import { ActivityViewPortrait } from "./features/activity/ActivityViewPortrait";
+import { useTxDetailsWindow } from "./features/activity/useTxDetailsWindow";
 import type { MiningProjection } from "./types/mining";
 import type { ConvertPipelineState } from "./features/swap/useConvertPipeline";
 import { SwapView } from "./features/swap/SwapView";
@@ -516,6 +517,18 @@ export function ViewRouter(props: ViewRouterProps) {
   // router — so the auth splash styling no longer applies here.
   const isSplashView = false;
 
+  // One history row's details, opened from the wallet's transaction-history
+  // page (2026-10-01). Held here because the wallet feature may not import
+  // Activity's `TxDetails`; the same bottom sheet Activity opens.
+  const txWindow = useTxDetailsWindow({
+    placement: "sheet",
+    visible: view === "dashboard",
+    addressByChain,
+    txByChain: chainTxByKey,
+    pricesByTicker,
+    zphStats: zphReserveInfo.stats,
+  });
+
   return (
     <div className="window-shell">
       {/* UXS-20260516-118: skip-to-content link — invisible until
@@ -765,8 +778,10 @@ export function ViewRouter(props: ViewRouterProps) {
           onChangeAlgorandDerivation={handleChangeAlgorandDerivation}
           currentLitecoinDerivationChoice={activeDerivationChoice.litecoin}
           onChangeLitecoinDerivation={handleChangeLitecoinDerivation}
+          onOpenTx={txWindow.open}
         />
       )}
+      {txWindow.element}
 
       {view === "swap" && (
         <SwapView

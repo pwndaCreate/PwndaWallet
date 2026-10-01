@@ -61,6 +61,7 @@ export function WalletTxHistorySubview({
   addressByChain,
   onCopy,
   onBack,
+  onOpenTx,
 }: {
   activeChain: ChainType;
   xmrSession: XmrSlice;
@@ -72,6 +73,10 @@ export function WalletTxHistorySubview({
   addressByChain: Record<string, string>;
   onCopy: (text: string) => void;
   onBack: () => void;
+  /** Open a row's transaction details (2026-10-01). `ViewRouter` renders
+   *  them: this feature may not import Activity's `TxDetails`. Passed to
+   *  every card below, so each asset's history opens the same way. */
+  onOpenTx?: (tx: ChainTx) => void;
 }) {
   const adapter = getAdapter(activeChain);
   const surface = historySurfaceFor(activeChain);
@@ -174,6 +179,7 @@ export function WalletTxHistorySubview({
           txHistory={xmrSession.txHistory}
           txLoading={xmrSession.txLoading}
           onCopy={onCopy}
+          onOpenTx={onOpenTx}
         />
       )}
       {surface === "zano" && (
@@ -182,6 +188,7 @@ export function WalletTxHistorySubview({
           txHistory={zanoSession.txHistory}
           txLoading={zanoSession.txLoading}
           onCopy={onCopy}
+          onOpenTx={onOpenTx}
         />
       )}
       {surface === "xelis" && (
@@ -191,6 +198,7 @@ export function WalletTxHistorySubview({
           txLoading={xelisSession.txLoading}
           txError={xelisSession.txError}
           onCopy={onCopy}
+          onOpenTx={onOpenTx}
         />
       )}
       {surface === "generic" && (
@@ -199,6 +207,7 @@ export function WalletTxHistorySubview({
           txs={merged.txs}
           loading={merged.loading}
           error={merged.error}
+          onOpenTx={onOpenTx}
         />
       )}
     </div>

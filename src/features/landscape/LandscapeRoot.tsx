@@ -19,6 +19,7 @@ import { EarnConvertBody } from "../swap/EarnConvertBody";
 import type { ConvertPipelineState } from "../swap/useConvertPipeline";
 import type { ConversionRow } from "../swap/components/earn-ui";
 import { ActivityLandscapeView } from "../activity/ActivityLandscapeView";
+import { useTxDetailsWindow } from "../activity/useTxDetailsWindow";
 import { SwapLandscapeView } from "../swap/SwapLandscapeView";
 import { MoneroNodesView } from "../monero/MoneroNodesView";
 import { ZephyrNodesView } from "../zephyr/ZephyrNodesView";
@@ -507,6 +508,19 @@ export function LandscapeRoot(props: {
   const sharedSyncState = xmrSeedLoaded ? xmrSyncState : "idle";
   const sharedSyncPercent = xmrSeedLoaded ? xmrSyncPercent : 0;
 
+  // One Recent row's details, as a centred window over the wallet tab
+  // (operator request, 2026-10-01). Held here because the wallet feature may
+  // not import Activity's `TxDetails`. Every history surface of the tab opens
+  // it: the Recent block, and the Zano and Xelis cards in their slots.
+  const txWindow = useTxDetailsWindow({
+    placement: "window",
+    visible: landscapeTab === "wallet" && !showUnifiedPortfolio,
+    addressByChain,
+    txByChain: chainTxByKey,
+    pricesByTicker,
+    zphStats: zphReserveInfo.stats,
+  });
+
   return (
     <LandscapeShell
       tab={landscapeTab}
@@ -609,6 +623,7 @@ export function LandscapeRoot(props: {
           currentLitecoinDerivationChoice={currentLitecoinDerivationChoice}
           onChangeLitecoinDerivation={handleChangeLitecoinDerivation}
           onCopy={copyToClipboard}
+          onOpenTx={txWindow.open}
           zanoCenterSlot={
             !walletsByChain.zano ? (
               <ZanoImportPanel
@@ -645,6 +660,7 @@ export function LandscapeRoot(props: {
                   txHistory={zanoTxHistory}
                   txLoading={zanoTxLoading}
                   onCopy={copyToClipboard}
+                  onOpenTx={txWindow.open}
                 />
               </>
             )
@@ -696,12 +712,14 @@ export function LandscapeRoot(props: {
                   txLoading={xelisSession.txLoading}
                   txError={xelisSession.txError}
                   onCopy={copyToClipboard}
+                  onOpenTx={txWindow.open}
                 />
               </>
             )
           }
         />
       )}
+      {txWindow.element}
 
       {landscapeTab === "swap" && (
         <SwapLandscapeView

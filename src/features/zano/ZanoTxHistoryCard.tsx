@@ -1,5 +1,8 @@
 import { Card } from "../../components/PrimitivesV2";
+import { openableRowProps } from "../../components/openableRow";
+import type { ChainTx } from "../../wallets/types";
 import { atomicToZano, type ZanoTransferEntry } from "../../wallets/zano-rpc";
+import { zanoTransfersToChainTx } from "../../wallets/zano-wallet";
 
 type SyncState = "idle" | "starting" | "ready" | "error";
 
@@ -11,17 +14,22 @@ type SyncState = "idle" | "starting" | "ready" | "error";
  * available during this integration — broadcasting one is a funds-moving
  * action). No confirmations count is rendered because none was confirmed to
  * exist in the real response; only block height, which was.
+ *
+ * With `onOpenTx`, a row with a hash opens its transaction's details, as the
+ * row Activity shows (`zanoTransfersToChainTx`), 2026-10-01.
  */
 export function ZanoTxHistoryCard({
   syncState,
   txHistory,
   txLoading,
   onCopy,
+  onOpenTx,
 }: {
   syncState: SyncState;
   txHistory: ZanoTransferEntry[];
   txLoading: boolean;
   onCopy: (text: string) => void;
+  onOpenTx?: (tx: ChainTx) => void;
 }) {
   return (
     <Card
@@ -50,15 +58,22 @@ export function ZanoTxHistoryCard({
             const date = tx.timestamp
               ? new Date(tx.timestamp * 1000).toLocaleString()
               : "—";
+            // A transfer with no hash has nothing to look up.
+            const open =
+              onOpenTx && tx.txHash
+                ? () => onOpenTx(zanoTransfersToChainTx([tx])[0])
+                : undefined;
             return (
               <div
                 key={tx.txHash ?? `zano-tx-${i}`}
+                {...openableRowProps(open)}
                 style={{
                   borderTop: "1px solid #222",
                   paddingTop: 8,
                   display: "flex",
                   flexDirection: "column",
                   gap: 2,
+                  cursor: open ? "pointer" : undefined,
                 }}
               >
                 <div
@@ -110,8 +125,12 @@ export function ZanoTxHistoryCard({
                       whiteSpace: "nowrap",
                       fontSize: "0.75em",
                     }}
-                    title={tx.txHash}
-                    onClick={() => onCopy(tx.txHash!)}
+                    title={`${tx.txHash}\nClick: copy`}
+                    onClick={(e) => {
+                      // Copies; does not also open the row's details.
+                      e.stopPropagation();
+                      onCopy(tx.txHash!);
+                    }}
                   >
                     {tx.txHash}
                   </code>

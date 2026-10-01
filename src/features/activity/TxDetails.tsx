@@ -670,11 +670,20 @@ export function TxDetails(props: TxDetailsProps) {
 }
 
 /**
- * Portrait: the same details over the list. Closes on the backdrop, the ✕
- * button, or Escape. The backdrop is the shared `ModalBackdrop`, so moving
- * the window never closes the sheet (the swap modals' 2026-09-30 fix).
+ * The same details over a list. Closes on the backdrop, the ✕ button, or
+ * Escape. The backdrop is the shared `ModalBackdrop`, so moving the window
+ * never closes it (the swap modals' 2026-09-30 fix).
+ *
+ * `placement`: "sheet", a bottom sheet over a portrait list (Activity, the
+ * wallet's history page); "window", a centred window like the swap details,
+ * for landscape's wallet tab, whose columns have no room for a details panel
+ * (operator request, 2026-10-01).
  */
-export function TxDetailsSheet({ onClose, ...props }: TxDetailsProps & { onClose: () => void }) {
+export function TxDetailsSheet({
+  onClose,
+  placement = "sheet",
+  ...props
+}: TxDetailsProps & { onClose: () => void; placement?: "sheet" | "window" }) {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
@@ -682,26 +691,49 @@ export function TxDetailsSheet({ onClose, ...props }: TxDetailsProps & { onClose
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+  const centred = placement === "window";
   return (
-    <ModalBackdrop onClick={onClose} align="end">
+    <ModalBackdrop onClick={onClose} align={centred ? "center" : "end"}>
       <div
         role="dialog"
+        aria-modal="true"
         aria-label="Transaction details"
-        style={{
-          width: "100%",
-          maxWidth: 460,
-          maxHeight: "88vh",
-          overflowY: "auto",
-          background: "var(--bg)",
-          border: "1px solid var(--border)",
-          borderBottom: "none",
-          padding: 18,
-          boxSizing: "border-box",
-        }}
+        data-tx-details={placement}
+        style={
+          centred
+            ? {
+                width: "min(460px, 92vw)",
+                maxHeight: "90vh",
+                overflowY: "auto",
+                background: "var(--bg-2)",
+                border: "1px solid var(--border-hi)",
+                padding: 22,
+                boxSizing: "border-box",
+              }
+            : {
+                width: "100%",
+                maxWidth: 460,
+                maxHeight: "88vh",
+                overflowY: "auto",
+                background: "var(--bg)",
+                border: "1px solid var(--border)",
+                borderBottom: "none",
+                padding: 18,
+                boxSizing: "border-box",
+              }
+        }
       >
         <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 12 }}>
-          <span style={{ ...mono, fontSize: 9, color: "var(--text-dim)", letterSpacing: 2, textTransform: "uppercase" }}>
-            transaction
+          <span
+            style={{
+              ...mono,
+              fontSize: centred ? 11 : 9,
+              color: centred ? "var(--accent)" : "var(--text-dim)",
+              letterSpacing: 2,
+              textTransform: "uppercase",
+            }}
+          >
+            {centred ? "transaction details" : "transaction"}
           </span>
           <button
             type="button"

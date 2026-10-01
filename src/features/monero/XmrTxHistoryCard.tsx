@@ -1,6 +1,8 @@
 import { Card } from "../../components/PrimitivesV2";
+import { openableRowProps } from "../../components/openableRow";
+import type { ChainTx } from "../../wallets/types";
 import { piconeroToXmr } from "../../wallets/xmr-rpc";
-import type { XmrTransfer } from "../../wallets/xmr-wallet";
+import { xmrTransferToChainTx, type XmrTransfer } from "../../wallets/xmr-wallet";
 
 type SyncState =
   | "idle"
@@ -19,18 +21,21 @@ type SyncState =
  *
  * Each row: direction icon + amount (in XMR), date, confirmations or
  * block height, fee for outgoing transactions, and the txid (click to
- * copy).
+ * copy). With `onOpenTx`, the rest of the row opens the transaction's
+ * details, as the row Activity shows (`xmrTransferToChainTx`), 2026-10-01.
  */
 export function XmrTxHistoryCard({
   syncState,
   txHistory,
   txLoading,
   onCopy,
+  onOpenTx,
 }: {
   syncState: SyncState;
   txHistory: XmrTransfer[];
   txLoading: boolean;
   onCopy: (text: string) => void;
+  onOpenTx?: (tx: ChainTx) => void;
 }) {
   return (
     <Card
@@ -59,15 +64,18 @@ export function XmrTxHistoryCard({
             const date = tx.timestamp
               ? new Date(tx.timestamp * 1000).toLocaleString()
               : "—";
+            const open = onOpenTx ? () => onOpenTx(xmrTransferToChainTx(tx)) : undefined;
             return (
               <div
                 key={`${tx.txid}-${tx.type}`}
+                {...openableRowProps(open)}
                 style={{
                   borderTop: "1px solid #222",
                   paddingTop: 8,
                   display: "flex",
                   flexDirection: "column",
                   gap: 2,
+                  cursor: open ? "pointer" : undefined,
                 }}
               >
                 <div
@@ -109,8 +117,12 @@ export function XmrTxHistoryCard({
                     whiteSpace: "nowrap",
                     fontSize: "0.75em",
                   }}
-                  title={tx.txid}
-                  onClick={() => onCopy(tx.txid)}
+                  title={`${tx.txid}\nClick: copy`}
+                  onClick={(e) => {
+                    // Copies; does not also open the row's details.
+                    e.stopPropagation();
+                    onCopy(tx.txid);
+                  }}
                 >
                   {tx.txid}
                 </code>

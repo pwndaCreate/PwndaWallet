@@ -308,6 +308,9 @@ export function DashboardView(props: {
   onChangeAlgorandDerivation?: (newChoice: string) => Promise<void>;
   currentLitecoinDerivationChoice?: string;
   onChangeLitecoinDerivation?: (newChoice: string) => Promise<void>;
+  /** Open one history row's transaction details (2026-10-01); rendered by
+   *  `ViewRouter`, which may import Activity's `TxDetails`. */
+  onOpenTx?: (tx: ChainTx) => void;
 }) {
   const {
     activeChain,
@@ -359,6 +362,7 @@ export function DashboardView(props: {
     onChangeAlgorandDerivation,
     currentLitecoinDerivationChoice,
     onChangeLitecoinDerivation,
+    onOpenTx,
   } = props;
 
   // Internal sub-view state — the Wallet bottom-nav tab can host
@@ -464,6 +468,7 @@ export function DashboardView(props: {
         addressByChain={addressByChain}
         onCopy={(text) => onCopy(text)}
         onBack={() => setWalletSubview("dashboard")}
+        onOpenTx={onOpenTx}
       />
     );
   }

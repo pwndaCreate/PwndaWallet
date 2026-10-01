@@ -5,6 +5,7 @@ import { getAdapter } from "../../wallets";
 import { txDisplayTicker } from "../../wallets/tx-display";
 import { openExternal } from "../../utils/openExternal";
 import { isHistoryUnavailableMessage } from "../../wallets/tx-history-errors";
+import { openableRowProps } from "../../components/openableRow";
 
 /**
  * Per-chain transaction history card for the portrait dashboard.
@@ -22,6 +23,9 @@ import { isHistoryUnavailableMessage } from "../../wallets/tx-history-errors";
  * Amounts carry the ticker of the asset the row moved (`txDisplayTicker`):
  * a Zephyr row can be ZEPH, ZEPHUSD, ZEPHRSV or ZEPHYRS, and until 2026-09-15
  * every one of them was printed as ZEPH.
+ *
+ * With `onOpenTx`, the rest of a row opens its transaction's details
+ * (operator request, 2026-10-01); the txid keeps its explorer/copy click.
  */
 
 export function ChainTxCard({
@@ -29,11 +33,13 @@ export function ChainTxCard({
   txs,
   loading,
   error,
+  onOpenTx,
 }: {
   chain: ChainType;
   txs: ChainTx[];
   loading: boolean;
   error: string | null;
+  onOpenTx?: (tx: ChainTx) => void;
 }) {
   const adapter = getAdapter(chain);
 
@@ -72,15 +78,18 @@ export function ChainTxCard({
             const date = tx.timestamp
               ? new Date(tx.timestamp * 1000).toLocaleString()
               : "—";
+            const open = onOpenTx ? () => onOpenTx(tx) : undefined;
             return (
               <div
                 key={`${tx.hash}-${tx.direction}`}
+                {...openableRowProps(open)}
                 style={{
                   borderTop: "1px solid #222",
                   paddingTop: 8,
                   display: "flex",
                   flexDirection: "column",
                   gap: 2,
+                  cursor: open ? "pointer" : undefined,
                 }}
               >
                 <div
@@ -130,6 +139,8 @@ export function ChainTxCard({
                   }}
                   title={`${tx.hash}\nClick: open in explorer · Shift-click: copy`}
                   onClick={(e) => {
+                    // The hash's own click, not also the row's details.
+                    e.stopPropagation();
                     if (e.shiftKey) {
                       void navigator.clipboard.writeText(tx.hash);
                       return;

@@ -14,7 +14,8 @@ import { getAdapter } from "../../wallets";
 import { explorerTxUrl } from "../../wallets/explorers";
 import { openExternal } from "../../utils/openExternal";
 import { assetRank } from "../../wallets/coin-metadata";
-import type { XmrTransfer } from "../../wallets/xmr-wallet";
+import { xmrTransferToChainTx, type XmrTransfer } from "../../wallets/xmr-wallet";
+import { openableRowProps } from "../../components/openableRow";
 import { piconeroToXmr } from "../../wallets/xmr-rpc";
 import type { ZphAssetBalance, ZphAssetType } from "../../wallets/zph-rpc";
 import { ZPH_ASSET_COLOR } from "../../wallets/zph-rpc";
@@ -176,6 +177,7 @@ export function WalletLandscapeView({
   currentLitecoinDerivationChoice,
   onChangeLitecoinDerivation,
   onCopy,
+  onOpenTx,
 }: {
   walletsByChain: Partial<Record<ChainType, WalletInfo>>;
   activeChain: ChainType;
@@ -252,6 +254,9 @@ export function WalletLandscapeView({
   onChangeLitecoinDerivation?: (newChoice: string) => Promise<void>;
   /** Copy-to-clipboard helper used by the legacy panels. */
   onCopy?: (text: string) => void;
+  /** Open one Recent row's transaction details (2026-10-01). `LandscapeRoot`
+   *  renders them: this feature may not import Activity's `TxDetails`. */
+  onOpenTx?: (tx: ChainTx) => void;
 }) {
   // RAM plan 3.1: chains whose wallet sidecar is asleep show " · paused".
   const pausedChains = usePausedChains();
@@ -1493,6 +1498,7 @@ export function WalletLandscapeView({
                 ) : (
                   <ActivityList
                     chain="monero"
+                    onOpen={onOpenTx}
                     items={xmrRecent.map((tx) => {
                       const isIn = tx.type === "in" || tx.type === "pool";
                       return {
@@ -1506,6 +1512,9 @@ export function WalletLandscapeView({
                             ? `${tx.confirmations} conf`
                             : "unconfirmed",
                         hash: tx.txid,
+                        // The row Activity shows for this transfer, so its
+                        // details read the same from either place.
+                        tx: xmrTransferToChainTx(tx),
                       };
                     })}
                   />
@@ -1528,7 +1537,9 @@ export function WalletLandscapeView({
               ) : (
                 <ActivityList
                   chain={activeChain}
+                  onOpen={onOpenTx}
                   items={genericRecent.map((tx) => ({
+                    tx,
                     key: `${tx.hash}-${tx.direction}`,
                     direction:
                       tx.direction === "in"
@@ -1717,6 +1728,7 @@ export function WalletLandscapeView({
 function ActivityList({
   items,
   chain,
+  onOpen,
 }: {
   items: Array<{
     key: string;
@@ -1726,20 +1738,28 @@ function ActivityList({
     when: string;
     peer?: string;
     hash?: string;
+    /** The row as Activity has it; the details open from this. */
+    tx?: ChainTx;
   }>;
   /** Every item in one list is the currently active chain — matches
    *  `ChainTxCard`'s one-chain-per-card contract, so `explorerTxUrl` only
    *  needs this once rather than threaded per row. */
   chain: ChainType;
+  /** Open a row's transaction details (2026-10-01). The hash below keeps
+   *  its own click: explorer, or copy with Shift. */
+  onOpen?: (tx: ChainTx) => void;
 }) {
   return (
     <div style={{ display: "flex", flexDirection: "column" }}>
       {items.map((it) => {
         const isIn = it.direction === "in";
         const failed = it.direction === "failed";
+        const open = onOpen && it.tx ? () => onOpen(it.tx!) : undefined;
         return (
           <div
             key={it.key}
+            {...openableRowProps(open)}
+            data-wallet-recent-row={open ? "openable" : undefined}
             style={{
               display: "flex",
               alignItems: "center",
@@ -1747,6 +1767,8 @@ function ActivityList({
               padding: "8px 0",
               borderBottom: "1px solid var(--border-soft)",
               fontFamily: "var(--font-mono)",
+              cursor: open ? "pointer" : undefined,
+              transition: "background .12s ease",
             }}
           >
             <span
