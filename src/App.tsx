@@ -99,7 +99,7 @@ import { useLayout } from "./features/landscape/useLayout";
 import { toMiningFocus } from "./features/mining/featureFocus";
 import type { FeatureFocus } from "./state/featureFocus";
 import { LandscapeRoot } from "./features/landscape/LandscapeRoot";
-import { useConvertPipeline } from "./features/swap/useConvertPipeline";
+import { useConvertPipeline, shouldAdoptAsHop1 } from "./features/swap/useConvertPipeline";
 import { deriveWalletAddresses, addressForAssetId } from "./features/swap/asset-address-resolver";
 import { getDropdownTickers } from "./features/swap/swap-data";
 import {
@@ -2050,24 +2050,39 @@ function App() {
   });
 
   /**
+   * The nonce of the CONVERT seed that already produced a hop 1, so one click
+   * adopts at most one bid (`shouldAdoptAsHop1`).
+   */
+  const adoptedSeedNonceRef = useRef<number | null>(null);
+
+  /**
    * Adopt a freshly-submitted P2P swap into BOTH the tracker and, when the
    * convert pipeline is waiting for its first hop, the pipeline.
    *
    * Without this the pipeline seeded the form, the user confirmed a bid, and
-   * nothing ever told the pipeline which bid it was — so it sat at
-   * "hop1-running" forever and hop 2 was unreachable. The tracker adopt is
-   * unconditional; the pipeline adopt is not, because a plain P2P swap the
-   * user started from the Swap tab is not a conversion.
+   * nothing ever told the pipeline which bid it was — so it never left `idle`
+   * and hop 2 was unreachable. The tracker adopt is unconditional; the
+   * pipeline adopt is not, because a plain P2P swap the user started from the
+   * Swap tab is not a conversion.
+   *
+   * Which bid is hop 1 is `shouldAdoptAsHop1`'s decision. It compares
+   * tickers. This check used to compare `handle.sendCoin` with "XMR", but the
+   * confirm modal's handle names the coin as the swap node does ("Monero"),
+   * so it never passed and no hop 1 was ever adopted (operator request,
+   * 2026-10-01).
    */
   const adoptSidecarSwap = useCallback(
     (handle: Parameters<NonNullable<typeof sidecarTracker>["adopt"]>[0]) => {
       sidecarTracker?.adopt(handle);
-      const expectsHop1 =
-        convertPipeline.stage === "idle" || convertPipeline.stage === "hop1-running";
-      const isConvertLeg =
-        handle.sendCoin?.toUpperCase() === "XMR" &&
-        handle.receiveCoin?.toUpperCase() === "LTC";
-      if (expectsHop1 && isConvertLeg && convertSeed?.router === "basicswap") {
+      if (
+        shouldAdoptAsHop1({
+          stage: convertPipeline.stage,
+          handle,
+          seed: convertSeed,
+          adoptedSeedNonce: adoptedSeedNonceRef.current,
+        })
+      ) {
+        adoptedSeedNonceRef.current = convertSeed?.nonce ?? null;
         (convertPipeline as unknown as {
           adoptHop1: (h: typeof handle) => void;
         }).adoptHop1(handle);

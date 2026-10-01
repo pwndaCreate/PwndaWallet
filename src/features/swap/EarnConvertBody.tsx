@@ -372,7 +372,11 @@ export function EarnConvertBody({
       }
       bodyStyle={{ paddingTop: 4, paddingBottom: 4 }}
     >
-      <ConversionsList rows={conversions} />
+      {/* `rows`, the same list the count above reads: the prop when a parent
+          passes one, else the local log. This rendered `conversions`, which
+          no parent passes, so the panel could read "1 total" over "no
+          conversions yet" once a hop 1 was ever adopted (2026-10-01). */}
+      <ConversionsList rows={rows} />
     </EarnPanel>
   );
 

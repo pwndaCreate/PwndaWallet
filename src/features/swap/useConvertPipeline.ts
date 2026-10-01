@@ -33,9 +33,11 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type { SidecarSwapState, SidecarTrackedSwap } from "../swap-sidecar";
+import { tickerForCoin } from "../swap-sidecar";
 import {
   recordConversionStarted,
   updateConversion,
+  type ConversionRecord,
 } from "./convert-history";
 
 /** The coin every conversion routes through. */
@@ -146,6 +148,98 @@ const HOP1_UNWOUND = new Set([
   "counterparty-recovered",
 ]);
 
+/**
+ * Is this P2P swap the conversion's first hop: XMR sent, LTC received?
+ *
+ * Compares TICKERS, through `tickerForCoin`, on both sides. The handle the
+ * confirm modal passes up names coins the way the swap node does, because it
+ * is built from the offer (`TakerOffer.sendCoin` is the offer's `coin_to`):
+ * "Monero" and "Litecoin". Only a handle rebuilt from swap history holds
+ * tickers. The first version compared `sendCoin.toUpperCase()` with "XMR",
+ * which "MONERO" never equals, so the pipeline never adopted a hop 1: after
+ * the user confirmed the bid it stayed `idle`, logged no conversion, and hop 2
+ * was unreachable (operator request, 2026-10-01).
+ *
+ * "Litecoin MWEB" resolves to LTC_MWEB, another coin with its own wallet, so
+ * it is not the route hop.
+ */
+export function isConvertHop1Leg(handle: {
+  sendCoin?: string | null;
+  receiveCoin?: string | null;
+}): boolean {
+  return (
+    tickerForCoin(handle.sendCoin) === CONVERT_SOURCE &&
+    tickerForCoin(handle.receiveCoin) === CONVERT_ROUTE_HOP
+  );
+}
+
+/** The part of App's swap-form seed that {@link shouldAdoptAsHop1} reads. */
+export interface ConvertSeedLike {
+  router: string;
+  nonce: number;
+}
+
+/**
+ * Should a P2P swap the user just placed become the pipeline's hop 1?
+ *
+ * App's `adoptSidecarSwap` asks this for every bid the confirm modal places;
+ * the tracker adopts every bid regardless. All four must hold:
+ *
+ * - the pipeline is waiting for hop 1 (`idle`, or `hop1-running` as the first
+ *   version allowed);
+ * - the form was seeded by CONVERT (`router: "basicswap"`). A plain P2P swap
+ *   the user started from the Swap tab is not a conversion;
+ * - that seed has not already produced a hop 1. The seed outlives the click
+ *   that made it, so without this every later XMR -> LTC bid of the session
+ *   would count as a conversion too, and one placed while hop 1 runs would
+ *   replace the bid the pipeline follows. One CONVERT click, one hop 1.
+ *   (Dormant while the coin check below could never pass; live with the fix.)
+ * - the swap is XMR -> LTC ({@link isConvertHop1Leg}).
+ */
+export function shouldAdoptAsHop1(args: {
+  stage: ConvertStage;
+  handle: { sendCoin?: string | null; receiveCoin?: string | null };
+  seed: ConvertSeedLike | null | undefined;
+  /** The nonce of the seed that already produced a hop 1, if one has. */
+  adoptedSeedNonce: number | null;
+}): boolean {
+  const { stage, handle, seed, adoptedSeedNonce } = args;
+  if (stage !== "idle" && stage !== "hop1-running") return false;
+  if (!seed || seed.router !== "basicswap") return false;
+  if (adoptedSeedNonce != null && adoptedSeedNonce === seed.nonce) return false;
+  return isConvertHop1Leg(handle);
+}
+
+/** A coin as the conversion log names it: a ticker. */
+function tickerOf(coin: string | null | undefined): string {
+  return (tickerForCoin(coin) ?? coin ?? "").trim().toUpperCase();
+}
+
+/**
+ * The conversion-log row for an adopted hop 1, with TICKERS.
+ *
+ * The handle names coins as the swap node does ("Monero"); the CONVERSIONS
+ * list keys its coin icons and labels on tickers. Swap history's P2P rows
+ * convert for the same reason (`p2p-history.ts::tickerOf`).
+ */
+export function hop1ConversionRecord(
+  handle: SidecarSwapHandleLike,
+  targetCoin: string,
+  startedAt: number,
+): ConversionRecord {
+  return {
+    id: handle.bidId,
+    fromTicker: tickerOf(handle.sendCoin),
+    viaTicker: tickerOf(handle.receiveCoin),
+    toTicker: targetCoin,
+    fromAmount: handle.sendAmount,
+    viaAmount: "",
+    toAmount: "",
+    startedAt,
+    status: "running",
+  };
+}
+
 export function useConvertPipeline({
   enabled,
   sidecar,
@@ -252,17 +346,10 @@ export function useConvertPipeline({
       setHop1BidId(handle.bidId);
       writeStored(HOP1_STORAGE_KEY, handle.bidId);
       setStage("hop1-running");
-      recordConversionStarted({
-        id: handle.bidId,
-        fromTicker: handle.sendCoin,
-        viaTicker: handle.receiveCoin,
-        toTicker: targetCoin,
-        fromAmount: handle.sendAmount,
-        viaAmount: "",
-        toAmount: "",
-        startedAt: Date.now(),
-        status: "running",
-      });
+      // Tickers, not the node's coin names (2026-10-01): this wrote
+      // `handle.sendCoin` as is, which would have logged "Monero" the first
+      // time a hop 1 was ever adopted.
+      recordConversionStarted(hop1ConversionRecord(handle, targetCoin, Date.now()));
     },
     [targetCoin],
   );
