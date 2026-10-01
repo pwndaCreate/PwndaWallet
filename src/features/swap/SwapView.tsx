@@ -274,6 +274,11 @@ export function SwapView({
     appliedSeedRef.current = convertSeed.nonce;
     setSwapMode("cross");
     setSubTab("swap");
+    // A seed asks for the form. Portrait's CONVERT mode hides it, and CONVERT
+    // NOW is pressed from inside that mode, so the form was filled out of
+    // sight and the button seemed to do nothing (sandbox, 2026-10-01).
+    // Landscape opens its Swap tab instead, so it never showed there.
+    setPortraitMode("swap");
     void setPreferredRouter(convertSeed.router as RouterPreference);
     // Only overwrite a side the seed actually names. An asset's SWAP tile
     // seeds the FROM coin and leaves the destination alone; blanking it
