@@ -100,18 +100,11 @@ vi.mock("./session-send", async (importOriginal) => {
   };
 });
 
-// Sui's SDK, faked the way `sessionSend.test.ts` fakes it: the transaction
-// records what it was asked to split and to whom it transfers.
-vi.mock("@mysten/sui/client", () => ({
-  SuiClient: class {
-    executeTransactionBlock() {
-      return Promise.resolve({ digest: "SUI-DIGEST", effects: { status: { status: "success" } } });
-    }
-    getTransactionBlock() {
-      return Promise.reject(new Error("not found"));
-    }
-  },
-}));
+// Sui's transaction builder, faked: it records what it was asked to split, to
+// whom it transfers, and the gas it was given. Since 2026-10-01 the chain
+// reads and the submit are GraphQL through the proxy (`suiGraphql` below),
+// not the SDK's JSON-RPC client, which is why that client is no longer faked
+// here; `suiSend.test.ts` covers the send with the real builder.
 vi.mock("@mysten/sui/transactions", async (importOriginal) => {
   const actual: any = await importOriginal();
   class FakeTransaction {
@@ -125,6 +118,15 @@ vi.mock("@mysten/sui/transactions", async (importOriginal) => {
     }
     transferObjects(_o: unknown, to: string) {
       S.suiLog.push(["transferObjects", to]);
+    }
+    setGasPrice(p: bigint) {
+      S.suiLog.push(["setGasPrice", p]);
+    }
+    setGasBudget(b: bigint) {
+      S.suiLog.push(["setGasBudget", b]);
+    }
+    setGasPayment(p: unknown[]) {
+      S.suiLog.push(["setGasPayment", p.length]);
     }
     async build() {
       return new Uint8Array([9, 9, 9]);
@@ -195,6 +197,9 @@ const SUI_ASSET = SWAP_COIN_META.SUI.nearIntentsAsset!;
 const NEAR_ASSET = "nep141:wrap.near";
 const NEAR_DEST = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const SUI_DEPOSIT = "0x" + "5d".repeat(32);
+const { TransactionDataBuilder } = await import("@mysten/sui/transactions");
+/** The digest of the fake builder's bytes: what a real Sui deposit reports. */
+const SUI_FAKE_DIGEST = TransactionDataBuilder.getDigestFromBytes(new Uint8Array([9, 9, 9]));
 const inMinutes = (m: number) => new Date(Date.now() + m * 60_000).toISOString();
 
 /** Executor input for an XLM or SUI deposit, bound correctly. */
@@ -272,8 +277,49 @@ async function horizonFetch(input: unknown, init?: { method?: string; body?: unk
   throw new Error(`unscripted Horizon ${init?.method ?? "GET"} ${path}`);
 }
 
+/**
+ * Sui's GraphQL, as the proxy returns it (2026-10-01 layouts): one coin of
+ * 5 SUI and no address balance, a successful dry run, a successful submit.
+ */
+function suiGraphql(args: { url: string; body: string }) {
+  const { query } = JSON.parse(args.body);
+  const data = (d: unknown) => ({ status: 200, body: JSON.stringify({ data: d }), headers: [] });
+  if (query.includes("simulateTransaction")) {
+    return data({
+      simulateTransaction: {
+        effects: {
+          status: "SUCCESS",
+          executionError: null,
+          gasEffects: { gasSummary: { computationCost: 100000, storageCost: 1976000, storageRebate: 0 } },
+        },
+      },
+    });
+  }
+  if (query.includes("executeTransaction")) {
+    return data({ executeTransaction: { effects: { digest: SUI_FAKE_DIGEST, status: "SUCCESS", executionError: null } } });
+  }
+  if (query.includes("objects(")) {
+    const id = "0x" + "c0".repeat(32);
+    return data({
+      epoch: { referenceGasPrice: "100" },
+      address: {
+        balance: { coinBalance: "5000000000", addressBalance: "0" },
+        objects: {
+          nodes: [
+            { address: id, version: 1, digest: "4ZAVLMEE62Aa8gm41JKUfzSQW4wdp5T62vDkdYgN1g4U", contents: { json: { id, balance: "5000000000" } } },
+          ],
+        },
+      },
+    });
+  }
+  throw new Error(`unscripted Sui GraphQL ${String(query).slice(0, 60)}`);
+}
+
 async function fakeInvoke(cmd: string, args: any): Promise<unknown> {
   switch (cmd) {
+    case "http_proxy_call":
+      if (String(args?.url).includes("graphql.mainnet.sui.io")) return suiGraphql(args);
+      throw new Error(`unscripted proxy call ${args?.url}`);
     case "swap_get_stellar_address":
       return S.signer.stellar;
     case "swap_sign_stellar_tx": {
@@ -390,10 +436,15 @@ describe("SUI deposits (F7 follow-up, 2026-09-29 send-safety audit)", () => {
     const r = await executeIntentsTrade(
       bound({ fromAsset: "SUI", amountIn: "1234567891", depositAddress: SUI_DEPOSIT }),
     );
-    expect(r.sourceTxHash).toBe("SUI-DIGEST");
+    // The hash of the bytes that were signed (2026-10-01: the send reports its
+    // own digest, not the node's).
+    expect(r.sourceTxHash).toBe(SUI_FAKE_DIGEST);
     expect(S.suiLog).toContainEqual(["splitCoins", 1234567891n]);
     expect(S.suiLog).toContainEqual(["transferObjects", SUI_DEPOSIT]);
     expect(S.suiLog).toContainEqual(["setSender", suiMe.address]);
+    // Gas from GraphQL: the reference price, then the budget and the one coin.
+    expect(S.suiLog).toContainEqual(["setGasPrice", 100n]);
+    expect(S.suiLog).toContainEqual(["setGasPayment", 1]);
   });
 
   it("an unknown outcome is recorded with the digest and never retried on the same quote", async () => {

@@ -41,6 +41,17 @@
  * `features/swap/session-send.ts::executeSuiTransfer` (wired 2026-09-02; the
  * note that stood here said it had never been written, which stopped being
  * true that day). See `sendTransaction` below.
+ *
+ * ## 2026-10-01 — every read, and the send's, on GraphQL (operator request)
+ *
+ * The balance and the by-hash read moved from publicnode's JSON-RPC to
+ * GraphQL, and the send's chain calls (its coins, the gas price, the dry run,
+ * the submit and the status) are the GraphQL functions in "The send's chain
+ * calls" below. Sui's published timeline ends JSON-RPC on full nodes, code
+ * included, in mid-October 2026 (docs.sui.io/develop/accessing-data/
+ * json-rpc-migration, read 2026-10-01). publicnode's own page announced
+ * nothing that day, so when it stops is not known. `SUI_RPC` is kept for one
+ * case only, explained at the constant.
  */
 
 import { mnemonicToSeedSync } from "@scure/bip39";
@@ -67,6 +78,9 @@ import { uniqueAddresses, urlHost } from "./parties-b-common";
 // (docs.sui.io/develop/accessing-data/json-rpc-migration). It was the sole,
 // hardcoded, no-fallback source here, so every dashboard read failed on
 // every session — "Sui not loaded" wasn't intermittent, it was permanent.
+// (Corrected 2026-10-01: 2026-08-22 is when this wallet noticed. Sui's
+// timeline has JSON-RPC off on its own mainnet full nodes from the week of
+// 2026-07-27, as the header's 2026-08-14 note says.)
 //
 // publicnode.com still serves the legacy JSON-RPC surface and is already on
 // the Rust proxy allowlist (used by ETH/AVAX/Polygon/Arbitrum/Base/Optimism/
@@ -82,16 +96,23 @@ import { uniqueAddresses, urlHost } from "./parties-b-common";
 // answers CORS for any origin, including the SDK's own request headers
 // (preflight checked 2026-09-29).
 //
-// ⚠ publicnode's JSON-RPC surface may itself go away around mid-October 2026,
-// following the upstream JSON-RPC deprecation. When it does, the fix is the
-// GraphQL/gRPC migration (the reads here and the SDK transport for sends), not
-// another JSON-RPC host. Not migrated yet on purpose: a transport change to the
-// send path wants its own verification pass.
-//
 // History is no longer read here (2026-10-01): `suix_queryTransactionBlocks`
 // fails WHOLE once publicnode has pruned one old transaction of the address
-// (see `getTransactionHistory`), so it moved to GraphQL. The balance and the
-// first parties read still use this host.
+// (see `getTransactionHistory`), so it moved to GraphQL.
+//
+// Nor, later that day, are the balance, the by-hash read or the send
+// (operator request, 2026-10-01; the header has why). What still uses this
+// host is ONE path of the send: a wallet that holds SUI in an ADDRESS BALANCE
+// (Sui's per-address balance with no coin object, on mainnet since release
+// 1.72, May 2026). `@mysten/sui` 1.x has no transaction format that spends an
+// address balance. A fullnode's JSON-RPC hands such clients a "compatibility
+// coin reservation" instead, a synthetic coin in `suix_getCoins` that spends
+// from the address balance (docs.sui.io, "Migrating from Coin to Address
+// Balances"; `get_owned_coins` in sui-json-rpc at mainnet-v1.80.1). GraphQL
+// lists real coins only. So `session-send.ts` builds that one case here, and
+// when this host stops answering, a wallet whose SUI sits in an address
+// balance can send only what its coins hold, until the wallet moves to
+// `@mysten/sui` 2.x.
 export const SUI_RPC = "https://sui-rpc.publicnode.com";
 const DERIVATION_PATH = "m/44'/784'/0'/0'/0'";
 
@@ -160,6 +181,14 @@ interface GraphQLResponse<T> {
   errors?: Array<{ message: string }>;
 }
 
+function errorText(e: unknown): string {
+  return e instanceof Error ? e.message : String(e);
+}
+
+// The JSON-RPC helper that stood here (`suiRpcCall`, publicnode) went with
+// its last two callers, the balance and the first by-hash read, on
+// 2026-10-01.
+
 /**
  * POST a GraphQL query, trying each configured endpoint in turn.
  *
@@ -170,37 +199,6 @@ interface GraphQLResponse<T> {
  * with no redundancy, a blip is guaranteed to reach the UI, and it must
  * arrive labelled "unknown" rather than "you have nothing".
  */
-// Legacy JSON-RPC call against the publicnode endpoint (see SUI_RPC above).
-// Restored during the origin/main merge: the auto-merge kept origin/main's
-// GraphQL helper and dropped this one, while the adapter body below (taken from
-// the swap-desk side, which has the working send path) still calls it.
-function errorText(e: unknown): string {
-  return e instanceof Error ? e.message : String(e);
-}
-
-async function suiRpcCall<T>(method: string, params: unknown[]): Promise<T> {
-  const r = await httpProxyCall({
-    method: "POST",
-    url: SUI_RPC,
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
-    headers: { "Content-Type": "application/json" },
-  });
-  if (r.status < 200 || r.status >= 300) {
-    throw new Error(`Sui RPC HTTP ${r.status}: ${r.body.slice(0, 200)}`);
-  }
-  const parsed = JSON.parse(r.body) as {
-    result?: T;
-    error?: { code: number; message: string };
-  };
-  if (parsed.error) {
-    throw new Error(`Sui RPC ${method}: ${parsed.error.message}`);
-  }
-  if (parsed.result === undefined) {
-    throw new Error(`Sui RPC ${method}: no result`);
-  }
-  return parsed.result;
-}
-
 async function suiGraphQL<T>(
   query: string,
   variables: Record<string, unknown> = {}
@@ -265,29 +263,13 @@ async function suiGraphQLAt<T>(
 // Transaction parties (2026-09-30)
 // =========================================================================
 
-/** One balance change, owner and amount read out of either API's shape. */
+/** One balance change: its owner, coin type and signed amount. */
 export interface SuiBalanceChange {
   /** The owning address; absent for object-owned, shared or immutable owners. */
   owner?: string;
   coinType: string;
   /** Signed, in the coin's base unit (MIST for SUI). */
   amount: bigint;
-}
-
-/** JSON-RPC `balanceChanges` (`owner: { AddressOwner }`, `amount` as a string). */
-export function suiRpcBalanceChanges(raw: unknown): SuiBalanceChange[] {
-  const out: SuiBalanceChange[] = [];
-  for (const c of Array.isArray(raw) ? raw : []) {
-    const amount = String(c?.amount ?? "");
-    if (!/^-?\d+$/.test(amount)) continue;
-    const owner = c?.owner?.AddressOwner;
-    out.push({
-      ...(typeof owner === "string" ? { owner } : {}),
-      coinType: String(c?.coinType ?? ""),
-      amount: BigInt(amount),
-    });
-  }
-  return out;
 }
 
 /**
@@ -342,16 +324,25 @@ function suiRowCounterparty(
   return best?.owner;
 }
 
-/** publicnode's answer for a digest it does not hold (checked live 2026-09-30). */
-function isSuiRpcNotFound(e: unknown): boolean {
-  return /Could not find the referenced transaction/i.test(errorText(e));
-}
-
+/**
+ * One transaction's sender and balance changes (`getTransactionParties`).
+ *
+ * `balanceChangesJson` since 2026-10-01, as in the history query: the typed
+ * `balanceChanges` connection this read before answers one page, 20 changes
+ * unless asked for more (`serviceConfig.defaultPageSize`, read live
+ * 2026-10-01), so a transaction that paid more owners than that listed only
+ * some of its recipients.
+ */
 const SUI_TX_PARTIES_QUERY = `query ($digest: String!) {
   transaction(digest: $digest) {
     sender { address }
-    effects { balanceChanges { nodes { owner { address } amount coinType { repr } } } }
+    effects { balanceChangesJson }
   }
+}`;
+
+/** The SUI balance (`getBalance`): coins plus the address balance. */
+const SUI_BALANCE_QUERY = `query ($address: SuiAddress!) {
+  address(address: $address) { balance(coinType: "0x2::sui::SUI") { totalBalance } }
 }`;
 
 // =========================================================================
@@ -520,6 +511,259 @@ export function suiHistoryRow(node: SuiHistoryNode, address: string): ChainTx | 
 }
 
 // =========================================================================
+// The send's chain calls, over GraphQL (operator request, 2026-10-01)
+// =========================================================================
+//
+// `session-send.ts::executeSuiTransfer` builds a transfer with
+// `@mysten/sui` 1.45.2. Until 2026-10-01 it handed the SDK a JSON-RPC client
+// (publicnode), whose resolver (`jsonRpc/json-rpc-resolver.js`) did three
+// things: gas price = `suix_getReferenceGasPrice`; budget = a dry run of the
+// transfer at `SUI_DRY_RUN_BUDGET` with no gas coins, its computation cost +
+// `SUI_GAS_SAFE_OVERHEAD` × price + storage cost − rebate, never less than
+// computation + overhead; gas payment = the first page of `suix_getCoins`.
+// The functions below are those three reads on GraphQL, plus the submit and
+// the status. Fed the same chain state, the transfer they build is the same
+// bytes (`suiSend.test.ts`).
+
+/**
+ * The budget the dry run is asked at, 50 SUI in MIST: the SDK resolver's
+ * `MAX_GAS`. Kept equal, so the dry run is the same transaction.
+ */
+export const SUI_DRY_RUN_BUDGET = 50_000_000_000n;
+
+/** The resolver's `GAS_SAFE_OVERHEAD`: 1,000 gas units at the gas price. */
+const SUI_GAS_SAFE_OVERHEAD = 1000n;
+
+/**
+ * The most coins one gas payment holds: one page of `suix_getCoins`, which
+ * is what the JSON-RPC resolver used (the fullnode's `QUERY_MAX_RESULT_LIMIT`,
+ * 50 unless the operator configures another). GraphQL's `Address.objects`
+ * pages at 50 too (`serviceConfig.maxPageSize`, read live 2026-10-01).
+ */
+export const SUI_GAS_PAYMENT_MAX = 50;
+
+/** One SUI coin object. */
+export interface SuiCoinRef {
+  objectId: string;
+  /** A u64, as a decimal string. */
+  version: string;
+  /** Base58. */
+  digest: string;
+  balance: bigint;
+}
+
+/** What a transfer is built from: the gas price, the balance's two halves, the coins. */
+export interface SuiSendState {
+  referenceGasPrice: bigint;
+  /** SUI in coin objects. */
+  coinBalance: bigint;
+  /** SUI in the address balance, which has no coin object (see `SUI_RPC`). */
+  addressBalance: bigint;
+  /** The address's SUI coins: one page, at most `SUI_GAS_PAYMENT_MAX`. */
+  coins: SuiCoinRef[];
+}
+
+/** The gas a dry run reports. */
+export interface SuiGasUsed {
+  computationCost: bigint;
+  storageCost: bigint;
+  storageRebate: bigint;
+}
+
+/** What `executeTransaction` answered. */
+export interface SuiExecution {
+  digest?: string;
+  status?: "SUCCESS" | "FAILURE";
+  error?: string;
+}
+
+const SUI_SEND_STATE_QUERY = `query ($address: SuiAddress!) {
+  epoch { referenceGasPrice }
+  address(address: $address) {
+    balance(coinType: "0x2::sui::SUI") { coinBalance addressBalance }
+    objects(first: ${SUI_GAS_PAYMENT_MAX}, filter: { type: "0x2::coin::Coin<0x2::sui::SUI>" }) {
+      nodes { address version digest contents { json } }
+    }
+  }
+}`;
+
+const SUI_SIMULATE_QUERY = `query ($tx: JSON!) {
+  simulateTransaction(transaction: $tx) {
+    effects {
+      status
+      executionError { message }
+      gasEffects { gasSummary { computationCost storageCost storageRebate } }
+    }
+  }
+}`;
+
+const SUI_EXECUTE_MUTATION = `mutation ($tx: Base64!, $signatures: [Base64!]!) {
+  executeTransaction(transactionDataBcs: $tx, signatures: $signatures) {
+    effects { digest status executionError { message } }
+  }
+}`;
+
+const SUI_EFFECTS_QUERY = `query ($digest: String!) {
+  transactionEffects(digest: $digest) { status executionError { message } }
+}`;
+
+/**
+ * A u64 out of a GraphQL answer: `BigInt` and `UInt53` fields arrive as a
+ * string or a number. Throws, naming `what`, on anything else.
+ */
+function suiU64(v: unknown, what: string): bigint {
+  const s = typeof v === "number" && Number.isSafeInteger(v) ? String(v) : typeof v === "string" ? v : "";
+  if (!/^\d+$/.test(s)) throw new Error(`Sui returned no ${what}`);
+  return BigInt(s);
+}
+
+/**
+ * The gas price, both halves of the SUI balance, and up to 50 SUI coins of
+ * `address`, in one GraphQL request. Exported for `session-send.ts` and tests.
+ *
+ * Throws when any part is missing, and on a coin it cannot read: dropping a
+ * coin would change which coins pay, so a coin it cannot read is an error.
+ * An address with no coins answers `nodes: []` (the public test seed, live
+ * 2026-10-01).
+ */
+export async function readSuiSendState(address: string): Promise<SuiSendState> {
+  type Node = { address?: unknown; version?: unknown; digest?: unknown; contents?: { json?: { balance?: unknown } | null } | null };
+  const d = await suiGraphQL<{
+    epoch?: { referenceGasPrice?: unknown } | null;
+    address?: {
+      balance?: { coinBalance?: unknown; addressBalance?: unknown } | null;
+      objects?: { nodes?: Node[] | null } | null;
+    } | null;
+  }>(SUI_SEND_STATE_QUERY, { address: address.trim() });
+  const referenceGasPrice = suiU64(d.epoch?.referenceGasPrice, "reference gas price");
+  const balance = d.address?.balance;
+  const nodes = d.address?.objects?.nodes;
+  if (!balance || !Array.isArray(nodes)) throw new Error("Sui returned no balance or coin list for this address");
+  const coins = nodes.map((n): SuiCoinRef => {
+    const objectId = typeof n?.address === "string" ? n.address.toLowerCase() : "";
+    const digest = typeof n?.digest === "string" ? n.digest : "";
+    // 32 bytes in base58 is 32 to 44 characters; the SDK checks the length
+    // again when it encodes the payment.
+    if (!/^0x[0-9a-f]{64}$/.test(objectId) || !/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(digest)) {
+      throw new Error(`Sui returned a coin this wallet cannot read: ${JSON.stringify(n).slice(0, 160)}`);
+    }
+    return {
+      objectId,
+      version: suiU64(n.version, "coin version").toString(),
+      digest,
+      balance: suiU64(n.contents?.json?.balance, "coin balance"),
+    };
+  });
+  return {
+    referenceGasPrice,
+    coinBalance: suiU64(balance.coinBalance, "coin balance"),
+    addressBalance: suiU64(balance.addressBalance, "address balance"),
+    coins,
+  };
+}
+
+/**
+ * The gas payment: the largest coins first, ties by object id, at most
+ * `SUI_GAS_PAYMENT_MAX` — the order `suix_getCoins` lists them in (its index
+ * key is the inverted balance, then the object id: `CoinIndexKey2`,
+ * sui-core `jsonrpc_index.rs` at mainnet-v1.80.1). GraphQL's coin index is
+ * keyed the same way (`object_by_owner.rs` in sui-indexer-alt-consistent-
+ * store), so this sort should change nothing; it is here so the payment does
+ * not depend on that. Exported for tests.
+ */
+export function suiGasPayment(coins: readonly SuiCoinRef[]): SuiCoinRef[] {
+  return [...coins]
+    .sort((a, b) =>
+      a.balance !== b.balance
+        ? a.balance > b.balance
+          ? -1
+          : 1
+        : a.objectId < b.objectId
+          ? -1
+          : a.objectId > b.objectId
+            ? 1
+            : 0,
+    )
+    .slice(0, SUI_GAS_PAYMENT_MAX);
+}
+
+/** The JSON-RPC resolver's budget from a dry run's gas. Exported for tests. */
+export function suiGasBudget(price: bigint, gas: SuiGasUsed): bigint {
+  const base = gas.computationCost + SUI_GAS_SAFE_OVERHEAD * price;
+  const total = base + gas.storageCost - gas.storageRebate;
+  return total > base ? total : base;
+}
+
+/**
+ * Dry-run `txBytes` (`simulateTransaction`, the GraphQL form of
+ * `sui_dryRunTransactionBlock`) and return its gas. A dry run that fails
+ * throws the resolver's own words, so an error reads as it did. With no gas
+ * coins in the transaction, both APIs run it on a stand-in gas coin
+ * (`0xff…ff`, version 2) and report the same costs: checked live on
+ * 2026-10-01 for a transfer from the public test seed, 100,000 computation,
+ * 1,976,000 storage, 0 rebate from each.
+ */
+export async function simulateSuiGas(txBytes: Uint8Array): Promise<SuiGasUsed> {
+  type Effects = {
+    status?: unknown;
+    executionError?: { message?: unknown } | null;
+    gasEffects?: { gasSummary?: Record<string, unknown> | null } | null;
+  };
+  const d = await suiGraphQL<{ simulateTransaction?: { effects?: Effects | null } | null }>(SUI_SIMULATE_QUERY, {
+    tx: { bcs: { value: Buffer.from(txBytes).toString("base64") } },
+  });
+  const fx = d.simulateTransaction?.effects;
+  if (fx?.status === "FAILURE") {
+    const why = typeof fx.executionError?.message === "string" ? fx.executionError.message : "FAILURE";
+    throw new Error(`Dry run failed, could not automatically determine a budget: ${why}`);
+  }
+  if (fx?.status !== "SUCCESS") throw new Error("Sui's dry run returned no result");
+  const g = fx.gasEffects?.gasSummary;
+  return {
+    computationCost: suiU64(g?.computationCost, "computation cost"),
+    storageCost: suiU64(g?.storageCost, "storage cost"),
+    storageRebate: suiU64(g?.storageRebate, "storage rebate"),
+  };
+}
+
+/**
+ * Submit signed bytes (`executeTransaction`, which answers once the
+ * transaction is final). Throws when no endpoint answered; the caller settles
+ * that by digest, never by building again. With more than one endpoint
+ * configured, the next is sent the same bytes: the same transaction, which
+ * Sui runs at most once.
+ */
+export async function executeSuiTransaction(txBytesBase64: string, signatureBase64: string): Promise<SuiExecution> {
+  const d = await suiGraphQL<{
+    executeTransaction?: { effects?: { digest?: unknown; status?: unknown; executionError?: { message?: unknown } | null } | null } | null;
+  }>(SUI_EXECUTE_MUTATION, { tx: txBytesBase64, signatures: [signatureBase64] });
+  const fx = d.executeTransaction?.effects;
+  return {
+    ...(typeof fx?.digest === "string" ? { digest: fx.digest } : {}),
+    ...(fx?.status === "SUCCESS" || fx?.status === "FAILURE" ? { status: fx.status } : {}),
+    ...(typeof fx?.executionError?.message === "string" ? { error: fx.executionError.message } : {}),
+  };
+}
+
+/**
+ * A transaction's outcome by digest, or `null` while GraphQL does not have
+ * it. Its indexing can trail the network, so a fresh transaction may read
+ * `null` for a moment (the schema says so).
+ */
+export async function suiTransactionStatus(
+  digest: string,
+): Promise<{ status: "SUCCESS" | "FAILURE"; error?: string } | null> {
+  const d = await suiGraphQL<{
+    transactionEffects?: { status?: unknown; executionError?: { message?: unknown } | null } | null;
+  }>(SUI_EFFECTS_QUERY, { digest });
+  const fx = d.transactionEffects;
+  if (fx == null) return null;
+  if (fx.status !== "SUCCESS" && fx.status !== "FAILURE") throw new Error("Sui returned effects with no status");
+  const error = typeof fx.executionError?.message === "string" ? fx.executionError.message : undefined;
+  return { status: fx.status, ...(error ? { error } : {}) };
+}
+
+// =========================================================================
 // Adapter
 // =========================================================================
 
@@ -578,18 +822,24 @@ export const suiAdapter: ChainAdapter = {
     };
   },
 
+  /**
+   * The SUI balance, from GraphQL since 2026-10-01 (operator request; it was
+   * publicnode's `suix_getBalance`).
+   *
+   * `totalBalance` is the coins plus the address balance, the same sum the
+   * JSON-RPC `totalBalance` was (docs.sui.io, "Migrating from Coin to Address
+   * Balances"), so the number does not change.
+   *
+   * Throws on a failed read (2026-08-22) — it used to read as zero. An
+   * unfunded address is a real `totalBalance: "0"` (the public test seed,
+   * live 2026-10-01), not an exception.
+   */
   async getBalance(address: string): Promise<string> {
-    // Throws on RPC failure (2026-08-22) — used to read as zero. An
-    // unfunded address is a real `totalBalance: "0"`, not an exception.
-    const r = await suiRpcCall<{ totalBalance: string }>(
-      "suix_getBalance",
-      [address, "0x2::sui::SUI"]
+    const d = await suiGraphQL<{ address?: { balance?: { totalBalance?: unknown } | null } | null }>(
+      SUI_BALANCE_QUERY,
+      { address: address.trim() },
     );
-    const mist = BigInt(r.totalBalance);
-    // 1 SUI = 1e9 MIST.
-    const intPart = mist / 1_000_000_000n;
-    const fracPart = mist % 1_000_000_000n;
-    return `${intPart}.${fracPart.toString().padStart(9, "0")}`;
+    return formatMist(suiU64(d.address?.balance?.totalBalance, "balance for this address"));
   },
 
   async sendTransaction(): Promise<TxResult> {
@@ -632,9 +882,10 @@ export const suiAdapter: ChainAdapter = {
    *
    * so the history threw "Sui history could not be read" for every address
    * with history older than publicnode keeps. GraphQL returned all 31 of the
-   * same address's transactions in one 200 ms request. It is also the
+   * same address's transactions in one 200 ms request. It was also the
    * adapter's other host already (fees, network info, the parties fallback),
-   * on the Rust proxy allowlist as `sui.io`.
+   * on the Rust proxy allowlist as `sui.io`; since later that day it is the
+   * only one (the header).
    *
    * One request: GraphQL lists what the address sent AND received
    * (`relation: AFFECTED`), where the JSON-RPC history needed two queries
@@ -683,55 +934,32 @@ export const suiAdapter: ChainAdapter = {
   },
 
   /**
-   * `sui_getTransactionBlock` on publicnode, then Sui's GraphQL — the
-   * adapter's other host — when publicnode does not have it (2026-09-30).
+   * One transaction's sender and recipients, from Sui's GraphQL
+   * (`transaction(digest)`); `null` when GraphQL answers `transaction: null`.
    *
-   * The second source is not redundancy for its own sake: publicnode PRUNES.
-   * Checked live 2026-09-30 on the public test seed's history, a digest its
-   * own `suix_queryTransactionBlocks` still lists (EFPAnhSs…, 2026-05-11)
-   * answers `-32602 Could not find the referenced transaction`, while
-   * graphql.mainnet.sui.io returns it in full. So publicnode's "not found"
-   * is not the chain's; GraphQL's `transaction: null` is.
+   * GraphQL alone since 2026-10-01 (operator request). publicnode's
+   * `sui_getTransactionBlock` was asked first until then, and its "not found"
+   * was never believed: it PRUNES. A digest its own history still listed
+   * (EFPAnhSs…, the public test seed, 2026-05-11) answered `-32602 Could not
+   * find the referenced transaction` on 2026-09-30, while GraphQL returned it
+   * in full. GraphQL serves transactions from the first checkpoint on
+   * (`serviceConfig.availableRange`, read live 2026-10-01).
    */
   async getTransactionParties(hash: string): Promise<TxParties | null> {
     const digest = hash.trim();
-    const failures: string[] = [];
+    let answer: {
+      data: { transaction?: { sender?: { address?: unknown } | null; effects?: { balanceChangesJson?: unknown } | null } | null };
+      url: string;
+    };
     try {
-      const r = await suiRpcCall<{
-        transaction?: { data?: { sender?: string } };
-        balanceChanges?: unknown;
-      }>("sui_getTransactionBlock", [digest, { showInput: true, showBalanceChanges: true }]);
-      return suiTransferParties(
-        r.transaction?.data?.sender,
-        suiRpcBalanceChanges(r.balanceChanges),
-        urlHost(SUI_RPC),
-      );
+      answer = await suiGraphQLAt(SUI_TX_PARTIES_QUERY, { digest });
     } catch (e) {
-      failures.push(`${urlHost(SUI_RPC)}: ${isSuiRpcNotFound(e) ? "not found (pruned or unknown)" : errorText(e)}`);
+      throw new Error(`Sui transaction ${digest} could not be read: ${errorText(e)}`);
     }
-    try {
-      type Node = { owner?: { address?: string } | null; amount?: string; coinType?: { repr?: string } | null };
-      const { data: d, url } = await suiGraphQLAt<{
-        transaction: {
-          sender?: { address?: string } | null;
-          effects?: { balanceChanges?: { nodes?: Node[] } | null } | null;
-        } | null;
-      }>(SUI_TX_PARTIES_QUERY, { digest });
-      if (d.transaction == null) return null;
-      const changes: SuiBalanceChange[] = [];
-      for (const n of d.transaction.effects?.balanceChanges?.nodes ?? []) {
-        if (!/^-?\d+$/.test(String(n?.amount ?? ""))) continue;
-        changes.push({
-          ...(typeof n.owner?.address === "string" ? { owner: n.owner.address } : {}),
-          coinType: String(n.coinType?.repr ?? ""),
-          amount: BigInt(String(n.amount)),
-        });
-      }
-      return suiTransferParties(d.transaction.sender?.address, changes, urlHost(url));
-    } catch (e) {
-      failures.push(errorText(e));
-    }
-    throw new Error(`Sui transaction ${digest} could not be read: ${failures.join(" | ")}`);
+    const t = answer.data.transaction;
+    if (t == null) return null;
+    const sender = typeof t.sender?.address === "string" ? t.sender.address : undefined;
+    return suiTransferParties(sender, suiJsonBalanceChanges(t.effects?.balanceChangesJson) ?? [], urlHost(answer.url));
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

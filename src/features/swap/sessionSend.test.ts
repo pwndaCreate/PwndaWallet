@@ -1,12 +1,16 @@
 /**
- * Stellar and Sui dashboard sends, and the signing session around them
- * (2026-09-29 send-safety audit).
+ * Stellar dashboard sends, and the signing session around them (2026-09-29
+ * send-safety audit).
  *
- * Fakes: Horizon and the Rust commands for Stellar; the SDK's client and
- * transaction builder for Sui. Everything else is real — stellar-base builds
- * and hashes the transaction, and the fake Rust signer computes the same
- * digest `swap_sign_stellar_tx` does (sha256(network id || ENVELOPE_TYPE_TX ||
- * tx)) with the abandon seed's Stellar key.
+ * Fakes: Horizon and the Rust commands for Stellar. Everything else is real —
+ * stellar-base builds and hashes the transaction, and the fake Rust signer
+ * computes the same digest `swap_sign_stellar_tx` does (sha256(network id ||
+ * ENVELOPE_TYPE_TX || tx)) with the abandon seed's Stellar key.
+ *
+ * The Sui sends that were here moved to `suiSend.test.ts` on 2026-10-01, when
+ * the send moved to GraphQL (operator request): they faked the SDK's
+ * JSON-RPC client and transaction builder, and are tested now against the
+ * real builder, with every rule they held.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { readFileSync } from "node:fs";
@@ -21,64 +25,17 @@ import {
   TransactionBuilder,
 } from "@stellar/stellar-base";
 
-const sui = vi.hoisted(() => ({
-  clientUrls: [] as string[],
-  log: [] as unknown[][],
-  exec: (async () => ({ digest: "", effects: { status: { status: "success" } } })) as (
-    a: unknown,
-  ) => Promise<any>,
-  lookup: (async () => {
-    throw new Error("Could not find the referenced transaction");
-  }) as (a: unknown) => Promise<any>,
-}));
-
 vi.mock("../../lib/tauri", () => ({ invoke: vi.fn() }));
-vi.mock("@mysten/sui/client", () => ({
-  SuiClient: class {
-    constructor(o: { url: string }) {
-      sui.clientUrls.push(o.url);
-    }
-    executeTransactionBlock(a: unknown) {
-      return sui.exec(a);
-    }
-    getTransactionBlock(a: unknown) {
-      return sui.lookup(a);
-    }
-  },
-}));
-vi.mock("@mysten/sui/transactions", async (importOriginal) => {
-  const actual: any = await importOriginal();
-  class FakeTransaction {
-    gas = { $kind: "GasCoin" };
-    setSender(s: string) {
-      sui.log.push(["setSender", s]);
-    }
-    splitCoins(_c: unknown, amounts: unknown[]) {
-      sui.log.push(["splitCoins", ...amounts]);
-      return [{ $kind: "Result" }];
-    }
-    transferObjects(_o: unknown, to: string) {
-      sui.log.push(["transferObjects", to]);
-    }
-    async build() {
-      sui.log.push(["build"]);
-      return new Uint8Array([1, 2, 3, 4]);
-    }
-  }
-  return { ...actual, Transaction: FakeTransaction };
-});
 
 import { invoke } from "../../lib/tauri";
 import {
   SESSION_SEND_TIMING,
   closeSendSession,
   executeStellarTransfer,
-  executeSuiTransfer,
 } from "./session-send";
 import { stellarAdapter } from "../../wallets/stellar-wallet";
-import { suiAdapter, SUI_RPC } from "../../wallets/sui-wallet";
+import { suiAdapter } from "../../wallets/sui-wallet";
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
-import { TransactionDataBuilder } from "@mysten/sui/transactions";
 
 const ABANDON =
   "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
@@ -87,8 +44,9 @@ const ABANDON =
 const xlm = stellarAdapter.deriveFromMnemonic(ABANDON);
 const XLM_SEED = Uint8Array.from(Buffer.from(xlm.privateKey, "hex"));
 const XLM_PUB = ed25519.getPublicKey(XLM_SEED);
+// The session's Sui address is what `closeSendSession` asks to tell its own
+// session from a newer one.
 const suiMe = suiAdapter.deriveFromMnemonic(ABANDON);
-const SUI_PUB = ed25519.getPublicKey(Uint8Array.from(Buffer.from(suiMe.privateKey, "hex")));
 
 const g = (n: number) => Keypair.fromRawEd25519Seed(Buffer.alloc(32, n)).publicKey();
 const DEST = g(9);
@@ -179,11 +137,6 @@ async function fakeInvoke(cmd: string, args: any): Promise<unknown> {
     }
     case "swap_get_sui_address":
       return suiSigner;
-    case "swap_sign_sui_tx":
-      return {
-        signatureBase64: Buffer.from([0, 1, 2]).toString("base64"),
-        publicKeyBase64: Buffer.from(SUI_PUB).toString("base64"),
-      };
     case "swap_lock":
       return null;
     default:
@@ -225,12 +178,6 @@ beforeEach(() => {
   };
   stellarSigner = xlm.address;
   suiSigner = suiMe.address;
-  sui.clientUrls = [];
-  sui.log = [];
-  sui.exec = async () => ({ digest: "DIGEST-OK", effects: { status: { status: "success" } } });
-  sui.lookup = async () => {
-    throw new Error("Could not find the referenced transaction");
-  };
   if (SESSION_SEND_TIMING) Object.assign(SESSION_SEND_TIMING, {
     pollMs: 2,
     stellarTimeoutSecs: 1,
@@ -380,61 +327,7 @@ describe("Stellar amounts go through the decimal parser (#13)", () => {
   });
 });
 
-describe("Sui sends (#3, #8, #9)", () => {
-  const TO = "0x" + "ab".repeat(32);
-  const sendSui = (over: Partial<Parameters<typeof executeSuiTransfer>[0]> = {}) =>
-    executeSuiTransfer({ sessionId: "s", fromAddress: suiMe.address, to: TO, amount: "1.5", ...over });
-
-  it("builds and submits through the adapter's live endpoint, not the dead official host", async () => {
-    await sendSui();
-    // The literal first: before 2026-09-29 this was fullnode.mainnet.sui.io,
-    // whose JSON-RPC answers -32601 "has been deprecated".
-    expect(sui.clientUrls[0]).toBe("https://sui-rpc.publicnode.com");
-    expect(sui.clientUrls).toEqual([SUI_RPC]);
-  });
-
-  it.each([
-    ["0x" + "ab".repeat(20), /Ethereum address/],
-    ["0x" + "a".repeat(63), /has 63/],
-    ["0x2", /has 1/],
-    ["ab".repeat(32), /starts with 0x/],
-    ["0x" + "zz".repeat(32), /not a Sui address/],
-  ])("refuses %s before building", async (to, why) => {
-    await expect(sendSui({ to })).rejects.toThrow(why);
-    expect(sui.log.some(([k]) => k === "build")).toBe(false);
-    expect(invoked("swap_sign_sui_tx")).toEqual([]);
-  });
-
-  it("trims and lowercases the recipient", async () => {
-    await sendSui({ to: `  0X${"AB".repeat(32)} ` });
-    expect(sui.log).toContainEqual(["transferObjects", TO]);
-  });
-
-  it("refuses a wallet whose address is not the session's, before building", async () => {
-    suiSigner = "0x" + "cd".repeat(32);
-    await expect(sendSui()).rejects.toThrow(/isn't supported yet/);
-    expect(sui.log.some(([k]) => k === "build")).toBe(false);
-    expect(invoked("swap_sign_sui_tx")).toEqual([]);
-  });
-
-  it("a submit that throws is settled by digest when the transaction did run", async () => {
-    sui.exec = async () => {
-      throw new Error("fetch failed");
-    };
-    sui.lookup = async () => ({ effects: { status: { status: "success" } } });
-    const digest = TransactionDataBuilder.getDigestFromBytes(new Uint8Array([1, 2, 3, 4]));
-    await expect(sendSui()).resolves.toEqual({ txHash: digest });
-  });
-
-  it("a submit that throws and is never found is an unknown outcome with the digest", async () => {
-    sui.exec = async () => {
-      throw new Error("Request timeout");
-    };
-    const err = await sendSui().catch((e) => e);
-    expect(isSendOutcomeUnknown(err)).toBe(true);
-    expect(err.hash).toBe(TransactionDataBuilder.getDigestFromBytes(new Uint8Array([1, 2, 3, 4])));
-  });
-});
+// The Sui sends (#3, #8, #9) moved to `suiSend.test.ts` (2026-10-01).
 
 describe("the signing session is locked when the send is over (#14)", () => {
   it("locks it when it is still this send's session", async () => {

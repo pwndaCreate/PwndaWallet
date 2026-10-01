@@ -140,7 +140,7 @@ describe("Stellar parties", () => {
 });
 
 // =========================================================================
-// Sui — publicnode JSON-RPC, then GraphQL
+// Sui — GraphQL (publicnode's JSON-RPC was asked first until 2026-10-01)
 // =========================================================================
 
 describe("Sui parties", () => {
@@ -148,117 +148,84 @@ describe("Sui parties", () => {
   const SPONSOR = "0x" + "7b".repeat(32);
   const RECIPIENT = "0x" + "5e".repeat(32);
   const DIGEST = "5iVDN5KzN3zAbj1CexYCvdBdJUEvkFRdkYk4KrfyVnLz";
-  const SUI = "0x2::sui::SUI";
   const SUI_EXPANDED = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
   const USDC = "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC";
-  const rpcResult = (result: unknown) => json(200, { jsonrpc: "2.0", id: 1, result });
-  const rpcError = (code: number, message: string) => json(200, { jsonrpc: "2.0", id: 1, error: { code, message } });
-  /** The layout publicnode returned for a sponsored transaction on 2026-09-30. */
-  const block = (balanceChanges: unknown[]) => ({
-    digest: DIGEST,
-    transaction: {
+  /**
+   * `transaction(digest)` with `balanceChangesJson`, in the layout GraphQL
+   * returned for the public test seed's transactions on 2026-10-01
+   * (`[{ address, coinType, amount }]`, the coin type expanded).
+   */
+  const tx = (changes: Array<[string, string, string?]>) =>
+    json(200, {
       data: {
-        messageVersion: "v1",
-        transaction: { kind: "ProgrammableTransaction", inputs: [], transactions: [] },
-        sender: SENDER,
-        gasData: { payment: [], owner: SPONSOR, price: "721", budget: "950000000" },
+        transaction: {
+          sender: { address: SENDER },
+          effects: {
+            balanceChangesJson: changes.map(([address, amount, coinType]) => ({
+              address,
+              coinType: coinType ?? SUI_EXPANDED,
+              amount,
+            })),
+          },
+        },
       },
-      txSignatures: [],
-    },
-    balanceChanges,
-    timestampMs: "1790788601973",
-    checkpoint: "328740563",
-  });
-  const route = (rpc: () => { status: number; body: string }, gql: () => { status: number; body: string }) => {
-    proxy.handler = (req) => (req.url.includes("graphql") ? gql() : rpc());
+    });
+  /** GraphQL answers; any other host fails the read (2026-10-01: no publicnode). */
+  const graphqlOnly = (answer: () => { status: number; body: string }) => {
+    proxy.handler = (req) => {
+      if (req.url !== "https://graphql.mainnet.sui.io/graphql") throw new Error(`asked ${req.url}`);
+      return answer();
+    };
   };
 
   it("the sender, not the gas sponsor, and the owner whose SUI rose", async () => {
-    route(
-      () =>
-        rpcResult(
-          block([
-            { owner: { AddressOwner: SPONSOR }, coinType: SUI, amount: "-1291380" },
-            { owner: { AddressOwner: SENDER }, coinType: SUI, amount: "-500000000" },
-            { owner: { AddressOwner: RECIPIENT }, coinType: SUI, amount: "500000000" },
-          ]),
-        ),
-      () => {
-        throw new Error("GraphQL must not be asked");
-      },
-    );
-    expect(await suiAdapter.getTransactionParties!(DIGEST, RECIPIENT)).toEqual({
-      from: [SENDER],
-      to: [RECIPIENT],
-      source: "sui-rpc.publicnode.com",
-    });
-    const req = JSON.parse(proxy.calls[0].body ?? "{}");
-    expect(req).toMatchObject({
-      method: "sui_getTransactionBlock",
-      params: [DIGEST, { showInput: true, showBalanceChanges: true }],
-    });
-  });
-
-  it("a transfer of another coin: whoever's balance of it rose", async () => {
-    route(
-      () =>
-        rpcResult(
-          block([
-            { owner: { AddressOwner: SENDER }, coinType: SUI, amount: "-1500000" },
-            { owner: { AddressOwner: SENDER }, coinType: USDC, amount: "-2000000" },
-            { owner: { AddressOwner: RECIPIENT }, coinType: USDC, amount: "2000000" },
-          ]),
-        ),
-      () => json(500, {}),
-    );
-    expect(await suiAdapter.getTransactionParties!(DIGEST, SENDER)).toMatchObject({ from: [SENDER], to: [RECIPIENT] });
-  });
-
-  it("pruned on publicnode (-32602, live): asks GraphQL, which has it", async () => {
-    route(
-      () => rpcError(-32602, `Could not find the referenced transaction [TransactionDigest(${DIGEST})].`),
-      () =>
-        json(200, {
-          data: {
-            transaction: {
-              sender: { address: SENDER },
-              effects: {
-                balanceChanges: {
-                  nodes: [
-                    { owner: { address: RECIPIENT }, amount: "500000000", coinType: { repr: SUI_EXPANDED } },
-                    { owner: { address: SENDER }, amount: "-501097880", coinType: { repr: SUI_EXPANDED } },
-                  ],
-                },
-              },
-            },
-          },
-        }),
+    graphqlOnly(() =>
+      tx([
+        [SPONSOR, "-1291380"],
+        [SENDER, "-500000000"],
+        [RECIPIENT, "500000000"],
+      ]),
     );
     expect(await suiAdapter.getTransactionParties!(DIGEST, RECIPIENT)).toEqual({
       from: [SENDER],
       to: [RECIPIENT],
       source: "graphql.mainnet.sui.io",
     });
-    expect(JSON.parse(proxy.calls[1].body ?? "{}").variables).toEqual({ digest: DIGEST });
+    expect(proxy.calls).toHaveLength(1);
+    const req = JSON.parse(proxy.calls[0].body ?? "{}");
+    expect(req.variables).toEqual({ digest: DIGEST });
+    expect(req.query).toContain("effects { balanceChangesJson }");
   });
 
-  it("unknown to both: null (GraphQL answers `transaction: null`)", async () => {
-    route(
-      () => rpcError(-32602, `Could not find the referenced transaction [TransactionDigest(${DIGEST})].`),
-      () => json(200, { data: { transaction: null } }),
+  it("a transfer of another coin: whoever's balance of it rose", async () => {
+    graphqlOnly(() =>
+      tx([
+        [SENDER, "-1500000"],
+        [SENDER, "-2000000", USDC],
+        [RECIPIENT, "2000000", USDC],
+      ]),
     );
+    expect(await suiAdapter.getTransactionParties!(DIGEST, SENDER)).toMatchObject({ from: [SENDER], to: [RECIPIENT] });
+  });
+
+  it("every recipient of a transaction that paid more owners than one page of balance changes", async () => {
+    // The typed `balanceChanges` connection this read until 2026-10-01 answers
+    // 20 unless asked for more (`serviceConfig.defaultPageSize`, live); the
+    // JSON form is whole.
+    const owners = Array.from({ length: 25 }, (_, i) => "0x" + (i + 16).toString(16).repeat(32));
+    graphqlOnly(() => tx([[SENDER, "-25000000000"], ...owners.map((o): [string, string] => [o, "1000000000"])]));
+    expect((await suiAdapter.getTransactionParties!(DIGEST, SENDER))?.to).toEqual(owners);
+  });
+
+  it("unknown: null (GraphQL answers `transaction: null`; it serves every checkpoint)", async () => {
+    graphqlOnly(() => json(200, { data: { transaction: null } }));
     await expect(suiAdapter.getTransactionParties!(DIGEST, SENDER)).resolves.toBeNull();
   });
 
-  it("publicnode down, GraphQL says unknown: null — GraphQL's answer is the chain's", async () => {
-    route(() => ({ status: 502, body: "bad gateway" }), () => json(200, { data: { transaction: null } }));
-    await expect(suiAdapter.getTransactionParties!(DIGEST, SENDER)).resolves.toBeNull();
-  });
-
-  it("both down: throws, naming both", async () => {
-    route(() => ({ status: 502, body: "bad gateway" }), () => ({ status: 503, body: "unavailable" }));
+  it("GraphQL down: throws, naming the host", async () => {
+    graphqlOnly(() => ({ status: 503, body: "unavailable" }));
     await expect(suiAdapter.getTransactionParties!(DIGEST, SENDER)).rejects.toThrow(
-      /Sui transaction .* could not be read: sui-rpc\.publicnode\.com: .*502.* \| Sui GraphQL failed .*503/,
+      /Sui transaction .* could not be read: Sui GraphQL failed .*graphql\.mainnet\.sui\.io.*503/,
     );
   });
 

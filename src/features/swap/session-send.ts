@@ -59,7 +59,18 @@ import { invoke } from "../../lib/tauri";
 import type { EncryptedData } from "../../crypto";
 import type { SendMemo, TxResult } from "../../wallets/types";
 import { SendOutcomeUnknownError } from "../../wallets/send-outcome";
-import { SUI_RPC, suiAddressFromPublicKey } from "../../wallets/sui-wallet";
+import {
+  SUI_DRY_RUN_BUDGET,
+  SUI_RPC,
+  executeSuiTransaction,
+  readSuiSendState,
+  simulateSuiGas,
+  suiAddressFromPublicKey,
+  suiGasBudget,
+  suiGasPayment,
+  suiTransactionStatus,
+  type SuiSendState,
+} from "../../wallets/sui-wallet";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { executeNearNativeTransfer } from "./swap-sources";
 
@@ -602,15 +613,26 @@ export function parseSuiRecipient(input: string): string {
 /**
  * Native SUI transfer.
  *
- * Uses the SDK's `Transaction` so gas coin selection, budget and the BCS
- * encoding are the library's problem rather than ours. `build({ client })`
- * resolves the sender's coins and the reference gas price from the fullnode,
- * which is why this needs a network round-trip before signing.
+ * Uses the SDK's `Transaction` so the BCS encoding is the library's problem
+ * rather than ours. What it reads from the chain to fill in the gas — the
+ * reference gas price, a dry run for the budget, the coins that pay — comes
+ * from Sui's GraphQL since 2026-10-01 (operator request: Sui is ending
+ * JSON-RPC, and `build({ client })` with the SDK's JSON-RPC client read all
+ * three from publicnode). `buildSuiTransfer` does what that client's
+ * resolver did, so the same chain state gives the same bytes to sign;
+ * `suiSend.test.ts` builds one transfer both ways and compares them.
  *
- * The fullnode is `SUI_RPC` from the wallet adapter (2026-09-29): this used
- * its own copy of the official host, whose JSON-RPC is shut down (-32601
- * "JSON-RPC on public fullnodes has been deprecated"), so every Sui send
- * failed at build time while balances read fine.
+ * The exception is an address balance (`SUI_RPC` in the adapter has why).
+ * Then the transfer is still built through publicnode's JSON-RPC, whose
+ * compatibility coin reservation is the only way this SDK can spend an
+ * address balance; when that fails, from the coins alone if they cover the
+ * amount and the gas, and otherwise it is refused before signing.
+ *
+ * The submit, and the lookup that settles an uncertain one, are GraphQL too.
+ *
+ * Before 2026-09-29 the JSON-RPC host was the official one, whose JSON-RPC
+ * is shut down (-32601 "JSON-RPC on public fullnodes has been deprecated"),
+ * so every Sui send failed at build time while balances read fine.
  */
 export async function executeSuiTransfer(args: {
   sessionId: string;
@@ -632,69 +654,128 @@ export async function executeSuiTransfer(args: {
   ).toLowerCase();
   if (signerAddress !== from) throw new Error(keyMismatchText("Sui", from, signerAddress));
 
-  const { Transaction, TransactionDataBuilder } = await import("@mysten/sui/transactions");
-  const { SuiClient } = await import("@mysten/sui/client");
-
-  const client = new SuiClient({ url: SUI_RPC });
-
-  const tx = new Transaction();
-  tx.setSender(from);
-  const [coin] = tx.splitCoins(tx.gas, [mist]);
-  tx.transferObjects([coin], to);
-
-  const bytes = await tx.build({ client });
+  const { TransactionDataBuilder } = await import("@mysten/sui/transactions");
+  const bytes = await buildSuiTransfer(from, to, mist);
   // Fixed by the bytes, so a failed submit can be looked up by it.
   const digest = TransactionDataBuilder.getDigestFromBytes(bytes);
+  const txBytesBase64 = Buffer.from(bytes).toString("base64");
 
   const signed = await invoke<SignedSui>("swap_sign_sui_tx", {
     sessionId: args.sessionId,
-    input: { txBytesBase64: Buffer.from(bytes).toString("base64") },
+    input: { txBytesBase64 },
   });
   const signedBy = suiAddressFromPublicKey(Buffer.from(signed.publicKeyBase64, "base64"));
   if (signedBy.toLowerCase() !== from) throw new Error(keyMismatchText("Sui", from, signedBy));
 
-  let res: Awaited<ReturnType<typeof client.executeTransactionBlock>>;
+  let res: Awaited<ReturnType<typeof executeSuiTransaction>>;
   try {
-    res = await client.executeTransactionBlock({
-      transactionBlock: Buffer.from(bytes).toString("base64"),
-      signature: signed.signatureBase64,
-      options: { showEffects: true },
-    });
+    res = await executeSuiTransaction(txBytesBase64, signed.signatureBase64);
   } catch (e) {
     // The node may have passed it on before failing to answer. Settled by
     // digest, never by building a second transaction.
-    return settleSuiByDigest(client, digest, errText(e));
+    return settleSuiByDigest(digest, errText(e));
   }
-  const status = res.effects?.status?.status;
-  if (status && status !== "success") {
+  if (res.status === "FAILURE") {
     throw new Error(
-      `Sui ran the transaction and it failed (${res.effects?.status?.error ?? status}). ` +
-        `The gas fee was spent; the amount was not sent. Digest: ${res.digest}`,
+      `Sui ran the transaction and it failed (${res.error ?? "FAILURE"}). ` +
+        `The gas fee was spent; the amount was not sent. Digest: ${digest}`,
     );
   }
-  return { txHash: res.digest || digest };
+  // An answer that names no outcome is not a success (it used to be: the
+  // JSON-RPC answer was read as sent unless it said otherwise).
+  if (res.status !== "SUCCESS") return settleSuiByDigest(digest, "the answer named no outcome");
+  // The digest is the hash of the bytes that were signed, so it is the one
+  // reported, as for Stellar.
+  if (res.digest && res.digest !== digest) {
+    console.warn(`[sui] GraphQL returned digest ${res.digest}, computed ${digest}`);
+  }
+  return { txHash: digest };
 }
 
-async function settleSuiByDigest(
-  client: { getTransactionBlock(input: { digest: string; options?: { showEffects?: boolean } }): Promise<any> },
-  digest: string,
-  why: string,
-): Promise<{ txHash: string }> {
+/**
+ * The transfer's bytes, ready to sign (`executeSuiTransfer` has the two ways
+ * it is built). Every throw here comes before signing.
+ */
+async function buildSuiTransfer(from: string, to: string, mist: bigint): Promise<Uint8Array> {
+  const { Transaction } = await import("@mysten/sui/transactions");
+  const transfer = () => {
+    const tx = new Transaction();
+    tx.setSender(from);
+    const [coin] = tx.splitCoins(tx.gas, [mist]);
+    tx.transferObjects([coin], to);
+    return tx;
+  };
+
+  let state: SuiSendState;
+  try {
+    state = await readSuiSendState(from);
+  } catch (e) {
+    throw new Error(`Sui could not be read to prepare the transfer (${errText(e)}). Nothing was sent.`);
+  }
+
+  let jsonRpcError = "";
+  if (state.addressBalance > 0n) {
+    try {
+      const { SuiClient } = await import("@mysten/sui/client");
+      return await transfer().build({ client: new SuiClient({ url: SUI_RPC }) });
+    } catch (e) {
+      jsonRpcError = errText(e);
+    }
+  }
+
+  const payment = suiGasPayment(state.coins);
+  if (payment.length === 0) {
+    throw new Error(
+      state.addressBalance > 0n
+        ? addressBalanceRefusal(0n, state.addressBalance, jsonRpcError)
+        : "This Sui account has no SUI to pay the network fee. Nothing was sent.",
+    );
+  }
+  const tx = transfer();
+  tx.setGasPrice(state.referenceGasPrice);
+  // The dry run is the resolver's: no gas coins, its fixed budget.
+  tx.setGasBudget(SUI_DRY_RUN_BUDGET);
+  tx.setGasPayment([]);
+  const budget = suiGasBudget(state.referenceGasPrice, await simulateSuiGas(await tx.build()));
+  if (state.addressBalance > 0n) {
+    const inCoins = payment.reduce((sum, c) => sum + c.balance, 0n);
+    if (inCoins < mist + budget) {
+      throw new Error(addressBalanceRefusal(inCoins, state.addressBalance, jsonRpcError));
+    }
+  }
+  tx.setGasBudget(budget);
+  tx.setGasPayment(payment.map(({ objectId, version, digest }) => ({ objectId, version, digest })));
+  return tx.build();
+}
+
+/** The refusal for a send that only an address balance could pay. */
+function addressBalanceRefusal(inCoins: bigint, addressBalance: bigint, why: string): string {
+  return (
+    `${atomicToDecimal(addressBalance, 9)} SUI of this wallet is held as a Sui address balance. This ` +
+    `wallet can spend it only through Sui's JSON-RPC, which did not work (${why}). Its coin objects ` +
+    `hold ${atomicToDecimal(inCoins, 9)} SUI, which has to cover the amount and the network fee. ` +
+    `Nothing was sent.`
+  );
+}
+
+/**
+ * Look a submitted transaction up by digest until GraphQL has it or
+ * `suiLookupMs` passes. Not found by then is an unknown outcome, never
+ * "failed": the transaction may still be running.
+ */
+async function settleSuiByDigest(digest: string, why: string): Promise<{ txHash: string }> {
   const deadline = Date.now() + SESSION_SEND_TIMING.suiLookupMs;
   for (;;) {
-    let status: string | undefined;
-    let error: string | undefined;
+    let found: Awaited<ReturnType<typeof suiTransactionStatus>> = null;
     try {
-      const r = await client.getTransactionBlock({ digest, options: { showEffects: true } });
-      status = r?.effects?.status?.status;
-      error = r?.effects?.status?.error;
+      found = await suiTransactionStatus(digest);
     } catch {
-      // Not known to this node (yet), or the node is unreachable: ask again.
+      // Unreachable for the moment: ask again.
     }
-    if (status === "success") return { txHash: digest };
-    if (status) {
+    if (found?.status === "SUCCESS") return { txHash: digest };
+    if (found?.status === "FAILURE") {
       throw new Error(
-        `Sui ran the transaction and it failed (${error ?? status}). The gas fee was spent; ` +
+        `Sui ran the transaction and it failed (${found.error ?? "FAILURE"}). The gas fee was spent; ` +
           `the amount was not sent. Digest: ${digest}`,
       );
     }
