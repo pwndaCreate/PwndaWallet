@@ -206,8 +206,15 @@ describe("the locked-and-waiting state", () => {
     expect(refundStage({ bid_state_ind: 14 })).toBe("running");
 
     // Terminal refund states: the coins are back, say so.
-    for (const ind of [16, 17, 18]) {
+    for (const ind of [16, 17]) {
       expect(refundStage({ bid_state_ind: ind }), String(ind)).toBe("done");
+    }
+    // 18 (FAILED_SWIPED) was in that list until 2026-10-01. It is no refund
+    // on either leg: the swiper (scriptless) was paid the coin it was buying,
+    // and the scripted leg's coin is what the swipe took. The panel told the
+    // scripted leg "refund complete. your coins are back".
+    for (const leg of ["scripted", "scriptless", "unknown"] as const) {
+      expect(refundStage({ bid_state_ind: 18 }, leg), `18 @ ${leg}`).toBe(null);
     }
 
     // The two classifiers must never both claim a bid, or the UI stacks two

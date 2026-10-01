@@ -655,7 +655,15 @@ export function confirmationsFromEvents(
  *   14 SCRIPT_TX_PREREFUND   the scripted leg has moved into the pre-refund tx
  *   16 NOSCRIPT_TX_RECOVERED the scriptless coin — yours — is back
  *   17 FAILED_REFUNDED       swap over, funds refunded
- *   18 FAILED_SWIPED         swap over, funds swiped back
+ *
+ * Not 18 FAILED_SWIPED, on either leg (corrected 2026-10-01; it read "swap
+ * over, funds swiped back" and returned `done` for every leg but the
+ * scriptless one). The swipe spends the scripted leg's refund output to the
+ * swiper (deployed engine: published under `if was_sent:`,
+ * `basicswap.py:9030-9073`, built by `createCoinALockRefundSwipeTx`, which
+ * signs with the follower's key and pays the follower, `:17483-17530`). So
+ * the swiper was paid the coin it was buying, and the scripted leg's coin
+ * was taken. Neither got a refund.
  */
 export type RefundStage = "running" | "done" | null;
 
@@ -671,13 +679,13 @@ export function refundStage(
   ) {
     return "done";
   }
-  // FAILED_SWIPED is a refund only for the side that LOST the scripted leg.
-  // On the scriptless leg this node is the swiper — it was paid the coin it
-  // was buying — and "refund complete, your coins are back" would name the
-  // wrong coin and the wrong event. That side gets `SwipePanel` instead.
-  if (s === BID_STATE_IDS.XMR_SWAP_FAILED_SWIPED) {
-    return leg === "scriptless" ? null : "done";
-  }
+  // FAILED_SWIPED is a refund for NEITHER side. The scriptless leg is the
+  // swiper and was paid the coin it was buying; the scripted leg is the side
+  // whose coin the swipe took ("Recovered by the other user" on the step
+  // panel, and the node's own "the other party claimed the refund").
+  // "refund complete, your coins are back" was shown to the scripted leg
+  // here until 2026-10-01: false for the coin, and for the event. (`leg`
+  // stays in the signature for the call site; no refund reading needs it now.)
   return null;
 }
 
