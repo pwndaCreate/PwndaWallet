@@ -226,12 +226,29 @@ async function getBalance(address: string): Promise<string> {
   return nanoErgToErg(BigInt(j.nanoErgs || "0"));
 }
 
+/**
+ * One explorer row from `ownAddr`'s side: direction, amount, the fee when
+ * this address paid it, and the other party.
+ *
+ * The amount does not include the fee (operator request, 2026-10-01). A send
+ * read as the address's whole loss, `ownIn - ownOut`, which counts the
+ * miner-fee box too: "sent 0.003104034 ERG" for a transfer that paid
+ * 0.002004034 ERG and a 0.0011 ERG fee. Every other chain's row, and the
+ * send form, state the amount without the fee and the fee beside it
+ * (`useTxHistory.ts`'s 2026-09-30 note on the UTXO accounts), so this does
+ * too: when every input is this address's, it paid the fee — the outputs to
+ * the miner-fee contract — and `fee` carries it. A transaction other inputs
+ * helped fund (a DEX order) keeps the whole loss as its amount: whose share
+ * of the fee was whose is not on the chain.
+ */
 function classifyTxDirection(
   ownAddr: string,
   row: ExplorerTxRow,
 ): {
   direction: "in" | "out" | "self";
   amount: bigint;
+  /** nanoERG; present only when this address funded the transaction alone. */
+  fee?: bigint;
   counterparty?: string;
 } {
   // For an eUTXO row from the explorer, sum nano-value contributed by
@@ -246,23 +263,30 @@ function classifyTxDirection(
   const feeAddr = ergoMinerFeeAddress();
   let ownIn = 0n;
   let ownOut = 0n;
+  let feeOut = 0n;
   let counterIn: string | undefined;
   let counterOut: string | undefined;
-  for (const i of row.inputs ?? []) {
+  const inputs = row.inputs ?? [];
+  for (const i of inputs) {
     if (i.address === ownAddr) ownIn += BigInt(i.value || "0");
     else if (i.address && !counterIn) counterIn = i.address;
   }
   for (const o of row.outputs ?? []) {
     if (o.address === ownAddr) ownOut += BigInt(o.value || "0");
-    else if (o.address && o.address !== feeAddr && !counterOut) counterOut = o.address;
+    else if (o.address === feeAddr) feeOut += BigInt(o.value || "0");
+    else if (o.address && !counterOut) counterOut = o.address;
   }
   const delta = ownOut - ownIn;
+  // Funded by this address alone, so the fee is its own.
+  const soleFunder = inputs.length > 0 && inputs.every((i) => i.address === ownAddr);
+  const paidFee = soleFunder && feeOut > 0n && -delta >= feeOut;
   if (ownIn > 0n && delta <= 0n && !counterOut) {
-    return { direction: "self", amount: ownOut, counterparty: counterIn };
+    return { direction: "self", amount: ownOut, ...(paidFee ? { fee: feeOut } : {}), counterparty: counterIn };
   }
   if (delta > 0n) {
     return { direction: "in", amount: delta, counterparty: counterIn };
   }
+  if (paidFee) return { direction: "out", amount: -delta - feeOut, fee: feeOut, counterparty: counterOut };
   return { direction: "out", amount: -delta, counterparty: counterOut };
 }
 
@@ -276,7 +300,7 @@ async function getTransactionHistory(
     `/addresses/${address}/transactions?offset=${offset}&limit=${limit}`,
   );
   const items: ChainTx[] = (j.items ?? []).map((row) => {
-    const { direction, amount, counterparty } = classifyTxDirection(
+    const { direction, amount, fee, counterparty } = classifyTxDirection(
       address,
       row,
     );
@@ -287,6 +311,8 @@ async function getTransactionHistory(
       hash: row.id,
       direction,
       amount: nanoErgToErg(amount),
+      // Beside the amount, never inside it (2026-10-01, `classifyTxDirection`).
+      fee: fee !== undefined ? nanoErgToErg(fee) : undefined,
       timestamp: row.timestamp ? Math.floor(row.timestamp / 1000) : undefined,
       confirmations,
       height: row.inclusionHeight,

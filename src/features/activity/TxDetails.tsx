@@ -332,7 +332,12 @@ export function txDetailsModel(row: ChainTx, ctx: TxDetailsContext = {}): TxDeta
   const fee = tx.fee ? (feeTicker ? `${tx.fee} ${feeTicker}` : `${tx.fee} (paid by the sender)`) : null;
 
   const own = ctx.ownAddress;
-  const owned = [own, ...(ctx.ownAddresses ?? [])].filter((a): a is string => !!a);
+  // A row may also name the wallet's own identity on its chain when that is
+  // not the displayed address: a Hedera row's account id (`0.0.x`), while the
+  // wallet's address is its public key (2026-10-01). It is "you" too.
+  const owned = [own, ...(ctx.ownAddresses ?? []), metaString(tx, "ownAccountId")].filter(
+    (a): a is string => !!a,
+  );
   const isOwn = (a: string | undefined) => owned.some((o) => sameAddress(a, o));
   const sides = txSides(tx, {
     own,

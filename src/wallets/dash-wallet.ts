@@ -30,6 +30,7 @@ import type {
   SendOptions,
 } from "./types";
 import { proxyGetJson } from "./_proxy";
+import { decimalToAtomic } from "./decimal-amount";
 import { readUtxoParties, type UtxoPartiesSource } from "./parties-a-utxo";
 import type { UtxoAccountSpec } from "./utxo-account";
 import {
@@ -93,15 +94,16 @@ const INSIGHT_BASE = "https://insight.dash.org/insight-api";
 const DERIVATION_PATH = "m/44'/5'/0'/0/0"; // BIP-44, SLIP-44 coin type 5 = Dash
 
 /**
- * Where `getTransactionParties` reads a transaction: BlockCypher (the
- * history's source, whose txrefs name no addresses — the reason this read is
- * needed at all), then the other two hosts this adapter already looks
- * transactions up on, in `DASH_LOOKUPS` order. All through the proxy.
+ * Where `getTransactionParties` reads a transaction, in the order the history
+ * reads (2026-10-01): Insight first, as the history now does — its rows name
+ * every address already, so this read is mostly for rows that came from
+ * BlockCypher, whose txrefs name none — then BlockCypher, then Blockchair.
+ * All through the proxy.
  */
 const DASH_PARTIES_SOURCES: UtxoPartiesSource[] = [
+  { kind: "insight", base: INSIGHT_BASE, via: "proxy" },
   { kind: "blockcypher", base: BLOCKCYPHER_BASE, via: "proxy" },
   { kind: "blockchair", base: BLOCKCHAIR_BASE, via: "proxy" },
-  { kind: "insight", base: INSIGHT_BASE, via: "proxy" },
 ];
 
 // Standard 1-in 2-out P2PKH tx is ~226 bytes. Same as DOGE.
@@ -342,6 +344,113 @@ async function fetchFeeRateBlockcypher(): Promise<number> {
 // =========================================================================
 // Tx history
 // =========================================================================
+//
+// Sources, in order (operator request, 2026-10-01: Activity read
+// "rate limited: Dogecoin, Dash"):
+//
+//  1. Insight (`insight.dash.org`, on the Rust proxy allowlist for the
+//     balance since 2026-06-17). One request gives each transaction whole —
+//     every input's address and value, every output, the fee, the block time
+//     — so a row names both sides and the account merge can split the fee.
+//  2. BlockCypher, the only history source until then: one request too, but
+//     its txrefs name no address, and its ~100 requests an hour are shared
+//     with the DASH sends' UTXO reads and with LTC and DOGE. It answered
+//     `429 {"error": "Limits reached."}` on the operator's machine.
+//
+// Blockchair is not used for history: it answered 430 (IP blacklisted) from
+// the same machine on 2026-09-30.
+
+/**
+ * Insight's `/addrs/{addr}/txs` page cap: `to - from` above 50 is refused
+ * with `503 "from" (0) and "to" (51) range should be less than or equal to
+ * 50` (live, 2026-10-01).
+ */
+const INSIGHT_MAX_PAGE = 50;
+
+/** One transaction as Insight lists it (the fields a row reads; live layout). */
+export interface InsightTx {
+  txid: string;
+  vin?: Array<{ addr?: string; valueSat?: number; coinbase?: string }>;
+  vout?: Array<{ value?: string | number; scriptPubKey?: { addresses?: string[] } }>;
+  /** -1 while in the mempool. */
+  blockheight?: number;
+  confirmations?: number;
+  time?: number;
+  blocktime?: number;
+}
+
+/** Duffs from an Insight output's `value` ("0.00117200"), exactly. */
+function insightOutputDuffs(v: string | number | undefined): bigint {
+  const s = typeof v === "number" ? v.toFixed(8) : String(v ?? "0");
+  try {
+    return decimalToAtomic(s, 8, "Insight output value");
+  } catch {
+    return 0n;
+  }
+}
+
+/**
+ * One Insight transaction as `addr`'s row: its net, the fee when it sent,
+ * the first output that is not its own as the counterparty, and every
+ * input's and output's address for the account merge (`netAccountTx`) and
+ * the details. Exported for tests.
+ */
+export function insightTxToChainTx(tx: InsightTx, addr: string): ChainTx {
+  let mineIn = 0n;
+  let totalIn = 0n;
+  let coinbase = false;
+  const inputs: string[] = [];
+  for (const v of tx.vin ?? []) {
+    if (v.coinbase) coinbase = true;
+    const sat = BigInt(Math.trunc(Number(v.valueSat ?? 0)));
+    totalIn += sat;
+    if (v.addr === addr) mineIn += sat;
+    inputs.push(typeof v.addr === "string" ? v.addr : "");
+  }
+  let mineOut = 0n;
+  let totalOut = 0n;
+  let firstExternal: string | undefined;
+  const outputs: string[] = [];
+  for (const v of tx.vout ?? []) {
+    const sat = insightOutputDuffs(v.value);
+    const addrs = Array.isArray(v.scriptPubKey?.addresses) ? v.scriptPubKey!.addresses : [];
+    totalOut += sat;
+    if (addrs.includes(addr)) mineOut += sat;
+    else if (!firstExternal && addrs[0]) firstExternal = addrs[0];
+    outputs.push(addrs[0] ?? "");
+  }
+  const net = mineOut - mineIn;
+  const direction: ChainTx["direction"] = net > 0n ? "in" : net < 0n ? "out" : "self";
+  const fee = !coinbase && totalIn >= totalOut ? totalIn - totalOut : null;
+  const height = typeof tx.blockheight === "number" && tx.blockheight > 0 ? tx.blockheight : undefined;
+  const abs = net < 0n ? -net : net;
+  return {
+    chain: "dash",
+    hash: tx.txid,
+    direction,
+    amount: `${abs / 100_000_000n}.${(abs % 100_000_000n).toString().padStart(8, "0")}`,
+    fee: direction === "out" && fee !== null ? `${fee / 100_000_000n}.${(fee % 100_000_000n).toString().padStart(8, "0")}` : undefined,
+    timestamp: tx.blocktime ?? tx.time,
+    // As the BlockCypher rows: Insight's own count, 0 in the mempool.
+    confirmations: height !== undefined ? (tx.confirmations ?? undefined) : 0,
+    height,
+    counterparty: direction === "out" ? firstExternal : undefined,
+    meta: {
+      netSat: Number(net),
+      ...(fee !== null ? { feeSat: Number(fee) } : {}),
+      source: "insight.dash.org",
+      outputs,
+      inputs,
+    },
+  };
+}
+
+async function fetchHistoryInsight(addr: string, limit = 25): Promise<ChainTx[]> {
+  const to = Math.min(Math.max(1, limit), INSIGHT_MAX_PAGE);
+  const r = await proxyGetJson<{ items?: InsightTx[] }>(`${INSIGHT_BASE}/addrs/${addr}/txs?from=0&to=${to}`);
+  if (!r || !Array.isArray(r.items)) throw new Error("unexpected response (no items)");
+  return r.items.filter((t) => typeof t?.txid === "string").map((t) => insightTxToChainTx(t, addr));
+}
 
 interface BlockCypherTxRef {
   tx_hash: string;
@@ -711,10 +820,13 @@ export const dashAdapter: ChainAdapter = {
     opts?: { limit?: number; cursor?: string }
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
-    // A failure throws (2026-09-30). It read as an empty history, which the
-    // history hook stores as the address's list; `ChainAdapter` says an adapter
-    // throws once every source has failed, and this is the only one.
-    const items = await fetchHistoryBlockcypher(address, limit);
+    // A failure throws (2026-09-30): it read as an empty history. Since
+    // 2026-10-01 there are two sources (see "Tx history" above); it throws
+    // once both have failed, naming each one's answer.
+    const items = await tryEach<ChainTx[]>([
+      { name: "insight", fn: () => fetchHistoryInsight(address, limit) },
+      { name: "blockcypher", fn: () => fetchHistoryBlockcypher(address, limit) },
+    ]);
     return { items };
   },
 

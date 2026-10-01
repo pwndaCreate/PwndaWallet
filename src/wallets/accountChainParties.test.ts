@@ -263,32 +263,41 @@ describe("Sui parties", () => {
   });
 
   it("history rows now name the other side, as counterparty and meta.from / meta.to", async () => {
+    // GraphQL since 2026-10-01 (`sui-wallet.test.ts` has why); the live
+    // `Address.transactions` node layout.
     const ME = RECIPIENT;
-    proxy.handler = ({ body }) => {
-      const from = "FromAddress" in JSON.parse(body ?? "{}").params[0].filter;
-      const row = (digest: string, changes: unknown[]) => ({ digest, timestampMs: "1790000000000", checkpoint: "1", balanceChanges: changes });
-      return rpcResult({
-        data: from
-          ? [
-              row("DigestSent", [
-                { owner: { AddressOwner: ME }, coinType: SUI, amount: "-1001000000" },
-                { owner: { AddressOwner: SENDER }, coinType: SUI, amount: "1000000000" },
-              ]),
-            ]
-          : [
-              row("DigestReceived", [
-                { owner: { AddressOwner: SPONSOR }, coinType: SUI, amount: "-1000000" },
-                { owner: { AddressOwner: SENDER }, coinType: SUI, amount: "-250000000" },
-                { owner: { AddressOwner: ME }, coinType: SUI, amount: "250000000" },
-              ]),
-            ],
+    const node = (digest: string, sender: string, changes: Array<[string, string]>) => ({
+      digest,
+      sender: { address: sender },
+      effects: {
+        status: "SUCCESS",
+        timestamp: "2026-09-21T12:26:40.000Z",
+        checkpoint: { sequenceNumber: 1 },
+        executionError: null,
+        balanceChangesJson: changes.map(([address, amount]) => ({ address, coinType: SUI_EXPANDED, amount })),
+      },
+    });
+    proxy.handler = ({ url }) => {
+      expect(url).toContain("graphql");
+      return json(200, {
+        data: {
+          address: {
+            transactions: {
+              pageInfo: { hasPreviousPage: false, startCursor: "c" },
+              nodes: [
+                node("DigestSent", ME, [[ME, "-1001000000"], [SENDER, "1000000000"]]),
+                node("DigestReceived", SENDER, [[SPONSOR, "-1000000"], [SENDER, "-250000000"], [ME, "250000000"]]),
+              ],
+            },
+          },
+        },
       });
     };
     const items = (await suiAdapter.getTransactionHistory(ME)).items;
     const sent = items.find((t) => t.hash === "DigestSent")!;
     const received = items.find((t) => t.hash === "DigestReceived")!;
     expect(sent).toMatchObject({ direction: "out", counterparty: SENDER, meta: { from: ME, to: SENDER } });
-    // The sender's fall is the amount; the sponsor's, only gas.
+    // The transaction's sender, not its gas sponsor.
     expect(received).toMatchObject({ direction: "in", counterparty: SENDER, meta: { from: SENDER, to: ME } });
   });
 });
@@ -724,7 +733,8 @@ describe("Aptos parties and rows", () => {
   });
 
   it("history: an APT fungible-asset send reads its real amount and recipient; another asset is skipped", async () => {
-    stubFetch(() => [
+    // The sent list; the indexer (read since 2026-10-01) knows nothing more.
+    stubFetch((url) => (url.endsWith("/graphql") ? [200, { data: { account_transactions: [] } }] : [
       200,
       [
         tx({
@@ -738,9 +748,12 @@ describe("Aptos parties and rows", () => {
             arguments: [{ inner: "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b" }, THEM, "1000000"],
           }),
           hash: "0x" + "02".repeat(32),
+          // Each transaction has its own version (the history merges by it
+          // since 2026-10-01).
+          version: "7318426324",
         },
       ],
-    ]);
+    ]));
     const items = (await aptAdapter.getTransactionHistory(ME)).items;
     // Was: counterparty "[object Object]" and the recipient address read as
     // a hex amount; and the USDC transfer listed as APT.
@@ -1008,6 +1021,70 @@ describe("Ergo parties", () => {
     // Was: "out" of 0.0011 ERG, counterparty the fee contract.
     expect(merged).toMatchObject({ direction: "self", amount: "0.0039" });
     expect(merged.counterparty).toBeUndefined();
+  });
+
+  it("history: a send's amount leaves its fee out, and the fee stands beside it (2026-10-01)", async () => {
+    const OTHER = "9iInventedCoFunderAddressxxxxxxxxxxxxxxxxxxxxxxxxxx";
+    const withChange = {
+      ...tx,
+      id: "c1".repeat(32),
+      inputs: [{ ...tx.inputs[0], value: 5000000 }],
+      outputs: [
+        { ...tx.outputs[0], value: 2000000 },
+        { ...tx.outputs[0], boxId: "87".repeat(32), address: ME, value: 1900000 },
+        { ...tx.outputs[1], value: 1100000 },
+      ],
+    };
+    // Another address's input too (a DEX order): whose share of the fee was
+    // whose is not on the chain, so the whole loss stays the amount.
+    const coFunded = {
+      ...tx,
+      id: "c2".repeat(32),
+      inputs: [
+        { ...tx.inputs[0], value: 3000000 },
+        { ...tx.inputs[0], boxId: "52".repeat(32), address: OTHER, value: 1000000 },
+      ],
+      outputs: [
+        { ...tx.outputs[0], value: 2900000 },
+        { ...tx.outputs[1], value: 1100000 },
+      ],
+    };
+    const received = {
+      ...tx,
+      id: "c3".repeat(32),
+      inputs: [{ ...tx.inputs[0], address: THEM }],
+      outputs: [
+        { ...tx.outputs[0], address: ME },
+        { ...tx.outputs[1] },
+      ],
+    };
+    stubFetch(() => [200, { items: [tx, withChange, coFunded, received], total: 4 }]);
+    const [live, change, dex, receipt] = (await ergoAdapter.getTransactionHistory(ME)).items;
+    // Was "0.003104034": the 0.0011 ERG fee box counted as sent.
+    expect(live).toMatchObject({ direction: "out", amount: "0.002004034", fee: "0.0011", counterparty: THEM });
+    expect(change).toMatchObject({ direction: "out", amount: "0.002", fee: "0.0011" });
+    expect(dex).toMatchObject({ direction: "out", amount: "0.003" });
+    expect(dex.fee).toBeUndefined();
+    expect(receipt).toMatchObject({ direction: "in", amount: "0.002004034", counterparty: THEM });
+    expect(receipt.fee).toBeUndefined();
+  });
+
+  it("history: a consolidation carries the fee it paid", async () => {
+    const consolidation = {
+      ...tx,
+      id: "c4".repeat(32),
+      inputs: [
+        { ...tx.inputs[0], value: 3000000 },
+        { ...tx.inputs[0], boxId: "51".repeat(32), value: 2000000 },
+      ],
+      outputs: [
+        { ...tx.outputs[0], address: ME, value: 3900000 },
+        { ...tx.outputs[1], value: 1100000 },
+      ],
+    };
+    stubFetch(() => [200, { items: [consolidation], total: 1 }]);
+    const [row] = (await ergoAdapter.getTransactionHistory(ME)).items;
+    expect(row).toMatchObject({ direction: "self", amount: "0.0039", fee: "0.0011" });
   });
 
   it("404 `Not found Transaction with id` (live) from the mirrors: null; both failing: throws", async () => {

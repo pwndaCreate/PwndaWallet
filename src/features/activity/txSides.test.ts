@@ -115,6 +115,36 @@ describe("rows that already name both sides", () => {
   });
 });
 
+describe("a Hedera row: the wallet's account id is its own side (2026-10-01)", () => {
+  // The wallet's address is its PUBLIC KEY; the row and the chain name
+  // account ids. Without `meta.ownAccountId` nothing on either side was "you".
+  const PUBKEY = "0x" + "2e".repeat(32);
+  const ME = "0.0.3229";
+  const THEM = "0.0.3230";
+  const row: ChainTx = {
+    chain: "hedera",
+    hash: `${THEM}-1789999999-000000001`,
+    direction: "in",
+    amount: "1.00000000",
+    timestamp: 1_790_000_000,
+    counterparty: THEM,
+    meta: { name: "CRYPTOTRANSFER", result: "SUCCESS", ownAccountId: ME, from: [THEM], to: [ME] },
+  };
+
+  it("marks the account id the row names as the wallet's", () => {
+    const m = txDetailsModel(row, { ownAddress: PUBKEY });
+    expect(m.from).toEqual([{ address: THEM, you: false }]);
+    expect(m.to).toEqual([{ address: ME, you: true }]);
+    expect(m.needsParties).toBe(false);
+  });
+
+  it("and in what the chain said, when the details had to ask", () => {
+    const failed: ChainTx = { ...row, direction: "failed", meta: { ownAccountId: ME } };
+    const m = txDetailsModel(failed, { ownAddress: PUBKEY, parties: done({ from: [ME], to: [] }) });
+    expect(m.from).toEqual([{ address: ME, you: true }]);
+  });
+});
+
 describe("readTxParties: one read per transaction, answers kept for the session", () => {
   afterEach(() => {
     clearTxPartiesCache();

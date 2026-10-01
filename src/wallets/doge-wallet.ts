@@ -16,6 +16,9 @@
  *   - dogechain.info `dogechain.info/api/v1`         — tertiary for
  *     balance + UTXO + broadcast. API shape less consistent than the
  *     other two so we treat it as last-resort.
+ *   - Bitcore `api.bitcore.io/api/DOGE/mainnet`      — primary for
+ *     balance (2026-06-17) and, since 2026-10-01, the history fallback
+ *     when Blockchair refuses (see "History" below).
  *
  * All three hosts are already on `http_proxy.rs` allowlist via the
  * existing BTC/DOGE entries — no Rust change required.
@@ -120,9 +123,11 @@ const BITCORE_DOGE_BALANCE = (addr: string) =>
 
 /**
  * Where `getTransactionParties` reads a transaction: Blockchair, the
- * history's only source, then BlockCypher, the other host this adapter
+ * history's first source, then BlockCypher, the other host this adapter
  * already looks transactions up on (`DOGE_LOOKUPS`) — Blockchair blacklists a
- * busy IP (HTTP 430), which would otherwise leave no way to read one.
+ * busy IP (HTTP 430), which would otherwise leave no way to read one. (The
+ * history's fallback since 2026-10-01, Bitcore, is not a reader here:
+ * `parties-a-utxo.ts` has no Bitcore form.)
  */
 const DOGE_PARTIES_SOURCES: UtxoPartiesSource[] = [
   { kind: "blockchair", base: BLOCKCHAIR_BASE, via: "proxy" },
@@ -451,6 +456,278 @@ async function dogeSatPerKb(): Promise<{ satPerKb: number; oracle: number | null
     /* keep the floor */
   }
   return { satPerKb: clampDogeSatPerKb(oracle), oracle };
+}
+
+// =========================================================================
+// History — Blockchair, then Bitcore (2026-10-01)
+// =========================================================================
+//
+// Operator request, 2026-10-01: Activity read "rate limited: Dogecoin,
+// Dash". Blockchair was the ONLY DOGE history source, and it answered 430
+// (IP blacklisted) from the operator's machine on 2026-09-30.
+//
+// The hosts on the Rust proxy allowlist, checked for DOGE history (live,
+// read-only, the public test seed's address):
+//   - api.bitcore.io: `/address/{a}/txs` answers (200) — used below.
+//   - api.blockcypher.com: txrefs answer when it is not rate limited, but it
+//     is the source that was (`429 {"error": "Limits reached."}`), and its
+//     ~100 requests an hour are the DOGE sends' first UTXO source. Not used
+//     for history, so the history poll cannot spend the sends' budget.
+//   - dogechain.info: no TLS session from this machine
+//     (`tls_get_more_records:packet length too long`); the adapter notes it
+//     sits behind a bot gate. Not used.
+//
+// Bitcore lists COINS, not transactions: each output the address received
+// (`mintTxid`, `mintHeight`) and, once spent, what spent it (`spentTxid`,
+// `spentHeight`), with no time and no fee. So the row's net comes from the
+// coins (+value where minted, −value where spent), and each transaction's
+// block time and fee from `/tx/{txid}`, read once per session. The coins are
+// listed by when they were created, not spent: a coin older than the newest
+// BITCORE_DOGE_COINS could hide a recent spend of it — a limit of this
+// fallback, for an address with that many coins.
+
+const BITCORE_DOGE = "https://api.bitcore.io/api/DOGE/mainnet";
+/** Coins read per history read from Bitcore. */
+export const BITCORE_DOGE_COINS = 500;
+
+/** One Bitcore coin (an output the address received), live layout. */
+export interface BitcoreCoin {
+  mintTxid?: string;
+  /** -1 while the minting transaction is in the mempool. */
+  mintHeight?: number;
+  /** "" while unspent. */
+  spentTxid?: string;
+  /** -2 unspent, -1 spent in the mempool. */
+  spentHeight?: number;
+  value?: number;
+  address?: string;
+}
+
+/** A transaction's block time (POSIX s) and fee (sat), from Bitcore `/tx/{txid}`. */
+interface BitcoreTxDetail {
+  time?: number;
+  feeSat?: number;
+}
+
+/** Confirmed transactions' details, by txid. Bounded: oldest out. */
+const bitcoreTxDetails = new Map<string, BitcoreTxDetail>();
+const BITCORE_DETAILS_MAX = 2000;
+
+/** For tests: forget the transaction details read this session. */
+export function clearDogeHistoryCache(): void {
+  bitcoreTxDetails.clear();
+}
+
+async function bitcoreTxDetail(txid: string): Promise<BitcoreTxDetail> {
+  const known = bitcoreTxDetails.get(txid);
+  if (known) return known;
+  const t = await proxyGetJson<{ txid?: string; blockHeight?: number; blockTime?: string; fee?: number }>(
+    `${BITCORE_DOGE}/tx/${txid}`,
+  );
+  if (t?.txid !== txid) throw new Error(`bitcore answered another transaction for ${txid}`);
+  const ms = typeof t.blockTime === "string" ? Date.parse(t.blockTime) : NaN;
+  const detail: BitcoreTxDetail = {
+    ...(Number.isFinite(ms) ? { time: Math.floor(ms / 1000) } : {}),
+    ...(typeof t.fee === "number" && t.fee >= 0 ? { feeSat: t.fee } : {}),
+  };
+  if (typeof t.blockHeight === "number" && t.blockHeight > 0) {
+    bitcoreTxDetails.set(txid, detail);
+    while (bitcoreTxDetails.size > BITCORE_DETAILS_MAX) {
+      const oldest = bitcoreTxDetails.keys().next().value;
+      if (oldest === undefined) break;
+      bitcoreTxDetails.delete(oldest);
+    }
+  }
+  return detail;
+}
+
+/**
+ * Bitcore coins as the address's transactions: each txid's signed net
+ * (sat) and height, the mempool first, then newest first. Exported for tests.
+ */
+export function bitcoreCoinsToTxs(coins: readonly BitcoreCoin[], address: string): Array<{ txid: string; net: number; height: number }> {
+  const byTx = new Map<string, { txid: string; net: number; height: number }>();
+  const add = (txid: string | undefined, delta: number, height: number | undefined) => {
+    if (typeof txid !== "string" || !txid) return;
+    const h = typeof height === "number" ? height : -1;
+    const seen = byTx.get(txid);
+    if (seen) seen.net += delta;
+    else byTx.set(txid, { txid, net: delta, height: h });
+  };
+  for (const c of coins) {
+    if (c.address && c.address !== address) continue;
+    const value = typeof c.value === "number" && Number.isFinite(c.value) ? c.value : 0;
+    // Below -1 is a conflicting or failed record, never a transaction to list.
+    if (typeof c.mintHeight === "number" && c.mintHeight < -1) continue;
+    add(c.mintTxid, value, c.mintHeight);
+    if (c.spentTxid && !(typeof c.spentHeight === "number" && c.spentHeight < -1)) add(c.spentTxid, -value, c.spentHeight);
+  }
+  const rank = (h: number) => (h < 0 ? Number.POSITIVE_INFINITY : h);
+  return [...byTx.values()].sort((a, b) => rank(b.height) - rank(a.height));
+}
+
+/** `fn` over `items`, at most `size` at a time, results in order. */
+async function inPool<T, R>(items: readonly T[], size: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, worker));
+  return out;
+}
+
+const satToDoge = (sat: number) => (Math.abs(sat) / 1e8).toFixed(8);
+
+/**
+ * The first source: Blockchair's address dashboard (the txids), then its
+ * transaction dashboards in batches of 10. Moved here unchanged on
+ * 2026-10-01 except: it throws when the address is missing from the answer or
+ * when EVERY batch failed (an empty list built from failures is not "no
+ * transactions", and Bitcore should be asked instead); and a mempool row
+ * (`block_id: -1`) is no longer given height -1, which read "confirmed".
+ */
+async function fetchHistoryBlockchair(address: string, limit: number, offset: number): Promise<TxHistoryPage> {
+  const data = await proxyGetJson<{
+    data: Record<
+      string,
+      {
+        address: { received: number; spent: number };
+        transactions: string[];
+      }
+    >;
+  }>(`${BLOCKCHAIR_BASE}/dashboards/address/${address}?limit=${limit}&offset=${offset}`);
+  const entry = data.data?.[address];
+  if (!entry) throw new Error("blockchair: the answer does not list this address");
+  const txids: string[] = (entry.transactions ?? []).slice(0, limit);
+  if (txids.length === 0) return { items: [] };
+
+  const items: ChainTx[] = [];
+  let batches = 0;
+  let failed = 0;
+  let lastError = "";
+  for (let i = 0; i < txids.length; i += 10) {
+    const batch = txids.slice(i, i + 10);
+    batches += 1;
+    try {
+      const detail = await proxyGetJson<{
+        data: Record<
+          string,
+          {
+            transaction: { hash: string; time: string; block_id: number; fee: number };
+            inputs: { recipient: string; value: number }[];
+            outputs: { recipient: string; value: number }[];
+          }
+        >;
+      }>(`${BLOCKCHAIR_BASE}/dashboards/transactions/${batch.join(",")}`);
+      for (const txid of batch) {
+        const d = detail.data?.[txid];
+        if (!d) continue;
+        let outFromMe = 0;
+        for (const inp of d.inputs ?? []) {
+          if (inp.recipient === address) outFromMe += inp.value || 0;
+        }
+        let inToMe = 0;
+        let firstExternalOut: string | undefined;
+        for (const out of d.outputs ?? []) {
+          if (out.recipient === address) inToMe += out.value || 0;
+          else if (!firstExternalOut) firstExternalOut = out.recipient;
+        }
+        const net = inToMe - outFromMe;
+        const direction: ChainTx["direction"] =
+          net > 0 ? "in" : net < 0 ? "out" : "self";
+        const mined = d.transaction.block_id > 0;
+        items.push({
+          chain: "dogecoin",
+          hash: d.transaction.hash,
+          direction,
+          amount: satToDoge(net),
+          fee:
+            direction === "out" && d.transaction.fee
+              ? (d.transaction.fee / 1e8).toFixed(8)
+              : undefined,
+          timestamp: d.transaction.time
+            ? Math.floor(new Date(d.transaction.time + "Z").getTime() / 1000)
+            : undefined,
+          // Blockchair's mempool `block_id` is -1, which as a height read
+          // "confirmed" in the details (2026-10-01).
+          height: mined ? d.transaction.block_id : undefined,
+          ...(mined ? {} : { confirmations: 0 }),
+          counterparty: direction === "out" ? firstExternalOut : undefined,
+          // The signed net and the tx's addresses, for the account-wide
+          // merge (`accountTxHistory`, utxo-account-history.ts, 2026-09-30).
+          meta: {
+            netSat: net,
+            outputs: (d.outputs ?? []).map((o) => o.recipient ?? ""),
+            inputs: (d.inputs ?? []).map((i) => i.recipient ?? ""),
+          },
+        });
+      }
+    } catch (e) {
+      // A failed batch is skipped: partial history is still useful…
+      failed += 1;
+      lastError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  // …but every batch failing is a failed read, not an empty one.
+  if (failed === batches) throw new Error(`blockchair transaction details: ${lastError}`);
+  const cursor = txids.length === limit ? String(offset + limit) : undefined;
+  return { items, cursor };
+}
+
+/**
+ * The fallback: Bitcore's coins for the address, then each listed
+ * transaction's time and fee (`bitcoreTxDetail`, four at a time, once per
+ * session). See the section note for what Bitcore can and cannot say.
+ */
+async function fetchHistoryBitcore(address: string, limit: number, offset: number): Promise<TxHistoryPage> {
+  const coins = await proxyGetJson<BitcoreCoin[]>(`${BITCORE_DOGE}/address/${address}/txs?limit=${BITCORE_DOGE_COINS}`);
+  if (!Array.isArray(coins)) throw new Error("bitcore: unexpected response (not a list of coins)");
+  const all = bitcoreCoinsToTxs(coins, address);
+  const page = all.slice(offset, offset + limit);
+  let failed = 0;
+  let lastError = "";
+  const details = await inPool(page, 4, async (t) => {
+    try {
+      return await bitcoreTxDetail(t.txid);
+    } catch (e) {
+      failed += 1;
+      lastError = e instanceof Error ? e.message : String(e);
+      return null;
+    }
+  });
+  if (page.length > 0 && failed === page.length) throw new Error(`bitcore transaction details: ${lastError}`);
+  if (failed > 0) {
+    // Seen once in the 2026-10-01 live check (3 of 13, not reproduced in
+    // three bursts of 13 after it): said, so the next one can be read.
+    console.warn(`[doge] ${failed} of ${page.length} transaction(s) could not be read from bitcore this time: ${lastError}`);
+  }
+  const items: ChainTx[] = [];
+  page.forEach((t, i) => {
+    const d = details[i];
+    // A transaction whose details could not be read is left out this time
+    // (no time to sort it by); the next read asks again.
+    if (!d) return;
+    const direction: ChainTx["direction"] = t.net > 0 ? "in" : t.net < 0 ? "out" : "self";
+    const mined = t.height > 0;
+    items.push({
+      chain: "dogecoin",
+      hash: t.txid,
+      direction,
+      amount: satToDoge(t.net),
+      fee: direction === "out" && d.feeSat ? satToDoge(d.feeSat) : undefined,
+      timestamp: d.time,
+      height: mined ? t.height : undefined,
+      ...(mined ? {} : { confirmations: 0 }),
+      // The address's signed net, which the account merge sums per txid
+      // (`accountTxHistory`). Bitcore names no other address.
+      meta: { netSat: t.net, source: "api.bitcore.io" },
+    });
+  });
+  return { items, cursor: all.length > offset + limit ? String(offset + limit) : undefined };
 }
 
 // =========================================================================
@@ -848,87 +1125,13 @@ export const dogeAdapter: ChainAdapter = {
   ): Promise<TxHistoryPage> {
     const limit = opts?.limit ?? 25;
     const offset = opts?.cursor ? Number(opts.cursor) : 0;
-
-    // Blockchair's `dashboards/address` is the richest one-shot source for
-    // a doge address (sorted txid list, pagination via offset). Tx detail
-    // is then resolved in batches of 10. dogechain.info's history shape is
-    // less consistent — kept as a soft fallback only for the listing step,
-    // not for tx detail.
-    const data = await proxyGetJson<{
-      data: Record<
-        string,
-        {
-          address: { received: number; spent: number };
-          transactions: string[];
-        }
-      >;
-    }>(
-      `${BLOCKCHAIR_BASE}/dashboards/address/${address}?limit=${limit}&offset=${offset}`
-    );
-    const entry = data.data?.[address];
-    const txids: string[] = (entry?.transactions ?? []).slice(0, limit);
-    if (txids.length === 0) return { items: [] };
-
-    const items: ChainTx[] = [];
-    for (let i = 0; i < txids.length; i += 10) {
-      const batch = txids.slice(i, i + 10);
-      try {
-        const detail = await proxyGetJson<{
-          data: Record<
-            string,
-            {
-              transaction: { hash: string; time: string; block_id: number; fee: number };
-              inputs: { recipient: string; value: number }[];
-              outputs: { recipient: string; value: number }[];
-            }
-          >;
-        }>(`${BLOCKCHAIR_BASE}/dashboards/transactions/${batch.join(",")}`);
-        for (const txid of batch) {
-          const d = detail.data?.[txid];
-          if (!d) continue;
-          let outFromMe = 0;
-          for (const inp of d.inputs ?? []) {
-            if (inp.recipient === address) outFromMe += inp.value || 0;
-          }
-          let inToMe = 0;
-          let firstExternalOut: string | undefined;
-          for (const out of d.outputs ?? []) {
-            if (out.recipient === address) inToMe += out.value || 0;
-            else if (!firstExternalOut) firstExternalOut = out.recipient;
-          }
-          const net = inToMe - outFromMe;
-          const direction: ChainTx["direction"] =
-            net > 0 ? "in" : net < 0 ? "out" : "self";
-          items.push({
-            chain: "dogecoin",
-            hash: d.transaction.hash,
-            direction,
-            amount: (Math.abs(net) / 1e8).toFixed(8),
-            fee:
-              direction === "out" && d.transaction.fee
-                ? (d.transaction.fee / 1e8).toFixed(8)
-                : undefined,
-            timestamp: d.transaction.time
-              ? Math.floor(new Date(d.transaction.time + "Z").getTime() / 1000)
-              : undefined,
-            height: d.transaction.block_id,
-            counterparty: direction === "out" ? firstExternalOut : undefined,
-            // The signed net and the tx's addresses, for the account-wide
-            // merge (`accountTxHistory`, utxo-account-history.ts, 2026-09-30).
-            meta: {
-              netSat: net,
-              outputs: (d.outputs ?? []).map((o) => o.recipient ?? ""),
-              inputs: (d.inputs ?? []).map((i) => i.recipient ?? ""),
-            },
-          });
-        }
-      } catch {
-        /* skip the batch on failure; partial history is still useful */
-      }
-    }
-
-    const cursor = txids.length === limit ? String(offset + limit) : undefined;
-    return { items, cursor };
+    // Blockchair, then Bitcore (see "History" above); throws once both have
+    // failed, naming each one's answer. The cursor is an offset into the
+    // address's transactions, newest first, for either source.
+    return tryEach<TxHistoryPage>([
+      { name: "blockchair", fn: () => fetchHistoryBlockchair(address, limit, offset) },
+      { name: "bitcore", fn: () => fetchHistoryBitcore(address, limit, offset) },
+    ]);
   },
 
   /** Every input's and output's address, by txid (`parties-a-utxo.ts`). */

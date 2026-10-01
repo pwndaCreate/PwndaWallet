@@ -41,6 +41,19 @@ function tinybarsFixed8(t: bigint): string {
   return `${n / 100_000_000n}.${(n % 100_000_000n).toString().padStart(8, "0")}`;
 }
 
+/**
+ * Pages of `/transactions?account.id=…` one history read follows (operator
+ * request, 2026-10-01).
+ *
+ * The mirror answers that query one TIME WINDOW at a time, about 60 days
+ * (5,184,000 s between successive `links.next` timestamps, read live), and an
+ * empty window still carries a `links.next` to the one before it. The history
+ * made one request, so an account idle for more than ~60 days read "no
+ * transactions". Following five windows reaches back about 300 days; an
+ * account idle longer still reads empty, with the cursor to go further.
+ */
+export const HEDERA_HISTORY_MAX_PAGES = 5;
+
 /** The paying account of a transaction id (`0.0.1234-1790788932-436079025` → `0.0.1234`). */
 function hederaPayerOf(transactionId: unknown): string | undefined {
   const m = /^(\d+\.\d+\.\d+)[-@]/.exec(typeof transactionId === "string" ? transactionId : "");
@@ -258,14 +271,32 @@ export const hbarAdapter: ChainAdapter = {
     }
     if (!accountId) return { items: [] };
 
+    // Window after window until `limit` rows (see HEDERA_HISTORY_MAX_PAGES).
+    // Only the mirror's own relative `/api/v1/transactions?…` links are
+    // followed. A failure after the first page keeps what was read when that
+    // is something; when it is nothing it throws, since an empty answer
+    // built from a failure is not "no transactions".
     const cursorPart = opts?.cursor ? `&timestamp=lt:${opts.cursor}` : "";
-    const data = await proxyGetJson<{
-      transactions: any[];
-      links?: { next?: string | null };
-    }>(
-      `${MIRROR_API}/transactions?account.id=${accountId}&order=desc&limit=${limit}${cursorPart}`
-    );
-    const items: ChainTx[] = (data.transactions ?? []).map((tx) => {
+    let path: string | null =
+      `/api/v1/transactions?account.id=${accountId}&order=desc&limit=${limit}${cursorPart}`;
+    const raw: any[] = [];
+    let next: string | undefined;
+    for (let page = 0; page < HEDERA_HISTORY_MAX_PAGES && path; page++) {
+      let data: { transactions?: any[]; links?: { next?: string | null } };
+      try {
+        data = await proxyGetJson(`${MIRROR_BASE}${path}`);
+      } catch (e) {
+        if (raw.length === 0) throw e;
+        next = path;
+        break;
+      }
+      raw.push(...(Array.isArray(data.transactions) ? data.transactions : []));
+      next = typeof data.links?.next === "string" ? data.links.next : undefined;
+      path = next && /^\/api\/v1\/transactions\?/.test(next) ? next : null;
+      if (raw.length >= limit) break;
+    }
+    const kept = raw.slice(0, limit);
+    const items: ChainTx[] = kept.map((tx) => {
       // `transfers` lists every account's hbar delta within the tx, fee
       // included; with the fee taken out (2026-09-30, `hederaValueTransfers`)
       // the entry for our account tells us direction + amount. A transaction
@@ -285,6 +316,12 @@ export const hbarAdapter: ChainAdapter = {
           return mb > ma ? 1 : mb < ma ? -1 : 0;
         })[0]?.account;
       const success = tx.result === "SUCCESS";
+      // Both sides as account ids, the fee collectors left out (the same
+      // reading as `getTransactionParties`), and the wallet's OWN account id
+      // (2026-10-01). The wallet's address is its public key, so the details
+      // could not mark its side "you" by string; `TxDetails` treats
+      // `meta.ownAccountId` as the wallet's own.
+      const sides = hederaTxParties(tx);
       return {
         chain: "hedera",
         hash: tx.transaction_id,
@@ -303,15 +340,21 @@ export const hbarAdapter: ChainAdapter = {
           name: tx.name,
           result: tx.result,
           memo_base64: tx.memo_base64,
+          ownAccountId: accountId,
+          ...(sides && sides.from.length ? { from: sides.from } : {}),
+          ...(sides && sides.to.length ? { to: sides.to } : {}),
         },
       } as ChainTx;
     });
 
-    // Mirror's own pagination cursor lives at `links.next` as a relative
-    // URL; we extract the `timestamp` query for our cursor space.
+    // The cursor is a consensus timestamp: the next read asks for older ones
+    // (`timestamp=lt:`). When rows were cut at `limit`, it is the last kept
+    // row's; otherwise the mirror's own `links.next` (a relative URL).
     let nextCursor: string | undefined;
-    const next = data.links?.next;
-    if (next) {
+    if (raw.length > kept.length) {
+      const last = kept[kept.length - 1]?.consensus_timestamp;
+      if (typeof last === "string" && /^[\d.]+$/.test(last)) nextCursor = last;
+    } else if (next) {
       const m = next.match(/timestamp=lt:([\d.]+)/);
       if (m) nextCursor = m[1];
     }
@@ -327,7 +370,8 @@ export const hbarAdapter: ChainAdapter = {
    *
    * The addresses are account ids (`0.0.x`), while this wallet's own address
    * is its public key, so the details cannot mark the wallet's side by
-   * string alone.
+   * string alone; the history rows carry the wallet's account id as
+   * `meta.ownAccountId` for that (2026-10-01).
    */
   async getTransactionParties(hash: string): Promise<TxParties | null> {
     const at = /^(\d+\.\d+\.\d+)@(\d+)\.(\d+)$/.exec(hash.trim());

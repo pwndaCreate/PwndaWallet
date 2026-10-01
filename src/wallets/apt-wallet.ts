@@ -47,6 +47,23 @@ import { uniqueAddresses, urlHost } from "./parties-b-common";
 
 const APTOS_API = "https://api.mainnet.aptoslabs.com/v1";
 
+/**
+ * The Aptos indexer, on the same host (Hasura GraphQL; answers CORS for the
+ * webview's origins, checked live 2026-10-01). The history reads from it which
+ * transactions touched the account — receipts included — see
+ * `getTransactionHistory`.
+ */
+const APTOS_INDEXER = `${APTOS_API}/graphql`;
+
+/**
+ * The archive node for transactions the fullnode no longer keeps. The API
+ * names it itself, in its answer for a pruned version (live 2026-10-01):
+ * `410 {"error_code":"version_pruned","message":"Ledger version(7255244540)
+ * has been pruned",…,"archival_endpoint":"https://archive.mainnet.aptoslabs.com/v1"}`.
+ * The fullnode kept about the last 150 million versions (~two weeks).
+ */
+const APTOS_ARCHIVE_API = "https://archive.mainnet.aptoslabs.com/v1";
+
 /** APT has 8 decimal places; the atomic unit is the octa. */
 export const APT_DECIMALS = 8;
 
@@ -197,6 +214,33 @@ export function aptosTransferOf(payload: unknown): { legs: AptosTransferLeg[]; a
     default:
       return null;
   }
+}
+
+/**
+ * The framework functions `aptosTransferOf` reads, as `module::function`.
+ * Kept beside its switch; `aptHistory.test.ts` checks each one is read.
+ */
+export const APTOS_TRANSFER_FUNCTIONS: readonly string[] = [
+  "aptos_account::transfer",
+  "aptos_account::transfer_coins",
+  "coin::transfer",
+  "aptos_account::transfer_fungible_assets",
+  "primary_fungible_store::transfer",
+  "aptos_account::batch_transfer",
+  "aptos_account::batch_transfer_coins",
+  "aptos_account::batch_transfer_fungible_assets",
+];
+
+/** `0x1::module::function` (any spelling of `0x1`) is one of {@link APTOS_TRANSFER_FUNCTIONS}. */
+function isAptosTransferFunction(id: unknown): boolean {
+  const m = /^(0x[0-9a-fA-F]{1,64})::(\w+)::(\w+)$/.exec(typeof id === "string" ? id.trim() : "");
+  return !!m && readAptosAddress(m[1]) === readAptosAddress("0x1") && APTOS_TRANSFER_FUNCTIONS.includes(`${m[2]}::${m[3]}`);
+}
+
+/** An indexer `asset_type` that is APT: the legacy coin, or the fungible asset `0xa`. */
+function isAptAssetType(assetType: unknown): boolean {
+  if (typeof assetType !== "string") return false;
+  return sameMoveType(assetType, APT_COIN_TYPE) || readAptosAddress(assetType) === APT_FA_METADATA;
 }
 
 /**
@@ -388,6 +432,296 @@ function aptosRefusalText(vmStatus: string): string {
     return `Not enough APT for this amount plus the network fee (Aptos: ${s}). Nothing was sent.`;
   }
   return `Aptos would refuse this transfer (${s}). Nothing was sent.`;
+}
+
+// =========================================================================
+// History: what the account sent AND received (2026-10-01)
+// =========================================================================
+//
+// Operator request, 2026-10-01 (the 2026-09-30 parties work found it): Aptos
+// Activity never showed a receipt. The history read
+// `/accounts/{addr}/transactions`, which lists the transactions the account
+// SENT, by sequence number; a transfer TO it is another account's.
+//
+// Found on the way, live for the public test seed (0xeb663b…): that list
+// is ALSO cut to what the fullnode keeps. The account has sent 16
+// transactions (`sequence_number: "16"`); the list returned 2, because
+// `oldest_ledger_version` was 7,285,429,912 and the other 14 are older.
+// Asking for one of them by version answers `410 version_pruned`.
+//
+// So the indexer (GraphQL, same host) says which transactions touched the
+// account and what they did to its APT, and each one is then read whole by
+// version — the fullnode for recent ones, the archive node the API names for
+// older ones — and mapped by the same rules as the sent list. The indexer has
+// no transaction hash, and a row needs one (explorer links, the details'
+// by-hash read, matching a swap's own record), hence the per-version reads.
+// Transactions never change, so each is read once per session (`aptosTxCache`).
+
+/** The fields of a committed transaction the rows use. */
+interface AptosTxRecord {
+  type?: unknown;
+  version: string;
+  hash?: unknown;
+  sender?: unknown;
+  success?: unknown;
+  vm_status?: unknown;
+  gas_used?: unknown;
+  gas_unit_price?: unknown;
+  timestamp?: unknown;
+  payload?: unknown;
+}
+
+function slimAptosTx(t: any): AptosTxRecord {
+  const p = t?.payload;
+  return {
+    type: t?.type,
+    version: String(t?.version ?? ""),
+    hash: t?.hash,
+    sender: t?.sender,
+    success: t?.success,
+    vm_status: t?.vm_status,
+    gas_used: t?.gas_used,
+    gas_unit_price: t?.gas_unit_price,
+    timestamp: t?.timestamp,
+    payload: p && typeof p === "object"
+      ? { function: p.function, type_arguments: p.type_arguments, arguments: p.arguments }
+      : undefined,
+  };
+}
+
+/** Committed transactions read this session, by version. Bounded: oldest out. */
+const aptosTxCache = new Map<string, AptosTxRecord>();
+const APTOS_TX_CACHE_MAX = 1000;
+/** Below this version the fullnode answers 410; learned from that answer. */
+let aptosOldestKept: bigint | null = null;
+
+function cacheAptosTx(t: AptosTxRecord): void {
+  if (!/^\d+$/.test(t.version)) return;
+  aptosTxCache.delete(t.version);
+  aptosTxCache.set(t.version, t);
+  while (aptosTxCache.size > APTOS_TX_CACHE_MAX) {
+    const oldest = aptosTxCache.keys().next().value;
+    if (oldest === undefined) break;
+    aptosTxCache.delete(oldest);
+  }
+}
+
+/** For tests: forget what this session has read. */
+export function clearAptosHistoryCache(): void {
+  aptosTxCache.clear();
+  aptosOldestKept = null;
+}
+
+/** One committed transaction by version: the fullnode, else (410) the archive. */
+async function aptosTxByVersion(version: string): Promise<AptosTxRecord> {
+  const cached = aptosTxCache.get(version);
+  if (cached) return cached;
+  const pruned = aptosOldestKept !== null && BigInt(version) < aptosOldestKept;
+  let base = pruned ? APTOS_ARCHIVE_API : APTOS_API;
+  let r = await fetch(`${base}/transactions/by_version/${version}`);
+  if (!pruned && r.status === 410) {
+    const body = await r.json().catch(() => null);
+    const oldest = body?.oldest_ledger_version;
+    if (typeof oldest === "string" && /^\d+$/.test(oldest)) aptosOldestKept = BigInt(oldest);
+    base = APTOS_ARCHIVE_API;
+    r = await fetch(`${base}/transactions/by_version/${version}`);
+  }
+  if (!r.ok) throw new Error(`${urlHost(base)} answered HTTP ${r.status} for version ${version}`);
+  const t = slimAptosTx(await r.json());
+  if (t.version !== version) throw new Error(`${urlHost(base)} answered another version for ${version}`);
+  cacheAptosTx(t);
+  return t;
+}
+
+/** The account's sent list (`/accounts/{addr}/transactions`): recent sends, whole. */
+async function aptosSentTransactions(addr: string, limit: number): Promise<AptosTxRecord[]> {
+  const r = await fetch(`${APTOS_API}/accounts/${addr}/transactions?limit=${limit}`);
+  // An account that was never funded does not exist yet: nothing sent.
+  if (r.status === 404) return [];
+  if (!r.ok) throw new Error(`Aptos node HTTP ${r.status}`);
+  const rows: unknown = await r.json();
+  const out = (Array.isArray(rows) ? rows : []).map(slimAptosTx);
+  for (const t of out) cacheAptosTx(t);
+  return out;
+}
+
+/** What the indexer says one transaction did to the account. */
+export interface AptosIndexerEntry {
+  version: string;
+  /** APT (octas) deposited to the account, gas aside. */
+  deposited: bigint;
+  /** Worth reading whole: it moved the account's APT, or it is a framework
+   *  transfer the account sent that failed (only its gas moved). */
+  wanted: boolean;
+}
+
+const APTOS_ACCOUNT_TXS_QUERY = `query ($address: String!, $limit: Int!) {
+  account_transactions(
+    where: { account_address: { _eq: $address } }
+    order_by: { transaction_version: desc }
+    limit: $limit
+  ) {
+    transaction_version
+    fungible_asset_activities(where: { owner_address: { _eq: $address } }) {
+      type
+      amount
+      asset_type
+      is_gas_fee
+      is_transaction_success
+      entry_function_id_str
+    }
+  }
+}`;
+
+/**
+ * The indexer's `account_transactions` answer as entries, newest first.
+ * Exported for tests. Throws on anything that is not that answer.
+ *
+ * The activity layout read live for the public test seed (2026-10-01): a
+ * send is `0x1::fungible_asset::Withdraw` of `0x…0a` plus a
+ * `0x1::aptos_coin::GasFeeEvent` (`is_gas_fee: true`); a receipt, a
+ * `0x1::fungible_asset::Deposit`; from before APT moved to the fungible-asset
+ * standard, `0x1::coin::DepositEvent` of `0x1::aptos_coin::AptosCoin`; a
+ * failed send, only its gas event, with `is_transaction_success: false`.
+ */
+export function aptosIndexerEntries(answer: unknown): AptosIndexerEntry[] {
+  const rows = (answer as { account_transactions?: unknown } | null)?.account_transactions;
+  if (!Array.isArray(rows)) throw new Error("the indexer's answer has no account_transactions");
+  const out: AptosIndexerEntry[] = [];
+  for (const row of rows) {
+    const v = row?.transaction_version;
+    const version = typeof v === "number" || typeof v === "string" ? String(v) : "";
+    if (!/^\d+$/.test(version)) continue;
+    let deposited = 0n;
+    let moved = false;
+    let failedTransfer = false;
+    for (const a of Array.isArray(row?.fungible_asset_activities) ? row.fungible_asset_activities : []) {
+      if (a?.is_transaction_success === false && isAptosTransferFunction(a?.entry_function_id_str)) {
+        failedTransfer = true;
+      }
+      if (a?.is_gas_fee === true || !isAptAssetType(a?.asset_type)) continue;
+      const kind = String(a?.type ?? "").split("::").pop() ?? "";
+      const units = /^\d+$/.test(String(a?.amount ?? "")) ? BigInt(String(a.amount)) : 0n;
+      if (/deposit/i.test(kind)) {
+        moved = true;
+        deposited += units;
+      } else if (/withdraw/i.test(kind)) {
+        moved = true;
+      }
+    }
+    out.push({ version, deposited, wanted: moved || failedTransfer });
+  }
+  return out;
+}
+
+async function aptosIndexedTransactions(addr: string, limit: number): Promise<AptosIndexerEntry[]> {
+  const r = await fetch(APTOS_INDEXER, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: APTOS_ACCOUNT_TXS_QUERY, variables: { address: addr, limit } }),
+  });
+  if (!r.ok) throw new Error(`${urlHost(APTOS_API)} indexer HTTP ${r.status}`);
+  const j = await r.json();
+  if (Array.isArray(j?.errors) && j.errors.length) {
+    throw new Error(`${urlHost(APTOS_API)} indexer: ${j.errors.map((e: any) => e?.message).join("; ")}`);
+  }
+  return aptosIndexerEntries(j?.data);
+}
+
+/** `fn` over `items`, at most `size` at a time, results in order. */
+async function inPool<T, R>(items: readonly T[], size: number, fn: (t: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < items.length) {
+      const i = next++;
+      out[i] = await fn(items[i]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(size, items.length) }, worker));
+  return out;
+}
+
+/**
+ * One committed transaction as this account's APT row, or `null` when it
+ * moved no APT for it. Exported for tests. The rules of the sent list, with
+ * receipts added:
+ *
+ *  - A framework transfer of APT (`aptosTransferOf`): sent by the account, it
+ *    is a send of every leg paid to someone else ("self" when every leg comes
+ *    back), with the gas as its fee; sent by another account, a receipt of
+ *    the legs paid to this one.
+ *  - Any other call that paid this account APT (a swap, a bridge): a receipt
+ *    of what the indexer saw deposited (`deposited`), from the transaction's
+ *    sender. Other calls the account sent are left out, as before.
+ *  - An aborted transaction is `failed`, committed, its gas still the
+ *    sender's (2026-09-30).
+ */
+export function aptosHistoryRow(tx: unknown, addr: string, deposited = 0n): ChainTx | null {
+  const t = (tx ?? {}) as AptosTxRecord & Record<string, unknown>;
+  if (t.type !== "user_transaction") return null;
+  const sender = typeof t.sender === "string" ? readAptosAddress(t.sender) : "";
+  const outgoing = sender === addr;
+  // Covers the legacy coin path AND the post-migration fungible-asset one,
+  // each read with its own argument order (`aptosTransferOf`). A transfer
+  // of another coin or fungible asset is not listed as APT (2026-09-30).
+  const xfer = aptosTransferOf(t.payload);
+  let intended: "in" | "out" | "self";
+  let units: bigint;
+  let counterparty: string;
+  if (xfer?.apt && outgoing) {
+    const toOthers = xfer.legs.filter((l) => readAptosAddress(l.to) !== addr);
+    intended = toOthers.length === 0 ? "self" : "out";
+    units = (toOthers.length ? toOthers : xfer.legs).reduce((sum, l) => sum + l.units, 0n);
+    counterparty = toOthers[0]?.to ?? xfer.legs[0]?.to ?? "";
+  } else if (xfer?.apt && xfer.legs.some((l) => readAptosAddress(l.to) === addr)) {
+    intended = "in";
+    units = xfer.legs.filter((l) => readAptosAddress(l.to) === addr).reduce((sum, l) => sum + l.units, 0n);
+    counterparty = String(t.sender ?? "");
+  } else if (!outgoing && deposited > 0n && t.success !== false) {
+    intended = "in";
+    units = deposited;
+    counterparty = String(t.sender ?? "");
+  } else {
+    return null;
+  }
+  // A transaction that aborted is committed too — it paid gas — but it
+  // moved nothing. Corrected 2026-09-30: it was listed as a send of its
+  // full amount with `confirmations: 0`, which reads "unconfirmed" (0
+  // means waiting for a block, `ChainTx`), so the Activity details said
+  // "▲ sent … unconfirmed" for a week-old failure and the list pinned
+  // it above newer rows. Now `failed`, as XRP and the EVM chains do.
+  const failed = t.success === false;
+  const version = /^\d+$/.test(String(t.version ?? "")) ? Number(t.version) : undefined;
+  let fee: string | undefined;
+  if (outgoing) {
+    try {
+      // The gas is this wallet's only when it sent the transaction.
+      fee = atomicToDecimal(BigInt(String(t.gas_used ?? 0)) * BigInt(String(t.gas_unit_price ?? 0)), APT_DECIMALS);
+    } catch {
+      fee = undefined;
+    }
+  }
+  return {
+    chain: "aptos",
+    hash: String(t.hash ?? ""),
+    direction: failed ? "failed" : intended,
+    amount: atomicToDecimal(units, APT_DECIMALS),
+    fee,
+    // Aptos timestamps are MICROseconds since epoch, not milliseconds.
+    timestamp: t.timestamp ? Math.floor(Number(t.timestamp) / 1_000_000) : undefined,
+    height: version,
+    // The chain is final on inclusion: a transaction listed here is
+    // committed, whether it succeeded or not. No count (`undefined`) with
+    // its version as the block reads "confirmed"; a count of 1 read
+    // "confirming (1)" and "1 / 6 pending" in the details.
+    confirmations: undefined,
+    counterparty,
+    meta: {
+      intended,
+      ...(failed ? { failure: String(t.vm_status ?? "aborted") } : {}),
+    },
+  };
 }
 
 export const aptAdapter: ChainAdapter = {
@@ -587,68 +921,71 @@ export const aptAdapter: ChainAdapter = {
     }
   },
 
+  /**
+   * What the account sent AND received, newest first (2026-10-01; see the
+   * "History" section above for why).
+   *
+   *  1. In parallel: the indexer's transactions for the account
+   *     (`aptosIndexedTransactions`) and the fullnode's sent list
+   *     (`aptosSentTransactions`, which also covers an indexer that lags
+   *     behind a send made a moment ago).
+   *  2. Each indexed transaction that moved the account's APT, and is not in
+   *     the sent list, is read whole by version (`aptosTxByVersion`, four at
+   *     a time, once per session).
+   *  3. One row per transaction (`aptosHistoryRow`), newest first, `limit`
+   *     of them.
+   *
+   * Throws only when nothing could be read. Without the indexer, the sent
+   * list is the answer (what this showed before 2026-10-01), with a warning;
+   * a transaction that could not be read by version is left out this time and
+   * read on the next poll.
+   */
   async getTransactionHistory(
     address: string,
     opts?: { limit?: number },
   ): Promise<TxHistoryPage> {
-    const limit = opts?.limit ?? 25;
+    const limit = Math.max(1, Math.floor(opts?.limit ?? 25));
     const addr = normalizeAptosAddress(address);
-    // Note (2026-09-30): this endpoint lists the transactions the account
-    // SENT, by sequence number. A transfer TO it is someone else's
-    // transaction and is not here — for the public test seed it returned its
-    // two sends and none of the receipts that funded them. Not changed here;
-    // see the fix log of that day.
-    const r = await fetch(`${APTOS_API}/accounts/${addr}/transactions?limit=${limit}`);
-    if (r.status === 404) return { items: [] };
-    if (!r.ok) throw new Error(`Aptos node HTTP ${r.status}`);
-    const rows: any[] = await r.json();
+    const [sent, indexed] = await Promise.allSettled([
+      aptosSentTransactions(addr, limit),
+      aptosIndexedTransactions(addr, limit),
+    ]);
+    if (sent.status === "rejected" && indexed.status === "rejected") {
+      throw new Error(
+        `Aptos history could not be read: ${errorText(sent.reason)}; the indexer: ${errorText(indexed.reason)}`,
+      );
+    }
 
-    const items: ChainTx[] = [];
-    for (const t of Array.isArray(rows) ? rows : []) {
-      if (t.type !== "user_transaction") continue;
-      // Covers the legacy coin path AND the post-migration fungible-asset one,
-      // each read with its own argument order (`aptosTransferOf`). A transfer
-      // of another coin or fungible asset is skipped, not listed as APT
-      // (corrected 2026-09-30).
-      const xfer = aptosTransferOf(t?.payload);
-      if (!xfer || !xfer.apt) continue;
-      const outgoing =
-        normalizeAptosAddress(String(t.sender ?? "0x0")) === addr;
-      const intended = outgoing ? "out" : "in";
-      // A send moved every leg; a receipt, the legs paid to this address.
-      const units = xfer.legs
-        .filter((l) => outgoing || readAptosAddress(l.to) === addr)
-        .reduce((sum, l) => sum + l.units, 0n);
-      // A transaction that aborted is committed too — it paid gas — but it
-      // moved nothing. Corrected 2026-09-30: it was listed as a send of its
-      // full amount with `confirmations: 0`, which reads "unconfirmed" (0
-      // means waiting for a block, `ChainTx`), so the Activity details said
-      // "▲ sent … unconfirmed" for a week-old failure and the list pinned
-      // it above newer rows. Now `failed`, as XRP and the EVM chains do.
-      const failed = t.success === false;
-      items.push({
-        chain: "aptos",
-        hash: String(t.hash ?? ""),
-        direction: failed ? "failed" : intended,
-        amount: atomicToDecimal(units, APT_DECIMALS),
-        // The gas is this wallet's only when it sent the transaction.
-        fee: outgoing
-          ? atomicToDecimal(BigInt(t.gas_used ?? 0) * BigInt(t.gas_unit_price ?? 0), APT_DECIMALS)
-          : undefined,
-        // Aptos timestamps are MICROseconds since epoch, not milliseconds.
-        timestamp: t.timestamp ? Math.floor(Number(t.timestamp) / 1_000_000) : undefined,
-        height: t.version ? Number(t.version) : undefined,
-        // The chain is final on inclusion: a transaction listed here is
-        // committed, whether it succeeded or not. No count (`undefined`)
-        // with its version as the block reads "confirmed"; a count of 1
-        // read "confirming (1)" and "1 / 6 pending" in the details.
-        confirmations: undefined,
-        counterparty: outgoing ? xfer.legs[0]?.to ?? "" : String(t.sender ?? ""),
-        meta: {
-          intended,
-          ...(failed ? { failure: String(t.vm_status ?? "aborted") } : {}),
+    const txs = new Map<string, AptosTxRecord>();
+    if (sent.status === "fulfilled") for (const t of sent.value) txs.set(t.version, t);
+    const deposited = new Map<string, bigint>();
+    const failures: string[] = [];
+    if (indexed.status === "fulfilled") {
+      const wanted = indexed.value.filter((e) => e.wanted);
+      for (const e of wanted) deposited.set(e.version, e.deposited);
+      await inPool(
+        wanted.map((e) => e.version).filter((v) => !txs.has(v)),
+        4,
+        async (v) => {
+          try {
+            txs.set(v, await aptosTxByVersion(v));
+          } catch (e) {
+            failures.push(`version ${v}: ${errorText(e)}`);
+          }
         },
-      });
+      );
+    } else {
+      console.warn(`[aptos] the indexer could not be read, so receipts are missing this time: ${errorText(indexed.reason)}`);
+    }
+
+    const items = [...txs.values()]
+      .map((t) => aptosHistoryRow(t, addr, deposited.get(t.version) ?? 0n))
+      .filter((row): row is ChainTx => row !== null)
+      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
+      .slice(0, limit);
+    if (failures.length > 0) {
+      if (items.length === 0) throw new Error(`Aptos history could not be read: ${failures.slice(0, 3).join("; ")}`);
+      console.warn(`[aptos] ${failures.length} transaction(s) could not be read this time; first: ${failures[0]}`);
     }
     return { items };
   },
@@ -658,18 +995,38 @@ export const aptAdapter: ChainAdapter = {
    * directly like every Aptos read (2026-09-30). The node answers 404
    * `transaction_not_found` for a hash it does not know; a pending
    * transaction has its sender and payload already, so it reads the same.
+   *
+   * Then the archive node (2026-10-01). The fullnode answers that SAME 404
+   * for a transaction it has pruned — read live for the public test seed's
+   * receipt of 2026-09-18 (0x608724a4…), which the archive returned whole —
+   * so its "not found" said "not shown yet" in the details of anything older
+   * than about two weeks. `null` when both say 404; throws when neither
+   * answered.
    */
   async getTransactionParties(hash: string): Promise<TxParties | null> {
-    const url = `${APTOS_API}/transactions/by_hash/${encodeURIComponent(hash.trim())}`;
-    let r: Response;
-    try {
-      r = await fetch(url);
-    } catch (e) {
-      throw new Error(`${urlHost(APTOS_API)} could not be reached: ${errorText(e)}`);
+    const id = hash.trim();
+    const failures: string[] = [];
+    let unknown = false;
+    for (const base of [APTOS_API, APTOS_ARCHIVE_API]) {
+      let r: Response;
+      try {
+        r = await fetch(`${base}/transactions/by_hash/${encodeURIComponent(id)}`);
+      } catch (e) {
+        failures.push(`${urlHost(base)} could not be reached: ${errorText(e)}`);
+        continue;
+      }
+      if (r.status === 404) {
+        unknown = true;
+        continue;
+      }
+      if (!r.ok) {
+        failures.push(`${urlHost(base)} answered HTTP ${r.status} for transaction ${id}`);
+        continue;
+      }
+      return aptosTxParties(await r.json(), urlHost(base));
     }
-    if (r.status === 404) return null;
-    if (!r.ok) throw new Error(`${urlHost(APTOS_API)} answered HTTP ${r.status} for transaction ${hash.trim()}`);
-    return aptosTxParties(await r.json(), urlHost(APTOS_API));
+    if (unknown) return null;
+    throw new Error(failures.join("; "));
   },
 
   async getFeeEstimate(): Promise<FeeEstimate> {

@@ -371,31 +371,42 @@ export async function getZanoTransactionHistory(): Promise<ZanoTransferEntry[]> 
  * One mapping for both paths: the adapter's `getTransactionHistory`, and
  * App.tsx, which since 2026-09-16 feeds Activity from the Zano session's own
  * read instead of polling the sidecar a second time through the adapter.
+ *
+ * A send names its recipients (2026-10-01, operator request): the entry's
+ * `remote_addresses`, which the parser used to drop, as `meta.to` and the
+ * first as `counterparty`. The details add this wallet as the sender. A
+ * receipt is left as it was: the protocol hides who sent it, and an address
+ * an incoming entry does list is the sender's own unchecked claim
+ * (`tx_payer`), so a row does not present it as the sender.
  */
 export function zanoTransfersToChainTx(
   entries: readonly ZanoTransferEntry[],
   limit?: number,
 ): ChainTx[] {
   const rows = limit == null ? entries : entries.slice(0, limit);
-  return rows.map((e) => ({
-    chain: "zano",
-    hash: e.txHash ?? "",
-    direction: e.isIncome ? "in" : "out",
-    // A transfer the RPC gave no readable amount for has none here either
-    // (2026-10-01): "0" read as a fact in Activity and in the details the
-    // wallet's history now opens, where `ZanoTxHistoryCard` has said
-    // "amount unavailable" since 2026-09-04. Empty is "no amount" to every
-    // renderer, and lets the details ask the wallet for it.
-    amount: e.amountUnknown
-      ? ""
-      : atomicToZano(
-          e.amount,
-          e.assetId === ZANO_NATIVE_ASSET_ID ? ZANO_NATIVE_DECIMALS : 12
-        ),
-    timestamp: e.timestamp,
-    height: e.height,
-    meta: { assetId: e.assetId },
-  }));
+  return rows.map((e): ChainTx => {
+    const recipients = !e.isIncome && e.remoteAddresses?.length ? e.remoteAddresses : null;
+    return {
+      chain: "zano",
+      hash: e.txHash ?? "",
+      direction: e.isIncome ? "in" : "out",
+      // A transfer the RPC gave no readable amount for has none here either
+      // (2026-10-01): "0" read as a fact in Activity and in the details the
+      // wallet's history now opens, where `ZanoTxHistoryCard` has said
+      // "amount unavailable" since 2026-09-04. Empty is "no amount" to every
+      // renderer, and lets the details ask the wallet for it.
+      amount: e.amountUnknown
+        ? ""
+        : atomicToZano(
+            e.amount,
+            e.assetId === ZANO_NATIVE_ASSET_ID ? ZANO_NATIVE_DECIMALS : 12
+          ),
+      timestamp: e.timestamp,
+      height: e.height,
+      ...(recipients ? { counterparty: recipients[0] } : {}),
+      meta: { assetId: e.assetId, ...(recipients ? { to: [...recipients] } : {}) },
+    };
+  });
 }
 
 // =========================================================================

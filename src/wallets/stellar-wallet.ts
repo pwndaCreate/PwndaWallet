@@ -256,6 +256,52 @@ export function ledgerOfOperationId(id: string): number | undefined {
   return ledger > 0 ? ledger : undefined;
 }
 
+/** One Horizon effect, the fields a merge's amount is read from. */
+interface HorizonEffect {
+  type: string;
+  account?: string;
+  amount?: string;
+  asset_type?: string;
+}
+
+/** Merged amounts already read, by operation id: an operation never changes. */
+const mergedAmounts = new Map<string, string>();
+
+/** For tests: forget the merged amounts read this session. */
+export function clearStellarMergeCache(): void {
+  mergedAmounts.clear();
+}
+
+/**
+ * The XLM an `account_merge` moved (2026-10-01). The operation names only
+ * its two accounts (`account` merged into `into`); the amount is in its
+ * effects, read live for the public test seed's merge (94390a05…, operation
+ * 275583690330103809):
+ *
+ *   account_debited             GB3JDW…  0.9998310 native
+ *   account_credited            GCNAQJ…  0.9998310 native
+ *   account_removed             GB3JDW…
+ *   account_sponsorship_removed GB3JDW…
+ *
+ * `undefined` when the effects do not say; a failed read throws. One request
+ * per merge, once per session.
+ */
+async function accountMergeAmount(op: HorizonOperation): Promise<string | undefined> {
+  const known = mergedAmounts.get(op.id);
+  if (known) return known;
+  const r = await proxyGetJson<{ _embedded?: { records?: HorizonEffect[] } }>(
+    `${HORIZON_BASE}/operations/${encodeURIComponent(op.id)}/effects?limit=50`,
+  );
+  const effects = r._embedded?.records ?? [];
+  const native = (e: HorizonEffect) => (e.asset_type ?? "native") === "native";
+  const amount =
+    effects.find((e) => e.type === "account_credited" && e.account === op.into && native(e))?.amount ??
+    effects.find((e) => e.type === "account_debited" && e.account === op.account && native(e))?.amount;
+  if (typeof amount !== "string" || !/^\d+(\.\d+)?$/.test(amount)) return undefined;
+  mergedAmounts.set(op.id, amount);
+  return amount;
+}
+
 async function fetchHistory(addr: string, limit = 25): Promise<ChainTx[]> {
   let r: { _embedded: { records: HorizonOperation[] } };
   try {
@@ -272,20 +318,36 @@ async function fetchHistory(addr: string, limit = 25): Promise<ChainTx[]> {
   const items: ChainTx[] = [];
   const me = addr.toUpperCase();
   for (const op of records) {
-    if (op.type !== "payment" && op.type !== "create_account") continue;
+    const merge = op.type === "account_merge";
+    if (op.type !== "payment" && op.type !== "create_account" && !merge) continue;
     if (op.asset_type && op.asset_type !== "native") continue;
     // An account's first funding is a `create_account`, whose parties and
     // amount are `funder` / `account` / `starting_balance`. Read as a
     // payment, it was "+0 XLM" received from nobody (2026-09-30).
+    //
+    // An `account_merge` moves the merged account's whole XLM balance into
+    // `into` and deletes it. It was skipped until 2026-10-01 (operator
+    // request), so the move that emptied an account never showed in
+    // Activity. Its amount is read from its effects (`accountMergeAmount`);
+    // when they cannot be read, the amount is "" — unknown, shown as "—" —
+    // and asked again on the next read.
     const create = op.type === "create_account";
-    const from = create ? op.funder : op.from;
-    const to = create ? op.account : op.to;
+    const from = create ? op.funder : merge ? op.account : op.from;
+    const to = create ? op.account : merge ? op.into : op.to;
     const direction = from && from.toUpperCase() === me ? "out" : "in";
+    let amount = (create ? op.starting_balance : op.amount) ?? "0";
+    if (merge) {
+      try {
+        amount = (await accountMergeAmount(op)) ?? "";
+      } catch {
+        amount = "";
+      }
+    }
     items.push({
       chain: "stellar",
       hash: op.transaction_hash,
       direction,
-      amount: (create ? op.starting_balance : op.amount) ?? "0",
+      amount,
       timestamp: Math.floor(new Date(op.created_at).getTime() / 1000),
       // Horizon lists closed ledgers only, and a closed ledger is final:
       // no count, the ledger as the block (a count of 1 read "1 / 6
@@ -293,7 +355,11 @@ async function fetchHistory(addr: string, limit = 25): Promise<ChainTx[]> {
       confirmations: undefined,
       height: ledgerOfOperationId(op.id),
       counterparty: direction === "out" ? to : from,
-      meta: { ...(from ? { from } : {}), ...(to ? { to } : {}) },
+      meta: {
+        ...(from ? { from } : {}),
+        ...(to ? { to } : {}),
+        ...(merge ? { method: "account merge" } : {}),
+      },
     });
   }
   return items;

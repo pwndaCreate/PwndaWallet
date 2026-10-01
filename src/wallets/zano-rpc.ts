@@ -377,6 +377,16 @@ export interface ZanoTransferEntry {
    * received transfer displayed as "▲ Sent -0 ZANO").
    */
   amountUnknown?: boolean;
+  /**
+   * `wallet_transfer_info.remote_addresses`, kept since 2026-10-01 (operator
+   * request: history rows named no address because this parser dropped it).
+   * simplewallet's own description (vendored v2.2.1.506,
+   * `wallet_public_structs_defs.h`): "destination if it's outgoing transfer or
+   * sender if it's incoming". An incoming sender is there only when the
+   * sender attached its own address (`tx_payer`), a claim the chain does not
+   * check. Absent when the entry lists none.
+   */
+  remoteAddresses?: string[];
 }
 
 /**
@@ -500,6 +510,14 @@ function parseTransferEntry(e: any): ZanoTransferEntry {
     );
   }
 
+  // The other side's addresses, as listed (see `ZanoTransferEntry`).
+  const remoteAddresses: string[] = [];
+  for (const a of Array.isArray(e?.remote_addresses) ? e.remote_addresses : []) {
+    if (typeof a === "string" && a.trim() && !remoteAddresses.includes(a.trim())) {
+      remoteAddresses.push(a.trim());
+    }
+  }
+
   return {
     isIncome,
     amount,
@@ -508,6 +526,7 @@ function parseTransferEntry(e: any): ZanoTransferEntry {
     txHash: e?.tx_hash,
     timestamp: e?.timestamp,
     ...(amountUnknown ? { amountUnknown: true } : {}),
+    ...(remoteAddresses.length ? { remoteAddresses } : {}),
   };
 }
 

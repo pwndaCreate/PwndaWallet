@@ -29,7 +29,7 @@ vi.mock("../lib/tauri", () => ({
   }),
 }));
 
-import { ledgerOfOperationId, stellarAdapter } from "./stellar-wallet";
+import { clearStellarMergeCache, ledgerOfOperationId, stellarAdapter } from "./stellar-wallet";
 import { suiAdapter } from "./sui-wallet";
 
 beforeEach(() => {
@@ -97,26 +97,114 @@ describe("Stellar history", () => {
     proxy.handler = () => ({ status: 503, body: "upstream unavailable" });
     await expect(stellarAdapter.getTransactionHistory!(ME)).rejects.toThrow(/HTTP 503/);
   });
+
+  describe("account merges (2026-10-01)", () => {
+    // The public test seed's own merge (94390a05…, operation
+    // 275583690330103809), read live: the operation names the two accounts,
+    // its effects the amount. Ids and accounts invented.
+    const OP_ID = "275583690330103809";
+    const merge = (account: string, into: string) => ({
+      id: OP_ID,
+      paging_token: OP_ID,
+      transaction_successful: true,
+      source_account: account,
+      type: "account_merge",
+      type_i: 8,
+      created_at: "2026-08-28T13:59:04Z",
+      transaction_hash: "94".repeat(32),
+      account,
+      into,
+    });
+    const effects = (account: string, into: string, amount = "0.9998310") => ({
+      _embedded: {
+        records: [
+          { type: "account_debited", account, amount, asset_type: "native" },
+          { type: "account_credited", account: into, amount, asset_type: "native" },
+          { type: "account_removed", account },
+          { type: "account_sponsorship_removed", account },
+        ],
+      },
+    });
+    const route = (ops: unknown[], fx: () => { status: number; body: string }) => {
+      const asked: string[] = [];
+      proxy.handler = ({ url }) => {
+        asked.push(url);
+        if (url.includes(`/operations/${OP_ID}/effects`)) return fx();
+        expect(url).toContain(`/accounts/${ME}/operations`);
+        return { status: 200, body: JSON.stringify({ _embedded: { records: ops } }) };
+      };
+      return asked;
+    };
+    afterEach(() => clearStellarMergeCache());
+
+    it("this account merged into another: a send of its whole balance, the amount from the effects", async () => {
+      // Was: skipped — the move that emptied the account was not in Activity.
+      route([merge(ME, THEM)], () => ({ status: 200, body: JSON.stringify(effects(ME, THEM)) }));
+      const [row] = (await stellarAdapter.getTransactionHistory!(ME)).items;
+      expect(row).toMatchObject({
+        direction: "out",
+        amount: "0.9998310",
+        counterparty: THEM,
+        hash: "94".repeat(32),
+        height: Number(BigInt(OP_ID) >> 32n),
+        meta: { from: ME, to: THEM, method: "account merge" },
+      });
+      expect(row.confirmations).toBeUndefined();
+    });
+
+    it("another account merged into this one: a receipt", async () => {
+      route([merge(THEM, ME)], () => ({ status: 200, body: JSON.stringify(effects(THEM, ME, "12.5000000")) }));
+      const [row] = (await stellarAdapter.getTransactionHistory!(ME)).items;
+      expect(row).toMatchObject({ direction: "in", amount: "12.5000000", counterparty: THEM, meta: { from: THEM, to: ME } });
+    });
+
+    it("effects that cannot be read leave the amount unknown, and are asked again; a read amount is kept", async () => {
+      let asked = route([merge(ME, THEM)], () => ({ status: 503, body: "upstream unavailable" }));
+      const [unknown] = (await stellarAdapter.getTransactionHistory!(ME)).items;
+      expect(unknown).toMatchObject({ direction: "out", amount: "", counterparty: THEM });
+      asked = route([merge(ME, THEM)], () => ({ status: 200, body: JSON.stringify(effects(ME, THEM)) }));
+      expect((await stellarAdapter.getTransactionHistory!(ME)).items[0].amount).toBe("0.9998310");
+      expect(asked.filter((u) => u.includes("/effects"))).toHaveLength(1);
+      asked = route([merge(ME, THEM)], () => ({ status: 500, body: "must not be asked" }));
+      expect((await stellarAdapter.getTransactionHistory!(ME)).items[0].amount).toBe("0.9998310");
+      expect(asked.filter((u) => u.includes("/effects"))).toHaveLength(0);
+    });
+  });
 });
 
 describe("Sui history", () => {
+  // Read through GraphQL since 2026-10-01 (`sui-wallet.test.ts` has why);
+  // the node layout is the live query's.
   const ADDR = "0x" + "c3".repeat(32);
-  const block = (digest: string, checkpoint: string | undefined, amount: string) => ({
+  const node = (digest: string, checkpoint: number | null, amount: string) => ({
     digest,
-    timestampMs: "1790000000000",
-    ...(checkpoint ? { checkpoint } : {}),
-    balanceChanges: [{ owner: { AddressOwner: ADDR }, coinType: "0x2::sui::SUI", amount }],
+    sender: { address: ADDR },
+    effects: {
+      status: "SUCCESS",
+      timestamp: "2026-09-21T12:26:40.000Z",
+      checkpoint: checkpoint === null ? null : { sequenceNumber: checkpoint },
+      executionError: null,
+      balanceChangesJson: [
+        { address: ADDR, coinType: "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI", amount },
+      ],
+    },
   });
 
   it("a checkpointed transaction has no count and its checkpoint; one without is unconfirmed", async () => {
-    proxy.handler = ({ body }) => {
-      const req = JSON.parse(body ?? "{}");
-      expect(req.method).toBe("suix_queryTransactionBlocks");
-      const from = "FromAddress" in req.params[0].filter;
+    proxy.handler = ({ url, body }) => {
+      expect(url).toContain("graphql");
+      expect(JSON.parse(body ?? "{}").query).toContain("relation: AFFECTED");
       return {
         status: 200,
         body: JSON.stringify({
-          result: { data: from ? [block("DigestSent", "250000000", "-1000000000")] : [block("DigestIncoming", undefined, "2500000000")] },
+          data: {
+            address: {
+              transactions: {
+                pageInfo: { hasPreviousPage: false, startCursor: "c" },
+                nodes: [node("DigestIncoming", null, "2500000000"), node("DigestSent", 250000000, "-1000000000")],
+              },
+            },
+          },
         }),
       };
     };
@@ -129,7 +217,7 @@ describe("Sui history", () => {
     expect(incoming.height).toBeUndefined();
   });
 
-  it("both queries failing is an error, not an empty history", async () => {
+  it("a failed read is an error, not an empty history", async () => {
     proxy.handler = () => ({ status: 502, body: "bad gateway" });
     await expect(suiAdapter.getTransactionHistory!(ADDR)).rejects.toThrow(/Sui history could not be read: .*502/);
   });

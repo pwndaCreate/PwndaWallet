@@ -87,6 +87,11 @@ import { uniqueAddresses, urlHost } from "./parties-b-common";
 // GraphQL/gRPC migration (the reads here and the SDK transport for sends), not
 // another JSON-RPC host. Not migrated yet on purpose: a transport change to the
 // send path wants its own verification pass.
+//
+// History is no longer read here (2026-10-01): `suix_queryTransactionBlocks`
+// fails WHOLE once publicnode has pruned one old transaction of the address
+// (see `getTransactionHistory`), so it moved to GraphQL. The balance and the
+// first parties read still use this host.
 export const SUI_RPC = "https://sui-rpc.publicnode.com";
 const DERIVATION_PATH = "m/44'/784'/0'/0'/0'";
 
@@ -310,11 +315,15 @@ export function suiTransferParties(
 }
 
 /**
- * The other side of a history row, from its SUI balance changes (the list
- * query asks for nothing else). A send's counterparty is the owner whose SUI
- * rose the most; a receipt's, the owner whose SUI fell the most — the sender,
- * who also paid the gas. Inference for a sponsored receipt: the sponsor's
- * fall is only gas, so the sender's (the amount) is still the larger one.
+ * The other side of a history row, from its SUI balance changes. A send's
+ * counterparty is the owner whose SUI rose the most; a receipt's, the owner
+ * whose SUI fell the most.
+ *
+ * Corrected 2026-10-01: this read a receipt's sender as "the largest faller,
+ * since a sponsor's fall is only gas". That is wrong whenever the amount is
+ * smaller than the gas — it named the sponsor. The GraphQL history knows the
+ * sender and names it (`suiHistoryRow`); this is left for a receipt the
+ * address sent itself (a swap that paid it SUI) and for sends.
  */
 function suiRowCounterparty(
   changes: readonly SuiBalanceChange[],
@@ -344,6 +353,171 @@ const SUI_TX_PARTIES_QUERY = `query ($digest: String!) {
     effects { balanceChanges { nodes { owner { address } amount coinType { repr } } } }
   }
 }`;
+
+// =========================================================================
+// History over GraphQL (2026-10-01)
+// =========================================================================
+
+/**
+ * The most transactions one GraphQL page holds. Checked live 2026-10-01:
+ * `serviceConfig.maxPageSize` reads 50 for `Address.transactions`, and 51 is
+ * refused with `Page size is too large: 51 > 50` (GRAPHQL_VALIDATION_FAILED).
+ */
+export const SUI_HISTORY_MAX_PAGE = 50;
+
+/**
+ * An address's transactions (operator request, 2026-10-01: Sui history moved
+ * off publicnode's JSON-RPC, which fails the whole list over one pruned
+ * transaction).
+ *
+ *  - `relation: AFFECTED` is load-bearing. The field defaults to `SENT` (its
+ *    schema description), which lists what the address sent and nothing it
+ *    received — the Aptos receipt gap of 2026-09-30 in another chain.
+ *    AFFECTED is "the sender, sponsor, or the owner of some object that was
+ *    created, modified or transferred".
+ *  - `last: N` is the newest N, listed OLDEST first within the page;
+ *    `before: <startCursor>` pages further back.
+ *  - `balanceChangesJson` is every balance change at once, in the gRPC proto
+ *    format (`[{ address, coinType, amount }]`, read live). The typed
+ *    `balanceChanges` connection pages at 50, so an airdrop to more owners
+ *    than that could cut this address's own change off the first page.
+ */
+const SUI_HISTORY_QUERY = `query ($address: SuiAddress!, $last: Int!, $before: String) {
+  address(address: $address) {
+    transactions(last: $last, before: $before, relation: AFFECTED) {
+      pageInfo { hasPreviousPage startCursor }
+      nodes {
+        digest
+        sender { address }
+        effects {
+          status
+          timestamp
+          checkpoint { sequenceNumber }
+          executionError { message }
+          balanceChangesJson
+        }
+      }
+    }
+  }
+}`;
+
+/** One `Address.transactions` node, as `SUI_HISTORY_QUERY` asks for it. */
+export interface SuiHistoryNode {
+  digest?: unknown;
+  sender?: { address?: unknown } | null;
+  effects?: {
+    status?: unknown;
+    /** ISO-8601, like `effects.timestamp` everywhere in this API (see the file header). */
+    timestamp?: unknown;
+    checkpoint?: { sequenceNumber?: unknown } | null;
+    executionError?: { message?: unknown } | null;
+    balanceChangesJson?: unknown;
+  } | null;
+}
+
+/**
+ * `balanceChangesJson` (`[{ address, coinType, amount }]`) as balance changes;
+ * `null` when the field is not a list at all. Exported for tests.
+ */
+export function suiJsonBalanceChanges(raw: unknown): SuiBalanceChange[] | null {
+  if (!Array.isArray(raw)) return null;
+  const out: SuiBalanceChange[] = [];
+  for (const c of raw) {
+    const amount = String(c?.amount ?? "");
+    if (!/^-?\d+$/.test(amount)) continue;
+    out.push({
+      ...(typeof c?.address === "string" ? { owner: c.address } : {}),
+      coinType: String(c?.coinType ?? ""),
+      amount: BigInt(amount),
+    });
+  }
+  return out;
+}
+
+/**
+ * One history node as `address`'s SUI row, or `null` for a transaction that
+ * changed no balance at all (the JSON-RPC rows left those out too). Exported
+ * for tests. The rules the JSON-RPC rows followed are kept:
+ *
+ *  - the amount is this address's own SUI balance change (a send it paid gas
+ *    for includes the gas, as before); a transaction that moved only another
+ *    coin reads 0;
+ *  - a send's other side comes from the same balance changes
+ *    (`suiRowCounterparty`); a receipt's is the transaction's sender;
+ *  - a checkpointed transaction is final: no count, its checkpoint as height.
+ *
+ * New with GraphQL, which says whether the transaction executed: a FAILURE is
+ * `failed`. It moved nothing, so its amount is 0 and the gas this address
+ * paid is its fee; the JSON-RPC rows read that gas as a send.
+ */
+export function suiHistoryRow(node: SuiHistoryNode, address: string): ChainTx | null {
+  const digest = typeof node?.digest === "string" ? node.digest : "";
+  if (!digest) return null;
+  const me = address.trim().toLowerCase();
+  const fx: NonNullable<SuiHistoryNode["effects"]> = node.effects ?? {};
+  const ms = typeof fx.timestamp === "string" ? Date.parse(fx.timestamp) : NaN;
+  const cp = fx.checkpoint?.sequenceNumber;
+  const height = cp != null && /^\d+$/.test(String(cp)) ? Number(cp) : undefined;
+  const placed = {
+    timestamp: Number.isFinite(ms) ? Math.floor(ms / 1000) : undefined,
+    // A checkpointed transaction is final (2026-09-30; a count of 1 read
+    // "1 / 6 pending"). GraphQL lists checkpointed transactions only, so the
+    // `0` is for an answer that ever lacks one.
+    confirmations: height !== undefined ? undefined : 0,
+    height,
+  };
+  const sender = typeof node.sender?.address === "string" ? node.sender.address : undefined;
+  const sentByMe = sender?.toLowerCase() === me;
+
+  const changes = suiJsonBalanceChanges(fx.balanceChangesJson);
+  if (changes === null) {
+    // No balance changes in the answer: the transaction is real, its amount
+    // is not known. "" is how a row says so (`TxDetails`: "—").
+    return { chain: "sui", hash: digest, direction: sentByMe ? "out" : "in", amount: "", ...placed };
+  }
+  if (changes.length === 0) return null;
+  const mine = changes
+    .filter((c) => c.owner?.toLowerCase() === me && isSuiCoin(c.coinType))
+    .reduce((sum, c) => sum + c.amount, 0n);
+
+  if (fx.status === "FAILURE") {
+    const why = typeof fx.executionError?.message === "string" ? fx.executionError.message.trim() : "";
+    return {
+      chain: "sui",
+      hash: digest,
+      direction: "failed",
+      amount: formatMist(0n),
+      ...(mine < 0n ? { fee: formatMist(-mine) } : {}),
+      ...placed,
+      meta: { intended: sentByMe ? "out" : "in", failure: why ? why.slice(0, 160) : "FAILURE" },
+    };
+  }
+
+  const direction = mine < 0n ? "out" : "in";
+  // The other side (2026-09-30: rows named nobody). `meta.from` / `meta.to`
+  // are what the details read. A receipt's is the transaction's SENDER, which
+  // GraphQL names: the JSON-RPC rows inferred it as the largest SUI faller,
+  // and that is the gas SPONSOR whenever the amount is smaller than the gas
+  // (2026-10-01). A send's is the owner whose SUI rose most, as before.
+  const counterparty =
+    direction === "in" && sender && !sentByMe ? sender : suiRowCounterparty(changes, me, direction);
+  return {
+    chain: "sui",
+    hash: digest,
+    direction,
+    amount: formatMist(mine < 0n ? -mine : mine),
+    ...(counterparty
+      ? {
+          counterparty,
+          meta:
+            direction === "out"
+              ? { from: address, to: counterparty }
+              : { from: counterparty, to: address },
+        }
+      : {}),
+    ...placed,
+  };
+}
 
 // =========================================================================
 // Adapter
@@ -442,109 +616,75 @@ export const suiAdapter: ChainAdapter = {
     return { label: "Gas price", value: price, unit: "MIST" };
   },
 
+  /**
+   * The address's transactions through Sui's GraphQL (`SUI_HISTORY_QUERY`),
+   * newest first (operator request, 2026-10-01).
+   *
+   * # Why not publicnode's `suix_queryTransactionBlocks` any more
+   *
+   * It fails WHOLE once publicnode has pruned one old transaction of the
+   * address. Both of its filters (`FromAddress`, `ToAddress` — the compound
+   * `FromOrToAddress` was removed upstream on 2026-08-22) answered, for the
+   * public test seed, live on 2026-09-30 and again on 2026-10-01:
+   *
+   *   -32000 ErrorObject { code: InvalidParams, message: "unable to derive
+   *   balance/object changes because effect is empty", data: None }
+   *
+   * so the history threw "Sui history could not be read" for every address
+   * with history older than publicnode keeps. GraphQL returned all 31 of the
+   * same address's transactions in one 200 ms request. It is also the
+   * adapter's other host already (fees, network info, the parties fallback),
+   * on the Rust proxy allowlist as `sui.io`.
+   *
+   * One request: GraphQL lists what the address sent AND received
+   * (`relation: AFFECTED`), where the JSON-RPC history needed two queries
+   * merged by digest. A failed read throws: an address with no transactions
+   * answers an empty list, so an error is never "no transactions".
+   */
   async getTransactionHistory(
     address: string,
     opts?: { limit?: number; cursor?: string }
   ): Promise<TxHistoryPage> {
-    const limit = opts?.limit ?? 25;
-    type SuiTxBlock = {
-      digest: string;
-      timestampMs?: string;
-      checkpoint?: string;
-      balanceChanges?: Array<{
-        owner: { AddressOwner?: string };
-        coinType: string;
-        amount: string;
-      }>;
+    const last = Math.min(Math.max(1, Math.floor(opts?.limit ?? 25)), SUI_HISTORY_MAX_PAGE);
+    type Page = {
+      address: {
+        transactions: {
+          pageInfo?: { hasPreviousPage?: boolean; startCursor?: string | null } | null;
+          nodes?: SuiHistoryNode[] | null;
+        } | null;
+      } | null;
     };
-    // `FromOrToAddress` -- a single compound filter -- was removed from the
-    // supported set in the same upstream change that killed the official
-    // fullnode host (2026-08-22): every provider that still serves
-    // `suix_queryTransactionBlocks` at all now rejects it with
-    // "-32602 Feature is not supported", confirmed live against BOTH
-    // publicnode and the old official host. `FromAddress` and `ToAddress`
-    // (the two atomic filters it used to compose) still work, so this
-    // queries both and merges -- a real behavior change (two round trips
-    // instead of one), not just an endpoint swap.
-    const queryOne = (filter: { FromAddress: string } | { ToAddress: string }) =>
-      suiRpcCall<{ data: SuiTxBlock[] }>("suix_queryTransactionBlocks", [
-        { filter, options: { showBalanceChanges: true } },
-        opts?.cursor ?? null,
-        limit,
-        true, // descending
-      ]);
-    const [fromR, toR] = await Promise.allSettled([
-      queryOne({ FromAddress: address }),
-      queryOne({ ToAddress: address }),
-    ]);
-    if (fromR.status === "rejected" && toR.status === "rejected") {
-      // An error, not an empty history (2026-09-30): an address with no
-      // transactions answers an empty list, so two rejections are a failed
-      // read, and "no transactions" would hide it (the SPL fix, same day).
-      throw new Error(`Sui history could not be read: ${errorText(fromR.reason)}`);
+    let page: Page;
+    try {
+      page = await suiGraphQL<Page>(SUI_HISTORY_QUERY, {
+        address: address.trim(),
+        last,
+        before: opts?.cursor ?? null,
+      });
+    } catch (e) {
+      throw new Error(`Sui history could not be read: ${errorText(e)}`);
     }
-    // Merge by digest -- a self-transfer, or a tx this address both sent and
-    // received, would otherwise appear twice.
-    const byDigest = new Map<string, SuiTxBlock>();
-    for (const r of [fromR, toR]) {
-      if (r.status !== "fulfilled") continue;
-      for (const tx of r.value.data ?? []) byDigest.set(tx.digest, tx);
+    const conn = page.address?.transactions;
+    if (!conn) {
+      // `address` is answered for any valid address, even an unused one
+      // (`nodes: []`, checked live), so its absence is not an empty history.
+      throw new Error("Sui history could not be read: the answer listed no transactions field for the address");
     }
-    const items: ChainTx[] = [...byDigest.values()]
-      .filter((tx) => tx.balanceChanges && tx.balanceChanges.length > 0)
-      .map((tx): ChainTx => {
-        const change = tx.balanceChanges?.find(
-          (c) =>
-            c.coinType === "0x2::sui::SUI" &&
-            c.owner.AddressOwner?.toLowerCase() === address.toLowerCase()
-        );
-        const amountMist = change ? BigInt(change.amount) : 0n;
-        const direction = amountMist < 0n ? "out" : "in";
-        const absMist = amountMist < 0n ? -amountMist : amountMist;
-        const intPart = absMist / 1_000_000_000n;
-        const fracPart = absMist % 1_000_000_000n;
-        const amount = `${intPart}.${fracPart.toString().padStart(9, "0")}`;
-        // The other side, from the same balance changes (2026-09-30: rows
-        // named nobody). `meta.from` / `meta.to` are what the details read.
-        const counterparty = suiRowCounterparty(
-          suiRpcBalanceChanges(tx.balanceChanges),
-          address.toLowerCase(),
-          direction,
-        );
-        return {
-          chain: "sui",
-          hash: tx.digest,
-          direction,
-          amount,
-          ...(counterparty
-            ? {
-                counterparty,
-                meta:
-                  direction === "out"
-                    ? { from: address, to: counterparty }
-                    : { from: counterparty, to: address },
-              }
-            : {}),
-          timestamp: tx.timestampMs
-            ? Math.floor(parseInt(tx.timestampMs, 10) / 1000)
-            : undefined,
-          // A checkpointed transaction is final: no count, its checkpoint as
-          // the block (2026-09-30; a count of 1 read "1 / 6 pending").
-          confirmations: tx.checkpoint ? undefined : 0,
-          height: tx.checkpoint ? Number(tx.checkpoint) : undefined,
-        };
-      })
-      // Each sub-query is independently sorted descending; the merge is not.
-      // Newest-first by timestamp -- present on every tx, unlike checkpoint.
-      .sort((a, b) => (b.timestamp ?? 0) - (a.timestamp ?? 0))
-      .slice(0, limit);
-    return { items };
+    // The page is oldest first; the history is newest first.
+    const items = [...(conn.nodes ?? [])]
+      .reverse()
+      .map((n) => suiHistoryRow(n, address))
+      .filter((r): r is ChainTx => r !== null);
+    const info = conn.pageInfo;
+    return {
+      items,
+      ...(info?.hasPreviousPage && info.startCursor ? { cursor: info.startCursor } : {}),
+    };
   },
 
   /**
-   * `sui_getTransactionBlock` on the history's host (publicnode), then Sui's
-   * GraphQL — the adapter's other host — when publicnode does not have it
-   * (2026-09-30).
+   * `sui_getTransactionBlock` on publicnode, then Sui's GraphQL — the
+   * adapter's other host — when publicnode does not have it (2026-09-30).
    *
    * The second source is not redundancy for its own sake: publicnode PRUNES.
    * Checked live 2026-09-30 on the public test seed's history, a digest its
