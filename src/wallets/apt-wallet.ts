@@ -506,10 +506,40 @@ function cacheAptosTx(t: AptosTxRecord): void {
   }
 }
 
+/**
+ * Ask the fullnode once for the oldest version it keeps (its ledger info),
+ * before old versions are read, so they go straight to the archive.
+ *
+ * Sandbox, 2026-10-01: the first history read of a session cost eleven
+ * `410 version_pruned` answers. The versions are read four at a time, and
+ * every read in flight started before the first 410 taught the boundary;
+ * two readers at once (the wallet's Recent list and Activity) doubled it.
+ * Concurrent callers share this one request. A failure changes nothing:
+ * the 410 path below still learns the boundary.
+ */
+let aptosBoundaryAsk: Promise<void> | null = null;
+function learnAptosOldestKept(): Promise<void> {
+  if (aptosOldestKept !== null) return Promise.resolve();
+  aptosBoundaryAsk ??= (async () => {
+    try {
+      const r = await fetch(APTOS_API);
+      if (!r.ok) return;
+      const oldest = (await r.json())?.oldest_ledger_version;
+      if (typeof oldest === "string" && /^\d+$/.test(oldest)) aptosOldestKept = BigInt(oldest);
+    } catch {
+      // Unreadable: each old version learns it from its own 410 instead.
+    } finally {
+      aptosBoundaryAsk = null;
+    }
+  })();
+  return aptosBoundaryAsk;
+}
+
 /** For tests: forget what this session has read. */
 export function clearAptosHistoryCache(): void {
   aptosTxCache.clear();
   aptosOldestKept = null;
+  aptosBoundaryAsk = null;
 }
 
 /** One committed transaction by version: the fullnode, else (410) the archive. */
@@ -963,6 +993,10 @@ export const aptAdapter: ChainAdapter = {
     if (indexed.status === "fulfilled") {
       const wanted = indexed.value.filter((e) => e.wanted);
       for (const e of wanted) deposited.set(e.version, e.deposited);
+      const toRead = wanted
+        .map((e) => e.version)
+        .filter((v) => !txs.has(v) && !aptosTxCache.has(v));
+      if (toRead.length > 0) await learnAptosOldestKept();
       await inPool(
         wanted.map((e) => e.version).filter((v) => !txs.has(v)),
         4,

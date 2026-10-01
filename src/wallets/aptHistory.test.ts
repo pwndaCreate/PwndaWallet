@@ -148,6 +148,8 @@ describe("Aptos history: receipts, and sends older than the fullnode keeps (2026
     fullnode?: Record<string, unknown>;
     archive?: Record<string, unknown>;
     oldestKept?: string;
+    /** The fullnode's ledger info (`GET /v1`): its status when not 200. */
+    ledger?: number;
   }) {
     const seen: string[] = [];
     const reply = (status: number, body: unknown) => new Response(JSON.stringify(body), { status });
@@ -156,6 +158,11 @@ describe("Aptos history: receipts, and sends older than the fullnode keeps (2026
       vi.fn(async (u: string) => {
         const url = String(u);
         seen.push(url);
+        if (url === API) {
+          return opts.ledger && opts.ledger !== 200
+            ? reply(opts.ledger, { message: "down" })
+            : reply(200, { chain_id: 1, oldest_ledger_version: opts.oldestKept ?? "7285432434" });
+        }
         if (url === `${API}/graphql`) {
           return typeof opts.indexer === "number" ? reply(opts.indexer, { message: "down" }) : reply(200, opts.indexer);
         }
@@ -211,6 +218,9 @@ describe("Aptos history: receipts, and sends older than the fullnode keeps (2026
     const old = tx("7255245050", "53", ME, { function: "0x1::aptos_account::transfer", arguments: [THEM, "4988200"] });
     const older = tx("7255244540", "54", THEM, { function: "0x1::aptos_account::transfer", arguments: [ME, "5000000"] });
     const calls = stubAptos({
+      // The ledger info is unreadable here, so the 410s are what teach the
+      // boundary (the path every read had before 2026-10-01's ledger ask).
+      ledger: 503,
       sent: [],
       indexer: indexed([
         [7255245050, [gas(6300), act("0x1::fungible_asset::Withdraw", 4988200)]],
@@ -241,6 +251,33 @@ describe("Aptos history: receipts, and sends older than the fullnode keeps (2026
     });
     expect((await aptAdapter.getTransactionHistory!(ME)).items).toHaveLength(3);
     expect(next.filter((u) => u.includes("/by_version/"))).toEqual([`${ARCHIVE}/transactions/by_version/6000000000`]);
+  });
+
+  it("the first fill asks the ledger once and sends pruned versions straight to the archive", async () => {
+    // Sandbox, 2026-10-01: a session's first read cost eleven 410s. The
+    // versions are read four at a time, every read in flight started before
+    // the first 410 named the boundary, and two readers doubled it.
+    const old = tx("7255245050", "53", ME, { function: "0x1::aptos_account::transfer", arguments: [THEM, "4988200"] });
+    const older = tx("7255244540", "54", THEM, { function: "0x1::aptos_account::transfer", arguments: [ME, "5000000"] });
+    const calls = stubAptos({
+      sent: [],
+      indexer: indexed([
+        [7255245050, [gas(6300), act("0x1::fungible_asset::Withdraw", 4988200)]],
+        [7255244540, [act("0x1::fungible_asset::Deposit", 5000000)]],
+      ]),
+      archive: { "7255245050": old, "7255244540": older },
+    });
+    // Two readers at once, as the wallet's Recent list and Activity are.
+    const [a, b] = await Promise.all([
+      aptAdapter.getTransactionHistory!(ME),
+      aptAdapter.getTransactionHistory!(ME),
+    ]);
+    expect(a.items).toHaveLength(2);
+    expect(b.items).toHaveLength(2);
+    expect(calls.filter((u) => u === API)).toHaveLength(1);
+    // No version was asked of the fullnode, so no 410 was answered.
+    expect(calls.filter((u) => u.startsWith(`${API}/transactions/by_version/`))).toEqual([]);
+    expect(calls.filter((u) => u.startsWith(ARCHIVE)).length).toBeGreaterThanOrEqual(2);
   });
 
   it("each version is read once per session: the next poll reads only what is new", async () => {
