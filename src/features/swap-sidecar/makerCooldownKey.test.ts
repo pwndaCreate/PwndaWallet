@@ -65,7 +65,11 @@ vi.mock("../../api/basicswap", async (importOriginal) => {
 });
 
 import * as api from "../../api/basicswap";
-import type { BasicSwapBidDetail, BasicSwapOffer } from "../../api/basicswap";
+import type {
+  BasicSwapActiveSwap,
+  BasicSwapBidDetail,
+  BasicSwapOffer,
+} from "../../api/basicswap";
 import { toTakerOffers } from "./offers";
 import {
   COOLDOWN_REASON_EXPIRED,
@@ -213,31 +217,116 @@ describe("an unanswered bid cools the offer's maker", () => {
   });
 
   it("a swap with no maker on its handle cools its offer alone, never the bid's own address", () => {
-    // A swap rehydrated from the node, or one whose offer carried no address.
+    // A swap followed from history, or one whose offer carried no address.
     expect(cooldownTargetForUnansweredBid(expiredSwap({ makerAddress: undefined }))).toEqual({
       offerId: OFFER_UNANSWERED,
       makerAddress: null,
     });
     expect(cooldownTargetForUnansweredBid(expiredSwap({ makerAddress: "   " })).makerAddress).toBeNull();
-    const rehydrated = activeSwapToTracked({
-      bid_id: BID,
-      offer_id: OFFER_UNANSWERED,
-      created_at: CREATED,
-      expire_at: CREATED + 3600,
-      bid_state: "Expired",
-      coin_from: "Litecoin",
-      coin_to: "Monero",
-      amount_from: "0.69988801",
-      amount_to: "0.500000000000",
-      addr_from: MAKER_ASLEEP,
-      was_sent: true,
-    });
-    expect(cooldownTargetForUnansweredBid(rehydrated).makerAddress).toBeNull();
+    // (Until 2026-10-01 this also asserted that a swap rehydrated from
+    // `/json/active` cools no maker. It cools its maker now; see below.)
+  });
+
+  it("never cools this node's own address, even when a handle carries it as the maker", () => {
+    // A bid this node both sent and received: `/json/active` then reports
+    // `bid.bid_addr`, the address the bid record names as this node's.
+    expect(
+      cooldownTargetForUnansweredBid(expiredSwap({ makerAddress: OWN_BID_ADDR })),
+    ).toEqual({ offerId: OFFER_UNANSWERED, makerAddress: null });
   });
 
   it("carries the maker from the offer: toTakerOffer copies addr_from", () => {
     const [t] = toTakerOffers([row(OFFER_UNANSWERED, MAKER_ASLEEP, "0.714400000000")]);
     expect(t.makerAddress).toBe(MAKER_ASLEEP);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// A swap picked up from the node after a restart (operator request,
+// 2026-10-01: the open item "rehydrated swaps cool down only their offer id")
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * `/json/active` as the deployed engine writes it (`js_active`,
+ * `js_server.py:1717`): `"addr_from": bid.bid_addr if bid.was_received else
+ * offer.addr_from`. On a bid this node SENT that is the offer's maker; on one
+ * it received, the bidder. `activeSwapToTracked` now carries it as
+ * `makerAddress` for an explicit `was_sent: true` only.
+ */
+function activeRow(over: Partial<BasicSwapActiveSwap> = {}): BasicSwapActiveSwap {
+  return {
+    bid_id: BID,
+    offer_id: OFFER_UNANSWERED,
+    created_at: CREATED,
+    expire_at: CREATED + 3600,
+    bid_state: "Expired",
+    coin_from: "Litecoin",
+    coin_to: "Monero",
+    amount_from: "0.69988801",
+    amount_to: "0.500000000000",
+    addr_from: MAKER_ASLEEP,
+    was_sent: true,
+    ...over,
+  };
+}
+
+/** The rehydrated swap once the tracker has read the expired bid's record. */
+function rehydratedAndRead(over: Partial<BasicSwapActiveSwap> = {}): SidecarTrackedSwap {
+  return {
+    ...activeSwapToTracked(activeRow(over)),
+    detail: expiredBidDetail(),
+    stage: classifyBidState(31, "scriptless"),
+    lastPolledAt: (CREATED + 3700) * 1000,
+  };
+}
+
+describe("a swap picked up from the node cools its maker too", () => {
+  it("a bid this node sent: the row's addr_from is the offer's maker", () => {
+    expect(activeSwapToTracked(activeRow()).makerAddress).toBe(MAKER_ASLEEP);
+    expect(cooldownTargetForUnansweredBid(rehydratedAndRead())).toEqual({
+      offerId: OFFER_UNANSWERED,
+      makerAddress: MAKER_ASLEEP,
+    });
+  });
+
+  it("not the address the bid's own record names, which is this node's", () => {
+    const swap = rehydratedAndRead();
+    expect(swap.detail?.addr_from).toBe(OWN_BID_ADDR);
+    expect(cooldownTargetForUnansweredBid(swap).makerAddress).not.toBe(OWN_BID_ADDR);
+  });
+
+  it("a bid this node received names no maker: its addr_from is the bidder", () => {
+    const received = activeSwapToTracked(activeRow({ was_sent: false, addr_from: "pInventedBidderXXXXXXXXXXXXXXXXXXXX" }));
+    expect(received.makerAddress).toBeUndefined();
+  });
+
+  it("a row with no was_sent names no maker: it cannot say whose address it holds", () => {
+    expect(activeSwapToTracked(activeRow({ was_sent: undefined })).makerAddress).toBeUndefined();
+    expect(activeSwapToTracked(activeRow({ was_sent: null })).makerAddress).toBeUndefined();
+    expect(activeSwapToTracked(activeRow({ addr_from: null })).makerAddress).toBeUndefined();
+    expect(activeSwapToTracked(activeRow({ addr_from: "  " })).makerAddress).toBeUndefined();
+  });
+
+  it("a bid this node both sent and received cools nothing of its own", () => {
+    // `js_active` then writes `bid.bid_addr`, the address the record names.
+    const selfBid = rehydratedAndRead({ addr_from: OWN_BID_ADDR });
+    expect(cooldownTargetForUnansweredBid(selfBid).makerAddress).toBeNull();
+  });
+
+  it("still never re-bids: the node reports no payout address", () => {
+    expect(activeSwapToTracked(activeRow()).payoutAddress).toBeUndefined();
+  });
+
+  it("so the next quote goes to another maker, not the sleeping one's re-post", async () => {
+    coolDown(cooldownTargetForUnansweredBid(rehydratedAndRead()), COOLDOWN_REASON_EXPIRED);
+    vi.mocked(api.fetchOffers).mockResolvedValue([
+      row(OFFER_REPOSTED, MAKER_ASLEEP, "0.714400000000"),
+      row(OFFER_OTHER_MAKER, MAKER_AWAKE, "0.716000000000"),
+    ]);
+    const q = await fetchSidecarQuote({ from: "XMR", to: "LTC", amount: "0.5", prices: PRICES });
+    expect(q.offer.offerId).toBe(OFFER_OTHER_MAKER);
+    expect(q.offer.makerAddress).toBe(MAKER_AWAKE);
+    expect(api.swapSidecarPlaceBid).not.toHaveBeenCalled();
   });
 });
 

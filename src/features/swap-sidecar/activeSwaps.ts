@@ -46,9 +46,23 @@ import type { SidecarTrackedSwap } from "./useSidecarSwap";
  * Verified against the live 2026-09-05 row: `coin_from: Litecoin`,
  * `coin_to: Monero`, `was_sent: true`, and the operator sent 0.00999997 XMR to
  * receive 0.09992627 LTC.
+ *
+ * # Whose address `addr_from` is
+ *
+ * The deployed engine's `js_active` writes
+ * `"addr_from": bid.bid_addr if bid.was_received else offer.addr_from`
+ * (`js_server.py:1717`, read 2026-10-01). So on a bid this node SENT it is the
+ * offer's `addr_from`, the MAKER, and on a bid it received it is the bidder.
+ * It becomes `makerAddress` only for an explicit `was_sent: true`, so a swap
+ * picked up after a restart cools down its maker as well as its offer when it
+ * ends unanswered (`cooldownTargetForUnansweredBid`); until 2026-10-01 it
+ * carried no maker and cooled the offer id alone. A row with no `was_sent`
+ * cannot say whose address it holds, so it names no maker. Never the bid
+ * record's `addr_from`: on a sent bid that is this node's own address.
  */
 export function activeSwapToTracked(row: BasicSwapActiveSwap): SidecarTrackedSwap {
   const sent = row.was_sent !== false;
+  const maker = row.was_sent === true ? (row.addr_from ?? "").trim() : "";
   return {
     bidId: row.bid_id,
     offerId: row.offer_id,
@@ -70,6 +84,7 @@ export function activeSwapToTracked(row: BasicSwapActiveSwap): SidecarTrackedSwa
     // Deliberately no `payoutAddress`: the node does not report one, and its
     // absence is what stops an automatic re-bid firing on a swap this app did
     // not place itself.
+    ...(maker ? { makerAddress: maker } : {}),
   };
 }
 

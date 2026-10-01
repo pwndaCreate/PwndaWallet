@@ -1287,15 +1287,24 @@ export interface SidecarSwapHandle {
  * address: the engine's `describeBid` reports `bid.bid_addr` there
  * (`ui/util.py:367`), which `postXmrBid` takes from `prepareSMSGAddress`
  * (`basicswap.py:6965`; both read in the deployed runtime). So the maker half
- * of the cool-down never named a maker (2026-10-01). A swap this session did
- * not place (rehydrated from the node) carries no maker and cools its offer
- * alone, which is all the old key ever achieved.
+ * of the cool-down never named a maker (2026-10-01). A swap picked up from the
+ * node after a restart carries its maker too, from `/json/active`'s
+ * `addr_from` on a bid this node sent (`activeSwapToTracked`, 2026-10-01);
+ * one followed from swap history carries none and cools nothing at all.
+ *
+ * Never this node's own address: a maker equal to the bid record's
+ * `addr_from` (this node's, as above) is dropped. That can only happen on a
+ * bid this node both sent and received, a self-bid, where `/json/active`
+ * reports `bid.bid_addr` as well (deployed `js_server.py:1717`).
  */
 export function cooldownTargetForUnansweredBid(
-  swap: Pick<SidecarSwapHandle, "offerId" | "makerAddress">,
+  swap: Pick<SidecarSwapHandle, "offerId" | "makerAddress"> & {
+    detail?: { addr_from?: string | null } | null;
+  },
 ): CooldownTarget {
   const maker = swap.makerAddress?.trim();
-  return { offerId: swap.offerId, makerAddress: maker ? maker : null };
+  const own = swap.detail?.addr_from?.trim();
+  return { offerId: swap.offerId, makerAddress: maker && maker !== own ? maker : null };
 }
 
 /** One tracked swap: the handle plus whatever the last poll learned. */

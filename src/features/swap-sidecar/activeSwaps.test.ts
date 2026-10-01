@@ -59,6 +59,22 @@ describe("activeSwapToTracked", () => {
   it("carries no payout address, which is what blocks an auto re-bid", () => {
     expect(activeSwapToTracked(LIVE).payoutAddress).toBeUndefined();
   });
+
+  /**
+   * `js_active` (deployed `js_server.py:1717`): `"addr_from": bid.bid_addr if
+   * bid.was_received else offer.addr_from`. So the row's address is the
+   * MAKER's on a bid this node sent, and the bidder's on one it received
+   * (2026-10-01: a swap picked up after a restart cooled its offer id alone).
+   */
+  it("names the maker from a sent bid's addr_from, and nobody from a received one", () => {
+    const maker = "pInventedMakerXXXXXXXXXXXXXXXXXXXXX";
+    expect(activeSwapToTracked({ ...LIVE, addr_from: maker }).makerAddress).toBe(maker);
+    expect(
+      activeSwapToTracked({ ...LIVE, was_sent: false, addr_from: maker }).makerAddress,
+    ).toBeUndefined();
+    // The 2026-09-05 row above carries no `addr_from`, so it names no maker.
+    expect(activeSwapToTracked(LIVE).makerAddress).toBeUndefined();
+  });
 });
 
 describe("mergeActiveSwaps", () => {
