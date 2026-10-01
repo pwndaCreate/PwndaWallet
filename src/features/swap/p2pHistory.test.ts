@@ -718,6 +718,9 @@ describe("the swap details of a P2P row", () => {
     // GET reads carry no txids for an adaptor swap: said, not left blank.
     expect(html).toContain("data-p2p-no-txns");
     expect(html).toContain(`>Grove P2P<`);
+    // The live stage is the P2P section, so the NEAR-Intents-only line that
+    // says there is none does not show (combining the branches, 2026-10-01).
+    expect(html).not.toContain("Live status not available");
   });
 
   it("a finished swap: both legs with the wallet's explorer links, and no tracker button", async () => {

@@ -429,7 +429,9 @@ export function SwapDetailsModal({
                 </div>
               )}
             </div>
-          ) : (
+          ) : route === "p2p" ? null : (
+            // A P2P swap's live stage is the section below, read from the swap
+            // node, with the way to its live tracker (2026-10-01).
             <div
               data-live-status="unavailable"
               style={{ fontSize: 10, marginTop: 8, color: "var(--text-dim)" }}
