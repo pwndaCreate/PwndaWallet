@@ -372,6 +372,11 @@ export const SUI_HISTORY_MAX_PAGE = 50;
  *    format (`[{ address, coinType, amount }]`, read live). The typed
  *    `balanceChanges` connection pages at 50, so an airdrop to more owners
  *    than that could cut this address's own change off the first page.
+ *  - `gasInput.gasSponsor` (the gas coins' owner: the sender, or a sponsor)
+ *    and `gasEffects.gasSummary`, so a send's amount can leave its gas out
+ *    (operator request, 2026-10-01; `suiHistoryRow`). Read live for the
+ *    public test seed that day: both present on every node, the summary's
+ *    costs as numbers.
  */
 const SUI_HISTORY_QUERY = `query ($address: SuiAddress!, $last: Int!, $before: String) {
   address(address: $address) {
@@ -380,12 +385,14 @@ const SUI_HISTORY_QUERY = `query ($address: SuiAddress!, $last: Int!, $before: S
       nodes {
         digest
         sender { address }
+        gasInput { gasSponsor { address } }
         effects {
           status
           timestamp
           checkpoint { sequenceNumber }
           executionError { message }
           balanceChangesJson
+          gasEffects { gasSummary { computationCost storageCost storageRebate } }
         }
       }
     }
@@ -396,6 +403,8 @@ const SUI_HISTORY_QUERY = `query ($address: SuiAddress!, $last: Int!, $before: S
 export interface SuiHistoryNode {
   digest?: unknown;
   sender?: { address?: unknown } | null;
+  /** `gasSponsor` is the owner of the gas coins: the sender, unless sponsored. */
+  gasInput?: { gasSponsor?: { address?: unknown } | null } | null;
   effects?: {
     status?: unknown;
     /** ISO-8601, like `effects.timestamp` everywhere in this API (see the file header). */
@@ -403,7 +412,31 @@ export interface SuiHistoryNode {
     checkpoint?: { sequenceNumber?: unknown } | null;
     executionError?: { message?: unknown } | null;
     balanceChangesJson?: unknown;
+    gasEffects?: {
+      gasSummary?: { computationCost?: unknown; storageCost?: unknown; storageRebate?: unknown } | null;
+    } | null;
   } | null;
+}
+
+/**
+ * The gas a transaction charged its gas owner, in MIST: computation +
+ * storage − rebate (the schema's own definition of what is "deducted from
+ * its gas coins"). Can be negative: a transaction that frees more storage
+ * than it uses is paid a rebate (live, the test seed's G2ukojQB…: +3,078,120
+ * MIST). `null` when the answer carries no readable summary.
+ */
+function suiNetGas(summary: unknown): bigint | null {
+  const s = (summary ?? null) as { computationCost?: unknown; storageCost?: unknown; storageRebate?: unknown } | null;
+  if (!s) return null;
+  try {
+    return (
+      suiU64(s.computationCost, "computation cost") +
+      suiU64(s.storageCost, "storage cost") -
+      suiU64(s.storageRebate, "storage rebate")
+    );
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -430,9 +463,9 @@ export function suiJsonBalanceChanges(raw: unknown): SuiBalanceChange[] | null {
  * changed no balance at all (the JSON-RPC rows left those out too). Exported
  * for tests. The rules the JSON-RPC rows followed are kept:
  *
- *  - the amount is this address's own SUI balance change (a send it paid gas
- *    for includes the gas, as before); a transaction that moved only another
- *    coin reads 0;
+ *  - the amount is this address's own SUI balance change, except for the gas
+ *    of a send it paid (below); a transaction that moved only another coin,
+ *    with its gas paid by someone else, reads 0;
  *  - a send's other side comes from the same balance changes
  *    (`suiRowCounterparty`); a receipt's is the transaction's sender;
  *  - a checkpointed transaction is final: no count, its checkpoint as height.
@@ -440,6 +473,19 @@ export function suiJsonBalanceChanges(raw: unknown): SuiBalanceChange[] | null {
  * New with GraphQL, which says whether the transaction executed: a FAILURE is
  * `failed`. It moved nothing, so its amount is 0 and the gas this address
  * paid is its fee; the JSON-RPC rows read that gas as a send.
+ *
+ * A send's amount leaves its gas out (operator request, 2026-10-01; the rule
+ * Ergo's rows follow since that day, `erg-wallet.ts::classifyTxDirection`).
+ * It was this address's whole SUI change, gas included: the test seed's send
+ * of 2026-05-11 (6pAfmULA…) read "sent 0.500000000 SUI" while the recipient
+ * got 0.499880120 and 0.000119880 went to gas. Every other chain's row, and
+ * the send form, state the amount without the fee and the fee beside it. So
+ * when this address alone paid the gas (it owns the gas coins: no sponsor),
+ * the gas was a charge (`suiNetGas` above 0) and the loss covers it, the
+ * amount is the loss less the gas and `fee` holds the gas. Otherwise the
+ * whole change stays the amount, with no fee: a sponsored send (its whole
+ * change is what moved; the gas was someone else's), a receipt, a storage
+ * rebate, and an answer without the gas fields.
  */
 export function suiHistoryRow(node: SuiHistoryNode, address: string): ChainTx | null {
   const digest = typeof node?.digest === "string" ? node.digest : "";
@@ -492,11 +538,22 @@ export function suiHistoryRow(node: SuiHistoryNode, address: string): ChainTx | 
   // (2026-10-01). A send's is the owner whose SUI rose most, as before.
   const counterparty =
     direction === "in" && sender && !sentByMe ? sender : suiRowCounterparty(changes, me, direction);
+  // The gas, when this address alone paid it (see the doc comment).
+  const gasOwner = node.gasInput?.gasSponsor?.address;
+  const gas = suiNetGas(fx.gasEffects?.gasSummary);
+  const paidGas =
+    direction === "out" &&
+    typeof gasOwner === "string" &&
+    gasOwner.toLowerCase() === me &&
+    gas !== null &&
+    gas > 0n &&
+    -mine >= gas;
   return {
     chain: "sui",
     hash: digest,
     direction,
-    amount: formatMist(mine < 0n ? -mine : mine),
+    amount: formatMist(paidGas ? -mine - gas : mine < 0n ? -mine : mine),
+    ...(paidGas ? { fee: formatMist(gas) } : {}),
     ...(counterparty
       ? {
           counterparty,

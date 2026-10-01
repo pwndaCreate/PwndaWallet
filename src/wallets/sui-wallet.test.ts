@@ -124,22 +124,42 @@ describe("getTransactionHistory (GraphQL, 2026-10-01)", () => {
   const SUI = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
   const OTHER = "0x" + "cd".repeat(32);
   const SPONSOR = "0x" + "ef".repeat(32);
-  /** One `Address.transactions` node, in the layout the live query returned. */
+  /**
+   * One `Address.transactions` node, in the layout the live query returned.
+   * `gasOwner` and `gas` (computation, storage, rebate) add the gas fields
+   * the query asks since 2026-10-01, in their live layout: `gasInput.
+   * gasSponsor.address`, and `gasEffects.gasSummary` with numbers.
+   */
   const node = (
     digest: string,
     iso: string,
     checkpoint: number,
     changes: Array<[string, string]>,
-    over: { status?: string; sender?: string; error?: string; coinType?: string } = {},
+    over: {
+      status?: string;
+      sender?: string;
+      error?: string;
+      coinType?: string;
+      gasOwner?: string;
+      gas?: [number, number, number];
+    } = {},
   ) => ({
     digest,
     sender: { address: over.sender ?? ADDR },
+    ...(over.gasOwner ? { gasInput: { gasSponsor: { address: over.gasOwner } } } : {}),
     effects: {
       status: over.status ?? "SUCCESS",
       timestamp: iso,
       checkpoint: { sequenceNumber: checkpoint },
       executionError: over.error ? { message: over.error } : null,
       balanceChangesJson: changes.map(([address, amount]) => ({ address, coinType: over.coinType ?? SUI, amount })),
+      ...(over.gas
+        ? {
+            gasEffects: {
+              gasSummary: { computationCost: over.gas[0], storageCost: over.gas[1], storageRebate: over.gas[2] },
+            },
+          }
+        : {}),
     },
   });
   const gqlPage = (nodes: unknown[], pageInfo: Record<string, unknown> = { hasPreviousPage: false, startCursor: "c0" }) => ({
@@ -203,7 +223,9 @@ describe("getTransactionHistory (GraphQL, 2026-10-01)", () => {
       gqlPage([
         // Received 0.1 SUI; the sender paid its own gas.
         node("DigestIn", "2026-05-10T14:04:09.471Z", 274168221, [[OTHER, "-101097880"], [ADDR, "100000000"]], { sender: OTHER }),
-        // Sent 0.5 SUI: the recipient's rise is the counterparty.
+        // Sent 0.5 SUI: the recipient's rise is the counterparty. No gas
+        // fields in this node, so the whole change stays the amount (the gas
+        // is left out only when the answer says who paid it, below).
         node("DigestOut", "2026-05-11T03:45:28.118Z", 274364064, [[OTHER, "499880120"], [ADDR, "-500000000"]]),
         // Only another coin reached this address: a 0-SUI receipt, as before.
         node("DigestCoin", "2026-05-12T00:00:00.000Z", 274400000, [[ADDR, "2000000000"]], {
@@ -262,6 +284,85 @@ describe("getTransactionHistory (GraphQL, 2026-10-01)", () => {
     );
     const [row] = (await suiAdapter.getTransactionHistory!(ADDR)).items;
     expect(row).toMatchObject({ direction: "in", amount: "0.000863032", counterparty: OTHER, meta: { from: OTHER, to: ADDR } });
+  });
+
+  it("asks for the gas owner and the gas, so a send's amount can leave its gas out", async () => {
+    mockProxy.mockResolvedValue(gqlPage([]));
+    await suiAdapter.getTransactionHistory!(ADDR);
+    const { query } = JSON.parse(mockProxy.mock.calls[0][0].body);
+    expect(query).toContain("gasInput { gasSponsor { address } }");
+    expect(query).toContain("gasEffects { gasSummary { computationCost storageCost storageRebate } }");
+  });
+
+  it("a send this address paid the gas for: the amount leaves the gas out and `fee` holds it", async () => {
+    // The test seed's send of 2026-05-11 (6pAfmULA…), the live layout: 0.5 SUI
+    // left the address, the recipient got 0.49988012, the gas was 110,000
+    // computation + 988,000 storage − 978,120 rebate = 119,880 MIST.
+    mockProxy.mockResolvedValue(
+      gqlPage([
+        node("DigestOut", "2026-05-11T03:45:28.118Z", 274364064, [[OTHER, "499880120"], [ADDR, "-500000000"]], {
+          gasOwner: ADDR,
+          gas: [110000, 988000, 978120],
+        }),
+      ]),
+    );
+    const [row] = (await suiAdapter.getTransactionHistory!(ADDR)).items;
+    // Was "0.500000000", no fee.
+    expect(row).toMatchObject({
+      direction: "out",
+      amount: "0.499880120",
+      fee: "0.000119880",
+      counterparty: OTHER,
+      meta: { from: ADDR, to: OTHER },
+    });
+  });
+
+  it("a sponsored send keeps its whole change and no fee: the gas was the sponsor's", async () => {
+    // The test seed's 4RUbkLxb… (2025-07-04), the live layout: the sponsor's
+    // SUI paid the gas, the address's change is exactly what it sent.
+    mockProxy.mockResolvedValue(
+      gqlPage([
+        node(
+          "DigestSponsoredOut",
+          "2025-07-04T13:49:03.071Z",
+          163910339,
+          [[SPONSOR, "-1041640"], [OTHER, "10000000"], [ADDR, "-10000000"]],
+          { gasOwner: SPONSOR, gas: [2000000, 1976000, 2934360] },
+        ),
+      ]),
+    );
+    const [row] = (await suiAdapter.getTransactionHistory!(ADDR)).items;
+    expect(row).toMatchObject({ direction: "out", amount: "0.010000000", counterparty: OTHER });
+    expect(row.fee).toBeUndefined();
+  });
+
+  it("a send that moved only gas reads 0 with its fee; a loss smaller than the gas, or a rebate, stays whole", async () => {
+    mockProxy.mockResolvedValue(
+      gqlPage([
+        // Paid only the gas (a call that moved no SUI of its own).
+        node("DigestGasOnly", "2026-05-12T00:00:00.000Z", 274400001, [[ADDR, "-119880"]], {
+          gasOwner: ADDR,
+          gas: [110000, 988000, 978120],
+        }),
+        // Paid 119,880 of gas and got 69,880 back from the call: a net loss
+        // smaller than the gas. Whose share was whose is not in the answer.
+        node("DigestOffset", "2026-05-12T00:00:01.000Z", 274400002, [[ADDR, "-50000"], [OTHER, "50000"]], {
+          gasOwner: ADDR,
+          gas: [110000, 988000, 978120],
+        }),
+        // The test seed's G2ukojQB… (2025-01-22): freed storage, a net rebate.
+        node("DigestRebate", "2025-01-22T21:23:51.967Z", 104434360, [[ADDR, "3078120"]], {
+          gasOwner: ADDR,
+          gas: [750000, 14455200, 18283320],
+        }),
+      ]),
+    );
+    const byHash = Object.fromEntries((await suiAdapter.getTransactionHistory!(ADDR)).items.map((r) => [r.hash, r]));
+    expect(byHash.DigestGasOnly).toMatchObject({ direction: "out", amount: "0.000000000", fee: "0.000119880" });
+    expect(byHash.DigestOffset).toMatchObject({ direction: "out", amount: "0.000050000" });
+    expect(byHash.DigestOffset.fee).toBeUndefined();
+    expect(byHash.DigestRebate).toMatchObject({ direction: "in", amount: "0.003078120" });
+    expect(byHash.DigestRebate.fee).toBeUndefined();
   });
 
   it("a transaction that changed no balance is left out; one whose changes are missing reads amount unknown", async () => {
