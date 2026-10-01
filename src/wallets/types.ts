@@ -174,7 +174,9 @@ export interface TxParties {
    *  change included; the view marks the wallet's own). */
   to: string[];
   /** The protocol hides the sender (Monero, Zephyr, Zano): not a failed
-   *  read, and never "unknown sender". */
+   *  read, and never "unknown sender". When `from` is not empty as well, it
+   *  holds what the sender attached about itself (Zano's `tx_payer`), which
+   *  the chain does not check, and the details say so (2026-10-01). */
   senderHidden?: boolean;
   /** Only when the list row could not say (SPL): the wallet's side of the
    *  transfer, its amount in display units, and the fee it paid. */

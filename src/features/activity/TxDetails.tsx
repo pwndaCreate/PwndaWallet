@@ -185,6 +185,9 @@ export interface TxSides {
  *    counterparty to this wallet; a send went from this wallet to it.
  *  - A side still empty is filled from what the chain said when asked
  *    (`ctx.parties`), and otherwise carries a note saying why it is blank.
+ *  - A sender the protocol hides but the transaction names anyway (Zano's
+ *    `tx_payer`: `senderHidden` with addresses) is listed, its note saying
+ *    the sender attached it itself (2026-10-01).
  */
 export function txSides(
   tx: ChainTx,
@@ -219,8 +222,17 @@ export function txSides(
 
   const asked = ctx.parties;
   const p = asked?.status === "done" ? asked.parties : null;
+  // The chain hides the sender, yet named one: what the sender attached
+  // about itself (Zano's `tx_payer`), which nothing checks. Listed, and the
+  // side's note says it is a claim (operator request, 2026-10-01). The row
+  // leaves it out for that reason, and the details named it as the sender,
+  // so the two disagreed about who sent a receipt.
+  let claimedSender = false;
   if (p) {
-    if (!listedFrom.length && p.from.length) from = uniqAddresses(p.from);
+    if (!listedFrom.length && p.from.length) {
+      from = uniqAddresses(p.from);
+      claimedSender = p.senderHidden === true;
+    }
     if (!listedTo.length && p.to.length) to = uniqAddresses(p.to);
   }
 
@@ -246,7 +258,11 @@ export function txSides(
   return {
     from: from.map((a) => mark(a, false)),
     to: to.map((a) => mark(a, paidOthers && ctx.isOwn(a))),
-    fromNote: from.length ? null : noteFor("sender"),
+    fromNote: from.length
+      ? claimedSender
+        ? `The sender attached this address itself. ${ctx.chainName} does not check it.`
+        : null
+      : noteFor("sender"),
     toNote: to.length ? null : noteFor("recipient"),
     needsParties,
   };

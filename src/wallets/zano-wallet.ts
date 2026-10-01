@@ -377,7 +377,9 @@ export async function getZanoTransactionHistory(): Promise<ZanoTransferEntry[]> 
  * first as `counterparty`. The details add this wallet as the sender. A
  * receipt is left as it was: the protocol hides who sent it, and an address
  * an incoming entry does list is the sender's own unchecked claim
- * (`tx_payer`), so a row does not present it as the sender.
+ * (`tx_payer`), so a row does not present it as the sender. When the
+ * details read one, they show it as that claim (`zanoTransferParties`,
+ * 2026-10-01).
  */
 export function zanoTransfersToChainTx(
   entries: readonly ZanoTransferEntry[],
@@ -445,6 +447,13 @@ function zanoEntryIsOutgoing(e: Record<string, any>): boolean {
  *    the sender is hidden, as the protocol intends.
  *  - A sent transaction's recipients are known when this wallet sent it
  *    (kept from its unconfirmed record) or the transaction carries them.
+ *  - A receipt is `senderHidden` whether or not it lists a sender (operator
+ *    request, 2026-10-01). A listed sender is the sender's own claim, which
+ *    nothing checks: it is returned in `from` with `senderHidden`, and the
+ *    details show it as that claim (`TxDetails.tsx::txSides`). It used to be
+ *    returned as the sender, plainly, while the history row
+ *    (`zanoTransfersToChainTx`) left it out for the same reason, so the row
+ *    and the details disagreed about who sent a receipt.
  */
 export function zanoTransferParties(
   result: unknown,
@@ -470,8 +479,9 @@ export function zanoTransferParties(
   if (sent.length > 0 || pooled.some(zanoEntryIsOutgoing)) {
     return { from: uniqueAddresses([own]), to: remote, ...src };
   }
-  if (remote.length > 0) return { from: remote, to: uniqueAddresses([own]), ...src };
-  return { from: [], to: uniqueAddresses([own]), senderHidden: true, ...src };
+  // A receipt: the protocol hides its sender. `remote` is empty, or holds
+  // the sender's own unchecked claim (see above).
+  return { from: remote, to: uniqueAddresses([own]), senderHidden: true, ...src };
 }
 
 // =========================================================================

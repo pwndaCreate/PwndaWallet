@@ -94,14 +94,20 @@ describe("Zano: a search_for_transactions2 answer as parties", () => {
     expect(zanoTransferParties(r, ZTX, ZANO_OWN)).toEqual({ from: [ZANO_OWN], to: [ZANO_THEM] });
   });
 
-  it("a receipt hides its sender, unless the sender attached itself (show_sender)", () => {
+  it("a receipt hides its sender; one the sender attached itself (show_sender) stays a hidden sender's claim", () => {
     expect(zanoTransferParties({ in: [wti(true)] }, ZTX, ZANO_OWN)).toEqual({
       from: [],
       to: [ZANO_OWN],
       senderHidden: true,
     });
+    // Was `{ from: [ZANO_THEM], to: [ZANO_OWN] }`: the claim read as the
+    // sender, while the history row leaves it out (2026-10-01).
     const shown = { in: [wti(true, { show_sender: true, remote_addresses: [ZANO_THEM] })] };
-    expect(zanoTransferParties(shown, ZTX, ZANO_OWN)).toEqual({ from: [ZANO_THEM], to: [ZANO_OWN] });
+    expect(zanoTransferParties(shown, ZTX, ZANO_OWN)).toEqual({
+      from: [ZANO_THEM],
+      to: [ZANO_OWN],
+      senderHidden: true,
+    });
   });
 
   it("the pool list is not filtered by tx_id on simplewallet's side: other hashes are ignored here", () => {
