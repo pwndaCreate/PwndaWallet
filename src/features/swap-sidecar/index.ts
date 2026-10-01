@@ -44,6 +44,9 @@ export {
   requestSidecarTracker,
   type SidecarTrackerRequest,
   type SidecarTrackerOutcome,
+  // What became of an unanswered bid's automatic re-bid, so the EARN convert
+  // pipeline follows a re-bid of its first hop (2026-10-01).
+  type AutoRebidOutcome,
 } from "./useSidecarSwap";
 // The node's in-progress row -> the tracker's shape (which leg is sent), so
 // swap history reads a `/json/active` row exactly the way the tracker does.

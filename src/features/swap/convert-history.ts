@@ -18,9 +18,10 @@
  *                  NEAR leg's own settlement is tracked in Activity, and the
  *                  UI says so rather than this store claiming an outcome it
  *                  cannot see.
- * - `unwound`    — hop 1 refunded / cancelled / was recovered by the
- *                  counterparty. A normal outcome of that protocol, not an
- *                  error, and deliberately not called "failed".
+ * - `unwound`    — hop 1 refunded / cancelled with no re-bid following /
+ *                  was recovered by the counterparty. A normal outcome of
+ *                  that protocol, not an error, and deliberately not called
+ *                  "failed".
  *
  * Storage is `localStorage`, matching `swap-history-store`'s custody model:
  * this is a convenience log of the user's own activity, holds no secrets, and
@@ -31,7 +32,12 @@ const KEY = "pwnda.convert.history";
 const MAX_ENTRIES = 50;
 
 export interface ConversionRecord {
-  /** Hop 1's bid id — stable, and the only id the pipeline ever holds. */
+  /**
+   * Hop 1's bid id, the only id the pipeline ever holds. When the P2P tracker
+   * re-bids an unanswered hop 1, the row moves to the re-bid's id
+   * ({@link followConversionRebid}, 2026-10-01), so it is always the bid the
+   * pipeline is following.
+   */
   id: string;
   fromTicker: string;
   /** The route hop (LTC today), kept so a future route change stays readable. */
@@ -86,6 +92,36 @@ export function updateConversion(
   if (i < 0) return;
   rows[i] = { ...rows[i], ...patch };
   write(rows);
+}
+
+/**
+ * Move a run from hop 1's bid to the bid that replaced it (operator request,
+ * 2026-10-01): when hop 1 expires unanswered, `useSidecarSwap` may re-bid the
+ * same XMR, and the pipeline follows the re-bid as hop 1. Without this the
+ * run would stay under the dead bid's id, and every later write (`updateConversion`
+ * by the new id) would be a no-op.
+ *
+ * Keeps the run's place, start time and target. A row already under `toId`
+ * is dropped: one bid is one run. A no-op when `fromId` is unknown.
+ */
+export function followConversionRebid(
+  fromId: string,
+  toId: string,
+  patch: Partial<Omit<ConversionRecord, "id">> = {},
+): void {
+  if (!toId) return;
+  if (fromId === toId) {
+    updateConversion(fromId, patch);
+    return;
+  }
+  const rows = read();
+  const from = rows.find((r) => r.id === fromId);
+  if (!from) return;
+  write(
+    rows
+      .filter((r) => r.id !== toId)
+      .map((r) => (r.id === fromId ? { ...r, ...patch, id: toId } : r)),
+  );
 }
 
 /** "3d ago" / "9h ago" / "just now" — the age column in the mocks. */

@@ -1307,6 +1307,29 @@ export function cooldownTargetForUnansweredBid(
   return { offerId: swap.offerId, makerAddress: maker && maker !== own ? maker : null };
 }
 
+/**
+ * What became of the automatic re-bid of a bid that ended unanswered
+ * (`cancelled`), as {@link SidecarSwapState.rebids} reports it:
+ *
+ * - `trying`: the hook is getting a fresh quote or placing the re-bid now.
+ * - `placed`: the node took the re-bid, `bidId`. The tracker follows it
+ *   (`retryOf` names the ORIGINAL bid, so after two re-bids this is the only
+ *   link from a bid to the one that replaced it).
+ * - `none`: no re-bid follows: the retry budget is spent, `shouldAutoRetry`
+ *   refused, there was no replacement quote, the node refused the bid, the
+ *   swap carries no payout address (picked up from the node), or the bid was
+ *   only followed from swap history. `reason` says which.
+ *
+ * Added 2026-10-01 (operator request) so the EARN convert pipeline can follow
+ * a re-bid of its first hop instead of telling the user "unwound … start
+ * again" while a re-bid for the same XMR may be running. Before, the hook said
+ * this only in `console.warn` lines.
+ */
+export type AutoRebidOutcome =
+  | { status: "trying" }
+  | { status: "placed"; bidId: string }
+  | { status: "none"; reason: string };
+
 /** One tracked swap: the handle plus whatever the last poll learned. */
 export interface SidecarTrackedSwap extends SidecarSwapHandle {
   detail: BasicSwapBidDetail | null;
@@ -1328,6 +1351,14 @@ export interface SidecarSwapState {
   transport: SidecarTransport;
   /** A poll is in flight right now — what "Check now" shows while it works. */
   checking: boolean;
+  /**
+   * The automatic re-bid of every bid this session saw end unanswered
+   * (`cancelled`), keyed by THAT bid's id. A bid has an entry only once it
+   * has ended that way, and an entry is never removed, so it outlives the
+   * tracker dropping the finished bid from `swaps`. See
+   * {@link AutoRebidOutcome}.
+   */
+  rebids: Readonly<Record<string, AutoRebidOutcome>>;
   /** Adopt a freshly-submitted swap. Opens the tracker. */
   adopt: (handle: SidecarSwapHandle) => void;
   openTracker: (bidId: string) => void;
@@ -1784,6 +1815,17 @@ export function useSidecarSwap(opts: {
   // user is on the Swap tab, the Mine tab, or has the window minimised — which
   // is exactly when a bid quietly expires.
   const retriedRef = useRef<Set<string>>(new Set());
+  // Every unanswered bid whose re-bid outcome is recorded in `rebids`, so each
+  // is answered once (2026-10-01). Not `retriedRef`: that also holds the bids
+  // `openOrWatch` follows from swap history, which must never be cooled or
+  // re-bid. Those used to be skipped in silence; now they are answered
+  // `none`, so a caller waiting on a re-bid (the EARN convert pipeline) is
+  // told that none is coming.
+  const answeredRef = useRef<Set<string>>(new Set());
+  const [rebids, setRebids] = useState<Record<string, AutoRebidOutcome>>({});
+  const noteRebid = useCallback((bidId: string, outcome: AutoRebidOutcome) => {
+    setRebids((prev) => ({ ...prev, [bidId]: outcome }));
+  }, []);
   useEffect(() => {
     if (!enabled) return;
     // `cancelled` is BID_EXPIRED / BID_ABANDONED — the swap ended BEFORE any
@@ -1791,15 +1833,34 @@ export function useSidecarSwap(opts: {
     // different stage and is never touched here: there is nothing to re-bid,
     // the protocol's own timelock is what resolves it.
     const dead = swaps.filter(
-      (s) => s.stage.stage === "cancelled" && !retriedRef.current.has(s.bidId),
+      (s) => s.stage.stage === "cancelled" && !answeredRef.current.has(s.bidId),
     );
     if (dead.length === 0) return;
     for (const swap of dead) {
+      answeredRef.current.add(swap.bidId);
+      if (retriedRef.current.has(swap.bidId)) {
+        // Followed from swap history (`openOrWatch`): not this session's to
+        // cool down or re-bid.
+        noteRebid(swap.bidId, {
+          status: "none",
+          reason: "this bid is only followed here, so it is never re-bid automatically",
+        });
+        continue;
+      }
       retriedRef.current.add(swap.bidId);
       // The maker is the offer's, never `swap.detail?.addr_from`: on a bid
       // this node sent that field is its own address (2026-10-01).
       coolDown(cooldownTargetForUnansweredBid(swap), COOLDOWN_REASON_EXPIRED);
-      void attemptAutoRetry(swap);
+      noteRebid(swap.bidId, { status: "trying" });
+      const deadId = swap.bidId;
+      void attemptAutoRetry(swap).then(
+        (outcome) => noteRebid(deadId, outcome),
+        (e: unknown) =>
+          noteRebid(deadId, {
+            status: "none",
+            reason: `the re-bid stopped: ${String((e as { message?: unknown })?.message ?? e)}`,
+          }),
+      );
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [enabled, swaps]);
@@ -1809,8 +1870,12 @@ export function useSidecarSwap(opts: {
    * but ONLY where the spread gate would not have asked the user anything —
    * see `shouldAutoRetry`. Every refusal is logged with its reason; silence
    * would be indistinguishable from the feature not existing.
+   *
+   * Every path returns what happened (2026-10-01), recorded in `rebids` by
+   * the effect above; the return type makes a path that forgets one a type
+   * error.
    */
-  const attemptAutoRetry = useCallback(async (dead: SidecarTrackedSwap) => {
+  const attemptAutoRetry = useCallback(async (dead: SidecarTrackedSwap): Promise<AutoRebidOutcome> => {
     const attempt = (dead.retryAttempt ?? 0) + 1;
     const origin = dead.retryOf ?? dead.bidId;
     const payout = dead.payoutAddress;
@@ -1819,7 +1884,10 @@ export function useSidecarSwap(opts: {
         "[useSidecarSwap] auto-retry skipped: no payout address on this swap " +
           "(it was rehydrated from the node, which does not carry one)",
       );
-      return;
+      return {
+        status: "none",
+        reason: "no payout address on this swap (it was picked up from the swap node, which does not carry one)",
+      };
     }
     let quote: SidecarQuote;
     try {
@@ -1829,8 +1897,9 @@ export function useSidecarSwap(opts: {
         amount: dead.sendAmount,
       });
     } catch (e) {
-      console.warn(`[useSidecarSwap] auto-retry: no replacement quote — ${String((e as { message?: unknown })?.message ?? e)}`);
-      return;
+      const why = String((e as { message?: unknown })?.message ?? e);
+      console.warn(`[useSidecarSwap] auto-retry: no replacement quote — ${why}`);
+      return { status: "none", reason: `no replacement quote: ${why}` };
     }
     const decision = shouldAutoRetry({
       spread: quote.spread,
@@ -1849,12 +1918,12 @@ export function useSidecarSwap(opts: {
     });
     if (!decision.proceed) {
       console.warn(`[useSidecarSwap] auto-retry declined: ${decision.reason}`);
-      return;
+      return { status: "none", reason: decision.reason };
     }
     const result = await submitSidecarBid({ quote, addrTo: payout });
     if (!result.ok) {
       console.warn(`[useSidecarSwap] auto-retry bid refused: ${result.message}`);
-      return;
+      return { status: "none", reason: `the swap node refused the re-bid: ${result.message}` };
     }
     console.warn(
       `[useSidecarSwap] auto-retry ${attempt}/${AUTO_RETRY_MAX_ATTEMPTS}: re-bid ` +
@@ -1873,6 +1942,7 @@ export function useSidecarSwap(opts: {
       retryOf: origin,
       retryAttempt: attempt,
     });
+    return { status: "placed", bidId: result.bidId };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -1893,7 +1963,7 @@ export function useSidecarSwap(opts: {
   // Following it is a `swap_sidecar_*` read, so it waits on the same opt-in
   // check as the rehydrate. And it never counts as a bid this session placed:
   // marked as already retried, so if it turns out to have expired unanswered
-  // nobody cools its maker down or re-bids it.
+  // nobody cools its maker down or re-bids it (`rebids` then says `none`).
   const openOrWatch = useCallback(
     async (req: SidecarTrackerRequest): Promise<SidecarTrackerOutcome> => {
       if (!swapsRef.current.some((s) => s.bidId === req.bidId)) {
@@ -1954,6 +2024,7 @@ export function useSidecarSwap(opts: {
     trackerOpen,
     transport,
     checking,
+    rebids,
     adopt,
     openTracker,
     closeTracker,

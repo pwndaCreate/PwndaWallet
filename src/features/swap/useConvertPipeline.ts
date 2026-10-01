@@ -31,10 +31,16 @@
  * canvas ("manual CONVERT only") and the only shape compatible with this
  * repo's rule that a funds-moving action is always the operator's.
  */
-import { useCallback, useEffect, useMemo, useState } from "react";
-import type { SidecarSwapState, SidecarTrackedSwap } from "../swap-sidecar";
-import { tickerForCoin } from "../swap-sidecar";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type {
+  AutoRebidOutcome,
+  BidStage,
+  SidecarSwapState,
+  SidecarTrackedSwap,
+} from "../swap-sidecar";
+import { stageForBidState, tickerForCoin } from "../swap-sidecar";
 import {
+  followConversionRebid,
   recordConversionStarted,
   updateConversion,
   type ConversionRecord,
@@ -89,9 +95,9 @@ export interface ConvertPipelineState {
 
   /**
    * True when hop 1 ended in a way that is not "settled": refunded,
-   * cancelled, or recovered by the counterparty. Those are NORMAL outcomes of
-   * this protocol, not errors, so they get their own flag rather than being
-   * folded into `failed`.
+   * cancelled with no automatic re-bid following it, or recovered by the
+   * counterparty. Those are NORMAL outcomes of this protocol, not errors, so
+   * they get their own flag rather than being folded into `failed`.
    */
   hop1Unwound: boolean;
 
@@ -135,18 +141,151 @@ function writeStored(key: string, value: string | null): void {
 }
 
 /**
- * Terminal classifications, split by what they mean for the pipeline.
+ * What each tracker stage of hop 1 means for the pipeline. A `Record` over
+ * every stage, so a stage added to `bidStates.ts` fails the type check here
+ * until somebody decides what it means for a conversion.
  *
- * Mirrors `swap-sidecar/bidStates.ts`. `done` is the only one that produces
- * LTC to convert; the unwound three return the funds and end the pipeline
- * without an error, which is what the refund copy has always promised.
+ * Hop 1 sends XMR, so this node is always on its SCRIPTLESS leg; stages only
+ * the scripted leg reaches are still given the reading their words state.
+ *
+ * - `settled`: this node holds the LTC it was buying. `done`, and since
+ *   2026-10-01 `swiped` (operator request). Until then only `done` led to
+ *   `hop2-ready`, so a hop 1 the timelock had paid left EARN at "SWAP IN
+ *   PROGRESS…" for the session.
+ * - `unwound`: hop 1 is over and produced no LTC.
+ * - `unanswered`: `cancelled`, the bid ended before anything was locked. The
+ *   tracker may re-bid it; {@link nextHop1Step} reads `rebids` to know.
+ * - `running`: anything still moving, or that the protocol can still move.
  */
-const HOP1_SETTLED = "done";
-const HOP1_UNWOUND = new Set([
-  "refunded",
-  "cancelled",
-  "counterparty-recovered",
-]);
+type Hop1Reading = "running" | "settled" | "unwound" | "unanswered";
+
+const HOP1_STAGE_READING: Readonly<Record<BidStage, Hop1Reading>> = {
+  requesting: "running",
+  accepted: "running",
+  locking: "running",
+  "waiting-counterparty": "running",
+  finalising: "running",
+  done: "settled",
+  // The scripted leg's refund, still confirming.
+  refunding: "running",
+  refunded: "unwound",
+  // The other user's chain-A lock is unwinding; this node's XMR has not moved.
+  "timelock-unwinding": "running",
+  // Paid, and NOT finished: the LTC still sits on the swap's own key until the
+  // node's mercy tx (or, when none is sent, its sweep) moves it into the
+  // node's LTC wallet (deployed engine: with `altruistic` on, its default,
+  // `createCoinALockRefundSwipeTx` pays the swap's `KA_SWIPE` key, and
+  // `sendMercyTx` sets 18 once the mercy tx is out).
+  "swiped-settling": "running",
+  // The timelock paid this node the LTC it was buying. The engine pays it to
+  // the same LTC wallet as a normal completion, at another of its addresses:
+  // a completion pays the bid's pool address (`dest_af`), a swipe the
+  // swap's own key and then, by the mercy tx or the sweep, a second pool
+  // address (deployed `basicswap.py:7084-7092`, `:17491-17506`, `:9827-9849`).
+  swiped: "settled",
+  // State 36, the scripted leg's ending: the coin it was buying arrived.
+  "claimed-after-swipe": "settled",
+  // The other user took this side's locked coin. For hop 1 only a reading
+  // with no leg says this (state 18); {@link nextHop1Step} waits for the leg.
+  "counterparty-recovered": "unwound",
+  recovering: "running",
+  cancelled: "unanswered",
+  // Not terminal: a timelock refund can still be ahead of it.
+  "needs-attention": "running",
+  internal: "running",
+  unknown: "running",
+};
+
+/** What the pipeline does with hop 1 next. See {@link nextHop1Step}. */
+export type Hop1Step =
+  /** Nothing is known about hop 1 here: leave the stage alone. */
+  | { kind: "unknown" }
+  /** Still moving. `awaiting` names what a terminal-looking hop 1 waits on. */
+  | { kind: "running"; awaiting?: "rebid" | "leg" }
+  /** The LTC is in: hop 2 may start, with `viaAmount`. */
+  | { kind: "settled"; viaAmount: string }
+  /** Hop 1 expired unanswered and the tracker re-bid it: follow `bidId`. */
+  | { kind: "follow"; bidId: string }
+  /** Hop 1 ended without LTC, and no re-bid follows. */
+  | { kind: "unwound" };
+
+/**
+ * Does this state read differently from the two legs (`bidStates.ts`, "A bid
+ * state does NOT determine the story on its own")? Then a reading without a
+ * leg is a coin flip between two stories.
+ */
+function readingDependsOnLeg(state: string): boolean {
+  return stageForBidState(state, "scripted") !== stageForBidState(state, "scriptless");
+}
+
+/**
+ * The pipeline's next step for hop 1, from what the P2P tracker holds. Pure,
+ * so every hop-1 ending is pinned by a unit test (the suite runs in node,
+ * with no React renderer to run the effect; until 2026-10-01 the effect
+ * itself was the logic and had no test).
+ *
+ * - `hop1`: the tracker's entry for `hop1BidId`, or null when it holds none
+ *   (not adopted yet, or dropped after it finished).
+ * - `rebid`: `SidecarSwapState.rebids[hop1BidId]`. Present only once the
+ *   tracker saw that bid end unanswered.
+ *
+ * The rules, in order:
+ *
+ * 1. A terminal-looking reading whose meaning depends on the leg, made without
+ *    one, waits: a hop 1 picked up from `/json/active` after a restart is
+ *    read with no leg, and the no-leg reading of `XMR_SWAP_FAILED_SWIPED` is
+ *    `counterparty-recovered`, which would end the conversion as "unwound"
+ *    one poll before the read that says this node was PAID.
+ * 2. Any other reading of a hop 1 the tracker holds decides by its stage
+ *    ({@link HOP1_STAGE_READING}). `settled` hands hop 2 the bid's own
+ *    receive amount: the bid's record does not say what arrived (`describeBid`
+ *    reports the agreed amounts, not an output value), and what arrives is
+ *    the bid amount less the claim fee (`createSCLockSpendTx`: `locked_coin -
+ *    pay_fee`), or after a swipe less the pre-refund, swipe and mercy fees.
+ *    Hop 2's own form checks the balance, and the user confirms it.
+ * 3. Hop 1 ended unanswered (or the tracker dropped it after that): follow
+ *    the re-bid when one was `placed` (operator request, 2026-10-01: the
+ *    pipeline said "unwound" at once while a re-bid for the same XMR ran);
+ *    unwind only on `none`; while `trying`, or before the tracker has
+ *    answered at all, wait.
+ */
+export function nextHop1Step(args: {
+  hop1BidId: string;
+  hop1: Pick<SidecarTrackedSwap, "bidId" | "receiveAmount" | "stage"> | null;
+  rebid: AutoRebidOutcome | undefined;
+}): Hop1Step {
+  const { hop1BidId, hop1, rebid } = args;
+  if (hop1) {
+    const reading = HOP1_STAGE_READING[hop1.stage.stage];
+    if (reading !== "unanswered") {
+      const state = hop1.stage.state;
+      if (
+        reading !== "running" &&
+        hop1.stage.leg === "unknown" &&
+        state != null &&
+        readingDependsOnLeg(state)
+      ) {
+        return { kind: "running", awaiting: "leg" };
+      }
+      if (reading === "settled") return { kind: "settled", viaAmount: hop1.receiveAmount };
+      if (reading === "unwound") return { kind: "unwound" };
+      return { kind: "running" };
+    }
+  }
+  if (!rebid) return hop1 ? { kind: "running", awaiting: "rebid" } : { kind: "unknown" };
+  switch (rebid.status) {
+    case "trying":
+      return { kind: "running", awaiting: "rebid" };
+    case "placed":
+      // A re-bid the node answered with the same id (the browser sandbox's
+      // mock does) is already the bid the tracker holds under that id.
+      return rebid.bidId === hop1BidId
+        ? { kind: "running" }
+        : { kind: "follow", bidId: rebid.bidId };
+    case "none":
+      return { kind: "unwound" };
+  }
+}
 
 /**
  * Is this P2P swap the conversion's first hop: XMR sent, LTC received?
@@ -276,32 +415,58 @@ export function useConvertPipeline({
     return sidecar.swaps.find((s) => s.bidId === hop1BidId) ?? null;
   }, [hop1BidId, sidecar]);
 
-  /** Advance the stage from hop 1's own state machine. */
+  /** What the tracker says became of hop 1's re-bid, once it ended unanswered. */
+  const hop1Rebid = hop1BidId ? sidecar?.rebids?.[hop1BidId] : undefined;
+
+  // Read inside the effect, never a dependency of it: `sidecar` is a new
+  // object on every App render, and re-running the effect on each one would
+  // re-apply `hop2-ready` over a `hop2-running` the user has moved on to.
+  const sidecarRef = useRef(sidecar);
+  sidecarRef.current = sidecar;
+
+  /** Advance the stage from hop 1's own state machine ({@link nextHop1Step}). */
   useEffect(() => {
     if (!enabled || !hop1BidId) return;
-    if (!hop1) {
-      // The tracker has not adopted it yet (or has dropped it after a
-      // terminal read). Leave the stage alone rather than guessing.
-      return;
+    const step = nextHop1Step({ hop1BidId, hop1, rebid: hop1Rebid });
+    switch (step.kind) {
+      case "unknown":
+        // The tracker has not adopted it yet (or has dropped it after a
+        // terminal read). Leave the stage alone rather than guessing.
+        return;
+      case "settled":
+        setHop2InputAmount(step.viaAmount);
+        setHop1Unwound(false);
+        setStage("hop2-ready");
+        updateConversion(hop1BidId, { viaAmount: step.viaAmount });
+        return;
+      case "follow": {
+        // The tracker re-bid hop 1 after it expired unanswered (operator
+        // request, 2026-10-01): the same XMR, now on `step.bidId`. Follow it
+        // as hop 1, under its id in storage and in the conversion log.
+        const rebid = sidecarRef.current?.swaps.find((s) => s.bidId === step.bidId);
+        followConversionRebid(
+          hop1BidId,
+          step.bidId,
+          rebid?.sendAmount ? { fromAmount: rebid.sendAmount } : {},
+        );
+        setHop1BidId(step.bidId);
+        writeStored(HOP1_STORAGE_KEY, step.bidId);
+        setHop1Unwound(false);
+        setStage("hop1-running");
+        return;
+      }
+      case "unwound":
+        setHop1Unwound(true);
+        setStage("idle");
+        setHop1BidId(null);
+        writeStored(HOP1_STORAGE_KEY, null);
+        updateConversion(hop1BidId, { status: "unwound" });
+        return;
+      case "running":
+        setStage("hop1-running");
+        return;
     }
-    const cls = hop1.stage?.stage ?? null;
-    if (cls === HOP1_SETTLED) {
-      setHop2InputAmount(hop1.receiveAmount);
-      setHop1Unwound(false);
-      setStage("hop2-ready");
-      updateConversion(hop1.bidId, { viaAmount: hop1.receiveAmount });
-      return;
-    }
-    if (cls && HOP1_UNWOUND.has(cls)) {
-      setHop1Unwound(true);
-      setStage("idle");
-      setHop1BidId(null);
-      writeStored(HOP1_STORAGE_KEY, null);
-      updateConversion(hop1.bidId, { status: "unwound" });
-      return;
-    }
-    setStage("hop1-running");
-  }, [enabled, hop1, hop1BidId]);
+  }, [enabled, hop1, hop1BidId, hop1Rebid]);
 
   const beginHop1 = useCallback(() => {
     setHop1Unwound(false);
