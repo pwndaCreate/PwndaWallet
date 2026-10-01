@@ -78,6 +78,12 @@
 //! Every constant here is Phase-0 verified against
 //! `simplewallet v2.2.1.506[b76fa18]`; see
 //! `PwndaWalletVault/wiki/synthesis/zano-integration-plan.md` for the evidence.
+//! Re-checked 2026-10-01 against the official `v2.2.3.600[98bbd72]` and our
+//! `v2.2.3.601[b7d1088]` build: the JWT scheme, the two-stage lifecycle and
+//! the flags above are unchanged (2.2.3.600 refuses to start its RPC server
+//! without `--jwt-secret`, which we always pass), and 2.2.2 added an 8-256
+//! character wallet-password policy, which both our passwords meet (Main's
+//! is 64 hex characters, Scratch's 32).
 
 use futures_util::StreamExt;
 use sha2::{Digest as _, Sha256};
@@ -126,8 +132,9 @@ const ZANO_BINARY_NAME: &str = "simplewallet.exe";
 #[cfg(not(target_os = "windows"))]
 const ZANO_BINARY_NAME: &str = "simplewallet";
 
-/// Measured 16,963,968 B for v2.2.1.506. Guards against a truncated download
-/// or a placeholder being mistaken for the real binary.
+/// Measured 16,963,968 B for v2.2.1.506 and 17,750,960 B for the official
+/// v2.2.3.600 (2026-10-01). Guards against a truncated download or a
+/// placeholder being mistaken for the real binary.
 const REAL_BINARY_MIN_SIZE: u64 = 10 * 1024 * 1024;
 
 const ZANO_WALLET_DIR_NAME: &str = "zano-wallets";
@@ -167,8 +174,19 @@ const READY_POLL_MS: u64 = 250;
 // hash; the actual ZIP lives on Zano's own build server. Verified 2026-08-27
 // against the real v2.2.1.506 release page (raw HTML, not a summarized
 // fetch, after an earlier summarized read mis-transcribed a checksum).
+//
+// 2026-10-01: Zano's latest OFFICIAL release, the PGP-signed emergency release
+// v2.2.3.600 that followed the gateway-address attack (chain rolled back to
+// 3,833,000, HF7). It is what this fallback downloads, because downloads stay
+// official-only. It does NOT sync against Zano's current public nodes: they
+// run 2.2.3.601, which answers every non-compact block request with
+// GENESIS_MISMATCH, and 2.2.3.600 has no compact sync (measured with a
+// throwaway wallet against 37.27.100.59:10500: 9 refusals in 50 s, 0 blocks).
+// The wallet that syncs is the bundled payload (tier 3 of `resolve_rpc_binary`),
+// our stock build of 2.2.3.601 (`scripts/fetch-sidecars.mjs`), until Zano
+// publishes 2.2.3.601 or later; then pin that here and in fetch-sidecars.
 #[cfg(target_os = "windows")]
-const ZANO_RELEASE_TAG: &str = "2.2.1.506";
+const ZANO_RELEASE_TAG: &str = "2.2.3.600";
 
 // Windows only, deliberately. Zano's Windows release is a ZIP containing a
 // bare `simplewallet.exe` — the same shape ZEPH's downloader already
@@ -180,14 +198,22 @@ const ZANO_RELEASE_TAG: &str = "2.2.1.506";
 // Windows-gated along with the downloader itself (2026-09-11): there is no
 // non-Windows caller, and an ungated constant here is three dead-code warnings
 // on every Linux build.
+// From 2.2.3.600 Zano ships a GUI zip and a CLI zip; this is the GUI one, the
+// file the operator downloaded and whose SHA256 was checked against the
+// signed release notes on 2026-10-01. `simplewallet.exe` sits in a
+// subfolder (`zano-windows-x64-gui-2.2.3.600-98bbd72/`); the extractor
+// matches on the file name, so the folder does not matter. It is 324 MB for
+// a 17 MB binary: when this pin next moves, prefer the CLI zip
+// (`zano-win-x64-cli-release-…zip`, hash in the same signed notes) once its
+// contents have been checked; nobody here could fetch it on 2026-10-01.
 #[cfg(target_os = "windows")]
-const ZANO_ZIP_FILENAME: &str = "zano-win-x64-release-v2.2.1.506[b76fa18].zip";
+const ZANO_ZIP_FILENAME: &str = "zano-win-x64-gui-release-v2.2.3.600[98bbd72].zip";
 #[cfg(target_os = "windows")]
 const ZANO_ZIP_URL: &str =
-    "https://build.zano.org/builds/zano-win-x64-release-v2.2.1.506%5Bb76fa18%5D.zip";
+    "https://build.zano.org/builds/zano-win-x64-gui-release-v2.2.3.600%5B98bbd72%5D.zip";
 #[cfg(target_os = "windows")]
 const ZANO_ZIP_SHA256: &str =
-    "ab805baf58b78d3a4210ad85a9c74e8156746e1aebcb0a8a4dda32d0203cf87f";
+    "4acd854a346a084c0d0d16bc65998020b336e36da5277b6074aad9ced19e29c2";
 
 #[cfg(target_os = "windows")]
 #[derive(Clone, serde::Serialize)]

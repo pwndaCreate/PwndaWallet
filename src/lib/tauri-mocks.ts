@@ -4612,7 +4612,7 @@ const MOCKS: Record<string, (args: any) => unknown> = {
     wallets: [
       { id: "monero", installed: "v0.18.5.0", present: true, bundled: "v0.18.5.1" },
       { id: "zephyr", installed: null, present: false, bundled: "v2.3.0" },
-      { id: "zano", installed: null, present: true, bundled: "v2.2.1.506" },
+      { id: "zano", installed: null, present: true, bundled: "v2.2.3.601+src.b7d1088" },
       { id: "xelis", installed: null, present: false, bundled: null },
     ],
   }),

@@ -623,6 +623,13 @@ mod tests {
         assert!(!is_newer("v1.25.0", "v1.25.0"));
         assert!(is_newer("v2.2.1.507", "v2.2.1.506"));
         assert!(!is_newer("v2.2.1.506+src.ee3de1e", "v2.2.1.506"));
+        // 2026-10-01: both platforms bundle our stock 2.2.3.601 build. An install
+        // from an older bundle must be reconciled to it, and one already on it
+        // must be left alone; the commit's letters read as 0, not as a component.
+        assert!(is_newer("v2.2.3.601+src.b7d1088", "v2.2.1.506"));
+        assert!(is_newer("v2.2.3.601+src.b7d1088", "v2.2.1.506+src.ee3de1e"));
+        assert!(!is_newer("v2.2.3.601+src.b7d1088", "v2.2.3.601+src.b7d1088"));
+        assert!(is_newer("v2.2.3.602", "v2.2.3.601+src.b7d1088"));
     }
 
     #[test]

@@ -43,11 +43,16 @@ export const COIN_BINARIES = {
   // PWNDA 2026-09-04: zano, unit A5. NOT a stock download -- the swap engine's
   // scratch wallet needs `generate_from_keys`, which upstream Zano does not
   // have, so this is the locally BUILT patched binary from
-  // scripts/swap/zano-build/ (hyle-team/zano @ ee3de1e5 + the vendored patch).
+  // scripts/swap/zano-build/ (hyle-team/zano @ b7d1088, v2.2.3.601, + the vendored
+  // patches; ee3de1e5 / v2.2.1.506 until 2026-10-01).
   // Verified patched, not stock, by string-probing the built binary against the
   // stock one we already ship: generate_from_keys FOUND vs absent, with
   // getbalance present in both as the control proving the probe discriminates.
   // The two OpenSSL DLLs are listed because the build is STATIC=FALSE.
+  // Corrected 2026-10-01: the binaries do not load them. Zano's CMakeLists links
+  // OpenSSL statically whatever STATIC says, and `dumpbin /dependents` lists no
+  // OpenSSL DLL for zanod.exe or simplewallet.exe. They stay listed until a Grove
+  // bundle without them has been run.
   zano: [
     "zanod",
     "simplewallet",
@@ -64,7 +69,8 @@ export const COIN_BINARIES = {
  * zano on linux (2026-09-11): the Linux arm of the same patched build is STATIC
  * (`-D STATIC=TRUE` in scripts/swap/zano-build/build-zano-linux.sh, REU26's
  * proven recipe), so there is no OpenSSL runtime to ship beside it. The two
- * DLLs in the Windows list exist because THAT build is STATIC=FALSE. Demanding
+ * DLLs in the Windows list exist because THAT build is STATIC=FALSE (unneeded at
+ * run time, it turned out on 2026-10-01; see COIN_BINARIES.zano). Demanding
  * them on Linux fails the build on a file that is not supposed to exist;
  * silently appending them would ship Windows DLLs to Linux users.
  */

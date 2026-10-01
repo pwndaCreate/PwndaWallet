@@ -29,7 +29,8 @@
 // Output (ALL gitignored — binaries are never committed):
 //   src-tauri/binaries/monero-wallet-rpc.gz
 //   src-tauri/binaries/zephyr-wallet-rpc.gz
-//   src-tauri/binaries/zano-simplewallet.gz   <- both platforms (linux: 2026-09-11)
+//   src-tauri/binaries/zano-simplewallet.gz   <- both platforms (linux: 2026-09-11;
+//                                                both our own build: 2026-10-01)
 //   src-tauri/binaries/xelis-wallet.gz        <- both platforms (2026-09-15)
 //   src-tauri/binaries/sidecars.json   <- manifest: platform, versions, sha256
 //
@@ -99,21 +100,51 @@ const XELIS_ARCHIVE_SHA256 =
     ? "c1c3494793bc492da84d6c1b82bda4bf225bc9e71198e91e5bd70fd1bcc26127"
     : "424ac65de320a835b4cbe2c2a8b9140b12e8bab86cf5ebda89ffee024947135e";
 
-// ── Zano pins — MUST stay in sync with src-tauri/src/zano_rpc.rs ─────────────
-// (ZANO_ZIP_URL / ZANO_ZIP_SHA256). The in-zip binary is simplewallet.exe but the
-// bundle is zano-simplewallet.gz (see processOne's findName).
-const ZANO_TAG = "v2.2.1.506";
-const ZANO_ZIP_FILENAME = "zano-win-x64-release-v2.2.1.506[b76fa18].zip";
-const ZANO_ZIP_URL =
-  "https://build.zano.org/builds/zano-win-x64-release-v2.2.1.506%5Bb76fa18%5D.zip";
-const ZANO_ZIP_SHA256 =
-  "ab805baf58b78d3a4210ad85a9c74e8156746e1aebcb0a8a4dda32d0203cf87f";
+// ── Zano: BOTH platforms package OUR stock simplewallet build (2026-10-01) ──
+//
+// Until 2026-10-01 Windows extracted the vendor's pinned ZIP here (v2.2.1.506).
+// It packages our stock build now, for the reason Linux always has: there is no
+// vendor binary that works. Zano's public nodes run 2.2.3.601, which answers a
+// wallet without compact block sync with GENESIS_MISMATCH. The latest official
+// release, 2.2.3.600 (the PGP-signed emergency release after the gateway-address
+// attack), has no compact sync, and no official 2.2.3.601 exists yet. Both stock
+// builds come from b7d1088, the commit Zano's default node runs.
+//
+// Ours is as self-contained as Zano's own simplewallet.exe. Zano's CMakeLists
+// links OpenSSL statically (OPENSSL_USE_STATIC_LIBS) whatever STATIC says, and
+// `dumpbin /dependents` lists the same DLLs for both, none of them OpenSSL.
+//
+// When Zano publishes 2.2.3.601 or later, move Windows back to the vendor's ZIP
+// (processOne). src-tauri/src/zano_rpc.rs pins the vendor's ZIP for its download
+// fallback already; keep the two in step. Linux can follow then: from 2.2.3.600
+// Zano also publishes a Linux CLI tarball (zano-linux-x64-cli-release-….tar.bz2).
+// PwndaWalletVault/wiki/entities/Zano.md has the evidence.
+//
+// The pins below are OUR hashes of OUR builds: a tripwire, not provenance (see
+// "What the pin means here" further down).
+const ZANO_SRC_TAG = "v2.2.3.601";
+const ZANO_SRC_COMMIT = "b7d1088ee7f078587034ec2dbd8c5d4543fe610b";
+const ZANO_WIN_STOCK_DIR = path.join(
+  REPO_ROOT,
+  "scripts",
+  "swap",
+  "zano-build",
+  "out",
+  "win-stock"
+);
+const ZANO_WIN_STOCK_SHA256 = "16ba0ee0d8bf5ab6e22af3506133634c1ccab194d645f47e35924d276118851f";
+const ZANO_WIN_STOCK_BYTES = 17885184;
+const ZANO_WIN_BUILD_HINT =
+  "powershell -NoProfile -ExecutionPolicy Bypass -File " +
+  "scripts/swap/zano-build/Build-ZanoWallet.ps1 -SkipPatch " +
+  "-OutDir scripts/swap/zano-build/out/win-stock";
 
 // ── Zano, LINUX: a locally BUILT stock simplewallet (2026-09-11) ─────────────
 //
 // # Why this one artifact is built rather than downloaded
 //
-// Zano publishes a win-x64 ZIP (above) and a Linux **AppImage**. Only the ZIP
+// Zano publishes a win-x64 ZIP and a Linux **AppImage** (2026-10-01: 2.2.3.600
+// added CLI archives for both; see the block above). Only the ZIP
 // carries a separately-extractable `simplewallet`; whether the AppImage even
 // contains one, as opposed to the GUI app alone, has never been confirmed here —
 // and build.zano.org is unreachable from this machine (TLS handshake broken by
@@ -154,7 +185,8 @@ const ZANO_ZIP_SHA256 =
 // (`localVerified`, not `fetchVerified`) for exactly the same reason. Rebuilding
 // legitimately changes it: the build is not bit-reproducible, so a mismatch after
 // a deliberate rebuild means "update this pin in the same commit", not "stop".
-const ZANO_LINUX_SRC_COMMIT = "ee3de1e5a077b60106ba88301e236474680b1028";
+//
+// Built from ZANO_SRC_COMMIT above since 2026-10-01 (ee3de1e5, v2.2.1.506, before).
 const ZANO_LINUX_STOCK_DIR = path.join(
   REPO_ROOT,
   "scripts",
@@ -163,8 +195,11 @@ const ZANO_LINUX_STOCK_DIR = path.join(
   "out",
   "linux-stock"
 );
-const ZANO_LINUX_STOCK_SHA256 = "118d70506fdf4f077cca18a82f99b541e3ee00ab1180c2d4e70f95ee6fca4af6";
-const ZANO_LINUX_STOCK_BYTES = 46859400;
+const ZANO_LINUX_STOCK_SHA256 = "81b9ee2c7368cbe7cfb2c7197570ce9fd5e3e17e74b9f60060175eb049b2886d";
+const ZANO_LINUX_STOCK_BYTES = 46879880;
+const ZANO_LINUX_BUILD_HINT =
+  "OUT_DIR=scripts/swap/zano-build/out/linux-stock APPLY_PATCH=0 " +
+  "bash scripts/swap/zano-build/build-zano-linux.sh";
 
 async function exists(p) {
   try {
@@ -274,17 +309,18 @@ async function resolveMonero() {
  * `assemble-linux-grove.mjs` refuses a missing Linux runtime for the same reason
  * and in the same words.
  */
-async function processLocal({ label, binaryBase, srcPath, sha256, bytes, version }) {
+async function processLocal({ label, binaryBase, srcPath, sha256, bytes, version, buildHint }) {
   console.log(`[sidecars] ${label} ${version}`);
 
+  // The messages below used `\\n`, which a template literal prints as a
+  // backslash and an n, so each one came out as a single line (2026-10-01).
   if (!(await exists(srcPath))) {
     throw new Error(
-      `${label}: no binary at ${srcPath}.\\n` +
-        `This artifact is BUILT, not downloaded — Zano ships no extractable stock ` +
-        `Linux simplewallet (see the pin block in this file). Build it with:\\n` +
-        `  OUT_DIR=scripts/swap/zano-build/out/linux-stock APPLY_PATCH=0 \\\\\\n` +
-        `    bash scripts/swap/zano-build/build-zano-linux.sh\\n` +
-        `Refusing to package a Linux build whose ZANO wallet would be missing: the ` +
+      `${label}: no binary at ${srcPath}.\n` +
+        `This artifact is BUILT, not downloaded (the Zano pin block in this file ` +
+        `says why). Build it with:\n` +
+        `  ${buildHint}\n` +
+        `Refusing to package a build whose ZANO wallet would be missing: the ` +
         `coin is default-enabled, so it would be enabled and permanently parked.`
     );
   }
@@ -300,8 +336,8 @@ async function processLocal({ label, binaryBase, srcPath, sha256, bytes, version
   const rawSha = createHash("sha256").update(raw).digest("hex");
   if (rawSha !== sha256) {
     throw new Error(
-      `${label}: SHA256 MISMATCH for the locally built ${binaryBase}\\n` +
-        `  expected ${sha256}\\n  actual   ${rawSha}\\n` +
+      `${label}: SHA256 MISMATCH for the locally built ${binaryBase}\n` +
+        `  expected ${sha256}\n  actual   ${rawSha}\n` +
         `If you rebuilt it on purpose, this mismatch is EXPECTED — the build is not ` +
         `bit-reproducible. Re-verify the binary is the STOCK one (it must NOT answer ` +
         `generate_from_keys), then update the pin in this file in the same commit.`
@@ -407,32 +443,23 @@ async function main() {
     version: ZPH_TAG,
   });
 
-  // Zano — two different provenances for the same role, by necessity. Windows
-  // extracts the vendor's pinned ZIP; Linux packages a stock build from the
-  // pinned source, because the vendor ships no extractable Linux binary (see the
-  // ZANO_LINUX_STOCK_* block above for the full reasoning and why it must be the
-  // STOCK build rather than the patched one).
-  let zanoEntry;
-  if (TARGET === "win32") {
-    zanoEntry = await processOne({
-      label: "zano-simplewallet",
-      binaryBase: "zano-simplewallet",
-      findName: `simplewallet${EXE}`, // the in-zip name differs from the .gz name
-      url: ZANO_ZIP_URL,
-      filename: ZANO_ZIP_FILENAME,
-      sha256: ZANO_ZIP_SHA256,
-      version: ZANO_TAG,
-    });
-  } else {
-    zanoEntry = await processLocal({
-      label: "zano-simplewallet (stock, local build)",
-      binaryBase: "zano-simplewallet",
-      srcPath: path.join(ZANO_LINUX_STOCK_DIR, "simplewallet"),
-      sha256: ZANO_LINUX_STOCK_SHA256,
-      bytes: ZANO_LINUX_STOCK_BYTES,
-      version: `${ZANO_TAG}+src.${ZANO_LINUX_SRC_COMMIT.slice(0, 7)}`,
-    });
-  }
+  // Zano — our STOCK build from the pinned source on both platforms since
+  // 2026-10-01 (Windows extracted the vendor's ZIP until then). The pin blocks
+  // above say why, and why it must be the STOCK build rather than the patched
+  // one. The version reads as 2.2.3.601 to sidecar_update.rs's tier 1, so an
+  // install that came from an older bundle is reconciled to it.
+  const win = TARGET === "win32";
+  const zanoEntry = await processLocal({
+    label: "zano-simplewallet (stock, local build)",
+    binaryBase: "zano-simplewallet",
+    srcPath: win
+      ? path.join(ZANO_WIN_STOCK_DIR, "simplewallet.exe")
+      : path.join(ZANO_LINUX_STOCK_DIR, "simplewallet"),
+    sha256: win ? ZANO_WIN_STOCK_SHA256 : ZANO_LINUX_STOCK_SHA256,
+    bytes: win ? ZANO_WIN_STOCK_BYTES : ZANO_LINUX_STOCK_BYTES,
+    version: `${ZANO_SRC_TAG}+src.${ZANO_SRC_COMMIT.slice(0, 7)}`,
+    buildHint: win ? ZANO_WIN_BUILD_HINT : ZANO_LINUX_BUILD_HINT,
+  });
 
   // XELIS — one provenance for both platforms, unlike Zano.
   const xelisEntry = await processOne({

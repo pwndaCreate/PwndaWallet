@@ -628,7 +628,11 @@ const ZANO_CORE_PLACEHOLDER = {
   // (scripts/swap/zano-build/) produces the artifact locally, this pin
   // verifies it, same shape as LOCAL_WHEELS above (localVerified, not
   // fetchVerified) once wired in for real.
-  buildFrom: "hyle-team/zano @ ee3de1e5a077b60106ba88301e236474680b1028 + zano-0001-wallet-rpc-generate-from-keys.patch",
+  buildFrom: "hyle-team/zano @ b7d1088ee7f078587034ec2dbd8c5d4543fe610b (v2.2.3.601) + zano-0001-wallet-rpc-generate-from-keys.patch + zano-0002-quiet-est-height-failure.patch",
+  // REBUILT 2026-10-01 at v2.2.3.601, both platforms: Zano's public nodes run
+  // 2.2.3.601 and refuse wallets without compact sync (GENESIS_MISMATCH), and no
+  // official 2.2.3.601 download exists. The 2026-09-04 / 09-11 notes below
+  // describe the first builds; the hashes are the 2026-10-01 ones.
   // BUILT 2026-09-04 (win-x64). Unit A5 completed for Windows: Build-ZanoWallet.ps1
   // ran to completion for the first time on this machine after two PowerShell 5.1
   // defects in it were fixed (empty $PSScriptRoot in param() defaults; a native
@@ -648,10 +652,10 @@ const ZANO_CORE_PLACEHOLDER = {
     file: "simplewallet.exe + zanod.exe (local build, scripts/swap/zano-build/out/)",
     urls: [],
     sha256: {
-      "zanod.exe": "8b5d8ca031aa5a0ba40320d0cf5a9c066e727db971db497b7883448b0b03eef0",
-      "simplewallet.exe": "4830cae213799aa3861c0c35b3406ac82e678e2068b5840b04cea68feff9a22f",
+      "zanod.exe": "e6c44dba1a09b9bd31e293c428cb0106f01a1c4d3107881df527ec4d5f3005ed",
+      "simplewallet.exe": "8c9e511e39170dd2b1ff743f16d8c6da4014ba7fb69b2c9d1d5e2e7fc88859a0",
     },
-    bytes: { "zanod.exe": 19246080, "simplewallet.exe": 17922048 },
+    bytes: { "zanod.exe": 19373568, "simplewallet.exe": 17925120 },
     binaries: ["zanod.exe", "simplewallet.exe"],
   },
   // BUILT 2026-09-11 (linux-x64). The Docker blocker in zano-build/README.md's
@@ -667,6 +671,8 @@ const ZANO_CORE_PLACEHOLDER = {
   // spliced into COIN_CORES because there is nothing to fetch. STATIC=TRUE, so
   // unlike the Windows build there are no OpenSSL DLLs to ship beside it --
   // `PLATFORM_COIN_BINARIES` in bundle-binaries.mjs carries that difference.
+  // (2026-10-01: the Windows build does not load its DLLs either; OpenSSL is
+  // linked statically there too. See scripts/lib/bundle-coins.mjs.)
   //
   // Patch presence verified against the BINARY, not assumed: `generate_from_keys`
   // is present here and absent from the stock Linux build produced from the same
@@ -677,10 +683,10 @@ const ZANO_CORE_PLACEHOLDER = {
     file: "simplewallet + zanod (local build, scripts/swap/zano-build/out/)",
     urls: [],
     sha256: {
-      zanod: "08accc5a6d465942357739273f449774e05975146e435b7befb19fb7ab7fbdae",
-      simplewallet: "d4cd107279505e7dc3135177055eb5a6760bef930dbe9570ff77d120b0805b1f",
+      zanod: "42da16a300d0ef23ebe1214d56ebafec9b2e6bbc444fc0d22c441f17d6d4135c",
+      simplewallet: "ef92e18da3d260f2eee3a23ff65792c7ed8b624632df9ae4b6c35f6229ecbe56",
     },
-    bytes: { zanod: 47289320, simplewallet: 46879880 },
+    bytes: { zanod: 47391688, simplewallet: 46900360 },
     binaries: ["zanod", "simplewallet"],
   },
   signer: null,
