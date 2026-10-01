@@ -56,6 +56,7 @@ import {
   SwapDetailsModal,
   swapRowOpenProps,
 } from "./SwapDetailsModal";
+import { swapStatusLabel } from "./swap-details";
 import { useSwapSettings } from "../settings/useSwapSettings";
 import { deriveWalletAddresses } from "./asset-address-resolver";
 import {
@@ -660,16 +661,18 @@ export function SwapLandscapeView({
                         marginTop: 1,
                       }}
                     >
-                      {prettyAgo(h.createdAt)} · {h.status}
+                      {prettyAgo(h.createdAt)} · {swapStatusLabel(h)}
                     </div>
                   </div>
                   <Dot
                     color={
-                      h.status === "success"
-                        ? "green"
-                        : h.status === "pending"
-                          ? "amber"
-                          : "red"
+                      h.failureReason
+                        ? "amber"
+                        : h.status === "success"
+                          ? "green"
+                          : h.status === "pending"
+                            ? "amber"
+                            : "red"
                     }
                   />
                 </div>

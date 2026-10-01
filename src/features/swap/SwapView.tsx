@@ -52,6 +52,7 @@ import {
   SwapDetailsModal,
   swapRowOpenProps,
 } from "./SwapDetailsModal";
+import { swapStatusLabel } from "./swap-details";
 import { openExplorer } from "./TxHashField";
 import { useSwapSettings } from "../settings/useSwapSettings";
 import { deriveWalletAddresses } from "./asset-address-resolver";
@@ -1141,8 +1142,9 @@ function HistoryList({
           <span
             style={{
               fontSize: 9,
-              color:
-                h.status === "success"
+              color: h.failureReason
+                ? "var(--text-dim)"
+                : h.status === "success"
                   ? "var(--accent)"
                   : h.status === "pending"
                     ? "var(--warn)"
@@ -1153,7 +1155,7 @@ function HistoryList({
               textTransform: "uppercase",
             }}
           >
-            {h.status}
+            {swapStatusLabel(h)}
           </span>
         </div>
       ))}

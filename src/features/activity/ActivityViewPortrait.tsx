@@ -18,6 +18,7 @@ import {
   driftTone,
   formatActualReceived,
   formatDriftPercent,
+  swapStatusLabel,
   SWAP_ROW_OPEN_STYLE,
   SwapDetailsModal,
   swapRowOpenProps,
@@ -469,11 +470,13 @@ function SwapRow({
           ? "var(--danger)"
           : "var(--text-dim)";
   const statusColor =
-    swap.status === "success"
-      ? "var(--success)"
-      : swap.status === "pending"
-        ? "var(--warn)"
-        : "var(--danger)";
+    swap.failureReason
+      ? "var(--text-dim)"
+      : swap.status === "success"
+        ? "var(--success)"
+        : swap.status === "pending"
+          ? "var(--warn)"
+          : "var(--danger)";
   const shorten = (h: string) =>
     h.length > 14 ? `${h.slice(0, 6)}…${h.slice(-4)}` : h;
   return (
@@ -543,7 +546,7 @@ function SwapRow({
             border: `1px solid ${statusColor}`,
           }}
         >
-          {swap.status}
+          {swapStatusLabel(swap)}
         </span>
       </div>
       <div

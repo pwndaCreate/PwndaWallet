@@ -91,7 +91,8 @@ export type SwapStatusKey =
   | "pending"
   | "completed"
   | "refunded"
-  | "failed";
+  | "failed"
+  | "not-sent";
 
 export type SwapStatusTone = "ok" | "warn" | "bad";
 
@@ -146,6 +147,16 @@ export function swapStatusView(
         route === "intents"
           ? `NEAR Intents sent the deposit back to your ${row.fromAsset} address, the refund address in the quote.`
           : "Recorded as refunded.",
+    };
+  }
+  if (status === "failed" && row.failureReason === "deposit-not-on-chain") {
+    return {
+      key: "not-sent",
+      label: "Not sent",
+      tone: "warn",
+      detail:
+        `The deposit never reached ${swapNetworkName(row.fromAsset)}: its transaction is not on ` +
+        "the chain, so nothing was swapped and nothing left your wallet. There is nothing to recover.",
     };
   }
   if (status === "failed") {
@@ -521,6 +532,14 @@ const EVM_NATIVE_CHAIN: Readonly<Record<number, ChainType>> = {
 /** The network a swap asset lives on, as the swap screens name it. */
 export function swapNetworkName(asset: string): string {
   return ASSET_CAPABILITIES[asset.toUpperCase()]?.network ?? asset;
+}
+
+/** A history row's status as the swap lists print it: "not sent" for a
+ *  deposit that never reached its chain (2026-10-01), else the status. */
+export function swapStatusLabel(row: SwapHistoryEntry): string {
+  return row.status === "failed" && row.failureReason === "deposit-not-on-chain"
+    ? "not sent"
+    : row.status;
 }
 
 /** An explorer page for an address on a swap asset's chain, or null. */

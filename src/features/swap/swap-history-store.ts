@@ -8,6 +8,8 @@
  * via `loadSwapHistory()` and renders newest first.
  */
 import { getStore } from "../../store";
+import { atomicToDecimal } from "../../wallets/decimal-amount";
+import { ASSET_CAPABILITIES } from "./asset-capabilities";
 
 const STORE_KEY = "swapHistory";
 
@@ -91,6 +93,13 @@ export interface SwapHistoryEntry {
    */
   outcomeUnknown?: boolean;
   /**
+   * Why a row is `failed` when the wallet, not a provider, decided it
+   * (2026-10-01): `"deposit-not-on-chain"`, a pending NEAR Intents row
+   * whose deposit never reached its chain (`intents-stale-rows.ts`). Shown
+   * as "not sent": nothing was swapped and nothing left the wallet.
+   */
+  failureReason?: "deposit-not-on-chain";
+  /**
    * The quote's minimum received, display units of `toAsset` (2026-09-30).
    * Written with the row so the details view can show it after the quote
    * is gone; older rows have none and fall back to 1Click's echo.
@@ -159,9 +168,32 @@ export function formatDriftPercent(fraction: number | null): string {
   return `${sign}${pct.toFixed(1)}%`;
 }
 
+/** Rows recorded before this date may hold `toAmount` in base units. */
+const LEGACY_AMOUNT_CUTOFF_MS = Date.parse("2026-05-19T00:00:00Z");
+
+/**
+ * A row as the screens read it (2026-10-01). Rows written before 2026-05-19
+ * — older than any code in this repository's history — stored a NEAR
+ * Intents quote's `toAmount` in the asset's base units: the operator's
+ * three ETH → BTC rows of 2026-05-06 hold "12521" for 0.00012521 BTC, and
+ * the swap details read "~12521 BTC". Every later writer stores display
+ * units (the 2026-05-28 AVAX → ADA row holds "3.61074"). Read-time only:
+ * the stored row is not rewritten.
+ */
+export function normalizeLegacyAmounts(row: SwapHistoryEntry): SwapHistoryEntry {
+  const created = Date.parse(row.createdAt);
+  if (!Number.isFinite(created) || created >= LEGACY_AMOUNT_CUTOFF_MS) return row;
+  if (!/^\d+$/.test(row.toAmount ?? "")) return row;
+  const decimals = ASSET_CAPABILITIES[row.toAsset.toUpperCase()]?.decimals;
+  if (!decimals) return row;
+  return { ...row, toAmount: atomicToDecimal(BigInt(row.toAmount), decimals) };
+}
+
 export async function loadSwapHistory(): Promise<SwapHistoryEntry[]> {
   const store = await getStore();
-  const list = (await store.get<SwapHistoryEntry[]>(STORE_KEY)) ?? [];
+  const list = ((await store.get<SwapHistoryEntry[]>(STORE_KEY)) ?? []).map(
+    normalizeLegacyAmounts,
+  );
   // Sort newest first. Defensive copy — never mutate the array we got back.
   return [...list].sort((a, b) =>
     a.createdAt < b.createdAt ? 1 : a.createdAt > b.createdAt ? -1 : 0

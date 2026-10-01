@@ -40,8 +40,10 @@ import type { ChainType } from "../../wallets";
 import {
   loadSwapHistory,
   onSwapHistoryChange,
+  updateSwapHistoryEntry,
   type SwapHistoryEntry,
 } from "./swap-history-store";
+import { ownAddressesOnSource, patchForVerdict, staleVerdict } from "./intents-stale-rows";
 import { formatActualReceived } from "./swap-actual-received";
 import {
   DETAILS_POLL_MS,
@@ -226,6 +228,22 @@ export function SwapDetailsModal({
       : current?.destTxHash ?? echo?.destinationTxHashes[0] ?? null;
   const payoutParties = useTxParties(toChain, payoutHash, recipient ?? undefined, !!payoutHash);
   const utxoSummaries = useUtxoAccountSummaries();
+
+  // A pending row with no deposit address is settled by its source
+  // transaction, read above (`intents-stale-rows.ts`, 2026-10-01): not on
+  // its chain long after → "not sent"; on it → its deposit address, so
+  // 1Click can be asked. Written back, so every list agrees.
+  useEffect(() => {
+    if (!current || sourceParties.status !== "done") return;
+    const v = staleVerdict(current, sourceParties, Date.now(), ownAddressesOnSource(current, fromChain));
+    if (!v) return;
+    const patch = patchForVerdict(v, Date.now());
+    void updateSwapHistoryEntry(current.id, patch)
+      .then(() => setRow((r) => (r && r.id === current.id ? { ...r, ...patch } : r)))
+      .catch(() => {
+        /* stays as it is; the next open or wallet open tries again */
+      });
+  }, [current, sourceParties, fromChain]);
 
   const shown = current;
   if (!shown) return null;

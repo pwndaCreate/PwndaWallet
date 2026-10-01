@@ -18,6 +18,7 @@ import {
   driftTone,
   formatActualReceived,
   formatDriftPercent,
+  swapStatusLabel,
   SWAP_ROW_OPEN_STYLE,
   SwapDetailsModal,
   swapRowOpenProps,
@@ -569,11 +570,13 @@ function LandscapeSwapRow({
           ? "var(--danger)"
           : "var(--text-dim)";
   const statusColor =
-    swap.status === "success"
-      ? "var(--accent)"
-      : swap.status === "pending"
-        ? "var(--warn)"
-        : "var(--danger)";
+    swap.failureReason
+      ? "var(--text-dim)"
+      : swap.status === "success"
+        ? "var(--accent)"
+        : swap.status === "pending"
+          ? "var(--warn)"
+          : "var(--danger)";
   const shorten = (h: string) =>
     h.length > 16 ? `${h.slice(0, 8)}…${h.slice(-6)}` : h;
   return (
@@ -643,7 +646,7 @@ function LandscapeSwapRow({
             border: `1px solid ${statusColor}`,
           }}
         >
-          {swap.status}
+          {swapStatusLabel(swap)}
         </span>
       </div>
       <div

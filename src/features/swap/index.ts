@@ -27,6 +27,9 @@ export {
   type SwapHistoryStatus,
 } from "./swap-history-store";
 export { formatActualReceived } from "./swap-actual-received";
+// How a row's status reads in a list: "not sent" for a deposit that never
+// reached its chain (2026-10-01).
+export { swapStatusLabel } from "./swap-details";
 
 // The swap details modal and the row props that open it (2026-09-30). The
 // Activity SWAPS lists open the same modal as the Swap tab's RECENT SWAPS: one

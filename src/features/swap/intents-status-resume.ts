@@ -35,6 +35,7 @@ import {
   type SwapHistoryEntry,
 } from "./swap-history-store";
 import type { IntentsStatusResponse } from "../../lib/proxy-types";
+import { defaultSettleDeps, settleStaleIntentsRows, type SettleDeps } from "./intents-stale-rows";
 
 /** Rows older than this are not resumed: 1Click has long since decided them,
  *  and a stale row is better left for the user than polled forever. */
@@ -54,6 +55,9 @@ export interface ResumeDeps {
    *  swaps share an address (2026-09-30). */
   isActive: (depositAddress: string, depositMemo?: string) => boolean;
   now: () => number;
+  /** Settles rows that only their source transaction can settle
+   *  (`intents-stale-rows.ts`, 2026-10-01). */
+  settle?: (rows: SwapHistoryEntry[]) => Promise<SwapHistoryEntry[]>;
 }
 
 const defaultDeps: ResumeDeps = {
@@ -62,6 +66,7 @@ const defaultDeps: ResumeDeps = {
   poll: pollIntentsToTerminal,
   isActive: isIntentsPollActive,
   now: () => Date.now(),
+  settle: (rows) => settleStaleIntentsRows(rows, defaultSettleDeps(updateSwapHistoryEntry) as SettleDeps),
 };
 
 /** The pending Intents rows worth resuming. Pure, for tests. */
@@ -93,7 +98,22 @@ export async function resumePendingIntentsSwaps(
   } catch {
     return 0;
   }
-  const todo = rowsToResume(rows, deps.now(), deps.isActive);
+  // Rows written before deposit addresses were (2026-09-29): settle them
+  // from their source transaction first. One whose deposit address came
+  // back is asked about once below, however old it is.
+  let recovered: SwapHistoryEntry[] = [];
+  if (deps.settle) {
+    try {
+      recovered = await deps.settle(rows);
+    } catch {
+      recovered = [];
+    }
+  }
+  const todo = [
+    ...rowsToResume(rows, deps.now(), deps.isActive),
+    ...recovered.filter((r) => !deps.isActive(r.depositAddress!, r.depositMemo)),
+  ].filter((r, i, all) => all.findIndex((x) => x.id === r.id) === i);
+  const recoveredIds = new Set(recovered.map((r) => r.id));
   await Promise.all(
     todo.map(async (row) => {
       try {
@@ -102,7 +122,11 @@ export async function resumePendingIntentsSwaps(
           // A memo deposit's status is asked with its memo (2026-09-30);
           // rows without one poll exactly as before.
           ...(row.depositMemo ? { depositMemo: row.depositMemo } : {}),
-          deadline: row.depositDeadline,
+          // A recovered old row is long decided: ask for a few minutes, not
+          // until a deadline the row never recorded.
+          deadline: recoveredIds.has(row.id)
+            ? new Date(deps.now() + 5 * 60_000).toISOString()
+            : row.depositDeadline,
           intervalMs: 30_000,
         });
         const status = intentsStatusToHistory(
@@ -110,6 +134,8 @@ export async function resumePendingIntentsSwaps(
         );
         const actualReceived =
           status === "success" ? extractActualReceivedFromIntents(terminal) : undefined;
+        // Still undecided for a recovered row: leave it pending, untouched.
+        if (status === "pending" && recoveredIds.has(row.id)) return;
         await deps.update(row.id, {
           status,
           outcomeUnknown: false,
