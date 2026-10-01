@@ -19,7 +19,8 @@
  *  - back off a pair that keeps failing instead of retrying every minute;
  *  - after the first full page, poll a SMALL page and merge it into what is
  *    already held, falling back to a full page when the small one does not
- *    overlap (so a burst of new transactions cannot leave a gap);
+ *    overlap (so a burst of new transactions cannot leave a gap), but not
+ *    when both the held list and the small page are empty (2026-10-01);
  *  - an unchanged result is not an update.
  */
 import type { ChainTx } from "../../wallets/types";
@@ -54,12 +55,49 @@ export function isDue(now: number, lastAttemptAt: number, intervalMs: number): b
  * row in a FULL small page is new - there may be more new rows beyond it than
  * the page could carry, so the caller must fetch a full page instead of
  * merging (otherwise the list would silently skip transactions).
+ *
+ * An EMPTY page over an EMPTY held list connects (operator request,
+ * 2026-10-01). It returned `false`, so every poll of a chain with no
+ * transactions read a small page and then a full page: two reads, both empty.
+ * For Hedera that was about ten mirror requests per poll (10.9 s live for the
+ * public test seed), and every empty chain paid the same double. The held
+ * list is empty because the full page read this session found nothing
+ * (`useTxHistory` polls small pages only after one), and the small page says
+ * nothing is new, so a second full page has nothing to add. Inference, not
+ * observed: an adapter that filters its source's rows could still find a
+ * relevant row a full page reads and a small page does not; the held-list
+ * case has carried that same limit since 2026-09-25 ("a short page reached
+ * the end of history"). Nothing held at all (`undefined`) still asks for the
+ * full page, and so does a small page with rows over an empty list.
  */
 export function pollPageOverlaps(prev: ChainTx[] | undefined, page: ChainTx[], pollLimit: number): boolean {
-  if (!prev || prev.length === 0) return false;
+  if (!prev) return false;
+  if (prev.length === 0) return page.length === 0;
   if (page.length < pollLimit) return true; // the page reached the end of history
   const held = new Set(prev.map((t) => normalizeTxHash(t.hash)));
   return page.some((t) => held.has(normalizeTxHash(t.hash)));
+}
+
+/**
+ * One fetch of a pair's history, as `useTxHistory` makes it: the full page
+ * when `full` (the first fetch of a session, or a refresh the user asked
+ * for), otherwise a small page merged into `prev`, with a full page when the
+ * small one does not connect (`pollPageOverlaps`). `read(n)` asks the adapter
+ * for the newest `n` rows.
+ *
+ * Moved out of the hook (2026-10-01) so the reads a poll costs can be counted
+ * in a test without rendering React; the hook's behaviour is unchanged.
+ */
+export async function readPairHistory(
+  read: (limit: number) => Promise<ChainTx[]>,
+  prev: ChainTx[] | undefined,
+  opts: { full: boolean; limit: number; pollLimit: number },
+): Promise<ChainTx[]> {
+  if (opts.full) return read(opts.limit);
+  const page = await read(opts.pollLimit);
+  return pollPageOverlaps(prev, page, opts.pollLimit)
+    ? mergeHistoryPage(prev, page, opts.limit)
+    : read(opts.limit);
 }
 
 /**

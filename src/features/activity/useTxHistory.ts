@@ -27,9 +27,8 @@ import { dedupeTxRows, normalizeTxHash, txAssetKey, txRowKey } from "../../walle
 import { accountTxHistory } from "../../wallets/utxo-account-history";
 import {
   isDue,
-  mergeHistoryPage,
   pollIntervalMs,
-  pollPageOverlaps,
+  readPairHistory,
   sameError,
   sameHistory,
 } from "./txHistorySchedule";
@@ -479,16 +478,14 @@ export function useTxHistory(
         if (showLoading) setLoading((l) => ({ ...l, [k]: true }));
         try {
           const adapter = getAdapterByChain(chain);
-          const full = userInitiated || !st.fullDone;
-          let items: ChainTx[];
-          if (full) {
-            items = (await adapter.getTransactionHistory(address, { limit })).items;
-          } else {
-            const page = await adapter.getTransactionHistory(address, { limit: pollLimit });
-            items = pollPageOverlaps(prev, page.items, pollLimit)
-              ? mergeHistoryPage(prev, page.items, limit)
-              : (await adapter.getTransactionHistory(address, { limit })).items;
-          }
+          // Full page, or small page merged (`readPairHistory`, which since
+          // 2026-10-01 does not follow an empty poll of an empty list with a
+          // second, full read).
+          const items = await readPairHistory(
+            async (n) => (await adapter.getTransactionHistory(address, { limit: n })).items,
+            prev,
+            { full: userInitiated || !st.fullDone, limit, pollLimit },
+          );
           st.fullDone = true;
           st.failures = 0;
           // A pair dropped while its fetch was in flight (a wallet switch)

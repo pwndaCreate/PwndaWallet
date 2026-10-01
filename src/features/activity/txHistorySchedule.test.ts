@@ -12,6 +12,7 @@ import {
   mergeHistoryPage,
   pollIntervalMs,
   pollPageOverlaps,
+  readPairHistory,
   sameError,
   sameHistory,
 } from "./txHistorySchedule";
@@ -74,6 +75,56 @@ describe("pollPageOverlaps", () => {
   it("nothing held yet means a full page is needed", () => {
     expect(pollPageOverlaps(undefined, [tx("a", 1)], 3)).toBe(false);
     expect(pollPageOverlaps([], [tx("a", 1)], 3)).toBe(false);
+  });
+
+  it("an empty page over an empty held list connects: there is nothing for a full page to add (2026-10-01)", () => {
+    // Was false: every poll of a chain with no transactions read twice.
+    expect(pollPageOverlaps([], [], 3)).toBe(true);
+    // Nothing held at all is still not known to be empty.
+    expect(pollPageOverlaps(undefined, [], 3)).toBe(false);
+  });
+});
+
+describe("readPairHistory: the reads one fetch costs", () => {
+  /** A reader that counts the page sizes asked for. */
+  const reader = (rows: ChainTx[]) => {
+    const asked: number[] = [];
+    const read = async (n: number) => {
+      asked.push(n);
+      return rows.slice(0, n);
+    };
+    return { asked, read };
+  };
+  const opts = (full: boolean) => ({ full, limit: 50, pollLimit: 10 });
+
+  it("a poll of an empty history reads one small page (was a small page, then a full one)", async () => {
+    const r = reader([]);
+    expect(await readPairHistory(r.read, [], opts(false))).toEqual([]);
+    expect(r.asked).toEqual([10]);
+  });
+
+  it("the first fetch, and a refresh, read the full page once", async () => {
+    const r = reader([]);
+    await readPairHistory(r.read, undefined, opts(true));
+    expect(r.asked).toEqual([50]);
+  });
+
+  it("first rows on an empty list still fetch the full page; a short page over held rows merges", async () => {
+    const first = reader([tx("a", 1)]);
+    expect((await readPairHistory(first.read, [], opts(false))).map((t) => t.hash)).toEqual(["a"]);
+    expect(first.asked).toEqual([10, 50]);
+
+    const held = [tx("a", 1)];
+    const later = reader([tx("b", 2), tx("a", 1)]);
+    expect((await readPairHistory(later.read, held, opts(false))).map((t) => t.hash)).toEqual(["b", "a"]);
+    expect(later.asked).toEqual([10]);
+  });
+
+  it("a full small page of only new rows fetches the full page (no gap)", async () => {
+    const rows = Array.from({ length: 12 }, (_, i) => tx(`n${i}`, 100 - i));
+    const r = reader(rows);
+    expect(await readPairHistory(r.read, [tx("old", 1)], opts(false))).toHaveLength(12);
+    expect(r.asked).toEqual([10, 50]);
   });
 });
 
