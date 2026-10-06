@@ -149,14 +149,18 @@ const ALLOWED_HOST_SUFFIXES: &[&str] = &[
     // 2026-05-14. See `src/wallets/erg-rpc.ts` and `src/wallets/erg-wallet.ts`.
     "ergoplatform.com",
     "sigmaspace.io",
-    // Sui — JSON-RPC mainnet. `fullnode.mainnet.sui.io` (formerly the
-    // official public endpoint, still listed for org-suffix coverage) was
-    // DEPRECATED upstream 2026-08-22: every `suix_*` method now returns
-    // `-32601 Method not found ... migrate to gRPC or GraphQL`. The wallet
-    // adapter no longer calls it — see `publicnode.com` below, which still
-    // serves the legacy JSON-RPC surface. `nodereal.io` has no confirmed
-    // keyless endpoint (probed 2026-08-22, no response); kept for org-suffix
-    // coverage only, not actively used.
+    // Sui. `sui.io` carries the wallet's GraphQL reads
+    // (`graphql.mainnet.sui.io`, `src/wallets/chain-rpcs.ts`, since
+    // 2026-08-14). Its JSON-RPC host, `fullnode.mainnet.sui.io`, is no longer
+    // called: Sui switched JSON-RPC off on its own mainnet full nodes the
+    // week of 2026-07-27 (Sui's JSON-RPC migration guide), and every
+    // `suix_*` method there answers `-32601 Method not found ... migrate to
+    // gRPC or GraphQL`. The wallet noticed on 2026-08-22, which is the date
+    // this comment used to give as the deprecation (corrected 2026-10-06,
+    // from the log's Sui entry of 2026-10-01). What still needs JSON-RPC goes to
+    // `publicnode.com` below. `nodereal.io` has no confirmed keyless endpoint
+    // (probed 2026-08-22, no response); kept for org-suffix coverage only,
+    // not actively used.
     "sui.io",
     "nodereal.io",
     // Stellar — Horizon mainnet REST. Used by `src/wallets/stellar-wallet.ts`
