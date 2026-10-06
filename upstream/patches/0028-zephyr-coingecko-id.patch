@@ -34,22 +34,55 @@ at 4% of its value reads as a spectacular bargain everywhere it appears.
 Upstream candidate: yes, if Zephyr lands upstream -- it is a one-line id
 correction of exactly the shape already present for two other coins.
 
-diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
---- a/basicswap/basicswap.py
-+++ b/basicswap/basicswap.py
-@@ -17252,6 +17252,15 @@
-     def getExchangeName(self, coin_id: int, exchange_name: str) -> str:
-         if coin_id == Coins.BCH:
-             return "bitcoin-cash"
-+        # PWNDA-PATCH-28: Zephyr's chain name is "zephyr" and CoinGecko's id
-+        # for Zephyr Protocol is "zephyr-protocol". The bare "zephyr" id is a
-+        # different, unrelated token trading around $0.018 against ZEPH's
-+        # $0.40, so the console valued a 67.27 ZEPH balance at $1.19 instead
-+        # of $27.08 (measured 2026-09-05). Same shape as the BCH line above:
-+        # a chain whose CoinGecko id is not its chainparams name. This one is
-+        # worse than cosmetic because the same rates feed the offer book.
-+        if coin_id == Coins.ZEPH:
-+            return "zephyr-protocol"
-         if coin_id == Coins.FIRO:
-             return "zcoin"
+Rebased 2026-10-06 onto basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38). The function this patched is gone. v0.18.10 moved every oracle id into the coin's chainparams `rate_ids` (56153e3a), and oracles.getExchangeName reads `chainparams[coin]["rate_ids"]` with no fallback to the chain name. So the patch now adds `rate_ids` to the zephyr and zano chainparams, which PATCH-13 and PATCH-15 create. ZEPH's CoinGecko id stays "zephyr-protocol". ZANO resolved on its chain name until v0.18.9; it now needs its own entry, or every oracle fetch that includes it raises KeyError and, for CoinGecko, which is asked for all coins at once, returns no price for any coin. MEXC and CoinPaprika ids were checked against the live APIs on 2026-10-06 (ZEPH ~$0.363 and ZANO ~$5.26 on all three); Kraken, KuCoin and neroswap list neither coin. `verify-coin-price-ids.py` reads the ids through oracles.getExchangeName. The diff below is regenerated.
 
+diff --git a/basicswap/interface/zano/chainparams.py b/basicswap/interface/zano/chainparams.py
+index c47a0d5..da0e143 100644
+--- a/basicswap/interface/zano/chainparams.py
++++ b/basicswap/interface/zano/chainparams.py
+@@ -27,6 +27,19 @@ ZANO_COIN = 10**12  # src/currency_core/currency_config.h: COIN = 1e12 (12 decim
+ params = {
+     "name": "zano",
+     "ticker": "ZANO",
++    # PWNDA-PATCH-28: oracle ids. oracles.getExchangeName reads this dict with
++    # no fallback to the chain name, so without it every rate lookup that
++    # includes ZANO raises KeyError. Each id checked 2026-10-06 against the
++    # live API (ZANO ~$5.26 on all three).
++    "rate_ids": {
++        "coingecko.com": "zano",
++        # "kraken.com": N/A  # not listed on Kraken
++        # "kucoin.com": N/A  # not listed on KuCoin (market stats all null)
++        "mexc.com": "ZANOUSDT",
++        # "coinlore.com": not checked
++        "coinpaprika.com": "zano-zano",
++        # "neroswap.com": N/A  # not listed on neroswap
++    },
+     "client": "zano",
+     "decimal_places": 12,
+     "mainnet": {
+diff --git a/basicswap/interface/zephyr/chainparams.py b/basicswap/interface/zephyr/chainparams.py
+index 80960ed..d519337 100644
+--- a/basicswap/interface/zephyr/chainparams.py
++++ b/basicswap/interface/zephyr/chainparams.py
+@@ -30,6 +30,21 @@ ZEPH_COIN = 10**12
+ params = {
+     "name": "zephyr",
+     "ticker": "ZEPH",
++    # PWNDA-PATCH-28: oracle ids. The chain name "zephyr" is a DIFFERENT
++    # CoinGecko asset (an unrelated token, last updated 2019) -- ZEPH is
++    # "zephyr-protocol". oracles.getExchangeName reads this dict with no
++    # fallback to the name, so without it every rate lookup that includes
++    # ZEPH raises KeyError. Each id checked 2026-10-06 against the live API
++    # (ZEPH ~$0.363 on all three).
++    "rate_ids": {
++        "coingecko.com": "zephyr-protocol",
++        # "kraken.com": N/A  # not listed on Kraken
++        # "kucoin.com": N/A  # not listed on KuCoin (market stats all null)
++        "mexc.com": "ZEPHUSDT",
++        # "coinlore.com": not checked
++        "coinpaprika.com": "zeph2-zephyr-protocol",
++        # "neroswap.com": N/A  # not listed on neroswap
++    },
+     "client": "zephyr",
+     "decimal_places": 12,
+     "mainnet": {

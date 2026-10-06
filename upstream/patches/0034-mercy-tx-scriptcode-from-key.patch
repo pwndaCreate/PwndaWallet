@@ -83,6 +83,9 @@ Still needed on v0.18.9 (checked 2026-09-17): upstream still slices
 (`_spendSwipePayout`) builds its spend with the same `createMercyTx`, so this
 fix now covers the sweep too. The patch applies unchanged there.
 
+Still needed on v0.19.0 (checked 2026-10-06): createMercyTx still slices
+`prevout_script[2:22]` (interface/btc/btc.py). The patch applies unchanged.
+
 diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
 --- a/basicswap/interface/btc/btc.py
 +++ b/basicswap/interface/btc/btc.py

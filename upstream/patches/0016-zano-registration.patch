@@ -40,11 +40,13 @@ sit in the tuple; nothing about the ZANO wallet-rpc work changed.
  basicswap/chainparams.py |  12 ++++++++++--
  3 files changed, 111 insertions(+), 4 deletions(-)
 
+Rebased 2026-10-06 onto basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38): context only. Upstream imports the Nostr and SimpleX prepare modules right after the nmc import, where this patch adds zano's; zano's import stays with the coins, before them. The diff below is regenerated; the change it makes is the same.
+
 diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
-index b4b01846..919d4a69 100644
+index 838b300..19b29a1 100644
 --- a/basicswap/basicswap.py
 +++ b/basicswap/basicswap.py
-@@ -936,6 +936,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -968,6 +968,17 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
              "electrum_port",
              "electrum_ssl",
              "electrum_poll_interval",
@@ -62,7 +64,7 @@ index b4b01846..919d4a69 100644
          ):
              if setting_name in chain_client_settings:
                  self.coin_clients[coin][setting_name] = chain_client_settings[
-@@ -983,7 +994,55 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -1015,7 +1026,55 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                  self.coin_clients[coin]["walletrpcport"] = chain_client_settings.get(
                      "walletrpcport", chainparams[coin][self.chain]["walletrpcport"]
                  )
@@ -119,7 +121,7 @@ index b4b01846..919d4a69 100644
                      self.coin_clients[coin]["walletrpcauth"] = (
                          chain_client_settings["walletrpcuser"],
                          chain_client_settings["walletrpcpassword"],
-@@ -1273,6 +1332,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -1305,6 +1364,15 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
              from .interface.zephyr.zephyr import ZEPHInterface
  
              return ZEPHInterface(self.coin_clients[coin], self.chain, self)
@@ -135,7 +137,7 @@ index b4b01846..919d4a69 100644
          elif coin == Coins.PIVX:
              from .interface.pivx.pivx import PIVXInterface
  
-@@ -1429,6 +1497,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -1461,6 +1529,9 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                      # PWNDA-PATCH-14: Zephyr polls chain state the same way
                      # every other xmr-family coin does.
                      Coins.ZEPH: threadPollXMRChainState,
@@ -145,7 +147,7 @@ index b4b01846..919d4a69 100644
                  }.get(
                      c, threadPollChainState
                  )  # default case
-@@ -8311,7 +8382,21 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -8661,7 +8732,21 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
              if self.coin_clients[coin_type].get("connection_type") == "electrum":
                  return ci.getSpendableBalance()
              if hasattr(ci, "rpc_wallet"):
@@ -169,18 +171,18 @@ index b4b01846..919d4a69 100644
                      return balance_info["balance"]
                  elif coin_type == Coins.PART:
 diff --git a/basicswap/bin/prepare.py b/basicswap/bin/prepare.py
-index 43eebccf..77a8341c 100755
+index 15a4620..78de4bc 100644
 --- a/basicswap/bin/prepare.py
 +++ b/basicswap/bin/prepare.py
-@@ -80,6 +80,7 @@ from basicswap.interface.firo.core import prepare_module as firo_prepare
+@@ -75,6 +75,7 @@ from basicswap.interface.firo.core import prepare_module as firo_prepare
  from basicswap.interface.doge.core import prepare_module as doge_prepare
  from basicswap.interface.nav.core import prepare_module as nav_prepare
  from basicswap.interface.nmc.core import prepare_module as nmc_prepare
 +from basicswap.interface.zano.core import prepare_module as zano_prepare
+ from basicswap.network.nostr.prepare import prepare_module as nostr_prepare
+ from basicswap.network.simplex.prepare import prepare_module as simplex_prepare
  
- coin_prepare_modules = {
-     "particl": part_prepare,
-@@ -97,6 +98,7 @@ coin_prepare_modules = {
+@@ -94,6 +95,7 @@ coin_prepare_modules = {
      "zephyr": zephyr_prepare,
      "pivx": pivx_prepare,
      "firo": firo_prepare,
@@ -188,7 +190,7 @@ index 43eebccf..77a8341c 100755
  }
  
  known_coins = {
-@@ -173,6 +175,18 @@ known_coins = {
+@@ -170,6 +172,18 @@ known_coins = {
          doge_prepare.version_tag,
          doge_prepare.signers.keys(),
      ),
@@ -208,7 +210,7 @@ index 43eebccf..77a8341c 100755
  
  disabled_coins = [
 diff --git a/basicswap/chainparams.py b/basicswap/chainparams.py
-index e2916900..67b70210 100644
+index e291690..67b7021 100644
 --- a/basicswap/chainparams.py
 +++ b/basicswap/chainparams.py
 @@ -21,6 +21,7 @@ from basicswap.interface.dash.chainparams import params as dash_params

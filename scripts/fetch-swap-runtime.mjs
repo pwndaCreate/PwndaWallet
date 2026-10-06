@@ -95,8 +95,8 @@ const LOG = "[swap-runtime]";
 
 // Upstream source pins. These MUST match upstream/README.md's pin table — that
 // file is the human-readable copy of the same contract.
-const PIN_BASICSWAP_TAG = "v0.18.9";
-const PIN_BASICSWAP_COMMIT = "5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4";
+const PIN_BASICSWAP_TAG = "v0.19.0";
+const PIN_BASICSWAP_COMMIT = "277b46b0278f1cc76199f7e847988647a1b36e38";
 const PIN_COINCURVE_TAG = "basicswap_v0.4";
 const PIN_COINCURVE_COMMIT = "ff375ce4ac551afc99f359da784ffceeda03203f";
 
@@ -354,11 +354,17 @@ const LOCAL_WHEELS = [
   },
   {
     name: "basicswap",
-    version: "0.18.9",
-    file: "basicswap-0.18.9-py3-none-any.whl",
-    // Rebuilt 2026-09-17 from upstream/basicswap @ v0.18.9 with the buildCmd
-    // below (pip reported sha256=54880aba..., matching the file). v0.18.9 bumps
-    // basicswap/__init__.py itself, so the file name tracks the release again.
+    version: "0.19.0",
+    file: "basicswap-0.19.0-py3-none-any.whl",
+    // Rebuilt 2026-10-06 from a `git archive` of upstream/basicswap @ v0.19.0
+    // with the buildCmd below (pip reported sha256=59025211..., matching the
+    // file; its 373 package files are byte-identical to the tag's basicswap/).
+    // requirements.txt did not move, so this is the only pin that changed.
+    //
+    // Previous entry: rebuilt 2026-09-17 from upstream/basicswap @ v0.18.9 with
+    // the buildCmd below (pip reported sha256=54880aba..., matching the file).
+    // v0.18.9 bumps basicswap/__init__.py itself, so the file name tracks the
+    // release again.
     //
     // Previous entry, kept for the history below: rebuilt 2026-09-12 from upstream/basicswap @ v0.18.7 with the buildCmd
     // below; hash computed from the produced file, not taken from pip's log
@@ -373,8 +379,8 @@ const LOCAL_WHEELS = [
     // basicswap/__init__.py", and a user whose UI keeps telling him to update an
     // already-updated node. The file name is therefore NOT evidence of which
     // source built it -- the sha256 is.
-    sha256: "54880abad3ae4843f6490b6d099c7cddc4aff17cd1671368835585ca5424fabb",
-    bytes: 5209393,
+    sha256: "59025211d9c51c36e9bb3d3118327653d37792256a191b7f191a02b547f6593e",
+    bytes: 5277349,
     buildFrom: `upstream/basicswap @ ${PIN_BASICSWAP_TAG} (${PIN_BASICSWAP_COMMIT})`,
     buildBackend: "hatchling",
     buildCmd: "python -m pip wheel . --no-deps -w <wheelhouse>",
@@ -1191,6 +1197,14 @@ async function runFull() {
   const enginePatchSeries = (await readdir(path.join(REPO_ROOT, "upstream", "patches")))
     .filter((f) => /^\d{4}-.*\.patch$/.test(f))
     .sort();
+  // The ENGINE level, as apply-engine-patches.mjs counts it: a patch whose
+  // every touched path lies outside basicswap/ is exempt (no runtime ships it).
+  let enginePatchLevel = 0;
+  for (const f of enginePatchSeries) {
+    const text = await readFile(path.join(REPO_ROOT, "upstream", "patches", f), "utf8");
+    const files = [...text.matchAll(/^--- a\/(\S+)/gm), ...text.matchAll(/^\+\+\+ b\/(\S+)/gm)].map((m) => m[1]);
+    if (!(files.length > 0 && files.every((p) => !p.startsWith("basicswap/")))) enginePatchLevel++;
+  }
   const manifest = {
     schema: "pwnda.swap-sidecar.runtime-inputs/1",
     // The distribution this runtime becomes once the series is applied. The
@@ -1200,10 +1214,14 @@ async function runFull() {
     // one. Naming both and keeping them distinct is deliberate: conflating
     // "what we meant to build" with "what is running" is the 2026-08-25
     // PATCH-9 fault.
+    // Derived from the pin and the series rather than restated: until
+    // 2026-10-06 this read groveId("0.18.5", <file count>) through four pin
+    // moves, and the file count includes patches that touch nothing inside
+    // basicswap/ (0022, tests only), which the applier keeps out of the level.
     distribution: {
       name: DISTRO_NAME,
-      intendedId: groveId("0.18.5", enginePatchSeries.length),
-      upstream: "basicswap v0.18.5",
+      intendedId: groveId(PIN_BASICSWAP_TAG.replace(/^v/, ""), enginePatchLevel),
+      upstream: `basicswap ${PIN_BASICSWAP_TAG}`,
       _what:
         "Pwnda Grove is a DISTRIBUTION of BasicSwap: a pinned upstream tag plus " +
         "the tracked patch series in upstream/patches/. Not a fork -- the ENGINE " +
@@ -1253,7 +1271,7 @@ async function runFull() {
     },
     pins: {
       cpython: PIN_CPYTHON,
-      basicswap: { tag: PIN_BASICSWAP_TAG, commit: PIN_BASICSWAP_COMMIT, version: "0.18.9" },
+      basicswap: { tag: PIN_BASICSWAP_TAG, commit: PIN_BASICSWAP_COMMIT, version: "0.19.0" },
       coincurve: { tag: PIN_COINCURVE_TAG, commit: PIN_COINCURVE_COMMIT, version: "21.0.4", fork: true },
       cores: Object.fromEntries(COIN_CORES.map((c) => [c.coin, c.version])),
     },

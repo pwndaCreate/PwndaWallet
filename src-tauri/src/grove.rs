@@ -58,7 +58,7 @@ pub const DISTRO_SLUG: &str = "pwnda-grove";
 /// `PIN_BASICSWAP_TAG`. Kept honest by [`tests::expected_version_matches_the_pin`]
 /// — the constant cannot drift from the pin without a test going red, which is the
 /// whole point: a *restated* version in a comment is what went stale before.
-pub const EXPECTED_UPSTREAM_VERSION: &str = "0.18.9";
+pub const EXPECTED_UPSTREAM_VERSION: &str = "0.19.0";
 
 /// How many patches the series carries. Kept honest by
 /// [`tests::expected_patch_level_matches_the_series`], which counts

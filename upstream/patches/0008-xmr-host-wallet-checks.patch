@@ -116,16 +116,19 @@ incident writeup, and the 2026-09-03 entries above for this revision.
 
 ---
  basicswap/basicswap.py           | 42 +++++++++++++++++++++++++++++++++++++
- basicswap/interface/xmr/xmr.py   | 61 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++
- 2 files changed, 103 insertions(+)
+ basicswap/interface/xmr/xmr.py   | 69 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 111 insertions(+)
+
+Revised 2026-10-06 for basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38): v0.19.0 adds XMRInterface.publishBLockTxs (Smart Buy pays several swaps' coin B locks in one `transfer` from the main wallet). That is a second fund-moving call on the main wallet-rpc connection with the same race publishBLockTx has, and it had no guard. It now calls _confirmMainWalletIdentity before its in-flight lookup and transfer, as publishBLockTx does. ZEPHInterface inherits it. ZanoInterface has no publishBLockTxs, so the engine never batches ZANO locks (sendXmrBidCoinBLockTx checks hasattr). `verify-xmr-wallet-split.py` section 15 is the proof. The diff below is regenerated; the other hunks are unchanged.
 
 diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 14465db..dc45f5a 100644
 --- a/basicswap/basicswap.py
 +++ b/basicswap/basicswap.py
-@@ -981,6 +981,25 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -1030,6 +1030,25 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                      "rpcpassword", ""
                  )
-
+ 
 +                # PWNDA-PATCH-8: pass through the host-managed main-wallet
 +                # settings PWNDA-PATCH-5's XMRInterface.__init__ reads
 +                # (coin_settings.get("mainwalletrpcport") etc.). Absent for
@@ -148,7 +151,7 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
      def getXMRTrustedDaemon(self, coin, node_host: str) -> bool:
          coin = Coins(coin)  # Errors for invalid coin value
          chain_client_settings = self.getChainClientSettings(coin)
-@@ -5119,6 +5138,29 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -5256,6 +5275,29 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
              )  # All keys should be be derived from the Particl mnemonic
              return True  # TODO
          if c in self.xmr_based_coins:
@@ -179,12 +182,13 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
              if expect_address is None:
                  self.log.warning(
 diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
+index edbd57e..2a245f9 100644
 --- a/basicswap/interface/xmr/xmr.py
 +++ b/basicswap/interface/xmr/xmr.py
 @@ -324,6 +324,48 @@ class XMRInterface(CoinInterface):
              except Exception:
                  pass
-
+ 
 +    def _confirmMainWalletIdentity(self) -> None:
 +        # PWNDA-PATCH-8 (revised): re-read the main wallet-rpc connection's live
 +        # address and compare it to the identity confirmed earlier by openWallet's
@@ -230,10 +234,10 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
      def _openWallet(self, filename):
          # PWNDA-PATCH-5: reachable without going through `openWallet`, so it
          # selects too rather than trusting the caller to have done it.
-@@ -601,6 +643,17 @@ class XMRInterface(CoinInterface):
+@@ -628,6 +670,17 @@ class XMRInterface(CoinInterface):
              self.rpc_wallet("refresh")
              self._log.debug(f"Refreshing {self.coin_name()} wallet")
-
+ 
 +            # PWNDA-PATCH-8: openWallet() for an external main wallet only
 +            # CONFIRMS the address and caches it (PWNDA-PATCH-5) rather than
 +            # issuing open_wallet -- the host owns the process too and may
@@ -247,8 +251,23 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
 +
              Kbv = self.getPubkey(kbv)
              shared_addr: str = xmr_util.encode_address(Kbv, Kbs, self._addr_prefix)
-
-@@ -881,6 +934,12 @@ class XMRInterface(CoinInterface):
+ 
+@@ -664,6 +717,14 @@ class XMRInterface(CoinInterface):
+             self.openWallet(self._wallet_filename)
+             self.rpc_wallet("refresh")
+ 
++            # PWNDA-PATCH-8: v0.19.0 added this second fund-moving call on the
++            # main wallet (Smart Buy batches several swaps' coin B locks into
++            # one transfer). It carries the same race as publishBLockTx --
++            # the host may switch wallets between openWallet's confirmation
++            # and the transfer -- so it gets the same assertion, before the
++            # in-flight lookup reads get_transfers from whatever is open.
++            self._confirmMainWalletIdentity()
++
+             destinations = [
+                 {
+                     "amount": output_amount,
+@@ -945,6 +1006,12 @@ class XMRInterface(CoinInterface):
                  }
                  if self._fee_priority > 0:
                      params["priority"] = self._fee_priority
@@ -261,7 +280,7 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
                  rv = self.rpc_wallet("sweep_all", params)
                  if estimate_fee:
                      return {
-@@ -898,6 +957,8 @@ class XMRInterface(CoinInterface):
+@@ -962,6 +1029,8 @@ class XMRInterface(CoinInterface):
              }
              if self._fee_priority > 0:
                  params["priority"] = self._fee_priority
@@ -270,4 +289,3 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
              rv = self.rpc_wallet("transfer", params)
              if estimate_fee:
                  return {
-

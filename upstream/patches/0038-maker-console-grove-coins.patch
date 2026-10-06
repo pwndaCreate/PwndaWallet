@@ -44,7 +44,7 @@ The duplicate-process check in page_amm.py runs `ps aux`, which does not
 exist on Windows; the exception is caught and the check returns no processes,
 so only duplicate detection is lost there. Not patched.
 
-Applies to: basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4), after PATCH-37.
+Applies to: basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38), after PATCH-37.
 Marker: PWNDA-PATCH-38
 
 diff --git a/basicswap/static/js/pages/offer-new-page.js b/basicswap/static/js/pages/offer-new-page.js

@@ -44,19 +44,22 @@ negative controls.
 
 Upstream candidate: no. Upstream has no host-managed main wallet.
 
+Rebased 2026-10-06 onto basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38): context only. BasicSwap.__init__ gained `_last_checked_pending_routes` beside this patch's timer, and a neighbouring hunk's context moved. The diff below is regenerated; the change it makes is the same.
+
 diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
+index 4f3e4da..dcedebd 100644
 --- a/basicswap/basicswap.py
 +++ b/basicswap/basicswap.py
-@@ -491,6 +491,8 @@
-         self._last_checked_split_messages = 0
+@@ -522,6 +522,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
          self._last_checked_delayed_auto_accept = 0
+         self._last_checked_pending_routes = 0
          self._last_checked_pending_sweeps = 0
 +        # PWNDA-PATCH-37: when update() last synced the host-wallet pins.
 +        self._pwnda_last_pin_sync = 0
          self._pending_sweeps = {}
          self._possibly_revoked_offers = collections.deque([], maxlen=1000)
          self._expired_offer_revokes = collections.deque([], maxlen=1000)
-@@ -2108,6 +2110,10 @@
+@@ -2140,6 +2142,10 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
      def unlockWallets(self, password: str, coin=None) -> None:
          try:
              self._read_zmq_queue = False
@@ -67,7 +70,7 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
              for c in self.getListOfWalletCoins():
                  if coin and c != coin:
                      continue
-@@ -2116,6 +2122,8 @@
+@@ -2148,6 +2154,8 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                  except Exception as e:  # noqa: F841
                      self.log.warning(f"Failed to unlock wallet {getCoinName(c)}")
                      raise
@@ -76,11 +79,10 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
  
              if coin is None or coin == Coins.PART:
                  self._is_locked = False
-@@ -5347,6 +5355,76 @@
-                 self.closeDB(cursor, commit=True)
+@@ -5395,6 +5403,76 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
          except Exception as e:
              self.log.debug(f"Error clearing cached balances: {e}")
-+
+ 
 +    # PWNDA-PATCH-37: a host wallet's identity is pinned across restarts
 +    # while swaps on its coin are in progress.
 +    #
@@ -150,10 +152,11 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
 +                    f"PWNDA-PATCH-37: could not sync the {ci.coin_name()} "
 +                    f"host wallet pin: {e}"
 +                )
- 
++
      def getCachedMainWalletAddress(self, ci, cursor=None):
          db_key = "main_wallet_addr_" + ci.coin_name().lower()
-@@ -15578,6 +15656,11 @@
+         cached_addr = self.getStringKV(db_key, cursor)
+@@ -16036,6 +16114,11 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
                  self._retryPendingSweeps()
                  self._last_checked_pending_sweeps = now
  
@@ -166,9 +169,10 @@ diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
              self.logException(f"update {ex}")
  
 diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
+index 2a245f9..1244675 100644
 --- a/basicswap/interface/xmr/xmr.py
 +++ b/basicswap/interface/xmr/xmr.py
-@@ -122,6 +122,11 @@
+@@ -122,6 +122,11 @@ class XMRInterface(CoinInterface):
          self._have_checked_seed = False
          self._wallet_filename = coin_settings.get("wallet_name", "swap_wallet")
          self._cached_main_wallet_address = None
@@ -180,7 +184,7 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
  
          daemon_login = None
          if coin_settings.get("rpcuser", "") != "":
-@@ -300,9 +305,10 @@
+@@ -300,9 +305,10 @@ class XMRInterface(CoinInterface):
              # port fail loudly instead of silently operating on a stranger's
              # wallet.
              if self._cached_main_wallet_address is None:
@@ -194,11 +198,10 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
              return
          if is_default and self._cached_main_wallet_address is not None:
              try:
-@@ -323,6 +329,19 @@
-                 ]
+@@ -324,6 +330,19 @@ class XMRInterface(CoinInterface):
              except Exception:
                  pass
-+
+ 
 +    def _pwndaCheckExpectedMainWallet(self, address: str) -> None:
 +        # PWNDA-PATCH-37: see BasicSwap.pwndaSyncHostWalletPins. In memory
 +        # only; the caller holds _mx_wallet.
@@ -211,10 +214,11 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
 +            )
 +            raise TemporaryError(self._pwnda_identity_refusal)
 +        self._pwnda_identity_refusal = None
- 
++
      def _confirmMainWalletIdentity(self) -> None:
          # PWNDA-PATCH-8 (revised): re-read the main wallet-rpc connection's live
-@@ -360,6 +379,12 @@
+         # address and compare it to the identity confirmed earlier by openWallet's
+@@ -360,6 +379,12 @@ class XMRInterface(CoinInterface):
          except Exception:
              open_wallet_addr = "UNKNOWN"
          if open_wallet_addr != self._cached_main_wallet_address:
@@ -228,9 +232,10 @@ diff --git a/basicswap/interface/xmr/xmr.py b/basicswap/interface/xmr/xmr.py
                  f"main wallet-rpc connection reports {open_wallet_addr}, expected "
                  f"confirmed identity {self._cached_main_wallet_address}; "
 diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
+index 5aff347..6722db1 100644
 --- a/basicswap/interface/zano/zano.py
 +++ b/basicswap/interface/zano/zano.py
-@@ -252,6 +252,10 @@
+@@ -252,6 +252,10 @@ class ZanoInterface(CoinInterface):
          # while it is None, rather than treating "never confirmed" as "assume
          # OK".
          self._cached_main_wallet_address = None
@@ -241,7 +246,7 @@ diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
  
          # PWNDA-PATCH-15 (a): True when this ZANO deployment shares an externally
          # (host-)managed main wallet rather than one BasicSwap derives from its own
-@@ -669,6 +673,19 @@
+@@ -669,6 +673,19 @@ class ZanoInterface(CoinInterface):
              return
          if not address:
              return
@@ -261,7 +266,7 @@ diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
          self._cached_main_wallet_address = address
          self._log.info(
              f"PWNDA-PATCH-35: confirmed the ZANO main wallet identity at {when}: "
-@@ -701,6 +718,12 @@
+@@ -701,6 +718,12 @@ class ZanoInterface(CoinInterface):
          except Exception:
              open_wallet_addr = "UNKNOWN"
          if open_wallet_addr != self._cached_main_wallet_address:
@@ -274,7 +279,7 @@ diff --git a/basicswap/interface/zano/zano.py b/basicswap/interface/zano/zano.py
              raise TemporaryError(
                  f"main wallet-rpc connection reports {open_wallet_addr}, expected "
                  f"confirmed identity {self._cached_main_wallet_address}; "
-@@ -814,6 +837,13 @@
+@@ -814,6 +837,13 @@ class ZanoInterface(CoinInterface):
          with self._mx_wallet:
              # PWNDA-PATCH-35: see _cacheMainWalletIdentityIfUnset.
              self._cacheMainWalletIdentityIfUnset("wallet info")

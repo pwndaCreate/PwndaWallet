@@ -94,7 +94,7 @@ eleven hunks (segwit-only lock funding, per-input vsize pricing, electrumx)
 carried over unchanged.
 
 
-Applies to: basicswap v0.18.9 (5471e609b9fbcba1a528dac60e2e06fc2f1a8ca4)
+Applies to: basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38)
 
 REBASE 2026-09-12, v0.18.6 -> v0.18.7. Three of this patch's ten btc.py hunks
 stopped applying, all three for the same reason: upstream's "refactor: thread db
@@ -112,12 +112,13 @@ does NOT filter which UTXOs may fund a chain-A lock: the unimplemented
 _fundTxElectrum still selects from every signable address without regard to
 address type. The premise holds, so this is a rebase and not a deletion.
 
+Rebased 2026-10-06 onto basicswap v0.19.0 (277b46b0278f1cc76199f7e847988647a1b36e38): upstream's Smart Buy (f580f33b, "handle leader UTXO management") added a `prevouts` parameter -- preselected inputs -- to fundSCLockTx, fundTx and _fundTxElectrum. All three now take both `prevouts` and `require_segwit_inputs`, and fundSCLockTx passes both. In _fundTxElectrum the segwit filter runs after upstream's prevouts selection, so preselected inputs are held to the same rule as any other UTXO. Checked first, because "stopped applying" and "stopped being necessary" look the same: v0.19.0 still does not filter which UTXOs may fund a chain-A lock (`# TODO: Manually select only segwit prevouts` is still in fundTx), so the premise holds. The diff below is regenerated.
 ---
 diff --git a/basicswap/basicswap.py b/basicswap/basicswap.py
-index 60eb924..8ada398 100644
+index c20fce9..14465db 100644
 --- a/basicswap/basicswap.py
 +++ b/basicswap/basicswap.py
-@@ -3230,6 +3230,23 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
+@@ -3262,6 +3262,23 @@ class BasicSwap(BaseApp, BSXNetwork, UIApp):
              ci = self.ci(coin_type)
              hrp = ci.chainparams_network().get("hrp", "bc")
  
@@ -142,14 +143,13 @@ index 60eb924..8ada398 100644
              # migration.  Filter before querying, a wallet with none needs no
              # electrum traffic at all.
 diff --git a/basicswap/interface/btc/btc.py b/basicswap/interface/btc/btc.py
-index 8f156a3..9a4dfb7 100644
+index 5f4b2b2..dd08437 100644
 --- a/basicswap/interface/btc/btc.py
 +++ b/basicswap/interface/btc/btc.py
-@@ -1435,7 +1435,16 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-     def fundSCLockTx(
-         self, tx_bytes, feerate, vkbv=None, bid_id: bytes = None, cursor=None
+@@ -1449,8 +1449,22 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+         cursor=None,
+         prevouts=None,
      ) -> bytes:
--        funded_tx = self.fundTx(tx_bytes, feerate, bid_id=bid_id, cursor=cursor)
 +        # PWNDA-PATCH-7: the chain-A lock tx's refund is pre-signed against
 +        # THIS tx's predicted (pre-signing) txid -- see basicswap.py
 +        # createSCLockRefundTx / sendXmrBidCoinALockTx. That binding only
@@ -157,37 +157,44 @@ index 8f156a3..9a4dfb7 100644
 +        # funding input to be witness-type. require_segwit_inputs=True
 +        # refuses (before any counterparty message is sent) rather than
 +        # building a lock tx that would fail upstream's OWN late guard.
-+        funded_tx = self.fundTx(
-+            tx_bytes, feerate, bid_id=bid_id, cursor=cursor, require_segwit_inputs=True
-+        )
++        # Upstream's preselected `prevouts` (v0.19.0 Smart Buy) are subject
++        # to the same rule: _fundTxElectrum filters them like any other.
+         funded_tx = self.fundTx(
+-            tx_bytes, feerate, bid_id=bid_id, cursor=cursor, prevouts=prevouts
++            tx_bytes,
++            feerate,
++            bid_id=bid_id,
++            cursor=cursor,
++            prevouts=prevouts,
++            require_segwit_inputs=True,
+         )
  
          if self._disable_lock_tx_rbf:
-             tx = self.loadTx(funded_tx)
-@@ -2196,6 +2205,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-         subfee: bool = False,
+@@ -2213,6 +2227,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          bid_id: bytes = None,
          cursor=None,
+         prevouts=None,
 +        require_segwit_inputs: bool = False,
      ) -> bytes:
          if self.useBackend():
              return self._fundTxElectrum(
-@@ -2205,6 +2215,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-                 subfee=subfee,
+@@ -2223,6 +2238,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  bid_id=bid_id,
                  cursor=cursor,
+                 prevouts=prevouts,
 +                require_segwit_inputs=require_segwit_inputs,
              )
  
          feerate_str = self.format_amount(feerate)
-@@ -2231,6 +2242,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
-         subfee: bool = False,
+@@ -2261,6 +2277,7 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          bid_id: bytes = None,
          cursor=None,
+         prevouts=None,
 +        require_segwit_inputs: bool = False,
      ) -> bytes:
          wm = self.getWalletManager()
          backend = self.getBackend()
-@@ -2290,10 +2302,58 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2331,10 +2348,58 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  )
              raise ValueError("No UTXOs available")
  
@@ -248,7 +255,7 @@ index 8f156a3..9a4dfb7 100644
          if isinstance(feerate, int):
              fee_per_vbyte = max(1, feerate // 1000)
          else:
-@@ -2302,14 +2362,14 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2343,14 +2408,14 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
  
          selected_utxos = []
          total_input = 0
@@ -266,7 +273,7 @@ index 8f156a3..9a4dfb7 100644
              est_fee = est_vsize * fee_per_vbyte
              target = total_output if subfee else total_output + est_fee
              if total_input >= target:
-@@ -2324,13 +2384,24 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2365,13 +2430,24 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          funded_tx.nVersion = self.txVersion()
  
          dummy_witness_stack = []
@@ -292,7 +299,7 @@ index 8f156a3..9a4dfb7 100644
  
          for out in parsed_tx.vout:
              funded_tx.vout.append(out)
-@@ -2338,13 +2409,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2379,13 +2455,21 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
          witness_bytes_len_est = self.getWitnessStackSerialisedLength(
              dummy_witness_stack
          )
@@ -315,7 +322,7 @@ index 8f156a3..9a4dfb7 100644
          rough_fee = max(round(feerate_satkb * rough_vsize / 1000), min_relay_fee)
          rough_change = (
              (total_input - total_output)
-@@ -2359,12 +2438,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2400,12 +2484,19 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  change_addr = wm.getExistingInternalAddress(self.coin_type())
              if not change_addr:
                  change_addr = selected_utxos[0].get("address")
@@ -338,7 +345,7 @@ index 8f156a3..9a4dfb7 100644
              )
              final_fee = max(round(feerate_satkb * final_vsize / 1000), min_relay_fee)
              change = (
-@@ -2378,7 +2464,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2419,7 +2510,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
              else:
                  funded_tx.vout.pop()
                  final_vsize = self.getTxVSize(
@@ -349,7 +356,7 @@ index 8f156a3..9a4dfb7 100644
                  )
                  final_fee = max(
                      round(feerate_satkb * final_vsize / 1000), min_relay_fee
-@@ -2386,7 +2474,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
+@@ -2427,7 +2520,9 @@ class BTCInterface(FeeValidator, Secp256k1Interface):
                  change = 0
          else:
              final_vsize = self.getTxVSize(
