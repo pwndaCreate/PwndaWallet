@@ -732,12 +732,13 @@ const REGISTRY_ENTRIES: Record<string, AssetCapability> = {
     // `rpcsAvailable` true (corrected 2026-10-01). The executor's SUI branch
     // calls `session-send.ts::executeSuiTransfer` (since 2026-09-30), which
     // since 2026-10-01 reads, dry-runs, submits and looks up over Sui's
-    // GraphQL (`graphql.mainnet.sui.io`), and asks this host, the adapter's
-    // `SUI_RPC`, only to build a send that spends an address balance. It is
-    // publicnode because `fullnode.mainnet.sui.io` answers every JSON-RPC
-    // method with -32601: Sui turned JSON-RPC off on its own full nodes the
-    // week of 2026-07-27; the wallet noticed on 2026-08-22, the date this
-    // comment gave as the deprecation's.
+    // GraphQL (`graphql.mainnet.sui.io`). Until 2026-10-06 it asked this host,
+    // the adapter's `SUI_RPC`, to build a send that spends an address
+    // balance; with `@mysten/sui` 2.x it asks nothing here, and `SUI_RPC` is
+    // gone. It is publicnode because `fullnode.mainnet.sui.io` answers every
+    // JSON-RPC method with -32601: Sui turned JSON-RPC off on its own full
+    // nodes the week of 2026-07-27; the wallet noticed on 2026-08-22, the date
+    // this comment gave as the deprecation's.
     defaultRpcUrl: "https://sui-rpc.publicnode.com",
     explorerTxUrl: (h) => `https://suivision.xyz/txblock/${h}`,
     explorerAddressUrl: (a) => `https://suivision.xyz/account/${a}`,

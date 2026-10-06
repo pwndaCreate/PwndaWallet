@@ -114,7 +114,9 @@
  *        whole send: its state read, dry run, submit (answering the
  *        transaction's own digest) and status lookup. `swap_get_sui_address`
  *        and `swap_sign_sui_tx` answer as the bypass's account, so a sandbox
- *        Sui send runs to "sent". `degraded`: every Sui call 503s.
+ *        Sui send runs to "sent". `degraded`: every Sui call 503s. Since
+ *        2026-10-06 the 60 SUI are 5 in a coin and 55 in the address
+ *        balance, so a send can be paid each of the three ways.
  *      - XMR/ZPH wallet RPC (xmr_rpc_call/zph_rpc_call: get_balance /
  *        get_address / get_transfers) when wallet_populated / degraded.
  *        Since 2026-10-01 also the Send modal's Review → Confirm for both
@@ -1798,15 +1800,23 @@ function graphQlOne(
       },
     });
 
-  // The send's state read (`readSuiSendState`): the gas price, both halves
-  // of the balance and the coins, in one request. One coin holds it all; the
+  // The send's state read (`readSuiSendState`): the chain's id, the epoch and
+  // gas price, both halves of the balance and the coins, in one request. The
   // test seed's live answer, unfunded, is no coins and both halves 0.
+  //
+  // 2026-10-06 (`@mysten/sui` 2.x): the 60 SUI the balance reads are split, 5
+  // in one coin object and 55 in the ADDRESS BALANCE (no object), so a sandbox
+  // send reaches each way a transfer is paid for (`session-send.ts`,
+  // `SuiTransferSource`): up to about 4.99 SUI from the coin, up to about
+  // 54.99 from the address balance, more than that from both, until about
+  // 59.99. The chain id is mainnet's and the epoch the one read live that day.
   if (q.includes("objects(")) {
     const coinId = "0x" + "5a".repeat(32);
     return data({
-      epoch: { referenceGasPrice: "100" },
+      chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+      epoch: { epochId: 1272, referenceGasPrice: "100" },
       address: {
-        balance: { coinBalance: funded ? "60000000000" : "0", addressBalance: "0" },
+        balance: { coinBalance: funded ? "5000000000" : "0", addressBalance: funded ? "55000000000" : "0" },
         objects: {
           nodes: funded
             ? [
@@ -1814,7 +1824,7 @@ function graphQlOne(
                   address: coinId,
                   version: 872783653,
                   digest: "75hbt6uvDqjPZ9WgFtMhBnTeyHw7cinoHiz4FD2vEz2d",
-                  contents: { json: { id: coinId, balance: "60000000000" } },
+                  contents: { json: { id: coinId, balance: "5000000000" } },
                 },
               ]
             : [],
@@ -1858,7 +1868,9 @@ function jsonRpcOne(url: string, req: any, funded: boolean, degraded: boolean): 
   // and its send moved to GraphQL; only a send that spends an address balance
   // builds through publicnode, and the GraphQL mock reports none). Since then
   // the GraphQL arm's history is two rows, so this one is out of date as a
-  // copy; it is kept for anything that still calls these methods.
+  // copy; it is kept for anything that still calls these methods. Since
+  // 2026-10-06 (`@mysten/sui` 2.x) not even that send does: nothing in the
+  // wallet calls these methods.
   if ((method.startsWith("suix_") || method.startsWith("sui_")) && !degraded && !url.includes("fullnode.mainnet.sui.io")) {
     if (method === "suix_getBalance")
       return ok({ coinType: "0x2::sui::SUI", coinObjectCount: funded ? 1 : 0, totalBalance: funded ? "60000000000" : "0", lockedBalance: {} });

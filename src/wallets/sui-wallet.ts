@@ -50,8 +50,19 @@
  * calls" below. Sui's published timeline ends JSON-RPC on full nodes, code
  * included, in mid-October 2026 (docs.sui.io/develop/accessing-data/
  * json-rpc-migration, read 2026-10-01). publicnode's own page announced
- * nothing that day, so when it stops is not known. `SUI_RPC` is kept for one
- * case only, explained at the constant.
+ * nothing that day, so when it stops is not known. `SUI_RPC` was kept for one
+ * case only; it is gone since 2026-10-06 (below).
+ *
+ * ## 2026-10-06 — `@mysten/sui` 2.x: SUI in an address balance can be sent
+ *
+ * The operator approved the `@mysten/sui` 2.x upgrade that the 2026-10-01
+ * change left open (2.35.0). A send now spends SUI held as an ADDRESS BALANCE
+ * (Sui's per-address balance with no coin object) with 2.x's own pieces: a
+ * `FundsWithdrawal` input, `0x2::coin::redeem_funds`, gas paid from the
+ * address balance with a `ValidDuring` expiration
+ * (`session-send.ts::buildSuiTransfer` has the three ways a transfer is paid
+ * for). Nothing in the wallet asks publicnode's JSON-RPC any more: every Sui
+ * call, the send's included, is `suiGraphQL` below, through the proxy.
  */
 
 import { mnemonicToSeedSync } from "@scure/bip39";
@@ -72,48 +83,24 @@ import { httpProxyCall } from "./_proxy";
 import { rpcsFor } from "./chain-rpcs";
 import { uniqueAddresses, urlHost } from "./parties-b-common";
 
-// The official public endpoint (`fullnode.mainnet.sui.io`) was DEPRECATED
-// upstream 2026-08-22: every `suix_*` method now returns
-// `-32601 Method not found ... migrate to gRPC or GraphQL`
-// (docs.sui.io/develop/accessing-data/json-rpc-migration). It was the sole,
-// hardcoded, no-fallback source here, so every dashboard read failed on
-// every session — "Sui not loaded" wasn't intermittent, it was permanent.
-// (Corrected 2026-10-01: 2026-08-22 is when this wallet noticed. Sui's
-// timeline has JSON-RPC off on its own mainnet full nodes from the week of
-// 2026-07-27, as the header's 2026-08-14 note says.)
-//
-// publicnode.com still serves the legacy JSON-RPC surface and is already on
-// the Rust proxy allowlist (used by ETH/AVAX/Polygon/Arbitrum/Base/Optimism/
-// BSC/Monad/Solana already), so this needed no allowlist change. Verified
-// live 2026-08-22 for all three methods this adapter calls
-// (suix_getBalance, suix_getReferenceGasPrice, suix_queryTransactionBlocks).
-//
-// Exported 2026-09-29 (send-safety audit): the SEND path in
-// `features/swap/session-send.ts` hard-coded the dead official host, so every
-// Sui send failed at build time with the same -32601 while balances loaded
-// fine from here. One constant, so the two cannot drift apart again. That path
-// calls it directly from the webview through the SDK's `SuiClient`; publicnode
-// answers CORS for any origin, including the SDK's own request headers
-// (preflight checked 2026-09-29).
-//
-// History is no longer read here (2026-10-01): `suix_queryTransactionBlocks`
-// fails WHOLE once publicnode has pruned one old transaction of the address
-// (see `getTransactionHistory`), so it moved to GraphQL.
-//
-// Nor, later that day, are the balance, the by-hash read or the send
-// (operator request, 2026-10-01; the header has why). What still uses this
-// host is ONE path of the send: a wallet that holds SUI in an ADDRESS BALANCE
-// (Sui's per-address balance with no coin object, on mainnet since release
-// 1.72, May 2026). `@mysten/sui` 1.x has no transaction format that spends an
-// address balance. A fullnode's JSON-RPC hands such clients a "compatibility
-// coin reservation" instead, a synthetic coin in `suix_getCoins` that spends
-// from the address balance (docs.sui.io, "Migrating from Coin to Address
-// Balances"; `get_owned_coins` in sui-json-rpc at mainnet-v1.80.1). GraphQL
-// lists real coins only. So `session-send.ts` builds that one case here, and
-// when this host stops answering, a wallet whose SUI sits in an address
-// balance can send only what its coins hold, until the wallet moves to
-// `@mysten/sui` 2.x.
-export const SUI_RPC = "https://sui-rpc.publicnode.com";
+// `SUI_RPC`, the JSON-RPC host this adapter and the send used
+// (`https://sui-rpc.publicnode.com`), is gone since 2026-10-06 (operator
+// request). Its history, in short:
+//  - the official `fullnode.mainnet.sui.io` stopped serving JSON-RPC the week
+//    of 2026-07-27 (`-32601 Method not found ... migrate to gRPC or GraphQL`);
+//    the wallet noticed on 2026-08-22 and moved to publicnode, which needed
+//    no proxy-allowlist change;
+//  - on 2026-09-29 the send, which still named the official host, was pointed
+//    at the same constant;
+//  - on 2026-10-01 history moved to GraphQL (publicnode failed it WHOLE over
+//    one pruned transaction), then the balance, the by-hash read and the send.
+//    One send path stayed: an address holding an ADDRESS BALANCE (no coin
+//    object; mainnet since release 1.72, May 2026). `@mysten/sui` 1.x could
+//    spend one only through JSON-RPC's "compatibility coin reservation", a
+//    synthetic coin `suix_getCoins` lists (`get_owned_coins` in sui-json-rpc,
+//    mainnet-v1.80.1), which GraphQL does not.
+// `@mysten/sui` 2.x spends an address balance directly
+// (`session-send.ts::buildSuiTransfer`), so nothing asks publicnode now.
 const DERIVATION_PATH = "m/44'/784'/0'/0'/0'";
 
 /** Queries take the short form; responses come back fully expanded. */
@@ -572,19 +559,25 @@ export function suiHistoryRow(node: SuiHistoryNode, address: string): ChainTx | 
 // =========================================================================
 //
 // `session-send.ts::executeSuiTransfer` builds a transfer with
-// `@mysten/sui` 1.45.2. Until 2026-10-01 it handed the SDK a JSON-RPC client
-// (publicnode), whose resolver (`jsonRpc/json-rpc-resolver.js`) did three
+// `@mysten/sui`'s `Transaction` (2.x since 2026-10-06), offline: every field
+// is set from the reads below, so the SDK asks no server anything and nothing
+// a server resolved ends up in the bytes. Until 2026-10-01 the 1.x SDK's
+// JSON-RPC resolver (`jsonRpc/json-rpc-resolver.js`, publicnode) did three
 // things: gas price = `suix_getReferenceGasPrice`; budget = a dry run of the
 // transfer at `SUI_DRY_RUN_BUDGET` with no gas coins, its computation cost +
 // `SUI_GAS_SAFE_OVERHEAD` × price + storage cost − rebate, never less than
 // computation + overhead; gas payment = the first page of `suix_getCoins`.
-// The functions below are those three reads on GraphQL, plus the submit and
-// the status. Fed the same chain state, the transfer they build is the same
-// bytes (`suiSend.test.ts`).
+// The functions below are those reads on GraphQL, plus the submit and the
+// status. 2.x's own client resolver computes the budget the same way
+// (`computeGasBudget`, `MAX_GAS`, `GAS_SAFE_OVERHEAD` in its
+// `client/core-resolver.ts`, read in 2.35.0). For an account whose SUI is all
+// in coin objects, the transfer is the bytes 1.45.2 built from the same chain
+// state (`suiSend.test.ts`).
 
 /**
  * The budget the dry run is asked at, 50 SUI in MIST: the SDK resolver's
- * `MAX_GAS`. Kept equal, so the dry run is the same transaction.
+ * `MAX_GAS` (1.x and 2.x alike). Kept equal, so the dry run is the same
+ * transaction.
  */
 export const SUI_DRY_RUN_BUDGET = 50_000_000_000n;
 
@@ -595,7 +588,9 @@ const SUI_GAS_SAFE_OVERHEAD = 1000n;
  * The most coins one gas payment holds: one page of `suix_getCoins`, which
  * is what the JSON-RPC resolver used (the fullnode's `QUERY_MAX_RESULT_LIMIT`,
  * 50 unless the operator configures another). GraphQL's `Address.objects`
- * pages at 50 too (`serviceConfig.maxPageSize`, read live 2026-10-01).
+ * pages at 50 too (`serviceConfig.maxPageSize`, read live 2026-10-01 and
+ * 2026-10-06). The protocol allows 256 since version 96 (2.x's resolver uses
+ * that); kept at one page, so a coin-only send is still what 1.x built.
  */
 export const SUI_GAS_PAYMENT_MAX = 50;
 
@@ -609,12 +604,25 @@ export interface SuiCoinRef {
   balance: bigint;
 }
 
-/** What a transfer is built from: the gas price, the balance's two halves, the coins. */
+/**
+ * What a transfer is built from: the gas price, the balance's two halves, the
+ * coins, and (2026-10-06) the epoch and the chain, which a transfer paid from
+ * the address balance names in its `ValidDuring` expiration.
+ */
 export interface SuiSendState {
   referenceGasPrice: bigint;
+  /** The current epoch (`epoch.epochId`). */
+  epoch: bigint;
+  /**
+   * The chain's identifier, base58: its genesis checkpoint digest. Mainnet's
+   * is `4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S` (read live 2026-10-06,
+   * the same as `checkpoint(sequenceNumber: 0).digest`, which is what
+   * `@mysten/sui` 2.x asks for it).
+   */
+  chainIdentifier: string;
   /** SUI in coin objects. */
   coinBalance: bigint;
-  /** SUI in the address balance, which has no coin object (see `SUI_RPC`). */
+  /** SUI in the address balance, which has no coin object. */
   addressBalance: bigint;
   /** The address's SUI coins: one page, at most `SUI_GAS_PAYMENT_MAX`. */
   coins: SuiCoinRef[];
@@ -635,7 +643,8 @@ export interface SuiExecution {
 }
 
 const SUI_SEND_STATE_QUERY = `query ($address: SuiAddress!) {
-  epoch { referenceGasPrice }
+  chainIdentifier
+  epoch { epochId referenceGasPrice }
   address(address: $address) {
     balance(coinType: "0x2::sui::SUI") { coinBalance addressBalance }
     objects(first: ${SUI_GAS_PAYMENT_MAX}, filter: { type: "0x2::coin::Coin<0x2::sui::SUI>" }) {
@@ -645,7 +654,7 @@ const SUI_SEND_STATE_QUERY = `query ($address: SuiAddress!) {
 }`;
 
 const SUI_SIMULATE_QUERY = `query ($tx: JSON!) {
-  simulateTransaction(transaction: $tx) {
+  simulateTransaction(transaction: $tx, doGasSelection: false) {
     effects {
       status
       executionError { message }
@@ -675,24 +684,32 @@ function suiU64(v: unknown, what: string): bigint {
 }
 
 /**
- * The gas price, both halves of the SUI balance, and up to 50 SUI coins of
- * `address`, in one GraphQL request. Exported for `session-send.ts` and tests.
+ * The gas price, the epoch, the chain's identifier, both halves of the SUI
+ * balance, and up to 50 SUI coins of `address`, in one GraphQL request.
+ * Exported for `session-send.ts` and tests.
  *
  * Throws when any part is missing, and on a coin it cannot read: dropping a
  * coin would change which coins pay, so a coin it cannot read is an error.
  * An address with no coins answers `nodes: []` (the public test seed, live
- * 2026-10-01).
+ * 2026-10-01 and 2026-10-06).
  */
 export async function readSuiSendState(address: string): Promise<SuiSendState> {
   type Node = { address?: unknown; version?: unknown; digest?: unknown; contents?: { json?: { balance?: unknown } | null } | null };
   const d = await suiGraphQL<{
-    epoch?: { referenceGasPrice?: unknown } | null;
+    chainIdentifier?: unknown;
+    epoch?: { epochId?: unknown; referenceGasPrice?: unknown } | null;
     address?: {
       balance?: { coinBalance?: unknown; addressBalance?: unknown } | null;
       objects?: { nodes?: Node[] | null } | null;
     } | null;
   }>(SUI_SEND_STATE_QUERY, { address: address.trim() });
   const referenceGasPrice = suiU64(d.epoch?.referenceGasPrice, "reference gas price");
+  const epoch = suiU64(d.epoch?.epochId, "epoch");
+  // A 32-byte digest in base58. The SDK checks the length again when it
+  // encodes the expiration; the network refuses another chain's id
+  // ("Transaction chain ID … does not match network chain ID", live 2026-10-06).
+  const chainIdentifier = typeof d.chainIdentifier === "string" ? d.chainIdentifier : "";
+  if (!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(chainIdentifier)) throw new Error("Sui returned no chain identifier");
   const balance = d.address?.balance;
   const nodes = d.address?.objects?.nodes;
   if (!balance || !Array.isArray(nodes)) throw new Error("Sui returned no balance or coin list for this address");
@@ -713,6 +730,8 @@ export async function readSuiSendState(address: string): Promise<SuiSendState> {
   });
   return {
     referenceGasPrice,
+    epoch,
+    chainIdentifier,
     coinBalance: suiU64(balance.coinBalance, "coin balance"),
     addressBalance: suiU64(balance.addressBalance, "address balance"),
     coins,
@@ -758,7 +777,19 @@ export function suiGasBudget(price: bigint, gas: SuiGasUsed): bigint {
  * coins in the transaction, both APIs run it on a stand-in gas coin
  * (`0xff…ff`, version 2) and report the same costs: checked live on
  * 2026-10-01 for a transfer from the public test seed, 100,000 computation,
- * 1,976,000 storage, 0 rebate from each.
+ * 1,976,000 storage, 0 rebate from each (again on 2026-10-06, through 2.x's
+ * bytes).
+ *
+ * `doGasSelection: false` is written out since 2026-10-06. It is the
+ * schema's default, and it is what makes the empty gas payment a stand-in:
+ * asked to select gas, the server wants the 50 SUI dry-run budget from the
+ * account itself (live, the test seed: "Unable to perform gas selection due
+ * to insufficient SUI balance (in address balance or coins) … to satisfy
+ * required budget 50000000000"). 2.x's resolver asks the same way. A
+ * transfer paid from the address balance is priced on the stand-in coin too,
+ * which costs it the coin's storage it will not have: its budget comes out
+ * about 0.001 SUI higher than it needs (inference from the live gas of
+ * mainnet transactions paying gas that way, storage 0 for the gas).
  */
 export async function simulateSuiGas(txBytes: Uint8Array): Promise<SuiGasUsed> {
   type Effects = {

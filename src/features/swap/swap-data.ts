@@ -537,9 +537,9 @@ export function getRpcUrlsForBlockchain(blockchain: IntentsBlockchain): string[]
       // two hosts that serve no Sui JSON-RPC). A SUI deposit is
       // `session-send.ts::executeSuiTransfer`, which reads, dry-runs,
       // submits and looks up over Sui's GraphQL (`graphql.mainnet.sui.io`,
-      // `chain-rpcs.ts`) and asks publicnode's JSON-RPC (`SUI_RPC`) only to
-      // build a send that spends an address balance; the Rust broadcaster has
-      // no Sui arm. Checked live that day: `fullnode.mainnet.sui.io` answers
+      // `chain-rpcs.ts`; since 2026-10-06 also for a send that spends an
+      // address balance, which went to publicnode's JSON-RPC before); the
+      // Rust broadcaster has no Sui arm. Checked live that day: `fullnode.mainnet.sui.io` answers
       // every JSON-RPC method with -32601 "JSON-RPC on public fullnodes has
       // been deprecated" (Sui turned it off on its own full nodes the week of
       // 2026-07-27), and `sui-mainnet-rpc.nodereal.io` no longer resolves.

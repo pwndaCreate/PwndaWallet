@@ -28,6 +28,11 @@
  * below). Their answers keep the live layouts of that day, read for the
  * public test seed; `features/swap/suiSend.test.ts` drives them through a
  * whole send.
+ *
+ * 2026-10-06 (`@mysten/sui` 2.x, so an address balance can be sent): the state
+ * read also carries the epoch and the chain's id, and the dry run asks for a
+ * stand-in gas coin in so many words. The history is unchanged; two cases
+ * read live that day pin how it shows an address balance's deposits and gas.
  */
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
@@ -365,6 +370,45 @@ describe("getTransactionHistory (GraphQL, 2026-10-01)", () => {
     expect(byHash.DigestRebate.fee).toBeUndefined();
   });
 
+  it("a deposit into this address's address balance (`balance::send_funds`) is a receipt from its sender", async () => {
+    // Checked live 2026-10-06 (the 2026-10-01 entry had left it open): public
+    // mainnet transactions found with the filter `function:
+    // "0x2::balance::send_funds"` that paid SUI into another address's address
+    // balance, with no object of that address created, modified or
+    // transferred. The recipient's `relation: AFFECTED` history listed each
+    // (3 of 3, as did `filter: { affectedAddress }`), and `balanceChangesJson`
+    // held its rise. This one's layout, addresses invented: 2,347 MIST into
+    // the address balance, the sender paying 100,000 MIST of gas from its own
+    // address balance (no gas object, storage 0).
+    mockProxy.mockResolvedValue(
+      gqlPage([
+        node("DigestDeposit", "2026-10-06T15:45:02.651Z", 300000000, [[OTHER, "-102347"], [ADDR, "2347"]], {
+          sender: OTHER,
+          gasOwner: OTHER,
+          gas: [100000, 0, 0],
+        }),
+      ]),
+    );
+    const [row] = (await suiAdapter.getTransactionHistory!(ADDR)).items;
+    expect(row).toMatchObject({ direction: "in", amount: "0.000002347", counterparty: OTHER, meta: { from: OTHER, to: ADDR } });
+    expect(row.fee).toBeUndefined();
+  });
+
+  it("a send whose gas the address balance paid (no gas coin) leaves the gas out, as one paid with coins", async () => {
+    // The same live layout from the sender's side: `gasInput.gasSponsor` named
+    // the sender though the gas payment was empty and `gasObject` null.
+    mockProxy.mockResolvedValue(
+      gqlPage([
+        node("DigestFromBalance", "2026-10-06T15:45:02.651Z", 300000000, [[ADDR, "-102347"], [OTHER, "2347"]], {
+          gasOwner: ADDR,
+          gas: [100000, 0, 0],
+        }),
+      ]),
+    );
+    const [row] = (await suiAdapter.getTransactionHistory!(ADDR)).items;
+    expect(row).toMatchObject({ direction: "out", amount: "0.000002347", fee: "0.000100000", counterparty: OTHER });
+  });
+
   it("a transaction that changed no balance is left out; one whose changes are missing reads amount unknown", async () => {
     const quiet = node("DigestQuiet", "2026-01-01T00:00:00.000Z", 1, []);
     const missing = { ...node("DigestMissing", "2026-01-02T00:00:00.000Z", 2, []), effects: { status: "SUCCESS", timestamp: "2026-01-02T00:00:00.000Z", checkpoint: { sequenceNumber: 2 } } };
@@ -407,9 +451,11 @@ describe("the send's chain calls over GraphQL (operator request, 2026-10-01)", (
       json: { id: "0xb3103ee56b3e0aea3c3db9403e3f062f513026bc8bf3fac53c783ea571a3ef15", balance: "500000000" },
     },
   };
+  /** The live layout of 2026-10-06: `chainIdentifier` a string, `epochId` a number. */
   const state = (over: Record<string, unknown> = {}) =>
     gql({
-      epoch: { referenceGasPrice: "100" },
+      chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+      epoch: { epochId: 1272, referenceGasPrice: "100" },
       address: {
         balance: { coinBalance: "500000000", addressBalance: "0" },
         objects: { nodes: [SEED_COIN_NODE] },
@@ -417,11 +463,14 @@ describe("the send's chain calls over GraphQL (operator request, 2026-10-01)", (
       ...over,
     });
 
-  it("readSuiSendState: the gas price, both halves of the balance and a page of coins, in one request", async () => {
+  it("readSuiSendState: the chain, the epoch and gas price, both halves of the balance and a page of coins, in one request", async () => {
     mockProxy.mockResolvedValueOnce(state());
     const s = await readSuiSendState(ADDR);
     expect(s).toEqual({
       referenceGasPrice: 100n,
+      // 2026-10-06: what a transfer paid from the address balance names in its expiration.
+      epoch: 1272n,
+      chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
       coinBalance: 500000000n,
       addressBalance: 0n,
       coins: [
@@ -440,6 +489,8 @@ describe("the send's chain calls over GraphQL (operator request, 2026-10-01)", (
       `objects(first: ${SUI_GAS_PAYMENT_MAX}, filter: { type: "0x2::coin::Coin<0x2::sui::SUI>" })`,
     );
     expect(req.query).toContain('balance(coinType: "0x2::sui::SUI") { coinBalance addressBalance }');
+    expect(req.query).toContain("chainIdentifier");
+    expect(req.query).toContain("epoch { epochId referenceGasPrice }");
     expect(req.variables).toEqual({ address: ADDR });
   });
 
@@ -465,6 +516,13 @@ describe("the send's chain calls over GraphQL (operator request, 2026-10-01)", (
       state({ address: { balance: { coinBalance: "1", addressBalance: "0" }, objects: { nodes: [noBalance] } } }),
     );
     await expect(readSuiSendState(ADDR)).rejects.toThrow(/no coin balance/);
+    // 2026-10-06: the epoch and the chain an address-balance transfer names.
+    mockProxy.mockResolvedValueOnce(state({ epoch: { referenceGasPrice: "100" } }));
+    await expect(readSuiSendState(ADDR)).rejects.toThrow(/no epoch/);
+    mockProxy.mockResolvedValueOnce(state({ chainIdentifier: null }));
+    await expect(readSuiSendState(ADDR)).rejects.toThrow(/no chain identifier/);
+    mockProxy.mockResolvedValueOnce(state({ chainIdentifier: "35834a8a" }));
+    await expect(readSuiSendState(ADDR)).rejects.toThrow(/no chain identifier/);
   });
 
   it("suiGasPayment: largest first, ties by object id, at most one page of 50", () => {
@@ -525,7 +583,9 @@ describe("the send's chain calls over GraphQL (operator request, 2026-10-01)", (
       storageCost: 1976000n,
       storageRebate: 0n,
     });
-    expect(sent().query).toContain("simulateTransaction(transaction: $tx)");
+    // A stand-in gas coin, never the account's own gas (2026-10-06: written
+    // out; selecting gas would ask the account for the whole 50 SUI budget).
+    expect(sent().query).toContain("simulateTransaction(transaction: $tx, doGasSelection: false)");
     expect(sent().variables).toEqual({ tx: { bcs: { value: "AQID" } } });
   });
 

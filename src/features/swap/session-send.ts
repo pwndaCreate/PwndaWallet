@@ -62,7 +62,7 @@ import type { SendMemo, TxResult } from "../../wallets/types";
 import { SendOutcomeUnknownError } from "../../wallets/send-outcome";
 import {
   SUI_DRY_RUN_BUDGET,
-  SUI_RPC,
+  SUI_GAS_PAYMENT_MAX,
   executeSuiTransaction,
   readSuiSendState,
   simulateSuiGas,
@@ -619,17 +619,19 @@ export function parseSuiRecipient(input: string): string {
  * reference gas price, a dry run for the budget, the coins that pay — comes
  * from Sui's GraphQL since 2026-10-01 (operator request: Sui is ending
  * JSON-RPC, and `build({ client })` with the SDK's JSON-RPC client read all
- * three from publicnode). `buildSuiTransfer` does what that client's
- * resolver did, so the same chain state gives the same bytes to sign;
- * `suiSend.test.ts` builds one transfer both ways and compares them.
+ * three from publicnode).
  *
- * The exception is an address balance (`SUI_RPC` in the adapter has why).
- * Then the transfer is still built through publicnode's JSON-RPC, whose
- * compatibility coin reservation is the only way this SDK can spend an
- * address balance; when that fails, from the coins alone if they cover the
- * amount and the gas, and otherwise it is refused before signing.
+ * Since 2026-10-06 the SDK is `@mysten/sui` 2.x and the SUI can come from
+ * coin objects, from the address balance, or from both (`buildSuiTransfer`).
+ * The transfer is built offline, every field set here, so the SDK asks no
+ * server anything. Nothing goes to publicnode's JSON-RPC any more: an
+ * address balance used to be built there, through its compatibility coin
+ * reservation, the only way 1.x could spend one.
  *
  * The submit, and the lookup that settles an uncertain one, are GraphQL too.
+ * `swap_sign_sui_tx` signs the 2.x bytes as it signed 1.x's: BLAKE2b-256 of
+ * the `TransactionData` intent `[0, 0, 0]` and the bytes, ed25519
+ * (`suiSend.test.ts` checks the result against the SDK's own signer).
  *
  * Before 2026-09-29 the JSON-RPC host was the official one, whose JSON-RPC
  * is shut down (-32601 "JSON-RPC on public fullnodes has been deprecated"),
@@ -693,19 +695,59 @@ export async function executeSuiTransfer(args: {
   return { txHash: digest };
 }
 
+/** The coin type every transfer here moves. */
+const SUI_COIN_TYPE = "0x2::sui::SUI";
+
 /**
- * The transfer's bytes, ready to sign (`executeSuiTransfer` has the two ways
- * it is built). Every throw here comes before signing.
+ * Where a transfer's SUI comes from (2026-10-06, operator request: SUI held
+ * as an address balance must be spendable). A Sui address holds SUI in coin
+ * objects, in its address balance (no object at all), or both; the wallet
+ * shows the sum.
+ *
+ *  - `coins`: the coins pay the gas and the amount is split from them. Every
+ *    Sui send was this before 2026-10-06, and for the same chain state it is
+ *    the same bytes (`suiSend.test.ts` compares them with what 1.45.2 built).
+ *    An address balance, if there is one, is left alone.
+ *  - `address-balance`: a `FundsWithdrawal` of the amount, redeemed into a
+ *    coin by `0x2::coin::redeem_funds` and transferred, the gas paid from the
+ *    address balance too (an empty gas payment). With no object version to
+ *    tie it to one moment, such a transaction carries a `ValidDuring`
+ *    expiration: this epoch and the next, the chain's id, a random nonce.
+ *    That is the shape `@mysten/sui` 2.x documents ("Paying gas from address
+ *    balance", its `docs/transactions/offline.md`), and the shape mainnet
+ *    transactions paying gas that way carry (read live 2026-10-06).
+ *  - `both`: the coins pay the gas; what they lack is withdrawn from the
+ *    address balance and merged into the gas coin before the split. A gas
+ *    payment has to hold the whole budget before anything runs, and the part
+ *    of the gas coin a transaction can split is its balance less the budget,
+ *    so the withdrawal is exactly amount + budget − coins. (Inference: Sui's
+ *    adapter sets the budget aside in the gas coin before the commands run;
+ *    recalled from its `programmable_transactions/context.rs`, not re-read
+ *    for this change. If it did not, the withdrawal would only be larger
+ *    than needed, never short.)
+ *
+ * The recipient gets a coin object in every case, as before.
+ *
+ * Not used: the coin reservation `@mysten/sui`'s own client resolver puts in
+ * the gas payment when a transaction splits the gas coin and the address
+ * holds a balance (a synthetic gas coin standing for the address balance,
+ * `utils/coin-reservation.ts` in 2.35.0). Its helper is not exported, and
+ * "hybrid gas" spending such reservations is what stopped mainnet twice on
+ * 2026-05-28 and 29 (sui.io, 2026-05-31). Without it, one case cannot be
+ * paid and is refused before signing: the SUI covers the amount and the gas
+ * in total, but the coins hold less than the gas budget and the address
+ * balance less than the amount plus it.
+ */
+type SuiTransferSource = "coins" | "address-balance" | "both";
+
+/**
+ * The transfer's bytes, ready to sign. Each source above that could pay is
+ * priced by a dry run of its own shape, in the order listed; the first whose
+ * SUI covers the amount AND the budget is built. Every throw here comes
+ * before signing.
  */
 async function buildSuiTransfer(from: string, to: string, mist: bigint): Promise<Uint8Array> {
   const { Transaction } = await import("@mysten/sui/transactions");
-  const transfer = () => {
-    const tx = new Transaction();
-    tx.setSender(from);
-    const [coin] = tx.splitCoins(tx.gas, [mist]);
-    tx.transferObjects([coin], to);
-    return tx;
-  };
 
   let state: SuiSendState;
   try {
@@ -713,48 +755,129 @@ async function buildSuiTransfer(from: string, to: string, mist: bigint): Promise
   } catch (e) {
     throw new Error(`Sui could not be read to prepare the transfer (${errText(e)}). Nothing was sent.`);
   }
+  const coins = suiGasPayment(state.coins);
+  const inCoins = coins.reduce((sum, c) => sum + c.balance, 0n);
+  const inBalance = state.addressBalance;
+  if (inCoins === 0n && inBalance === 0n) {
+    throw new Error("This Sui account has no SUI to pay the network fee. Nothing was sent.");
+  }
+  const gasCoins = coins.map(({ objectId, version, digest }) => ({ objectId, version, digest }));
+  // Drawn once, so a dry run and the transfer it prices share it. It only has
+  // to be unique among this address's transactions in the two epochs: two
+  // otherwise identical ones with the same nonce are one transaction.
+  const nonce = crypto.getRandomValues(new Uint32Array(1))[0];
 
-  let jsonRpcError = "";
-  if (state.addressBalance > 0n) {
-    try {
-      const { SuiClient } = await import("@mysten/sui/client");
-      return await transfer().build({ client: new SuiClient({ url: SUI_RPC }) });
-    } catch (e) {
-      jsonRpcError = errText(e);
+  /** One source's transfer at `budget`; the dry run's has no gas coins. */
+  const shape = (source: SuiTransferSource, budget: bigint, dryRun: boolean) => {
+    const tx = new Transaction();
+    tx.setSender(from);
+    tx.setGasPrice(state.referenceGasPrice);
+    tx.setGasBudget(budget);
+    if (source === "address-balance") {
+      const [coin] = tx.moveCall({
+        target: "0x2::coin::redeem_funds",
+        typeArguments: [SUI_COIN_TYPE],
+        arguments: [tx.withdrawal({ amount: mist })],
+      });
+      tx.transferObjects([coin], to);
+      // The gas comes from the address balance: no gas coins.
+      tx.setGasPayment([]);
+      tx.setExpiration({
+        ValidDuring: {
+          minEpoch: state.epoch.toString(),
+          maxEpoch: (state.epoch + 1n).toString(),
+          minTimestamp: null,
+          maxTimestamp: null,
+          chain: state.chainIdentifier,
+          nonce,
+        },
+      });
+      return tx;
     }
-  }
+    if (source === "both") {
+      // The dry run withdraws what it can, the budget not being known yet; the
+      // transfer, exactly what the coins lack (never 0: Sui refuses a zero
+      // withdrawal, "Balance withdraw reservation amount must be non-zero",
+      // live 2026-10-06).
+      const topUp = dryRun ? (inBalance < mist ? inBalance : mist) : mist + budget - inCoins;
+      const [funds] = tx.moveCall({
+        target: "0x2::coin::redeem_funds",
+        typeArguments: [SUI_COIN_TYPE],
+        arguments: [tx.withdrawal({ amount: topUp })],
+      });
+      tx.mergeCoins(tx.gas, [funds]);
+    }
+    const [coin] = tx.splitCoins(tx.gas, [mist]);
+    tx.transferObjects([coin], to);
+    // The gas coins' versions protect the transfer from a replay, so no
+    // expiration: `None`, as 1.x wrote it. Set, not left out, because 2.x
+    // will not build the dry run's empty gas payment offline without one
+    // ("No sui client passed to Transaction#build, but transaction data was
+    // not sufficient to build offline": every Sui send, on the bare upgrade).
+    tx.setExpiration({ None: true });
+    tx.setGasPayment(dryRun ? [] : gasCoins);
+    return tx;
+  };
 
-  const payment = suiGasPayment(state.coins);
-  if (payment.length === 0) {
-    throw new Error(
-      state.addressBalance > 0n
-        ? addressBalanceRefusal(0n, state.addressBalance, jsonRpcError)
-        : "This Sui account has no SUI to pay the network fee. Nothing was sent.",
-    );
+  const covers = (source: SuiTransferSource, budget: bigint) =>
+    source === "coins"
+      ? inCoins >= mist + budget
+      : source === "address-balance"
+        ? inBalance >= mist + budget
+        : inCoins >= budget && inCoins + inBalance >= mist + budget;
+  const sources: SuiTransferSource[] = [];
+  if (inCoins > mist) sources.push("coins");
+  if (inBalance > mist) sources.push("address-balance");
+  if (inCoins > 0n && inBalance > 0n && inCoins + inBalance > mist) sources.push("both");
+
+  const budgets: bigint[] = [];
+  for (const source of sources) {
+    const dryRun = await shape(source, SUI_DRY_RUN_BUDGET, true).build();
+    const budget = suiGasBudget(state.referenceGasPrice, await simulateSuiGas(dryRun));
+    if (covers(source, budget)) return shape(source, budget, false).build();
+    budgets.push(budget);
   }
-  const tx = transfer();
-  tx.setGasPrice(state.referenceGasPrice);
-  // The dry run is the resolver's: no gas coins, its fixed budget.
-  tx.setGasBudget(SUI_DRY_RUN_BUDGET);
-  tx.setGasPayment([]);
-  const budget = suiGasBudget(state.referenceGasPrice, await simulateSuiGas(await tx.build()));
-  if (state.addressBalance > 0n) {
-    const inCoins = payment.reduce((sum, c) => sum + c.balance, 0n);
-    if (inCoins < mist + budget) {
-      throw new Error(addressBalanceRefusal(inCoins, state.addressBalance, jsonRpcError));
-    }
-  }
-  tx.setGasBudget(budget);
-  tx.setGasPayment(payment.map(({ objectId, version, digest }) => ({ objectId, version, digest })));
-  return tx.build();
+  throw new Error(suiShortfallText(state, inCoins, mist, budgets));
 }
 
-/** The refusal for a send that only an address balance could pay. */
-function addressBalanceRefusal(inCoins: bigint, addressBalance: bigint, why: string): string {
+/**
+ * The refusal when no source can pay (2026-10-06). It says where the SUI is,
+ * because "not enough" is not the whole answer when the account's total
+ * covers the transfer: the coins may hold less than the gas budget while the
+ * address balance holds less than the amount plus it, or the SUI may sit in
+ * more coin objects than one transfer can use. `fees` are the budgets the
+ * dry runs priced, if any ran.
+ */
+function suiShortfallText(state: SuiSendState, inCoins: bigint, mist: bigint, fees: bigint[]): string {
+  const sui = (v: bigint) => atomicToDecimal(v > 0n ? v : 0n, 9);
+  const fee = fees.reduce((max, f) => (f > max ? f : max), 0n);
+  const inBalance = state.addressBalance;
+  const held = state.coinBalance + inBalance;
+  // Short of the amount and the fee. With no dry run the fee is not known,
+  // and the amount alone is the test: no source was even worth pricing.
+  const short = (sum: bigint) => (fees.length === 0 ? sum <= mist : sum < mist + fee);
+  const where =
+    inBalance > 0n
+      ? `${sui(held)} SUI (${sui(state.coinBalance)} in coin objects, ${sui(inBalance)} in its address balance)`
+      : `${sui(held)} SUI`;
+  const feeText = fees.length > 0 ? ` (up to ${sui(fee)} SUI)` : "";
+  if (short(held)) {
+    return `This Sui account holds ${where}, not enough to send ${sui(mist)} SUI and pay the network fee${feeText}. Nothing was sent.`;
+  }
+  if (short(inCoins + inBalance)) {
+    // Enough in all, but some of it in coins past the one page a transfer uses.
+    return (
+      `This Sui account holds ${where}, but one transfer can spend at most ${SUI_GAS_PAYMENT_MAX} of its coin ` +
+      `objects, which hold ${sui(inCoins)} SUI here: not enough to send ${sui(mist)} SUI and pay the network ` +
+      `fee${feeText}. Send a smaller amount. Nothing was sent.`
+    );
+  }
+  // Enough in all; the fee fits neither side alone (`SuiTransferSource`).
+  const most = inCoins > inBalance ? inCoins - fee : inBalance - fee;
   return (
-    `${atomicToDecimal(addressBalance, 9)} SUI of this wallet is held as a Sui address balance. This ` +
-    `wallet can spend it only through Sui's JSON-RPC, which did not work (${why}). Its coin objects ` +
-    `hold ${atomicToDecimal(inCoins, 9)} SUI, which has to cover the amount and the network fee. ` +
+    `This Sui account holds ${where}. The network fee${feeText} is paid from its coin objects or from its ` +
+    `address balance, and with this amount neither can pay it. ` +
+    (most > 0n ? `You can send at most ${sui(most)} SUI. ` : "") +
     `Nothing was sent.`
   );
 }

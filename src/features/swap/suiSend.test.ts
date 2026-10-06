@@ -1,44 +1,63 @@
 /**
- * The Sui send on GraphQL (operator request, 2026-10-01: "Does the sui wallet
- * need to be changed?"). Sui's published timeline ends JSON-RPC on full nodes,
- * code included, in mid-October 2026, and until this change every Sui send
- * read its gas price, its dry run and its coins from publicnode's JSON-RPC
- * through `@mysten/sui`'s `build({ client })`, submitted there and looked a
- * failed submit up there.
+ * The Sui send on `@mysten/sui` 2.x (operator request; the upgrade approved
+ * 2026-10-06): SUI held as an ADDRESS BALANCE (no coin object; on mainnet
+ * since release 1.72, May 2026) is spendable, and nothing asks publicnode's
+ * JSON-RPC any more.
+ *
+ * Until then (base `522503b`) the wallet built with 1.45.2. An address
+ * balance could be spent only through JSON-RPC's compatibility coin
+ * reservation, on publicnode, and was refused before signing once that host
+ * failed; Sui is removing JSON-RPC from full nodes. On the bare upgrade every
+ * Sui send failed before signing: 2.x will not build the dry run's empty gas
+ * payment offline without an expiration ("No sui client passed to
+ * Transaction#build, but transaction data was not sufficient to build
+ * offline.").
  *
  * What these tests hold:
- *  - the bytes handed to the Rust signer are the bytes the old JSON-RPC build
- *    produced from the same chain state (the old build runs here, on the real
- *    SDK, against a fake publicnode);
- *  - with no address balance, nothing is asked of publicnode at all;
- *  - an address balance is still spent the old way while JSON-RPC answers
- *    (its compatibility coin reservation is the only way the 1.x SDK can), and
- *    refused before signing when that route is gone and the coins fall short;
+ *  - an account whose SUI is all in coin objects signs the bytes 1.45.2
+ *    signed from the same chain state, and dry-runs the same bytes;
+ *  - an address balance pays: a `FundsWithdrawal` redeemed by
+ *    `0x2::coin::redeem_funds`, gas from the address balance, a `ValidDuring`
+ *    expiration; with coins as well, the coins first, then the address
+ *    balance alone, then both (the coins paying the gas, the address balance
+ *    topping them up); each transaction decoded and checked;
+ *  - the refusals before signing, which say where the SUI is;
+ *  - the Rust signer's scheme signs 2.x's bytes exactly as the SDK's own
+ *    ed25519 signer does;
  *  - the send-safety rules of 2026-09-29: recipient and key checks before
  *    anything is read, sign once, settle an uncertain submit by digest.
  *
- * Fakes: the Rust commands (the signer is emulated exactly: BLAKE2b-256 of
- * intent [0,0,0] || bytes, ed25519 with the public abandon seed's Sui key),
- * the proxy's GraphQL answers and publicnode's JSON-RPC answers. Every answer
- * keeps the layout a live, read-only request returned on 2026-10-01 for the
- * public test seed (its address, its coin 0xb3103ee5… as it stood before its
- * send of 2026-05-11, a dry run of a transfer from it); other ids and digests
- * are invented. Nothing reaches a network.
+ * The 1.45.2 bytes below were made by the old test's `oldBuild` (base
+ * `suiSend.test.ts:262-272`: the 1.x SDK's own JSON-RPC resolver against
+ * that test's fake publicnode), run on 2026-10-06 with 1.45.2 installed
+ * outside the repo (`gen-v1-reference.mjs`, kept with the session's fix log).
+ * The fake chain states are the old test's.
+ *
+ * Fakes: the Rust commands (the signer is emulated exactly as `swap/sui.rs`
+ * signs: BLAKE2b-256 of intent [0,0,0] || bytes, ed25519 with the public
+ * abandon seed's Sui key) and the proxy's GraphQL answers, in the layouts a
+ * live, read-only request returned for the public test seed (2026-10-01 and
+ * 2026-10-06: its address, its coin 0xb3103ee5… as it stood before its send
+ * of 2026-05-11, a dry run of a transfer from it, the chain id, epoch 1272).
+ * The fake dry run refuses a withdrawal larger than the address balance with
+ * the words mainnet used that day. Other ids and digests are invented.
+ * `fetch` fails every call: nothing here may reach a network directly.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { ed25519 } from "@noble/curves/ed25519.js";
 import { blake2b } from "@noble/hashes/blake2.js";
-import { Transaction, TransactionDataBuilder } from "@mysten/sui/transactions";
-import { SuiClient } from "@mysten/sui/client";
+import { TransactionDataBuilder } from "@mysten/sui/transactions";
 import { bcs } from "@mysten/sui/bcs";
 import { toBase58 } from "@mysten/sui/utils";
+import { messageWithIntent } from "@mysten/sui/cryptography";
+import { Ed25519Keypair } from "@mysten/sui/keypairs/ed25519";
 import { verifyTransactionSignature } from "@mysten/sui/verify";
 
 vi.mock("../../lib/tauri", () => ({ invoke: vi.fn() }));
 
 import { invoke } from "../../lib/tauri";
 import { SESSION_SEND_TIMING, executeSuiTransfer } from "./session-send";
-import { SUI_RPC, suiAdapter } from "../../wallets/sui-wallet";
+import { suiAdapter } from "../../wallets/sui-wallet";
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
 
 const ABANDON =
@@ -46,10 +65,13 @@ const ABANDON =
 const me = suiAdapter.deriveFromMnemonic(ABANDON);
 const ME = me.address; // 0x5e93a736d04f…61f1
 const MY_SECRET = Uint8Array.from(Buffer.from(me.privateKey, "hex"));
-const MY_PUB = ed25519.getPublicKey(MY_SECRET);
 const OTHER_SECRET = new Uint8Array(32).fill(7);
 const TO = "0x" + "ab".repeat(32);
 const GRAPHQL = "https://graphql.mainnet.sui.io/graphql";
+/** Mainnet's chain id, as `chainIdentifier` answered live on 2026-10-06. */
+const MAINNET = "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S";
+const SUI_FULL = "0x0000000000000000000000000000000000000000000000000000000000000002::sui::SUI";
+const FRAMEWORK = "0x0000000000000000000000000000000000000000000000000000000000000002";
 
 /** An invented, well-formed object digest. */
 const objDigest = (n: number) => toBase58(new Uint8Array(32).fill(n));
@@ -73,19 +95,48 @@ const TIE_COIN: Coin = { objectId: "0x" + "11".repeat(32), version: 1000, digest
 const BIG_COIN: Coin = { objectId: "0x" + "ff".repeat(32), version: 5, digest: objDigest(9), balance: "2000000000" };
 
 /**
- * A compatibility coin reservation as `suix_getCoins` lists it: an ordinary
- * coin entry, second in the list, whose id, version and digest encode the
- * reservation (sui-json-rpc `get_owned_coins`, mainnet-v1.80.1). Invented.
+ * What 1.45.2 built from the old test's chain states (see the header):
+ * `live` is the live gas with SEED, TIE and BIG paying 1.5 SUI; `rebate` a
+ * dry run whose rebate exceeds its storage; `tie` TIE and SEED paying 0.1.
  */
-const RESERVATION: Coin = { objectId: "0x" + "5a".repeat(32), version: 77, digest: objDigest(3), balance: "3000000000" };
+const V1_BUILT = {
+  live: {
+    bytes:
+      "AAACAAgAL2hZAAAAAAAgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6sCAgABAQAAAQEDAAAAAAEBAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxA///////////////////////////////////////////BQAAAAAAAAAgCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkREREREREREREREREREREREREREREREREREREREREREegDAAAAAAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHsxA+5Ws+Cuo8PblAPj8GL1EwJryL8/rFPHg+pXGj7xUlnwU0AAAAACA00GAXvk4hn1vkt8jRdS9tfeRA4wiPS87dvZki5FbptV6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxZAAAAAAAAAAANCEAAAAAAAA=",
+    dryRun:
+      "AAACAAgAL2hZAAAAAAAgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6sCAgABAQAAAQEDAAAAAAEBAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxZAAAAAAAAAAAdDukCwAAAAA=",
+    digest: "2qcLe7Y3Yw293k11pAwvDPVdEUDXM1D7qc8inFuU5vue",
+  },
+  rebate: {
+    bytes:
+      "AAACAAgAL2hZAAAAAAAgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6sCAgABAQAAAQEDAAAAAAEBAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxA///////////////////////////////////////////BQAAAAAAAAAgCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkREREREREREREREREREREREREREREREREREREREREREegDAAAAAAAAIAcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHsxA+5Ws+Cuo8PblAPj8GL1EwJryL8/rFPHg+pXGj7xUlnwU0AAAAACA00GAXvk4hn1vkt8jRdS9tfeRA4wiPS87dvZki5FbptV6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxZAAAAAAAAABQ+AwAAAAAAAA=",
+    dryRun:
+      "AAACAAgAL2hZAAAAAAAgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6sCAgABAQAAAQEDAAAAAAEBAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxZAAAAAAAAAAAdDukCwAAAAA=",
+    digest: "9CLdaQJGCg9A35SJ1BfL6fabq26yMgs3Q6RqHovwEarB",
+  },
+  tie: {
+    bytes:
+      "AAACAAgA4fUFAAAAAAAgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6sCAgABAQAAAQEDAAAAAAEBAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxAhERERERERERERERERERERERERERERERERERERERERER6AMAAAAAAAAgBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwezED7laz4K6jw9uUA+PwYvUTAmvIvz+sU8eD6lcaPvFSWfBTQAAAAAIDTQYBe+TiGfW+S3yNF1L2195EDjCI9Lzt29mSLkVum1XpOnNtBPuyVzeqQL7kAXHvefZfroM3SePAif58whYfFkAAAAAAAAAAA0IQAAAAAAAA==",
+    dryRun:
+      "AAACAAgA4fUFAAAAAAAgq6urq6urq6urq6urq6urq6urq6urq6urq6urq6urq6sCAgABAQAAAQEDAAAAAAEBAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxAF6TpzbQT7slc3qkC+5AFx73n2X66DN0njwIn+fMIWHxZAAAAAAAAAAAdDukCwAAAAA=",
+    digest: "B5YyKsJjkfMJC5KjT96cM2hruqFwXGTgiL2jWrTLCkxk",
+  },
+};
 
 interface Chain {
   price: string;
+  epoch: number;
   /** The dry run's gas, as `simulateTransaction` reported it live (UInt53 numbers). */
   dry: { computationCost: number; storageCost: number; storageRebate: number };
   coins: Coin[];
   addressBalance: string;
-  jsonRpc: "up" | "gone";
+  /**
+   * What the address balance is when the dry run reaches the network, if it
+   * moved since the state read.
+   */
+  addressBalanceAtDryRun?: string;
+  /** SUI in coins past the one page the state read lists. */
+  coinsBeyondPage?: string;
   graphql: "up" | "down";
   simulate: "ok" | "fail";
   execute: "ok" | "fail" | "unreachable" | "no-outcome" | { digest: string };
@@ -96,18 +147,21 @@ let chain: Chain;
 
 const rec = {
   gql: [] as Array<{ url: string; query: string; variables: any }>,
-  rpc: [] as Array<{ method: string; params: any[] }>,
   signed: [] as string[],
 };
 
-const byBalanceThenId = (a: Coin, b: Coin) =>
-  BigInt(a.balance) !== BigInt(b.balance)
-    ? BigInt(a.balance) > BigInt(b.balance)
-      ? -1
-      : 1
-    : a.objectId < b.objectId
-      ? -1
-      : 1;
+/** 2,176,000 MIST: the budget the live gas gives at a price of 100. */
+const LIVE_BUDGET = 100_000n + 1_000n * 100n + 1_976_000n;
+
+/** A GraphQL error, in the layout mainnet answered a refused dry run with on 2026-10-06. */
+const gqlError = (message: string) => ({
+  status: 200,
+  body: JSON.stringify({
+    data: null,
+    errors: [{ message, locations: [{ line: 2, column: 3 }], path: ["simulateTransaction"], extensions: { code: "BAD_USER_INPUT" } }],
+  }),
+  headers: [],
+});
 
 /** The proxy's GraphQL answers (graphql.mainnet.sui.io). */
 function graphql(args: { url: string; body: string }) {
@@ -116,15 +170,28 @@ function graphql(args: { url: string; body: string }) {
   if (chain.graphql === "down") return { status: 503, body: "unavailable", headers: [] };
   const data = (d: unknown) => ({ status: 200, body: JSON.stringify({ data: d }), headers: [] });
   if (query.includes("simulateTransaction")) {
+    // Mainnet checks a withdrawal against the address balance before running
+    // anything (live, the test seed, 2026-10-06).
+    const tx = bcs.TransactionData.parse(Buffer.from(variables.tx.bcs.value, "base64")).V1!;
+    const available = BigInt(chain.addressBalanceAtDryRun ?? chain.addressBalance);
+    for (const input of tx.kind.ProgrammableTransaction!.inputs) {
+      const want = input.FundsWithdrawal ? BigInt(input.FundsWithdrawal.reservation.MaxAmountU64!) : null;
+      if (want === 0n) {
+        return gqlError(
+          "Invalid argument: Error checking transaction input objects: Invalid withdraw reservation: Balance withdraw reservation amount must be non-zero",
+        );
+      }
+      if (want !== null && want > available) {
+        return gqlError(
+          `Invalid argument: Error checking transaction input objects: Invalid withdraw reservation: Insufficient address balance of coin type 0x2::sui::SUI for address ${tx.sender}: the transaction requires ${want} but only ${available} is available. Note that the address balance does not include funds held in Coin objects owned by the address; to spend those funds, use the Coin objects directly as transaction inputs.`,
+        );
+      }
+    }
     return data({
       simulateTransaction: {
         effects:
           chain.simulate === "ok"
-            ? {
-                status: "SUCCESS",
-                executionError: null,
-                gasEffects: { gasSummary: chain.dry },
-              }
+            ? { status: "SUCCESS", executionError: null, gasEffects: { gasSummary: chain.dry } }
             : {
                 status: "FAILURE",
                 executionError: { message: "InsufficientCoinBalance in command 0" },
@@ -159,7 +226,7 @@ function graphql(args: { url: string; body: string }) {
     });
   }
   if (query.includes("objects(")) {
-    const inCoins = chain.coins.reduce((s, c) => s + BigInt(c.balance), 0n);
+    const listed = chain.coins.reduce((s, c) => s + BigInt(c.balance), 0n);
     // GraphQL is answered in object-id order here, not balance order, so the
     // wallet's own sort is what the bytes depend on.
     const nodes = [...chain.coins]
@@ -171,9 +238,13 @@ function graphql(args: { url: string; body: string }) {
         contents: { json: { id: c.objectId, balance: c.balance } },
       }));
     return data({
-      epoch: { referenceGasPrice: chain.price },
+      chainIdentifier: MAINNET,
+      epoch: { epochId: chain.epoch, referenceGasPrice: chain.price },
       address: {
-        balance: { coinBalance: String(inCoins), addressBalance: chain.addressBalance },
+        balance: {
+          coinBalance: String(listed + BigInt(chain.coinsBeyondPage ?? "0")),
+          addressBalance: chain.addressBalance,
+        },
         objects: { nodes },
       },
     });
@@ -181,103 +252,47 @@ function graphql(args: { url: string; body: string }) {
   throw new Error(`unscripted GraphQL ${query.slice(0, 80)}`);
 }
 
-/** publicnode's JSON-RPC (the old build), answered in the fullnode's layouts. */
-async function publicnode(_input: unknown, init?: { body?: unknown }) {
-  const req = JSON.parse(String(init?.body));
-  rec.rpc.push({ method: req.method, params: req.params });
-  const reply = (body: object) =>
-    new Response(JSON.stringify({ jsonrpc: "2.0", id: req.id, ...body }), {
-      status: 200,
-      headers: { "content-type": "application/json" },
-    });
-  if (chain.jsonRpc === "gone") {
-    return reply({ error: { code: -32601, message: "Method not found" } });
-  }
-  switch (req.method) {
-    case "suix_getReferenceGasPrice":
-      return reply({ result: chain.price });
-    case "sui_dryRunTransactionBlock":
-      return reply({
-        result: {
-          effects: {
-            status: { status: "success" },
-            gasUsed: {
-              computationCost: String(chain.dry.computationCost),
-              storageCost: String(chain.dry.storageCost),
-              storageRebate: String(chain.dry.storageRebate),
-              nonRefundableStorageFee: "0",
-            },
-          },
-        },
-      });
-    case "suix_getCoins": {
-      // The fullnode's order (CoinIndexKey2), with an address balance's
-      // reservation second when there is one.
-      const list = [...chain.coins].sort(byBalanceThenId);
-      if (BigInt(chain.addressBalance) > 0n) list.splice(1, 0, RESERVATION);
-      return reply({
-        result: {
-          data: list.map((c) => ({
-            coinType: "0x2::sui::SUI",
-            coinObjectId: c.objectId,
-            version: String(c.version),
-            digest: c.digest,
-            balance: c.balance,
-            previousTransaction: objDigest(1),
-          })),
-          nextCursor: null,
-          hasNextPage: false,
-        },
-      });
-    }
-    default:
-      throw new Error(`unscripted JSON-RPC ${req.method}`);
-  }
+/** `swap/sui.rs::sign_tx`: BLAKE2b-256 of the intent [0,0,0] and the bytes, ed25519; flag || sig || key. */
+function rustSign(txBytesBase64: string, secret: Uint8Array) {
+  const pub = ed25519.getPublicKey(secret);
+  const tx = Buffer.from(txBytesBase64, "base64");
+  const digest = blake2b(Buffer.concat([Buffer.from([0, 0, 0]), tx]), { dkLen: 32 });
+  const sig = ed25519.sign(digest, secret);
+  return {
+    signatureBase64: Buffer.from([0, ...sig, ...pub]).toString("base64"),
+    publicKeyBase64: Buffer.from(pub).toString("base64"),
+  };
 }
 
-/** The Rust core: the session's address, and `swap/sui.rs::sign_tx`. */
+/** The Rust core: the session's address, and the signer. */
 async function fakeInvoke(cmd: string, args: any): Promise<unknown> {
   switch (cmd) {
     case "http_proxy_call":
       return graphql(args);
     case "swap_get_sui_address":
       return ME;
-    case "swap_sign_sui_tx": {
+    case "swap_sign_sui_tx":
       rec.signed.push(args.input.txBytesBase64);
-      const secret = chain.signWith === "mine" ? MY_SECRET : OTHER_SECRET;
-      const pub = ed25519.getPublicKey(secret);
-      const tx = Buffer.from(args.input.txBytesBase64, "base64");
-      const digest = blake2b(Buffer.concat([Buffer.from([0, 0, 0]), tx]), { dkLen: 32 });
-      const sig = ed25519.sign(digest, secret);
-      return {
-        signatureBase64: Buffer.from([0, ...sig, ...pub]).toString("base64"),
-        publicKeyBase64: Buffer.from(pub).toString("base64"),
-      };
-    }
+      return rustSign(args.input.txBytesBase64, chain.signWith === "mine" ? MY_SECRET : OTHER_SECRET);
     default:
       throw new Error(`unscripted invoke ${cmd}`);
   }
 }
 
-/** The transfer as the code before 2026-10-01 built it: the SDK's JSON-RPC resolver. */
-async function oldBuild(to: string, mist: bigint): Promise<{ bytes: Uint8Array; dryRun: string }> {
-  const from = rec.rpc.length;
-  const tx = new Transaction();
-  tx.setSender(ME);
-  const [coin] = tx.splitCoins(tx.gas, [mist]);
-  tx.transferObjects([coin], to);
-  const bytes = await tx.build({ client: new SuiClient({ url: SUI_RPC }) });
-  const dry = rec.rpc.slice(from).find((r) => r.method === "sui_dryRunTransactionBlock");
-  return { bytes, dryRun: dry!.params[0] };
-}
-
 const send = (over: Partial<Parameters<typeof executeSuiTransfer>[0]> = {}) =>
   executeSuiTransfer({ sessionId: "s", fromAddress: ME, to: TO, amount: "1.5", ...over });
 
+/** The decoded transaction, without the decoder's `$kind` tags. */
+const decode = (b64: string) => {
+  const v1 = bcs.TransactionData.parse(Buffer.from(b64, "base64")).V1!;
+  return JSON.parse(JSON.stringify(v1, (k, v) => (k === "$kind" ? undefined : v)));
+};
 /** What was handed to the signer, decoded. */
-function signedTx(i = 0) {
-  return bcs.TransactionData.parse(Buffer.from(rec.signed[i], "base64")).V1!;
-}
+const signedTx = (i = 0) => decode(rec.signed[i]);
+/** The dry runs' bytes, base64, in the order they were asked. */
+const dryRuns = () => rec.gql.filter(({ query }) => query.includes("simulateTransaction")).map((g) => g.variables.tx.bcs.value as string);
+const u64 = (b64: string) => bcs.u64().parse(Buffer.from(b64, "base64"));
+const address = (b64: string) => bcs.Address.parse(Buffer.from(b64, "base64"));
 const gqlKinds = () =>
   rec.gql.map(({ query }) =>
     query.includes("simulateTransaction")
@@ -288,15 +303,33 @@ const gqlKinds = () =>
           ? "effects"
           : "state",
   );
+const coinRef = (c: Coin) => ({ objectId: c.objectId, version: String(c.version), digest: c.digest });
+/** The `redeem_funds` call that turns a withdrawal into a coin. */
+const redeemFunds = (input: number) => ({
+  MoveCall: {
+    package: FRAMEWORK,
+    module: "coin",
+    function: "redeem_funds",
+    typeArguments: [SUI_FULL],
+    arguments: [{ Input: input }],
+  },
+});
+const withdrawal = (mist: bigint) => ({
+  FundsWithdrawal: {
+    reservation: { MaxAmountU64: String(mist) },
+    typeArg: { Balance: SUI_FULL },
+    withdrawFrom: { Sender: true },
+  },
+});
 
 const savedTiming = { ...SESSION_SEND_TIMING };
 beforeEach(() => {
   chain = {
     price: "100",
+    epoch: 1272,
     dry: { computationCost: 100000, storageCost: 1976000, storageRebate: 0 },
     coins: [SEED_COIN, TIE_COIN, BIG_COIN],
     addressBalance: "0",
-    jsonRpc: "up",
     graphql: "up",
     simulate: "ok",
     execute: "ok",
@@ -304,10 +337,14 @@ beforeEach(() => {
     signWith: "mine",
   };
   rec.gql = [];
-  rec.rpc = [];
   rec.signed = [];
   Object.assign(SESSION_SEND_TIMING, { pollMs: 2, suiLookupMs: 30 });
-  vi.stubGlobal("fetch", vi.fn(publicnode));
+  vi.stubGlobal(
+    "fetch",
+    vi.fn(async (input: unknown) => {
+      throw new Error(`no direct network call expected: ${String(input)}`);
+    }),
+  );
   vi.mocked(invoke).mockReset();
   vi.mocked(invoke).mockImplementation(fakeInvoke as any);
 });
@@ -316,80 +353,260 @@ afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("the bytes signed do not change (operator request, 2026-10-01)", () => {
-  it("signs the bytes the JSON-RPC build signed, from the same chain state", async () => {
-    const before = await oldBuild(TO, 1_500_000_000n);
-    rec.rpc = [];
-    const r = await send();
-    expect(rec.signed).toHaveLength(1);
-    expect(rec.signed[0]).toBe(Buffer.from(before.bytes).toString("base64"));
+describe("an account whose SUI is all in coin objects: the bytes 1.45.2 signed (2026-10-06)", () => {
+  it.each([
+    ["the live gas", "live", () => {}, "1.5"],
+    ["a rebate larger than the storage cost (the budget's other branch)", "rebate", () => {
+      chain.dry = { computationCost: 750000, storageCost: 988000, storageRebate: 1978120 };
+    }, "1.5"],
+    ["two coins of the same balance: the object id orders them", "tie", () => {
+      chain.coins = [TIE_COIN, SEED_COIN];
+    }, "0.1"],
+  ] as const)("%s", async (_name, key, setUp, amount) => {
+    setUp();
+    const r = await send({ amount });
+    expect(rec.signed).toEqual([V1_BUILT[key].bytes]);
     // The dry run is the same transaction too.
-    const sim = rec.gql.find(({ query }) => query.includes("simulateTransaction"))!;
-    expect(sim.variables).toEqual({ tx: { bcs: { value: before.dryRun } } });
-    expect(r.txHash).toBe(TransactionDataBuilder.getDigestFromBytes(before.bytes));
+    expect(dryRuns()).toEqual([V1_BUILT[key].dryRun]);
+    expect(r.txHash).toBe(V1_BUILT[key].digest);
   });
 
-  it("holds for a dry run whose storage rebate exceeds its storage cost (the budget's other branch)", async () => {
-    chain.dry = { computationCost: 750000, storageCost: 988000, storageRebate: 1978120 };
-    const before = await oldBuild(TO, 1_500_000_000n);
-    await send();
-    expect(rec.signed[0]).toBe(Buffer.from(before.bytes).toString("base64"));
-    // computation + 1,000 x the gas price.
-    expect(signedTx().gasData.budget).toBe(String(750000 + 1000 * 100));
-  });
-
-  it("holds when the coins' balances tie: the object id orders them, as suix_getCoins does", async () => {
-    chain.coins = [TIE_COIN, SEED_COIN];
-    const before = await oldBuild(TO, 100_000_000n);
-    await send({ amount: "0.1" });
-    expect(rec.signed[0]).toBe(Buffer.from(before.bytes).toString("base64"));
-    expect(signedTx().gasData.payment.map((p) => p.objectId)).toEqual([TIE_COIN.objectId, SEED_COIN.objectId]);
-  });
-});
-
-describe("GraphQL only, when the address has no address balance", () => {
-  it("reads, dry-runs, submits through GraphQL; publicnode is never asked", async () => {
-    await send();
-    expect(rec.rpc).toEqual([]);
-    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
-    expect(gqlKinds()).toEqual(["state", "simulate", "execute"]);
-    expect(new Set(rec.gql.map((g) => g.url))).toEqual(new Set([GRAPHQL]));
-    // One read: the gas price, both halves of the balance, a page of coins.
-    const state = rec.gql[0];
-    expect(state.variables).toEqual({ address: ME });
-    expect(state.query).toContain("epoch { referenceGasPrice }");
-    expect(state.query).toContain('balance(coinType: "0x2::sui::SUI") { coinBalance addressBalance }');
-    expect(state.query).toContain('objects(first: 50, filter: { type: "0x2::coin::Coin<0x2::sui::SUI>" })');
-  });
-
-  it("submits the signed bytes with a signature that verifies for them and for this address", async () => {
-    await send();
-    const ex = rec.gql.find(({ query }) => query.includes("executeTransaction"))!;
-    expect(ex.variables.tx).toBe(rec.signed[0]);
-    expect(ex.variables.signatures).toHaveLength(1);
-    const key = await verifyTransactionSignature(Buffer.from(ex.variables.tx, "base64"), ex.variables.signatures[0], {
-      address: ME,
-    });
-    expect(key.toSuiAddress()).toBe(ME);
-  });
-
-  it("the transfer: the amount, the recipient, the largest coins first, the gas price", async () => {
+  it("the transfer, decoded: the amount, the recipient, the largest coins first, no expiration", async () => {
     await send({ amount: " 1.5 ", to: `  0X${"AB".repeat(32)} ` });
     const tx = signedTx();
     expect(tx.sender).toBe(ME);
-    const [amount, recipient] = tx.kind.ProgrammableTransaction!.inputs;
-    expect(bcs.u64().parse(Buffer.from(amount.Pure!.bytes, "base64"))).toBe("1500000000");
+    const { inputs, commands } = tx.kind.ProgrammableTransaction;
+    expect(inputs).toHaveLength(2);
+    expect(u64(inputs[0].Pure.bytes)).toBe("1500000000");
     // Trimmed and lowercased (2026-09-29 audit).
-    expect(bcs.Address.parse(Buffer.from(recipient.Pure!.bytes, "base64"))).toBe(TO);
-    expect(tx.gasData.payment.map((p) => [p.objectId, p.version])).toEqual([
-      [BIG_COIN.objectId, "5"],
-      [TIE_COIN.objectId, "1000"],
-      [SEED_COIN.objectId, "872783653"],
+    expect(address(inputs[1].Pure.bytes)).toBe(TO);
+    expect(commands).toEqual([
+      { SplitCoins: { coin: { GasCoin: true }, amounts: [{ Input: 0 }] } },
+      { TransferObjects: { objects: [{ NestedResult: [0, 0] }], address: { Input: 1 } } },
     ]);
-    expect(tx.gasData.price).toBe("100");
-    expect(tx.gasData.owner).toBe(ME);
-    // 100,000 + 1,000 x 100 + 1,976,000 - 0, as the resolver computes it.
-    expect(tx.gasData.budget).toBe("2176000");
+    expect(tx.gasData).toEqual({
+      payment: [coinRef(BIG_COIN), coinRef(TIE_COIN), coinRef(SEED_COIN)],
+      owner: ME,
+      price: "100",
+      // 100,000 + 1,000 x 100 + 1,976,000 - 0, as the resolver computes it.
+      budget: String(LIVE_BUDGET),
+    });
+    expect(tx.expiration).toEqual({ None: true });
+  });
+
+  it("an address balance beside coins that cover the transfer is left alone: the same bytes", async () => {
+    chain.addressBalance = "3000000000";
+    await send();
+    // Before 2026-10-06 an address balance sent the build to publicnode's
+    // JSON-RPC, whose compatibility reservation joined the gas payment.
+    expect(rec.signed).toEqual([V1_BUILT.live.bytes]);
+    expect(dryRuns()).toEqual([V1_BUILT.live.dryRun]);
+  });
+});
+
+describe("an address balance and no coin object (2026-10-06)", () => {
+  beforeEach(() => {
+    chain.coins = [];
+    chain.addressBalance = "3000000000";
+  });
+
+  it("is spent: a withdrawal redeemed into a coin, the gas from the address balance, a ValidDuring expiration", async () => {
+    const r = await send();
+    expect(rec.signed).toHaveLength(1);
+    const tx = signedTx();
+    expect(tx.sender).toBe(ME);
+    const { inputs, commands } = tx.kind.ProgrammableTransaction;
+    expect(inputs).toHaveLength(2);
+    expect(inputs[0]).toEqual(withdrawal(1_500_000_000n));
+    expect(address(inputs[1].Pure.bytes)).toBe(TO);
+    expect(commands).toEqual([
+      redeemFunds(0),
+      { TransferObjects: { objects: [{ NestedResult: [0, 0] }], address: { Input: 1 } } },
+    ]);
+    // No gas coins: the address balance pays.
+    expect(tx.gasData).toEqual({ payment: [], owner: ME, price: "100", budget: String(LIVE_BUDGET) });
+    const { nonce, ...validDuring } = tx.expiration.ValidDuring;
+    expect(validDuring).toEqual({ minEpoch: "1272", maxEpoch: "1273", minTimestamp: null, maxTimestamp: null, chain: MAINNET });
+    expect(Number.isInteger(nonce) && nonce >= 0 && nonce <= 0xffffffff).toBe(true);
+    expect(r.txHash).toBe(TransactionDataBuilder.getDigestFromBytes(Buffer.from(rec.signed[0], "base64")));
+    // One read, one dry run, one submit; nothing to publicnode.
+    expect(gqlKinds()).toEqual(["state", "simulate", "execute"]);
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+  });
+
+  it("the dry run is the same transaction at the 50 SUI budget, nonce and all", async () => {
+    await send();
+    const [dry] = dryRuns();
+    const priced = decode(dry);
+    const signed = signedTx();
+    expect(priced.gasData.budget).toBe("50000000000");
+    expect({ ...priced, gasData: { ...priced.gasData, budget: signed.gasData.budget } }).toEqual(signed);
+  });
+
+  it("covers the amount and the gas to the MIST: sent", async () => {
+    chain.addressBalance = String(1_500_000_000n + LIVE_BUDGET);
+    await send();
+    expect(rec.signed).toHaveLength(1);
+    expect(signedTx().kind.ProgrammableTransaction.inputs[0]).toEqual(withdrawal(1_500_000_000n));
+  });
+
+  it("one MIST short: refused before signing, saying where the SUI is", async () => {
+    chain.addressBalance = String(1_500_000_000n + LIVE_BUDGET - 1n);
+    const err = await send().catch((e) => e);
+    expect(err.message).toBe(
+      "This Sui account holds 1.502175999 SUI (0 in coin objects, 1.502175999 in its address balance), not enough " +
+        "to send 1.5 SUI and pay the network fee (up to 0.002176 SUI). Nothing was sent.",
+    );
+    expect(rec.signed).toEqual([]);
+    expect(gqlKinds()).not.toContain("execute");
+  });
+
+  it("each transfer draws its own nonce", async () => {
+    await send();
+    await send();
+    const [a, b] = [signedTx(0), signedTx(1)];
+    expect(a.expiration.ValidDuring.nonce).not.toBe(b.expiration.ValidDuring.nonce);
+  });
+
+  it("a dry run Sui refuses (the address balance moved since it was read): refused before signing", async () => {
+    chain.addressBalanceAtDryRun = "1000000000";
+    await expect(send()).rejects.toThrow(/Insufficient address balance of coin type 0x2::sui::SUI/);
+    expect(rec.signed).toEqual([]);
+  });
+});
+
+describe("coins and an address balance (2026-10-06)", () => {
+  it("the coins short, the address balance enough alone: paid from the address balance, no coin touched", async () => {
+    chain.coins = [SEED_COIN]; // 0.5 SUI
+    chain.addressBalance = "3000000000";
+    await send();
+    const tx = signedTx();
+    expect(tx.kind.ProgrammableTransaction.inputs[0]).toEqual(withdrawal(1_500_000_000n));
+    expect(tx.kind.ProgrammableTransaction.inputs.some((i: any) => i.Object)).toBe(false);
+    expect(tx.gasData.payment).toEqual([]);
+    expect(tx.expiration.ValidDuring.chain).toBe(MAINNET);
+    // The coins were not priced: 0.5 SUI cannot carry 1.5.
+    expect(gqlKinds()).toEqual(["state", "simulate", "execute"]);
+  });
+
+  it("neither alone, both together: the coins pay the gas, the address balance tops them up by what they lack", async () => {
+    // 3 SUI in coins, 1 SUI in the address balance, 3.5 SUI sent.
+    chain.addressBalance = "1000000000";
+    await send({ amount: "3.5" });
+    const tx = signedTx();
+    const { inputs, commands } = tx.kind.ProgrammableTransaction;
+    // 3.5 SUI + the budget - the 3 SUI the coins hold.
+    expect(inputs[0]).toEqual(withdrawal(3_500_000_000n + LIVE_BUDGET - 3_000_000_000n));
+    expect(u64(inputs[1].Pure.bytes)).toBe("3500000000");
+    expect(address(inputs[2].Pure.bytes)).toBe(TO);
+    expect(commands).toEqual([
+      redeemFunds(0),
+      { MergeCoins: { destination: { GasCoin: true }, sources: [{ NestedResult: [0, 0] }] } },
+      { SplitCoins: { coin: { GasCoin: true }, amounts: [{ Input: 1 }] } },
+      { TransferObjects: { objects: [{ NestedResult: [2, 0] }], address: { Input: 2 } } },
+    ]);
+    expect(tx.gasData).toEqual({
+      payment: [coinRef(BIG_COIN), coinRef(TIE_COIN), coinRef(SEED_COIN)],
+      owner: ME,
+      price: "100",
+      budget: String(LIVE_BUDGET),
+    });
+    // The gas coins' versions protect it from a replay.
+    expect(tx.expiration).toEqual({ None: true });
+    // Its dry run withdrew what it could (the budget unknown yet), with no gas coins.
+    const priced = decode(dryRuns()[0]);
+    expect(priced.kind.ProgrammableTransaction.inputs[0]).toEqual(withdrawal(1_000_000_000n));
+    expect(priced.gasData).toMatchObject({ payment: [], budget: "50000000000" });
+    expect(priced.kind.ProgrammableTransaction.commands).toEqual(commands);
+  });
+
+  it("tried in order, each priced by its own dry run: the coins, the address balance, then both", async () => {
+    // Each side holds the amount but not the gas on top; together they do.
+    chain.coins = [{ ...BIG_COIN, balance: "1501000000" }];
+    chain.addressBalance = "1501000000";
+    await send();
+    expect(gqlKinds()).toEqual(["state", "simulate", "simulate", "simulate", "execute"]);
+    const [coins, balance, both] = dryRuns().map(decode);
+    expect(coins.kind.ProgrammableTransaction.commands[0]).toHaveProperty("SplitCoins");
+    expect(balance.gasData.payment).toEqual([]);
+    expect(balance.expiration).toHaveProperty("ValidDuring");
+    expect(both.kind.ProgrammableTransaction.commands[1]).toHaveProperty("MergeCoins");
+    expect(signedTx().kind.ProgrammableTransaction.inputs[0]).toEqual(
+      withdrawal(1_500_000_000n + LIVE_BUDGET - 1_501_000_000n),
+    );
+  });
+
+  it("the fee fits neither side alone: refused before signing, with the most that can be sent", async () => {
+    // 1.501 SUI covers 1.498 SUI and the gas, but a 0.001 SUI coin cannot
+    // carry the gas and the address balance cannot carry 1.498 SUI and the gas.
+    chain.coins = [{ ...SEED_COIN, balance: "1000000" }];
+    chain.addressBalance = "1500000000";
+    const err = await send({ amount: "1.498" }).catch((e) => e);
+    expect(err.message).toBe(
+      "This Sui account holds 1.501 SUI (0.001 in coin objects, 1.5 in its address balance). The network fee " +
+        "(up to 0.002176 SUI) is paid from its coin objects or from its address balance, and with this amount " +
+        "neither can pay it. You can send at most 1.497824 SUI. Nothing was sent.",
+    );
+    expect(rec.signed).toEqual([]);
+  });
+
+  it("not enough in all: refused before anything is priced, saying where the SUI is", async () => {
+    chain.coins = [SEED_COIN];
+    chain.addressBalance = "500000000";
+    const err = await send().catch((e) => e);
+    expect(err.message).toBe(
+      "This Sui account holds 1 SUI (0.5 in coin objects, 0.5 in its address balance), not enough to send 1.5 SUI " +
+        "and pay the network fee. Nothing was sent.",
+    );
+    expect(gqlKinds()).toEqual(["state"]);
+    expect(rec.signed).toEqual([]);
+  });
+
+  it("coins that cover the amount but not the gas, and no address balance: refused, no longer signed to fail", async () => {
+    // Before 2026-10-06 this was signed and submitted. Its split of 2.999 SUI
+    // from a 3 SUI gas coin would fail on chain, the gas spent (inference:
+    // Sui sets the budget aside in the gas coin before the commands run).
+    const err = await send({ amount: "2.999" }).catch((e) => e);
+    expect(err.message).toBe(
+      "This Sui account holds 3 SUI, not enough to send 2.999 SUI and pay the network fee (up to 0.002176 SUI). " +
+        "Nothing was sent.",
+    );
+    expect(rec.signed).toEqual([]);
+  });
+
+  it("more SUI than one page of coins holds: refused, saying a transfer spends at most 50 coin objects", async () => {
+    chain.coinsBeyondPage = "2000000000";
+    const err = await send({ amount: "3.5" }).catch((e) => e);
+    expect(err.message).toBe(
+      "This Sui account holds 5 SUI, but one transfer can spend at most 50 of its coin objects, which hold 3 SUI " +
+        "here: not enough to send 3.5 SUI and pay the network fee. Send a smaller amount. Nothing was sent.",
+    );
+    expect(rec.signed).toEqual([]);
+  });
+});
+
+describe("GraphQL only: nothing goes to publicnode or anywhere else directly", () => {
+  it.each([
+    ["coins", () => {}],
+    ["the address balance", () => {
+      chain.coins = [];
+      chain.addressBalance = "3000000000";
+    }],
+    ["both", () => {
+      chain.addressBalance = "1000000000";
+    }],
+  ] as const)("paid from %s: every request is the proxy's GraphQL", async (_name, setUp) => {
+    setUp();
+    await send({ amount: _name === "both" ? "3.5" : "1.5" });
+    expect(vi.mocked(fetch)).not.toHaveBeenCalled();
+    expect(new Set(rec.gql.map((g) => g.url))).toEqual(new Set([GRAPHQL]));
+    // One read: the chain, the epoch and gas price, both halves of the balance, a page of coins.
+    const state = rec.gql[0];
+    expect(state.variables).toEqual({ address: ME });
+    expect(state.query).toContain("chainIdentifier");
+    expect(state.query).toContain("epoch { epochId referenceGasPrice }");
+    expect(state.query).toContain('balance(coinType: "0x2::sui::SUI") { coinBalance addressBalance }');
+    expect(state.query).toContain('objects(first: 50, filter: { type: "0x2::coin::Coin<0x2::sui::SUI>" })');
   });
 
   it("a dry run that fails is refused before signing", async () => {
@@ -411,61 +628,34 @@ describe("GraphQL only, when the address has no address balance", () => {
     chain.graphql = "down";
     await expect(send()).rejects.toThrow(/Sui could not be read to prepare the transfer \(.*503.*\)\. Nothing was sent/);
     expect(rec.signed).toEqual([]);
-    expect(rec.rpc).toEqual([]);
   });
 });
 
-describe("an address balance (no coin object; on mainnet since release 1.72)", () => {
-  beforeEach(() => {
-    chain.addressBalance = RESERVATION.balance;
-  });
-
-  it("is spent the old way while publicnode's JSON-RPC answers: its coin reservation pays", async () => {
-    const before = await oldBuild(TO, 1_500_000_000n);
-    rec.rpc = [];
-    await send();
-    expect(rec.signed[0]).toBe(Buffer.from(before.bytes).toString("base64"));
-    expect(signedTx().gasData.payment.map((p) => p.objectId)).toEqual([
-      BIG_COIN.objectId,
-      RESERVATION.objectId,
-      TIE_COIN.objectId,
-      SEED_COIN.objectId,
-    ]);
-    expect(rec.rpc.map((r) => r.method)).toEqual([
-      "suix_getReferenceGasPrice",
-      "sui_dryRunTransactionBlock",
-      "suix_getCoins",
-    ]);
-    // Submitted through GraphQL all the same.
-    expect(gqlKinds()).toEqual(["state", "execute"]);
-  });
-
-  it("JSON-RPC gone, coins enough: built from the coins alone", async () => {
-    chain.jsonRpc = "gone";
-    await send();
-    expect(signedTx().gasData.payment.map((p) => p.objectId)).toEqual([
-      BIG_COIN.objectId,
-      TIE_COIN.objectId,
-      SEED_COIN.objectId,
-    ]);
-    expect(gqlKinds()).toEqual(["state", "simulate", "execute"]);
-  });
-
-  it("JSON-RPC gone, coins short: refused before signing, saying where the SUI is", async () => {
-    chain.jsonRpc = "gone";
-    // 3 SUI in coins: 3.5 SUI and the gas do not fit.
-    const err = await send({ amount: "3.5" }).catch((e) => e);
-    expect(err.message).toMatch(
-      /^3 SUI of this wallet is held as a Sui address balance\. This wallet can spend it only through Sui's JSON-RPC, which did not work \(.*Method not found.*\)\. Its coin objects hold 3 SUI, which has to cover the amount and the network fee\. Nothing was sent\.$/,
-    );
-    expect(rec.signed).toEqual([]);
-  });
-
-  it("JSON-RPC gone and no coins at all: refused before signing", async () => {
-    chain.jsonRpc = "gone";
-    chain.coins = [];
-    await expect(send({ amount: "1" })).rejects.toThrow(/held as a Sui address balance[\s\S]*hold 0 SUI/);
-    expect(rec.signed).toEqual([]);
+describe("the Rust signer signs 2.x's bytes as the SDK does (2026-10-06)", () => {
+  it.each([
+    ["coins", () => {}, "1.5"],
+    ["the address balance", () => {
+      chain.coins = [];
+      chain.addressBalance = "3000000000";
+    }, "1.5"],
+    ["both", () => {
+      chain.addressBalance = "1000000000";
+    }, "3.5"],
+  ] as const)("paid from %s: the same signature as Ed25519Keypair.signTransaction, verified for this address", async (_name, setUp, amount) => {
+    setUp();
+    await send({ amount });
+    const ex = rec.gql.find(({ query }) => query.includes("executeTransaction"))!;
+    const bytes = Buffer.from(rec.signed[0], "base64");
+    // Submitted exactly as signed, with one signature.
+    expect(ex.variables.tx).toBe(rec.signed[0]);
+    expect(ex.variables.signatures).toEqual([rustSign(rec.signed[0], MY_SECRET).signatureBase64]);
+    // The intent `sui.rs` prepends is the SDK's TransactionData intent.
+    expect(Buffer.from(messageWithIntent("TransactionData", bytes))).toEqual(Buffer.concat([Buffer.from([0, 0, 0]), bytes]));
+    // ed25519 is deterministic: the SDK's own signer gives the same signature.
+    const sdk = await Ed25519Keypair.fromSecretKey(MY_SECRET).signTransaction(bytes);
+    expect(ex.variables.signatures[0]).toBe(sdk.signature);
+    const key = await verifyTransactionSignature(bytes, ex.variables.signatures[0], { address: ME });
+    expect(key.toSuiAddress()).toBe(ME);
   });
 });
 
@@ -494,6 +684,15 @@ describe("the send-safety rules of 2026-09-29 still hold", () => {
     chain.signWith = "other";
     await expect(send()).rejects.toThrow(/isn't supported yet/);
     expect(gqlKinds()).not.toContain("execute");
+  });
+
+  it("an address-balance transfer is signed once, like any other", async () => {
+    chain.coins = [];
+    chain.addressBalance = "3000000000";
+    chain.execute = "unreachable";
+    chain.effects = "missing";
+    expect(isSendOutcomeUnknown(await send().catch((e) => e))).toBe(true);
+    expect(rec.signed).toHaveLength(1);
   });
 });
 

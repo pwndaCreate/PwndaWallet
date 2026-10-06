@@ -38,6 +38,8 @@ const S = vi.hoisted(() => ({
   stellarImpl: null as null | ((a: any) => Promise<any>),
   suiImpl: null as null | ((a: any) => Promise<any>),
   suiLog: [] as unknown[][],
+  /** The Sui account's SUI: in one coin object, and in its address balance. */
+  suiFunds: { coin: "5000000000" as string | null, addressBalance: "0" },
   horizon: {
     accounts: {} as Record<string, unknown>,
     posted: [] as string[],
@@ -104,7 +106,10 @@ vi.mock("./session-send", async (importOriginal) => {
 // whom it transfers, and the gas it was given. Since 2026-10-01 the chain
 // reads and the submit are GraphQL through the proxy (`suiGraphql` below),
 // not the SDK's JSON-RPC client, which is why that client is no longer faked
-// here; `suiSend.test.ts` covers the send with the real builder.
+// here; `suiSend.test.ts` covers the send with the real builder. Since
+// 2026-10-06 (`@mysten/sui` 2.x) it also records a withdrawal from the
+// address balance, the Move call that redeems it, a merge, and the
+// expiration's kind.
 vi.mock("@mysten/sui/transactions", async (importOriginal) => {
   const actual: any = await importOriginal();
   class FakeTransaction {
@@ -115,6 +120,20 @@ vi.mock("@mysten/sui/transactions", async (importOriginal) => {
     splitCoins(_c: unknown, amounts: unknown[]) {
       S.suiLog.push(["splitCoins", ...amounts]);
       return [{ $kind: "Result" }];
+    }
+    withdrawal(o: { amount: unknown }) {
+      S.suiLog.push(["withdrawal", o.amount]);
+      return { $kind: "Input" };
+    }
+    moveCall(o: { target: string }) {
+      S.suiLog.push(["moveCall", o.target]);
+      return [{ $kind: "NestedResult" }];
+    }
+    mergeCoins(_into: unknown, from: unknown[]) {
+      S.suiLog.push(["mergeCoins", from.length]);
+    }
+    setExpiration(e: Record<string, unknown>) {
+      S.suiLog.push(["setExpiration", Object.keys(e)[0]]);
     }
     transferObjects(_o: unknown, to: string) {
       S.suiLog.push(["transferObjects", to]);
@@ -278,8 +297,9 @@ async function horizonFetch(input: unknown, init?: { method?: string; body?: unk
 }
 
 /**
- * Sui's GraphQL, as the proxy returns it (2026-10-01 layouts): one coin of
- * 5 SUI and no address balance, a successful dry run, a successful submit.
+ * Sui's GraphQL, as the proxy returns it (2026-10-01 layouts; the chain id and
+ * epoch as read live 2026-10-06): by default one coin of 5 SUI and no address
+ * balance (`S.suiFunds`), a successful dry run, a successful submit.
  */
 function suiGraphql(args: { url: string; body: string }) {
   const { query } = JSON.parse(args.body);
@@ -300,14 +320,16 @@ function suiGraphql(args: { url: string; body: string }) {
   }
   if (query.includes("objects(")) {
     const id = "0x" + "c0".repeat(32);
+    const { coin, addressBalance } = S.suiFunds;
     return data({
-      epoch: { referenceGasPrice: "100" },
+      chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+      epoch: { epochId: 1272, referenceGasPrice: "100" },
       address: {
-        balance: { coinBalance: "5000000000", addressBalance: "0" },
+        balance: { coinBalance: coin ?? "0", addressBalance },
         objects: {
-          nodes: [
-            { address: id, version: 1, digest: "4ZAVLMEE62Aa8gm41JKUfzSQW4wdp5T62vDkdYgN1g4U", contents: { json: { id, balance: "5000000000" } } },
-          ],
+          nodes: coin
+            ? [{ address: id, version: 1, digest: "4ZAVLMEE62Aa8gm41JKUfzSQW4wdp5T62vDkdYgN1g4U", contents: { json: { id, balance: coin } } }]
+            : [],
         },
       },
     });
@@ -359,6 +381,7 @@ beforeEach(() => {
   S.stellar.length = 0;
   S.sui.length = 0;
   S.suiLog.length = 0;
+  S.suiFunds = { coin: "5000000000", addressBalance: "0" };
   S.stellarImpl = null;
   S.suiImpl = null;
   S.horizon.posted = [];
@@ -445,6 +468,28 @@ describe("SUI deposits (F7 follow-up, 2026-09-29 send-safety audit)", () => {
     // Gas from GraphQL: the reference price, then the budget and the one coin.
     expect(S.suiLog).toContainEqual(["setGasPrice", 100n]);
     expect(S.suiLog).toContainEqual(["setGasPayment", 1]);
+    // No address balance: nothing withdrawn, no expiration (2026-10-06).
+    expect(S.suiLog.some(([op]) => op === "withdrawal")).toBe(false);
+    expect(S.suiLog).toContainEqual(["setExpiration", "None"]);
+  });
+
+  it("a deposit from SUI held in the address balance alone: withdrawn, redeemed, the gas from the address balance (2026-10-06)", async () => {
+    // Before 2026-10-06 this was built through publicnode's JSON-RPC, and
+    // refused before signing once that failed ("… held as a Sui address
+    // balance. This wallet can spend it only through Sui's JSON-RPC …").
+    S.suiFunds = { coin: null, addressBalance: "5000000000" };
+    const r = await executeIntentsTrade(
+      bound({ fromAsset: "SUI", amountIn: "1234567891", depositAddress: SUI_DEPOSIT }),
+    );
+    expect(r.sourceTxHash).toBe(SUI_FAKE_DIGEST);
+    expect(S.suiLog).toContainEqual(["withdrawal", 1234567891n]);
+    expect(S.suiLog).toContainEqual(["moveCall", "0x2::coin::redeem_funds"]);
+    expect(S.suiLog).toContainEqual(["transferObjects", SUI_DEPOSIT]);
+    expect(S.suiLog).toContainEqual(["setExpiration", "ValidDuring"]);
+    // No gas coin, in the dry run or the deposit; nothing split from one.
+    expect(S.suiLog.filter(([op]) => op === "setGasPayment")).toEqual([["setGasPayment", 0], ["setGasPayment", 0]]);
+    expect(S.suiLog.some(([op]) => op === "splitCoins")).toBe(false);
+    expect(invokedWith("swap_sign_sui_tx")).toHaveLength(1);
   });
 
   it("an unknown outcome is recorded with the digest and never retried on the same quote", async () => {

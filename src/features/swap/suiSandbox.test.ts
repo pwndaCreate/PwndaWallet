@@ -15,6 +15,10 @@
  * dispatcher (`getMock`, as `p2pHistorySandbox.test.ts` does), so what the
  * lead sees under `wallet_populated`, `degraded` and the unfunded default is
  * pinned here first.
+ *
+ * 2026-10-06 (`@mysten/sui` 2.x): the mock's 60 SUI are 5 in a coin and 55 in
+ * the address balance, so a sandbox send can be paid from the coin, from the
+ * address balance, or from both; each is built by the real SDK and decoded.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 
@@ -24,6 +28,8 @@ vi.mock("../../lib/tauri", () => ({
   invoke: vi.fn(async (cmd: string, args?: unknown) => h.getMock!(cmd, args)),
 }));
 
+import { bcs } from "@mysten/sui/bcs";
+import { invoke } from "../../lib/tauri";
 import {
   readSuiSendState,
   suiAdapter,
@@ -73,11 +79,15 @@ describe("wallet_populated: every Sui call has an answer, in the live layout", (
   });
 
   it("the send runs through every call: state, dry run, sign, submit; the status lookup knows its digest", async () => {
+    // 2026-10-06: the 60 SUI are 5 in a coin and 55 in the address balance,
+    // with the chain id and the epoch an address-balance transfer names.
     await expect(readSuiSendState(ME)).resolves.toMatchObject({
       referenceGasPrice: 100n,
-      coinBalance: 60_000_000_000n,
-      addressBalance: 0n,
-      coins: [{ balance: 60_000_000_000n }],
+      epoch: 1272n,
+      chainIdentifier: "4btiuiMPvEENsttpZC7CZ53DruC3MAgfznDbASZ7DR6S",
+      coinBalance: 5_000_000_000n,
+      addressBalance: 55_000_000_000n,
+      coins: [{ balance: 5_000_000_000n }],
     });
     const warn = vi.spyOn(console, "warn");
     // Was: "Sending from this Sui wallet isn't supported yet…" (the
@@ -88,6 +98,44 @@ describe("wallet_populated: every Sui call has an answer, in the live layout", (
     // "[sui] GraphQL returned digest …" warning), and recorded it.
     expect(warn.mock.calls.some((c) => String(c[0]).includes("[sui] GraphQL returned digest"))).toBe(false);
     await expect(suiTransactionStatus(txHash)).resolves.toEqual({ status: "SUCCESS" });
+  });
+
+  // 2026-10-06 (`@mysten/sui` 2.x): what the lead can send in the sandbox, and
+  // which way each is paid. The budget is the mock's dry run: 0.002176 SUI.
+  it.each([
+    ["0.1", "the coin", (tx: any) => {
+      expect(tx.gasData.payment).toHaveLength(1);
+      expect(tx.expiration).toEqual({ None: true, $kind: "None" });
+      expect(tx.kind.ProgrammableTransaction.commands[0]).toHaveProperty("SplitCoins");
+    }],
+    ["10", "the address balance", (tx: any) => {
+      expect(tx.gasData.payment).toEqual([]);
+      expect(tx.expiration.ValidDuring).toMatchObject({ minEpoch: "1272", maxEpoch: "1273" });
+      expect(tx.kind.ProgrammableTransaction.inputs[0].FundsWithdrawal.reservation.MaxAmountU64).toBe("10000000000");
+    }],
+    ["59", "both", (tx: any) => {
+      expect(tx.gasData.payment).toHaveLength(1);
+      // 59 SUI + the budget - the 5 SUI coin.
+      expect(tx.kind.ProgrammableTransaction.inputs[0].FundsWithdrawal.reservation.MaxAmountU64).toBe("54002176000");
+      expect(tx.kind.ProgrammableTransaction.commands[1]).toHaveProperty("MergeCoins");
+    }],
+  ] as const)("a send of %s SUI is paid from %s, and runs to sent", async (amount, _source, check) => {
+    vi.mocked(invoke).mockClear();
+    const { txHash } = await executeSuiTransfer({ sessionId: "sandbox", fromAddress: ME, to: TO, amount });
+    const signed = vi.mocked(invoke).mock.calls.filter(([cmd]) => cmd === "swap_sign_sui_tx");
+    expect(signed).toHaveLength(1);
+    const b64 = (signed[0][1] as { input: { txBytesBase64: string } }).input.txBytesBase64;
+    check(bcs.TransactionData.parse(Buffer.from(b64, "base64")).V1);
+    await expect(suiTransactionStatus(txHash)).resolves.toEqual({ status: "SUCCESS" });
+  });
+
+  it("past what both hold with the fee: refused before signing, saying where the SUI is", async () => {
+    vi.mocked(invoke).mockClear();
+    await expect(executeSuiTransfer({ sessionId: "sandbox", fromAddress: ME, to: TO, amount: "59.999" })).rejects.toThrow(
+      "This Sui account holds 60 SUI (5 in coin objects, 55 in its address balance), not enough to send 59.999 SUI " +
+        "and pay the network fee (up to 0.002176 SUI). Nothing was sent.",
+    );
+    expect(vi.mocked(invoke).mock.calls.some(([cmd]) => cmd === "swap_sign_sui_tx")).toBe(false);
   });
 });
 
