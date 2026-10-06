@@ -707,6 +707,10 @@ pub fn run() {
             sidecar_fees::sidecar_fees_reserve,
             #[cfg(feature = "full")]
             swap_bid::swap_sidecar_recover_bid,
+            // One bid's record WITH its transactions: a POST whose only body
+            // is `{"show_extra": true}`, built in Rust (2026-10-01).
+            #[cfg(feature = "full")]
+            swap_bid::swap_sidecar_bid_txns,
             #[cfg(feature = "full")]
             swap_bid::swap_sidecar_janitor_run,
             #[cfg(feature = "full")]

@@ -96,7 +96,11 @@ pub struct BidRequest {
     pub amount_from: String,
     /// Send-coin per 1 receive-coin, pinned to the offer.
     pub rate: String,
-    /// Where the bought coin should land. `None` lets the engine pick.
+    /// Where the bought coin should land: the payout address the user
+    /// reviewed. `None` leaves it to the engine, which pays its own wallet.
+    /// Sent as `destination_address` (see [`build_bid_body`]) and only after
+    /// [`payout_destination`] has checked it against the engine's own copy of
+    /// the offer.
     pub addr_to: Option<String>,
     pub valid_for_seconds: Option<u64>,
 }
@@ -290,8 +294,26 @@ pub fn extract_bid_id(v: &Value) -> Result<String, String> {
     })
 }
 
+/// The key the deployed engine reads a bid's payout address from.
+///
+/// `js_bids` (deployed `js_server.py:770-778`) reads `destination_address`:
+/// into `dest_af = ci_from.decodeAddress(...)` for a normal bid, or into
+/// `dest_bl` (the string itself) for a reversed one. It never reads
+/// `addr_to`, which is what this door sent until 2026-10-06, so every bid
+/// paid the swap node's own wallet (`getReceiveAddressFromPool`,
+/// `basicswap.py:7084-7092`) and never the address on the confirm screen.
+/// Found by the swap open-items pass of 2026-10-01; the operator's decision
+/// is that the engine pays the address the user confirmed.
+pub const DESTINATION_FIELD: &str = "destination_address";
+
 /// The body posted to the engine. Built here, never forwarded from the
 /// renderer, so no unexpected key can ride along.
+///
+/// The payout address goes in as [`DESTINATION_FIELD`]. `addr_to` must never
+/// appear: the engine ignores it, and a body carrying it looks as if it sets
+/// the payout while it sets nothing (the 2026-10-01 finding above).
+/// `swap_sidecar_place_bid` puts an address here only after
+/// [`payout_destination`] accepted it.
 pub fn build_bid_body(req: &BidRequest) -> Value {
     let mut body = serde_json::json!({
         "offer_id": req.offer_id,
@@ -304,12 +326,140 @@ pub fn build_bid_body(req: &BidRequest) -> Value {
         .map(|a| a.trim())
         .filter(|a| !a.is_empty())
     {
-        body["addr_to"] = Value::String(addr.to_string());
+        body[DESTINATION_FIELD] = Value::String(addr.to_string());
     }
     if let Some(v) = req.valid_for_seconds {
         body["valid_for_seconds"] = Value::String(v.to_string());
     }
     body
+}
+
+// ── The payout address: which forms the engine pays as written ──────────
+//
+// Operator decision, 2026-10-01: the engine pays the address the user
+// confirmed. Sending it is not enough on its own, because the deployed engine
+// handles some address forms in ways that do not pay that address. Read in the
+// deployed tree (`.swap-sidecar-work/runtime/Lib/site-packages/basicswap/`):
+//
+// * Which path an address takes depends on the coin bought, the offer's
+//   `coin_from`. `is_reverse_ads_bid` (`basicswap.py:3992`) is true when it is
+//   one of `scriptless_coins + coins_without_segwit` (`chainparams.py:55-71`:
+//   XMR, ZEPH, ZANO, DOGE among others, and DASH). Then the address is kept as
+//   a string, `dest_bl`, checked by that coin's `isValidAddress`
+//   (`basicswap.py:6993-7004`), and this node's chain-B redeem pays it
+//   (`redeemXmrBidCoinBLockTx`, `:14182-14191`). Otherwise (BTC, LTC, BCH) it
+//   becomes `dest_af = ci_from.decodeAddress(...)` (`js_server.py:776`),
+//   checked only for its LENGTH (`isValidSwapDest`, `basicswap.py:4393`: 20
+//   bytes, or a full P2WPKH/P2WSH script), and the chain-A spend the other
+//   side builds pays `getScriptForPubkeyHash(dest_af)`, which this node
+//   verifies (`interface/btc/btc.py:2045`, "Bad output destination").
+// * BTC/LTC `decodeAddress` (`interface/btc/btc.py:1298`) returns a bech32
+//   address's witness program, or a base58 address's hash with its version
+//   byte dropped. `getScriptForPubkeyHash` (`:1414`) is P2WPKH. So `bc1q`/
+//   `ltc1q` + 20 bytes is paid exactly; a legacy `1…`/`L…` address is paid as
+//   the P2WPKH of the same hash, an address the wallet does not show; a P2SH
+//   `3…`/`M…` address is paid as P2WPKH of a SCRIPT hash, which no key can
+//   spend; P2WSH, taproot and MWEB fail `isValidSwapDest` or the decode and
+//   the bid is refused.
+// * BCH `decodeAddress` (`interface/bch/bch.py:198`) is the CashAddr payload,
+//   prefix required (`contrib/cashaddress.py:219`), paid as P2PKH (`:377`, and
+//   the covenant's `out_1`, `basicswap.py:7357`). A `p…` (P2SH) payload would
+//   be paid as P2PKH of a script hash.
+// * DOGE and DASH redeem through `spendBLockTx` (`interface/btc/btc.py:3554`):
+//   base58 decode with the version dropped, paid as P2PKH (`doge.py:53`,
+//   `dash.py:94`). `isValidAddress` there is the node's `validateaddress`, which
+//   a P2SH address passes; it would be paid as P2PKH of a script hash.
+// * XMR and ZEPH (`interface/xmr/xmr.py:586`) accept a standard or a
+//   subaddress for their own prefixes and `sweep_all` to it (`:926-930`); an
+//   integrated address is refused. ZANO (`interface/zano/zano.py:1740`)
+//   accepts a plain `Zx…` address of exact length and `transfer`s to it
+//   (`:1536`).
+// * A non-adaptor-signature offer (SELLER_FIRST) reads no destination at all:
+//   `postBid` ignores it and the redeem pays the node's own pool address
+//   (`basicswap.py:8244`). With `strict_swap_type` on, the mainnet default
+//   (`:4021`), only PIVX/DASH pairs may use it, so none the wallet routes.
+//
+// So each coin has ONE form sent as written, the form the wallet itself
+// derives by default. Anything else is refused here; the renderer
+// (`swap-sidecar/payoutDestination.ts`, the same table) does not send it and
+// says on the confirm screen that the coin lands in the swap node's wallet.
+// This check is the backstop for that renderer rule, not a second opinion:
+// the two tables are pinned equal by `payoutDestination.test.ts`.
+
+/// `SwapTypes.XMR_SWAP` (deployed `basicswap_util.py:91`).
+const SWAP_TYPE_XMR: u64 = 5;
+
+/// The one address form per coin that the deployed engine pays exactly as
+/// written. Shape only: the engine verifies the checksum, and a shape that
+/// matches with a bad checksum is refused there, not paid elsewhere.
+pub const PAYOUT_ADDRESS_SHAPES: &[(&str, &str)] = &[
+    ("BTC", r"^bc1q[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}$"),
+    ("LTC", r"^ltc1q[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}$"),
+    ("BCH", r"^bitcoincash:q[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{41}$"),
+    ("DOGE", r"^D[1-9A-HJ-NP-Za-km-z]{33}$"),
+    ("DASH", r"^X[1-9A-HJ-NP-Za-km-z]{33}$"),
+    ("XMR", r"^[48][1-9A-HJ-NP-Za-km-z]{94}$"),
+    ("ZEPH", r"^(?:ZEPHYR[1-9A-HJ-NP-Za-km-z]{95}|ZEPHs[1-9A-HJ-NP-Za-km-z]{94})$"),
+    ("ZANO", r"^Zx[1-9A-HJ-NP-Za-km-z]{95}$"),
+];
+
+/// The ticker of the coin a bid on `offer` buys: the offer's `coin_from`, as
+/// the engine names it in `/json/offers` (`ci.coin_name()`: "Litecoin",
+/// "Bitcoin Cash", …). `None` for a coin the table above has no rule for.
+pub fn receive_ticker(offer: &Value) -> Option<&'static str> {
+    let name = field_str(offer, "coin_from")?;
+    let key: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    Some(match key.as_str() {
+        "BITCOIN" | "BTC" => "BTC",
+        "LITECOIN" | "LTC" => "LTC",
+        "BITCOINCASH" | "BCH" => "BCH",
+        "DOGECOIN" | "DOGE" => "DOGE",
+        "DASH" => "DASH",
+        "MONERO" | "XMR" => "XMR",
+        "ZEPHYR" | "ZEPH" => "ZEPH",
+        "ZANO" => "ZANO",
+        _ => return None,
+    })
+}
+
+/// The payout address to send as [`DESTINATION_FIELD`], or why it must not be
+/// sent. Checked against the ENGINE's copy of the offer (its `swap_type` and
+/// `coin_from`), not the renderer's.
+pub fn payout_destination(offer: &Value, addr: &str) -> Result<String, String> {
+    let addr = addr.trim();
+    if offer.get("swap_type").and_then(|v| v.as_u64()) != Some(SWAP_TYPE_XMR) {
+        return Err(
+            "this offer's swap protocol pays the swap node's own wallet whatever address is \
+             given, so the wallet should not have sent one. Nothing was sent."
+                .to_string(),
+        );
+    }
+    let ticker = receive_ticker(offer).ok_or_else(|| {
+        format!(
+            "the wallet has no payout rule for {}, so it should not have sent an address. \
+             Nothing was sent.",
+            field_str(offer, "coin_from").unwrap_or("this coin")
+        )
+    })?;
+    let pattern = PAYOUT_ADDRESS_SHAPES
+        .iter()
+        .find(|(t, _)| *t == ticker)
+        .map(|(_, p)| *p)
+        .ok_or_else(|| format!("no payout address form is recorded for {}", ticker))?;
+    let shape = regex::Regex::new(pattern)
+        .map_err(|e| format!("the {} payout address rule does not compile: {}", ticker, e))?;
+    if !shape.is_match(addr) {
+        return Err(format!(
+            "{:?} is not a {} address form the swap engine pays as written, so the bid is \
+             refused rather than paid somewhere else. Nothing was sent.",
+            addr, ticker
+        ));
+    }
+    Ok(addr.to_string())
 }
 
 fn now_secs() -> u64 {
@@ -369,6 +519,24 @@ pub async fn swap_sidecar_place_bid(
     };
     let offer = offer_from_reply(&offer_reply, &req.offer_id)?;
     verify_against_offer(&req, amount, rate_f, &offer, now_secs())?;
+
+    // 2b. The payout address, against the engine's own copy of the offer: only
+    //     a form the engine pays exactly as written goes into the body
+    //     (2026-10-01, see `payout_destination`). A form it would pay somewhere
+    //     else refuses the bid instead.
+    let destination = match req
+        .addr_to
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+    {
+        Some(a) => Some(payout_destination(&offer, a)?),
+        None => None,
+    };
+    let req = BidRequest {
+        addr_to: destination,
+        ..req
+    };
 
     // 3. The write. Pinned path, body built here.
     let url = format!("http://127.0.0.1:{}/json/{}", port, BID_NEW_PATH);
@@ -530,13 +698,175 @@ pub async fn swap_sidecar_recover_bid(
     let (port, auth) = api_context(&sc)?;
     let parsed = recover_bid_call(port, &auth, &bid_id).await?;
     if parsed.get("recovered").is_none() {
-        return Err(
-            "this swap-node runtime does not carry the recovery patch              (upstream/patches/0011); run `node scripts/apply-engine-patches.mjs`              and restart the node"
-                .to_string(),
-        );
+        return Err(NO_RECOVERY_PATCH.to_string());
     }
     serde_json::from_value(parsed)
         .map_err(|e| format!("could not read the recovery result: {}", e))
+}
+
+/// What the user reads when the engine has no PWNDA-PATCH-11 branch. One
+/// sentence: until 2026-10-06 it carried two runs of 14 spaces, after "patch"
+/// and after the script name, where a line continuation had been lost. Found
+/// while adding the read below to this file.
+const NO_RECOVERY_PATCH: &str = "this swap-node runtime does not carry the recovery patch \
+     (upstream/patches/0011); run `node scripts/apply-engine-patches.mjs` and restart the node";
+
+// ═══════════════════════════════════════════════════════════════════════════
+// A bid's transactions: the one read that needs the POST verb (2026-10-01)
+//
+// Operator request, 2026-10-01: P2P swap details should list each leg's
+// transactions. For an adaptor-signature swap (any pair with XMR, ZEPH or
+// ZANO) the engine lists them only on request: `describeBid` adds `txns` when
+// `show_txns` is set (deployed `ui/util.py:412-486`), and only a POST to
+// `bids/<id>` whose body carries `show_extra` sets it (`js_server.py:845-846`).
+// The renderer reads a bid with a GET, and `check_endpoint` keeps `bids/<id>`
+// GET-only on purpose: a POST body there is an ACTION (`accept`, `abandon`,
+// `pwndarecover`, `debugind`, `js_server.py:821-843`), and `chainbkeysplit`
+// answers with a key share (`:856-866`).
+//
+// So this is a door of its own, the same shape as the recovery call above: the
+// path is `bids/<id>` with a 56-hex id, the body is a constant built here, and
+// the renderer passes the id and nothing else. The allow-list is unchanged
+// (`renderer_still_cannot_post_to_a_bid` pins that).
+//
+// The REPLY is filtered too. With the engine's `debug_ui` setting on (a user
+// setting, off by default, `basicswap.py:479`), the same `show_txns` branch
+// adds `xmr_b_half_privatekey` and `xmr_b_half_privatekey_remote`, the key
+// shares of the chain-B lock (`ui/util.py:497-525`), next to the chain-B view
+// key. Those are what `chainbkeysplit` is kept out of reach for, so the reply
+// is cut down to an allow-list of the fields the wallet reads.
+
+/// The flag that makes `js_bids` list a bid's transactions. Present as a key;
+/// its value is not read (`have_data_entry`, `ui/util.py:76-79`).
+const BID_TXNS_FLAG: &str = "show_extra";
+
+/// The ONLY body the transactions read posts: `{"show_extra": true}`. Built
+/// here; the command takes no body from the renderer, so no other key
+/// (`accept`, `abandon`, `chainbkeysplit`, …) can reach the engine through it.
+pub fn bid_txns_body() -> Value {
+    serde_json::json!({ BID_TXNS_FLAG: true })
+}
+
+/// A bid id as the engine writes it: 28 bytes, hex (`ensure(len(bid_id) ==
+/// 28)`, `js_server.py:815`). Exactly 56 hex characters, so no word (`new`)
+/// and no extra path segment (`<id>/states`) can take the id's place.
+pub fn is_bid_id(s: &str) -> bool {
+    s.len() == 56 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// The URL of one bid's record. Only ever called with a checked id.
+fn bid_txns_url(port: u16, bid_id: &str) -> String {
+    format!("http://127.0.0.1:{}/json/bids/{}", port, bid_id)
+}
+
+/// Top-level `describeBid` fields the transactions read hands to the renderer.
+/// Everything else is dropped: the key shares above, the chain-B view key, and
+/// whatever a later engine adds.
+const BID_TXNS_REPLY_FIELDS: &[&str] = &[
+    "offer_id",
+    "coin_from",
+    "coin_to",
+    "ticker_from",
+    "ticker_to",
+    "amt_from",
+    "amt_to",
+    "bid_rate",
+    "bid_state",
+    "bid_state_ind",
+    "state_description",
+    "created_at_timestamp",
+    "state_time_timestamp",
+    "expired_at",
+    "was_sent",
+    "was_received",
+    "reverse_bid",
+    // A scripted-to-scripted swap's two locks ("<txid> <TICKER>" or "None",
+    // `ui/util.py:384`). Its claims and refunds (`:538-547`) are left out:
+    // with `strict_swap_type` on, the mainnet default (`basicswap.py:4021`),
+    // the engine runs that protocol only for PIVX/DASH pairs, none of which
+    // the wallet routes, and the wallet does not read them.
+    "initiate_tx",
+    "participate_tx",
+    // An adaptor-signature swap's transactions, entry by entry below.
+    "txns",
+];
+
+/// The fields of one `txns` entry (`ui/util.py:412-486`).
+const BID_TXNS_ENTRY_FIELDS: &[&str] = &["type", "txid", "confirms"];
+
+/// Cut the engine's reply down to [`BID_TXNS_REPLY_FIELDS`]. An `{"error": …}`
+/// reply passes through as an error object, as the generic proxy passes it,
+/// so the renderer's `isApiError` reads it the same way.
+pub fn bid_txns_reply(v: Value) -> Result<Value, String> {
+    let Some(obj) = v.as_object() else {
+        return Err("the swap node's reply was not a bid record".to_string());
+    };
+    if let Some(err) = obj.get("error") {
+        let text = err
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| err.to_string());
+        return Ok(serde_json::json!({ "error": text }));
+    }
+    let mut out = serde_json::Map::new();
+    for key in BID_TXNS_REPLY_FIELDS {
+        let Some(value) = obj.get(*key) else {
+            continue;
+        };
+        if *key == "txns" {
+            let entries: Vec<Value> = value
+                .as_array()
+                .map(|rows| {
+                    rows.iter()
+                        .filter_map(|row| row.as_object())
+                        .map(|row| {
+                            let mut kept = serde_json::Map::new();
+                            for f in BID_TXNS_ENTRY_FIELDS {
+                                if let Some(x) = row.get(*f) {
+                                    kept.insert((*f).to_string(), x.clone());
+                                }
+                            }
+                            Value::Object(kept)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            out.insert("txns".to_string(), Value::Array(entries));
+        } else {
+            out.insert((*key).to_string(), value.clone());
+        }
+    }
+    Ok(Value::Object(out))
+}
+
+/// The POST itself. The body is [`bid_txns_body`] and nothing else.
+async fn bid_txns_call(port: u16, auth: &str, bid_id: &str) -> Result<Value, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("http client build failed: {}", e))?;
+    let resp = client
+        .post(bid_txns_url(port, bid_id))
+        .header("Authorization", basic_auth_header(auth))
+        .json(&bid_txns_body())
+        .send()
+        .await
+        .map_err(|e| format!("swap node request failed: {}", e))?;
+    decode_api_response(resp).await
+}
+
+/// One bid's record WITH its transactions, for the swap history and details.
+/// Read-only: the body only asks the engine to list what it already recorded.
+#[tauri::command]
+pub async fn swap_sidecar_bid_txns(
+    sc: tauri::State<'_, SwapSidecarState>,
+    bid_id: String,
+) -> Result<Value, String> {
+    if !is_bid_id(&bid_id) {
+        return Err("that is not a valid bid id".to_string());
+    }
+    let (port, auth) = api_context(&sc)?;
+    bid_txns_reply(bid_txns_call(port, &auth, &bid_id).await?)
 }
 
 #[cfg(test)]
@@ -745,8 +1075,8 @@ mod tests {
         assert_eq!(
             keys,
             vec![
-                "addr_to",
                 "amount_from",
+                "destination_address",
                 "offer_id",
                 "rate",
                 "valid_for_seconds"
@@ -754,13 +1084,291 @@ mod tests {
         );
     }
 
+    /// The 2026-10-01 finding: the payout address went out as `addr_to`, a
+    /// key the deployed `js_bids` never reads (it reads `destination_address`,
+    /// `js_server.py:770-778`), so the engine paid its own wallet instead of
+    /// the address on the confirm screen.
+    #[test]
+    fn the_payout_address_is_sent_in_the_field_the_engine_reads() {
+        let mut r = req();
+        r.addr_to = Some(" ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh ".into());
+        let b = build_bid_body(&r);
+        assert_eq!(
+            b.get("destination_address").and_then(|v| v.as_str()),
+            Some("ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh")
+        );
+        assert!(
+            b.get("addr_to").is_none(),
+            "addr_to is ignored by the engine; sending it only looks like setting the payout"
+        );
+    }
+
     #[test]
     fn omits_an_absent_payout_address_rather_than_sending_empty() {
         let mut r = req();
         r.addr_to = Some("   ".into());
-        assert!(build_bid_body(&r).get("addr_to").is_none());
+        let b = build_bid_body(&r);
+        assert!(b.get("destination_address").is_none());
+        assert!(b.get("addr_to").is_none());
         r.addr_to = None;
-        assert!(build_bid_body(&r).get("addr_to").is_none());
+        let b = build_bid_body(&r);
+        assert!(b.get("destination_address").is_none());
+        assert!(b.get("addr_to").is_none());
+    }
+
+    // -- the payout address: forms the engine pays as written ------------
+    //
+    // Vectors: the world-public test seed ("abandon … about") for the
+    // bitcoin family, invented CryptoNote keys (G and 2G) encoded with the
+    // wallet's own encoders for XMR/ZEPH/ZANO, and BIP173/BIP86's published
+    // examples. `payoutDestination.test.ts` runs the same list.
+
+    fn offer_buying(coin: &str) -> Value {
+        json!({ "offer_id": "ab".repeat(28), "swap_type": 5, "coin_from": coin, "coin_to": "Monero" })
+    }
+
+    const PAYS_AS_WRITTEN: &[(&str, &str)] = &[
+        ("Bitcoin", "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"),
+        ("Litecoin", "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh"),
+        ("Bitcoin Cash", "bitcoincash:qqyx49mu0kkn9ftfj6hje6g2wfer34yfnq5tahq3q6"),
+        ("Dogecoin", "DBus3bamQjgJULBJtYXpEzDWQRwF5iwxgC"),
+        ("Dash", "XoJA8qE3N2Y3jMLEtZ3vcN42qseZ8LvFf5"),
+        ("Monero", "44yQXfkWZNmJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJCAof7pyUai3Q68xyoie3ASK9sBTXNue95yhG7PE7RLs4rqwDTA"),
+        ("Monero", "85oYs3QM9oBJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJCAof7pyUai3Q68xyoie3ASK9sBTXNue95yhG7PE7RLs4rdEtwF"),
+        ("Zephyr", "ZEPHYR2gFxHJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfG5oMhJqwM8VTD26sHnCRtxD4nc9amkwQQ4KPqC2fYvAUdc59X3p"),
+        ("Zephyr", "ZEPHs92AsZfJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRhndvPBW9giPpPRWyZEZNx1oihwAQfsH48NwuPEYhnBrmBZPkm9"),
+        ("Zano", "ZxCUF69qnXfJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ8RXqxM5RWMGuAR2uvk8dcAdhyEt5LtNRU7jNspTdSp41pscRv83C"),
+    ];
+
+    const PAID_ELSEWHERE_OR_REFUSED: &[(&str, &str)] = &[
+        // Legacy P2PKH: paid as the P2WPKH of the same hash, not this address.
+        ("Bitcoin", "1JaUQDVNRdhfNsVncGkXedaPSM5Gc54Hso"),
+        ("Litecoin", "LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez"),
+        // P2SH: a script hash paid as a pubkey hash, which no key can spend.
+        ("Bitcoin", "3GtVZYzsKF6Feikdjd4bDyPdAiyeHANY9b"),
+        ("Litecoin", "MUi6eFEWq7Sj3XaWUzJTDvSFTpaSdDR3fq"),
+        ("Bitcoin Cash", "bitcoincash:pqyx49mu0kkn9ftfj6hje6g2wfer34yfnqrwqc8jm8"),
+        ("Dogecoin", "9yD3AjCTjHyHvs4chBsGMz3DNPshJXyL3i"),
+        ("Dash", "7f1y4KLkmCjUfLy3RP4oWqiq5cBxRWfP62"),
+        // P2WSH and taproot: refused by `isValidSwapDest`.
+        ("Bitcoin", "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"),
+        ("Bitcoin", "bc1p5cyxnuxmeuwuvkwfem96lqzszd02n6xdcjrs20cac6yqjjwudpxqkedrcr"),
+        ("Litecoin", "ltc1qqurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurswpc8qurselq749"),
+        // Uppercase bech32: the engine's prefix test is case-sensitive.
+        ("Bitcoin", "BC1QCR8TE4KR609GCAWUTMRZA0J4XV80JY8Z306FYU"),
+        // CashAddr without its prefix: "Cash address is missing prefix".
+        ("Bitcoin Cash", "qqyx49mu0kkn9ftfj6hje6g2wfer34yfnq5tahq3q6"),
+        // Integrated / auditable: refused by the coin's `isValidAddress`.
+        ("Monero", "4Eg5YUa1AeHJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJCAof7pyUai3Q68xyoie3ASK9sBTXNue95yhG7PE7RLs6gqsUSqmg6b14AJGrE"),
+        ("Zano", "aZxb1EVcyvmJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ8QgcreQvwwCmh1mHADqPe3YhfxfRoJs1Gq4YyNFZBA28nQNxY9SY4"),
+        ("Zano", "iZ1xNPFPrayJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJ8RXqxM5RWMGuAR2uvk8dcAdhyEt5LtNRU7jNspTdSp4H5cJg5vSXu91115AmrYn"),
+        // Another coin's address.
+        ("Litecoin", "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"),
+        ("Zephyr", "44yQXfkWZNmJ8QgRfFWTzmJ8QgRfFWTzmJ8QgRfFWTzmJCAof7pyUai3Q68xyoie3ASK9sBTXNue95yhG7PE7RLs4rqwDTA"),
+    ];
+
+    #[test]
+    fn payout_forms_the_engine_pays_as_written_are_sent() {
+        for (coin, addr) in PAYS_AS_WRITTEN {
+            assert_eq!(
+                payout_destination(&offer_buying(coin), addr).as_deref(),
+                Ok(*addr),
+                "{coin}: {addr}"
+            );
+        }
+    }
+
+    #[test]
+    fn payout_forms_the_engine_would_pay_elsewhere_are_refused() {
+        for (coin, addr) in PAID_ELSEWHERE_OR_REFUSED {
+            let err = payout_destination(&offer_buying(coin), addr)
+                .expect_err(&format!("{coin}: {addr} must be refused"));
+            assert!(err.contains("Nothing was sent"), "{coin}: {err}");
+        }
+    }
+
+    #[test]
+    fn a_payout_address_on_a_non_adaptor_offer_is_refused() {
+        // SELLER_FIRST (1): `postBid` reads no destination at all.
+        let mut o = offer_buying("Litecoin");
+        o["swap_type"] = json!(1);
+        assert!(payout_destination(&o, "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh").is_err());
+        o.as_object_mut().unwrap().remove("swap_type");
+        assert!(payout_destination(&o, "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh").is_err());
+    }
+
+    #[test]
+    fn a_payout_address_for_a_coin_with_no_rule_is_refused() {
+        assert!(payout_destination(&offer_buying("Particl"), "Pinvented00000000000000000000000000").is_err());
+    }
+
+    #[test]
+    fn the_coin_bought_is_the_offers_coin_from_as_the_engine_names_it() {
+        for (name, ticker) in [
+            ("Bitcoin", "BTC"),
+            ("Litecoin", "LTC"),
+            ("Bitcoin Cash", "BCH"),
+            ("Dogecoin", "DOGE"),
+            ("Dash", "DASH"),
+            ("Monero", "XMR"),
+            ("Zephyr", "ZEPH"),
+            ("Zano", "ZANO"),
+        ] {
+            assert_eq!(receive_ticker(&offer_buying(name)), Some(ticker), "{name}");
+        }
+        assert_eq!(receive_ticker(&offer_buying("Particl")), None);
+        assert_eq!(receive_ticker(&json!({})), None);
+    }
+
+    #[test]
+    fn every_payout_shape_compiles_and_names_its_coin_once() {
+        let mut seen = std::collections::HashSet::new();
+        for (ticker, pattern) in PAYOUT_ADDRESS_SHAPES {
+            assert!(regex::Regex::new(pattern).is_ok(), "{ticker}: {pattern}");
+            assert!(seen.insert(*ticker), "{ticker} appears twice");
+            assert!(pattern.starts_with('^') && pattern.ends_with('$'), "{ticker} must be anchored");
+        }
+    }
+
+    #[test]
+    fn the_payout_is_checked_against_the_engines_offer_before_the_write() {
+        let at = THIS_FILE
+            .find("pub async fn swap_sidecar_place_bid(")
+            .expect("the command must exist");
+        let body = &THIS_FILE[at..];
+        let verify = body.find("verify_against_offer(").expect("must verify the offer");
+        let check = body.find("payout_destination(&offer").expect("must check the payout");
+        let post = body.find("port, BID_NEW_PATH").expect("must post");
+        assert!(verify < check && check < post, "the payout must be checked BEFORE the bid is posted");
+    }
+
+    // -- the transactions read (2026-10-01) -----------------------------
+
+    #[test]
+    fn the_txns_read_posts_exactly_show_extra() {
+        assert_eq!(
+            serde_json::to_string(&bid_txns_body()).unwrap(),
+            r#"{"show_extra":true}"#
+        );
+    }
+
+    #[test]
+    fn the_txns_read_takes_nothing_but_a_bid_id_from_the_renderer() {
+        // The command's parameters: the state and the id. No body, no path.
+        let at = THIS_FILE
+            .find("pub async fn swap_sidecar_bid_txns(")
+            .expect("the command must exist");
+        let sig_end = at + THIS_FILE[at..].find(") -> Result<Value, String>").unwrap();
+        let params: Vec<&str> = THIS_FILE[at + "pub async fn swap_sidecar_bid_txns(".len()..sig_end]
+            .lines()
+            .map(|p| p.trim().trim_end_matches(','))
+            .filter(|p| !p.is_empty())
+            .collect();
+        assert_eq!(
+            params,
+            vec!["sc: tauri::State<'_, SwapSidecarState>", "bid_id: String"]
+        );
+        // The one POST: its body is the constant above and nothing else.
+        let call = THIS_FILE
+            .find("async fn bid_txns_call(")
+            .expect("the call must exist");
+        let call_end = call + THIS_FILE[call..].find("decode_api_response(resp)").unwrap();
+        let body = &THIS_FILE[call..call_end];
+        assert_eq!(body.matches(".json(").count(), 1);
+        assert!(body.contains(".json(&bid_txns_body())"));
+    }
+
+    #[test]
+    fn the_txns_read_takes_a_56_hex_bid_id_only() {
+        let id = "0123456789abcdefABCDEF0123456789abcdef0123456789abcdef01";
+        assert_eq!(id.len(), 56);
+        assert!(is_bid_id(id));
+        let bad: Vec<String> = vec![
+            String::new(),
+            "new".to_string(),
+            id[..55].to_string(),
+            format!("{id}0"),
+            format!("{}g", &id[..55]),
+            format!("{id}/states"),
+            "../../../json/getcoinseed/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ];
+        for b in &bad {
+            assert!(!is_bid_id(b), "{b:?} must be refused");
+        }
+        assert_eq!(
+            bid_txns_url(11700, id),
+            format!("http://127.0.0.1:11700/json/bids/{id}")
+        );
+    }
+
+    #[test]
+    fn the_txns_reply_keeps_txids_and_drops_key_shares() {
+        // `describeBid(..., show_txns=True)` with `debug_ui` on: the shape of
+        // `ui/util.py:353-525`, invented values.
+        let reply = json!({
+            "offer_id": "aa".repeat(28),
+            "coin_from": "Litecoin",
+            "coin_to": "Monero",
+            "ticker_from": "LTC",
+            "ticker_to": "XMR",
+            "amt_from": "0.24650000",
+            "amt_to": "0.025000000000",
+            "bid_state": "Completed",
+            "bid_state_ind": 8,
+            "state_time_timestamp": 1_790_000_000u64,
+            "was_sent": true,
+            "was_received": null,
+            "reverse_bid": false,
+            "addr_from": "pwndaSandboxBidderAddr",
+            "events": [{ "at": 1, "desc": "Bid sent" }],
+            "show_txns": true,
+            "txns": [
+                { "type": "Chain A Lock", "txid": "11".repeat(32), "confirms": 5, "extra": "x" },
+                { "type": "Chain B Lock", "txid": "22".repeat(32), "confirms": null },
+                "not an object",
+            ],
+            "xmr_b_shared_address": "4shared",
+            "xmr_b_shared_viewkey": "view-key",
+            "xmr_b_half_privatekey": "KEY-SHARE",
+            "xmr_b_half_privatekey_remote": "REMOTE-KEY-SHARE",
+            "debug_ind": 0,
+        });
+        let out = bid_txns_reply(reply).unwrap();
+        let text = out.to_string();
+        for secret in ["KEY-SHARE", "view-key", "4shared"] {
+            assert!(!text.contains(secret), "{secret} must not reach the renderer: {text}");
+        }
+        for dropped in ["addr_from", "events", "show_txns", "debug_ind"] {
+            assert!(out.get(dropped).is_none(), "{dropped} is not on the allow-list");
+        }
+        assert_eq!(out["bid_state_ind"], json!(8));
+        assert_eq!(out["was_sent"], json!(true));
+        assert_eq!(
+            out["txns"],
+            json!([
+                { "type": "Chain A Lock", "txid": "11".repeat(32), "confirms": 5 },
+                { "type": "Chain B Lock", "txid": "22".repeat(32), "confirms": null },
+            ])
+        );
+    }
+
+    #[test]
+    fn an_error_reply_passes_through_as_an_error_object() {
+        assert_eq!(
+            bid_txns_reply(json!({ "error": "Unknown bid id" })).unwrap(),
+            json!({ "error": "Unknown bid id" })
+        );
+        assert!(bid_txns_reply(json!(["not", "a", "record"])).is_err());
+    }
+
+    #[test]
+    fn the_recovery_refusal_reads_as_one_sentence() {
+        assert!(!NO_RECOVERY_PATCH.contains("  "), "{NO_RECOVERY_PATCH:?}");
+        assert!(NO_RECOVERY_PATCH.contains("patch (upstream/patches/0011); run"));
+        // And the source no longer carries the run of spaces the old inline
+        // literal had (the needle is built, so this file cannot match itself).
+        let gap = format!("patch{}(upstream", " ".repeat(14));
+        assert!(!THIS_FILE.contains(&gap));
     }
 
     // -- the generic proxy stays shut ----------------------------------
