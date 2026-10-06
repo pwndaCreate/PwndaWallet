@@ -40,7 +40,7 @@ if ! command -v rustc >/dev/null 2>&1; then
 fi
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "[setup-linux] WARNING: node not installed. Install Node.js 20.x via"
+  echo "[setup-linux] WARNING: node not installed. Install Node.js 22.x via"
   echo "                       nodesource or nvm before running npm scripts."
 fi
 
