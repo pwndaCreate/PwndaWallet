@@ -240,9 +240,9 @@ export function speedUpFigures(quote: BtcSpeedUpQuote, usdPrice: number | null):
     newRate: formatRate(quote.newRate),
     newRateSource:
       quote.targetRate === null
-        ? "the least a replacement may pay (the network's fee estimate could not be read)"
+        ? "the least a replacement may pay; the network's fee estimate could not be read"
         : quote.atMinimum
-          ? `the least a replacement may pay (the network's fast rate, ${formatRate(quote.targetRate)}, is lower)`
+          ? `the least a replacement may pay; the network's fast rate, ${formatRate(quote.targetRate)}, is lower`
           : "the network's fast rate",
     newFee: btcText(quote.newFeeSat),
     newFeeUsd: usd(quote.newFeeSat),

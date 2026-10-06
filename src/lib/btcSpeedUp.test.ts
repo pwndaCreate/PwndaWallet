@@ -215,7 +215,7 @@ describe("what the review shows", () => {
 
   it("says when the minimum is paid instead of the fast rate, and drops USD without a price", () => {
     const f = speedUpFigures({ ...QUOTE, atMinimum: true, newRate: 3, targetRate: 2 }, null);
-    expect(f.newRateSource).toBe("the least a replacement may pay (the network's fast rate, 2.0 sat/vB, is lower)");
+    expect(f.newRateSource).toBe("the least a replacement may pay; the network's fast rate, 2.0 sat/vB, is lower");
     expect(f.newFeeUsd).toBeNull();
     expect(speedUpFigures({ ...QUOTE, targetRate: null }, 1).newRateSource).toMatch(/could not be read/);
   });
