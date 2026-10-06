@@ -237,8 +237,8 @@ export function P2PSwapDetails({
       {row.payoutTo === "node-wallet" && (
         <div data-p2p-payout="node-wallet" style={{ ...NOTE, marginTop: 10 }}>
           <span style={SMALL_CAPS}>payout · </span>
-          your swap node's {row.toAsset} wallet: this wallet's {row.toAsset} address is in a
-          form the swap engine does not pay as written, as the confirm screen said.
+          your swap node's {row.toAsset} wallet, not this wallet's {row.toAsset} address. The
+          confirm screen said so, and why, before the bid.
         </div>
       )}
 

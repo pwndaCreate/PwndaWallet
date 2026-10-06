@@ -332,10 +332,12 @@ export function EarnConvertBody({
           }}
         >
           {/* Where hop 1 paid (2026-10-01): the address on its confirm
-              screen, unless that address was in a form the swap engine does
-              not pay as written (`payoutDestination.ts`), when it paid the
-              swap node's own wallet. The second hop spends from this wallet's
-              own address, so that case is said plainly. */}
+              screen, unless the bid left the payout to the swap node, when it
+              paid the node's own wallet: an address in a form the engine does
+              not pay as written, or (2026-10-06) a node that follows LTC
+              through a full node (`payoutDestination.ts`). The second hop
+              spends from this wallet's own address, so that case is said
+              plainly. */}
           {hop2PaidTo === "node-wallet"
             ? `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your swap node's ${CONVERT_ROUTE_HOP} wallet, not at this wallet's ${CONVERT_ROUTE_HOP} address.`
             : `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your wallet.`}{" "}

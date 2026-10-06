@@ -385,6 +385,51 @@ pub fn build_bid_body(req: &BidRequest) -> Value {
 // says on the confirm screen that the coin lands in the swap node's wallet.
 // This check is the backstop for that renderer rule, not a second opinion:
 // the two tables are pinned equal by `payoutDestination.test.ts`.
+//
+// ── ...and only where the node can follow a payout to an outside address ──
+//
+// 2026-10-06: an address is sent only when the swap node can confirm a
+// payment to an address outside its wallet for the coin bought. Read in the
+// same deployed tree:
+//
+// * BTC, LTC and BCH are bought on a normal bid, paid by this node's chain-A
+//   redeem. The state machine completes such a bid when its chain watcher sees
+//   the lock spent (`process_XMR_SWAP_A_LOCK_tx_spend`,
+//   `basicswap.py:10560-10626`), whatever the redeem pays. A bid that lands in
+//   BID_ERROR after the redeem is published, though, is settled by
+//   PWNDA-PATCH-27 (`pwndaRecoverStalledBid`, `:7870-7940`, which the janitor
+//   below calls), and that reads the redeem's confirmations
+//   (`pwndaTxConfirmations`, `:7975-7999`): an electrum backend answers for
+//   any transaction; an RPC node answers for a confirmed one only with
+//   txindex (`getrawtransaction`) or for its wallet's own (`gettransaction`;
+//   "Only works for wallet txns", `interface/btc/btc.py:5055`). The engine
+//   neither turns txindex on for these coins nor reports it (only Particl's
+//   config gets `txindex=1`, `interface/part/core.py:150`), and a redeem
+//   paying the user's address is not the wallet's. On RPC that bid would stay
+//   "in progress" for good, the 2026-08-23 shape PATCH-27 exists for. So
+//   electrum only.
+// * DOGE and DASH get no electrum connection from this engine
+//   (`electrum_supported_coins` is bitcoin, litecoin, bitcoincash,
+//   `ui/page_settings.py:169-173`) and their RPC node has the same lookup, so
+//   by the same rule they are never sent. Their payout is a chain-B redeem
+//   like XMR's (next point), so this follows the rule, not a need of the
+//   settle path today: one entry each below if that should change.
+// * XMR, ZEPH and ZANO are bought on a reversed bid (`is_reverse_ads_bid`,
+//   `:3992`), paid by this node's chain-B redeem (`redeemXmrBidCoinBLockTx`).
+//   For an address its wallet does not own (`isAddressMine`, `:14184`) the
+//   engine marks the bid completed as soon as the redeem is submitted ("The
+//   spend won't be seen in the wallet, there is nothing to wait for",
+//   `:14262-14268`); for its own address it waits until its wallet finds the
+//   redeem (`findConfirmedTxnByHash`, `:9658-9670`, which for an outside
+//   address is a TODO, `interface/xmr/xmr.py:805`). Nothing reads an outside
+//   payout again, so nothing stalls on it whatever the connection. Nothing
+//   confirms it either.
+//
+// The connection is what the RUNNING engine reports: `connection_type` in
+// `/json/wallets` (`getWalletInfo`, `:16536`, from its live `coin_clients`,
+// not `basicswap.json`, which a settings edit rewrites before a restart
+// applies it, `:16324-16329`). Not read, or not listed, counts as not
+// electrum.
 
 /// `SwapTypes.XMR_SWAP` (deployed `basicswap_util.py:91`).
 const SWAP_TYPE_XMR: u64 = 5;
@@ -426,40 +471,169 @@ pub fn receive_ticker(offer: &Value) -> Option<&'static str> {
     })
 }
 
-/// The payout address to send as [`DESTINATION_FIELD`], or why it must not be
-/// sent. Checked against the ENGINE's copy of the offer (its `swap_type` and
-/// `coin_from`), not the renderer's.
-pub fn payout_destination(offer: &Value, addr: &str) -> Result<String, String> {
-    let addr = addr.trim();
-    if offer.get("swap_type").and_then(|v| v.as_u64()) != Some(SWAP_TYPE_XMR) {
-        return Err(
-            "this offer's swap protocol pays the swap node's own wallet whatever address is \
-             given, so the wallet should not have sent one. Nothing was sent."
-                .to_string(),
-        );
+/// How the swap node must reach a coin's chain before a payout to an outside
+/// address is sent (2026-10-06, the trace above): `"electrum"`, or `"any"` for
+/// a coin whose outside payout the engine never reads again. A coin missing
+/// here is never sent. `payoutDestination.ts` has the same table, pinned equal
+/// by its test.
+pub const PAYOUT_CONNECTION_REQUIRED: &[(&str, &str)] = &[
+    ("BTC", "electrum"),
+    ("LTC", "electrum"),
+    ("BCH", "electrum"),
+    ("DOGE", "electrum"),
+    ("DASH", "electrum"),
+    ("XMR", "any"),
+    ("ZEPH", "any"),
+    ("ZANO", "any"),
+];
+
+fn connection_required(ticker: &str) -> Option<&'static str> {
+    PAYOUT_CONNECTION_REQUIRED
+        .iter()
+        .find(|(t, _)| *t == ticker)
+        .map(|(_, need)| *need)
+}
+
+/// Whether a payout of `ticker` depends on how the node reaches its chain, so
+/// the place-bid door asks the node before it decides.
+pub fn payout_needs_connection(ticker: &str) -> bool {
+    connection_required(ticker) != Some("any")
+}
+
+/// The `connection_type` the running engine reports for `ticker` in a
+/// `/json/wallets` reply (ticker-keyed, `getWalletsInfo`). `None` for an error
+/// reply, a coin it does not list, or a coin whose entry is `{name, error}`.
+pub fn reported_connection(wallets: &Value, ticker: &str) -> Option<String> {
+    wallets
+        .get(ticker)?
+        .get("connection_type")?
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// What one payout decision looks at. A rule that needs more of the swap (the
+/// fee rule, if it comes: a taker buying a scripted coin with a scriptless one
+/// while the licence fee is live) adds its input here.
+pub struct PayoutCase<'a> {
+    /// The ENGINE's copy of the offer.
+    pub offer: &'a Value,
+    /// The coin bought, when the wallet has a rule for it.
+    pub ticker: Option<&'static str>,
+    /// The address as it would be sent, trimmed.
+    pub address: &'a str,
+    /// How the node reports it reaches the coin bought's chain, when read.
+    pub connection: Option<&'a str>,
+}
+
+/// One check: a refusal (a sentence ending "Nothing was sent."), or `None`.
+type PayoutCheck = fn(&PayoutCase<'_>) -> Option<String>;
+
+/// Every check an address passes before it is sent, in order; the first
+/// refusal decides. `payoutDestination.ts::PAYOUT_CHECKS` is the same list in
+/// the same order (`check_<name>` here, `name` there), pinned by its test: a
+/// new rule is one entry in each.
+const PAYOUT_CHECKS: &[PayoutCheck] = &[check_protocol, check_coin, check_form, check_connection];
+
+fn check_protocol(c: &PayoutCase<'_>) -> Option<String> {
+    if c.offer.get("swap_type").and_then(|v| v.as_u64()) == Some(SWAP_TYPE_XMR) {
+        return None;
     }
-    let ticker = receive_ticker(offer).ok_or_else(|| {
-        format!(
-            "the wallet has no payout rule for {}, so it should not have sent an address. \
-             Nothing was sent.",
-            field_str(offer, "coin_from").unwrap_or("this coin")
-        )
-    })?;
-    let pattern = PAYOUT_ADDRESS_SHAPES
+    Some(
+        "this offer's swap protocol pays the swap node's own wallet whatever address is \
+         given, so the wallet should not have sent one. Nothing was sent."
+            .to_string(),
+    )
+}
+
+fn check_coin(c: &PayoutCase<'_>) -> Option<String> {
+    if c.ticker.is_some() {
+        return None;
+    }
+    Some(format!(
+        "the wallet has no payout rule for {}, so it should not have sent an address. \
+         Nothing was sent.",
+        field_str(c.offer, "coin_from").unwrap_or("this coin")
+    ))
+}
+
+fn check_form(c: &PayoutCase<'_>) -> Option<String> {
+    let Some(ticker) = c.ticker else {
+        return check_coin(c);
+    };
+    let Some(pattern) = PAYOUT_ADDRESS_SHAPES
         .iter()
         .find(|(t, _)| *t == ticker)
         .map(|(_, p)| *p)
-        .ok_or_else(|| format!("no payout address form is recorded for {}", ticker))?;
-    let shape = regex::Regex::new(pattern)
-        .map_err(|e| format!("the {} payout address rule does not compile: {}", ticker, e))?;
-    if !shape.is_match(addr) {
-        return Err(format!(
+    else {
+        return Some(format!(
+            "no payout address form is recorded for {}. Nothing was sent.",
+            ticker
+        ));
+    };
+    match regex::Regex::new(pattern) {
+        Err(e) => Some(format!(
+            "the {} payout address rule does not compile: {}. Nothing was sent.",
+            ticker, e
+        )),
+        Ok(shape) if shape.is_match(c.address) => None,
+        Ok(_) => Some(format!(
             "{:?} is not a {} address form the swap engine pays as written, so the bid is \
              refused rather than paid somewhere else. Nothing was sent.",
-            addr, ticker
-        ));
+            c.address, ticker
+        )),
     }
-    Ok(addr.to_string())
+}
+
+fn check_connection(c: &PayoutCase<'_>) -> Option<String> {
+    let Some(ticker) = c.ticker else {
+        return check_coin(c);
+    };
+    match connection_required(ticker) {
+        Some("any") => None,
+        Some("electrum") => match c.connection {
+            Some("electrum") => None,
+            Some(other) => Some(format!(
+                "the swap node follows {} through a full node ({:?}), which can confirm a \
+                 payment only to its own wallet, so the wallet should not have sent an \
+                 outside address. Nothing was sent.",
+                ticker, other
+            )),
+            None => Some(format!(
+                "the swap node did not say how it reaches {}, so a payment to an outside \
+                 address could not be followed and the wallet should not have sent one. \
+                 Nothing was sent.",
+                ticker
+            )),
+        },
+        _ => Some(format!(
+            "no payout connection rule is recorded for {}. Nothing was sent.",
+            ticker
+        )),
+    }
+}
+
+/// The payout address to send as [`DESTINATION_FIELD`], or why it must not be
+/// sent. Checked against the ENGINE's copy of the offer (its `swap_type` and
+/// `coin_from`), not the renderer's, and against the node's own report of how
+/// it reaches the coin bought (`connection`, from `/json/wallets`; `None` when
+/// it was not read or did not say).
+pub fn payout_destination(
+    offer: &Value,
+    addr: &str,
+    connection: Option<&str>,
+) -> Result<String, String> {
+    let case = PayoutCase {
+        offer,
+        ticker: receive_ticker(offer),
+        address: addr.trim(),
+        connection,
+    };
+    match PAYOUT_CHECKS.iter().find_map(|check| check(&case)) {
+        Some(refusal) => Err(refusal),
+        None => Ok(case.address.to_string()),
+    }
 }
 
 fn now_secs() -> u64 {
@@ -522,15 +696,29 @@ pub async fn swap_sidecar_place_bid(
 
     // 2b. The payout address, against the engine's own copy of the offer: only
     //     a form the engine pays exactly as written goes into the body
-    //     (2026-10-01, see `payout_destination`). A form it would pay somewhere
-    //     else refuses the bid instead.
+    //     (2026-10-01), and only for a coin whose payout to an outside address
+    //     the node can follow (2026-10-06). How the node reaches that coin's
+    //     chain is read from the node itself, not taken from the renderer, and
+    //     only for a coin whose rule depends on it. Anything else refuses the
+    //     bid instead. See `payout_destination`.
     let destination = match req
         .addr_to
         .as_deref()
         .map(str::trim)
         .filter(|a| !a.is_empty())
     {
-        Some(a) => Some(payout_destination(&offer, a)?),
+        Some(a) => {
+            let connection = match receive_ticker(&offer) {
+                Some(ticker) if payout_needs_connection(ticker) => {
+                    engine_json(port, &auth, "wallets", ApiMethod::Get, None)
+                        .await
+                        .ok()
+                        .and_then(|wallets| reported_connection(&wallets, ticker))
+                }
+                _ => None,
+            };
+            Some(payout_destination(&offer, a, connection.as_deref())?)
+        }
         None => None,
     };
     let req = BidRequest {
@@ -1127,6 +1315,11 @@ mod tests {
         json!({ "offer_id": "ab".repeat(28), "swap_type": 5, "coin_from": coin, "coin_to": "Monero" })
     }
 
+    /// The form tests run on the connection that lets every coin through, so
+    /// the address form is the only thing they test (the connection rule has
+    /// its own tests below).
+    const ELECTRUM: Option<&str> = Some("electrum");
+
     const PAYS_AS_WRITTEN: &[(&str, &str)] = &[
         ("Bitcoin", "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu"),
         ("Litecoin", "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh"),
@@ -1171,7 +1364,7 @@ mod tests {
     fn payout_forms_the_engine_pays_as_written_are_sent() {
         for (coin, addr) in PAYS_AS_WRITTEN {
             assert_eq!(
-                payout_destination(&offer_buying(coin), addr).as_deref(),
+                payout_destination(&offer_buying(coin), addr, ELECTRUM).as_deref(),
                 Ok(*addr),
                 "{coin}: {addr}"
             );
@@ -1181,7 +1374,7 @@ mod tests {
     #[test]
     fn payout_forms_the_engine_would_pay_elsewhere_are_refused() {
         for (coin, addr) in PAID_ELSEWHERE_OR_REFUSED {
-            let err = payout_destination(&offer_buying(coin), addr)
+            let err = payout_destination(&offer_buying(coin), addr, ELECTRUM)
                 .expect_err(&format!("{coin}: {addr} must be refused"));
             assert!(err.contains("Nothing was sent"), "{coin}: {err}");
         }
@@ -1192,14 +1385,14 @@ mod tests {
         // SELLER_FIRST (1): `postBid` reads no destination at all.
         let mut o = offer_buying("Litecoin");
         o["swap_type"] = json!(1);
-        assert!(payout_destination(&o, "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh").is_err());
+        assert!(payout_destination(&o, "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh", ELECTRUM).is_err());
         o.as_object_mut().unwrap().remove("swap_type");
-        assert!(payout_destination(&o, "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh").is_err());
+        assert!(payout_destination(&o, "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh", ELECTRUM).is_err());
     }
 
     #[test]
     fn a_payout_address_for_a_coin_with_no_rule_is_refused() {
-        assert!(payout_destination(&offer_buying("Particl"), "Pinvented00000000000000000000000000").is_err());
+        assert!(payout_destination(&offer_buying("Particl"), "Pinvented00000000000000000000000000", ELECTRUM).is_err());
     }
 
     #[test]
@@ -1240,6 +1433,116 @@ mod tests {
         let check = body.find("payout_destination(&offer").expect("must check the payout");
         let post = body.find("port, BID_NEW_PATH").expect("must post");
         assert!(verify < check && check < post, "the payout must be checked BEFORE the bid is posted");
+    }
+
+    // -- ...and only where the node can follow it (2026-10-06) ------------
+
+    fn sent_for(coins: &[&str]) -> Vec<(&'static str, &'static str)> {
+        PAYS_AS_WRITTEN
+            .iter()
+            .filter(|(c, _)| coins.contains(c))
+            .copied()
+            .collect()
+    }
+
+    /// BTC, LTC and BCH: PATCH-27's settle re-reads this node's chain-A redeem,
+    /// which an electrum backend finds whatever it pays.
+    #[test]
+    fn an_electrum_coin_still_sends_the_address() {
+        for (coin, addr) in sent_for(&["Bitcoin", "Litecoin", "Bitcoin Cash"]) {
+            assert_eq!(
+                payout_destination(&offer_buying(coin), addr, Some("electrum")).as_deref(),
+                Ok(addr),
+                "{coin}"
+            );
+        }
+    }
+
+    /// The same coins on a full node (RPC, no txindex), and DOGE and DASH,
+    /// which have nothing else: no outside address, and not when the node did
+    /// not say either.
+    #[test]
+    fn a_coin_on_a_full_node_without_txindex_is_not_sent_to_an_outside_address() {
+        for (coin, addr) in sent_for(&["Bitcoin", "Litecoin", "Bitcoin Cash", "Dogecoin", "Dash"]) {
+            for connection in [Some("rpc"), Some("none"), None] {
+                let err = payout_destination(&offer_buying(coin), addr, connection)
+                    .expect_err(&format!("{coin} on {connection:?} must not be sent"));
+                assert!(err.contains("Nothing was sent"), "{coin}: {err}");
+            }
+        }
+    }
+
+    /// The engine completes a reversed bid paying an outside address when the
+    /// redeem is submitted (`basicswap.py:14262-14268`) and never reads it
+    /// again, so the connection does not decide anything for these.
+    #[test]
+    fn xmr_zeph_and_zano_payouts_do_not_depend_on_the_connection() {
+        let coins = sent_for(&["Monero", "Zephyr", "Zano"]);
+        assert_eq!(coins.len(), 5);
+        for (coin, addr) in coins {
+            for connection in [Some("rpc"), Some("electrum"), Some("none"), None] {
+                assert_eq!(
+                    payout_destination(&offer_buying(coin), addr, connection).as_deref(),
+                    Ok(addr),
+                    "{coin} on {connection:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_door_asks_the_node_only_where_the_rule_depends_on_it() {
+        for t in ["BTC", "LTC", "BCH", "DOGE", "DASH"] {
+            assert!(payout_needs_connection(t), "{t}");
+        }
+        for t in ["XMR", "ZEPH", "ZANO"] {
+            assert!(!payout_needs_connection(t), "{t}");
+        }
+    }
+
+    #[test]
+    fn every_payout_coin_has_a_connection_rule() {
+        let shapes: Vec<&str> = PAYOUT_ADDRESS_SHAPES.iter().map(|(t, _)| *t).collect();
+        let rules: Vec<&str> = PAYOUT_CONNECTION_REQUIRED.iter().map(|(t, _)| *t).collect();
+        assert_eq!(shapes, rules);
+        for (t, need) in PAYOUT_CONNECTION_REQUIRED {
+            assert!(["electrum", "any"].contains(need), "{t}: {need}");
+        }
+    }
+
+    /// `/json/wallets` is ticker-keyed; a coin that failed is `{name, error}`
+    /// and a node that failed altogether answers `{error}`.
+    #[test]
+    fn the_connection_is_the_running_engines_own_report() {
+        let wallets = json!({
+            "LTC": { "balance": "0.1", "connection_type": "electrum" },
+            "BTC": { "balance": "0", "connection_type": "rpc" },
+            "DOGE": { "name": "Dogecoin", "error": "Timeout" },
+        });
+        assert_eq!(reported_connection(&wallets, "LTC").as_deref(), Some("electrum"));
+        assert_eq!(reported_connection(&wallets, "BTC").as_deref(), Some("rpc"));
+        assert_eq!(reported_connection(&wallets, "DOGE"), None);
+        assert_eq!(reported_connection(&wallets, "BCH"), None);
+        assert_eq!(reported_connection(&json!({ "error": "Wallet is locked" }), "LTC"), None);
+    }
+
+    #[test]
+    fn the_payout_connection_is_read_from_the_node_before_the_write() {
+        let at = THIS_FILE
+            .find("pub async fn swap_sidecar_place_bid(")
+            .expect("the command must exist");
+        let body = &THIS_FILE[at..];
+        let body = &body[..body.find("const BID_RECOVER_FLAG").expect("the next item")];
+        let verify = body.find("verify_against_offer(").expect("must verify the offer");
+        let read = body
+            .find("\"wallets\", ApiMethod::Get")
+            .expect("must read the node's own report of how it reaches the coin");
+        let check = body.find("payout_destination(&offer").expect("must check the payout");
+        let post = body.find("port, BID_NEW_PATH").expect("must post");
+        assert!(
+            verify < read && read < check && check < post,
+            "the node must be asked after the offer is verified and before the payout is checked"
+        );
     }
 
     // -- the transactions read (2026-10-01) -----------------------------

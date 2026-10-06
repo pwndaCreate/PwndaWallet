@@ -102,8 +102,10 @@ export function SidecarConfirmModal({
    * are FLIPPED versus the aggregators: this is the DESTINATION-side wallet,
    * and it is a payout target, never a signing address. The engine is told
    * to pay it only in the one form per coin it pays as written
-   * (`payoutDestination.ts`, 2026-10-01); otherwise the screen says the coin
-   * lands in the swap node's own wallet, and that is what happens.
+   * (`payoutDestination.ts`, 2026-10-01), and only for a coin whose payout to
+   * an outside address the node can follow (2026-10-06); otherwise the screen
+   * says the coin lands in the swap node's own wallet, and that is what
+   * happens.
    */
   payoutAddress: string;
   /** Handed the accepted swap so the app-level tracker can adopt it. */
@@ -270,8 +272,9 @@ export function SidecarConfirmModal({
 
           Since 2026-10-06 the bid carries this address in the field the
           engine reads, so the engine pays it. Only in a form it pays as
-          written, though: for any other form the row says the coin lands in
-          the swap node's wallet, because that is where it goes. */}
+          written, though, and only where the node can follow the payout
+          (2026-10-06): otherwise the row says the coin lands in the swap
+          node's wallet, and why, because that is where it goes. */}
       {payoutPlan.to === "address" ? (
         <Row
           label={`Payout (${toAsset})`}

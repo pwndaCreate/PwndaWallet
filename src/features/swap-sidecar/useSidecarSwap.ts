@@ -546,6 +546,13 @@ export interface SidecarQuote {
    * `checkCoinsReady` refuses it identically either way.
    */
   walletReadiness: WalletSeedVerdict;
+  /**
+   * How the swap node reaches the chain of the coin bought, as it reports it:
+   * `connection_type` in the same `/json/wallets` read `funding` uses, or
+   * `null` when that read failed or did not list the coin. Decides whether the
+   * payout address is sent (2026-10-06, `payoutDestination.ts`).
+   */
+  receiveConnection: string | null;
   /** Non-fatal notes for the form to surface (spread band, missing advisory). */
   warnings: string[];
 }
@@ -859,6 +866,7 @@ export async function fetchSidecarQuote(
     expiresAt: offer.expireAt,
     funding,
     walletReadiness,
+    receiveConnection: nodeBalanceRows[receiveTicker]?.connectionType ?? null,
     warnings,
   };
 }
@@ -1035,6 +1043,15 @@ export async function fetchMinFillableAmount(args: {
   };
 }
 
+/** One coin's line of the node's `/json/wallets` table, as the quote reads it. */
+interface NodeBalanceRow {
+  balance: string | null;
+  locked?: boolean;
+  expectedSeed?: boolean | null;
+  /** `connection_type`: how the node reaches this coin's chain (2026-10-06). */
+  connectionType: string | null;
+}
+
 /**
  * The swap node's own per-coin balances, keyed by UPPERCASE ticker, with the
  * failure absorbed. `{}` means "could not read", which `assessBidFunding`
@@ -1043,19 +1060,11 @@ export async function fetchMinFillableAmount(args: {
  * Reads `/json/wallets` — the SAME endpoint `useSidecarBalances` renders — so
  * the funding verdict and the balances card can never contradict each other.
  */
-async function loadNodeBalancesQuietly(): Promise<
-  Record<
-    string,
-    { balance: string | null; locked?: boolean; expectedSeed?: boolean | null }
-  >
-> {
+async function loadNodeBalancesQuietly(): Promise<Record<string, NodeBalanceRow>> {
   try {
     const rv = await fetchWallets();
     if (isApiError(rv) || !rv || typeof rv !== "object") return {};
-    const out: Record<
-      string,
-      { balance: string | null; locked?: boolean; expectedSeed?: boolean | null }
-    > = {};
+    const out: Record<string, NodeBalanceRow> = {};
     for (const [key, info] of Object.entries(rv)) {
       if (!info || typeof info !== "object") continue;
       const w = info as {
@@ -1063,12 +1072,18 @@ async function loadNodeBalancesQuietly(): Promise<
         locked?: unknown;
         ticker?: unknown;
         expected_seed?: unknown;
+        connection_type?: unknown;
       };
       const ticker = String(w.ticker ?? key).toUpperCase();
       out[ticker] = {
         balance: typeof w.balance === "string" ? w.balance : null,
         locked: w.locked === true,
         expectedSeed: typeof w.expected_seed === "boolean" ? w.expected_seed : null,
+        // A `{name, error}` row carries none: unknown, never a guess.
+        connectionType:
+          typeof w.connection_type === "string" && w.connection_type.trim() !== ""
+            ? w.connection_type.trim()
+            : null,
       };
     }
     return out;
@@ -1181,20 +1196,26 @@ export interface SubmitSidecarBidArgs {
   /**
    * Where the bought coin should land: the payout address the user reviewed.
    * Sent as the bid's `destination_address` only when {@link planPayout} says
-   * the engine pays that form as written (2026-10-01); otherwise, or when
-   * omitted, the engine pays the node's own wallet for the receive coin. The
-   * confirm screen renders the same plan, so it says which before the click.
+   * the engine pays that form as written (2026-10-01) and the node can follow
+   * a payout of that coin to an outside address (2026-10-06); otherwise, or
+   * when omitted, the engine pays the node's own wallet for the receive coin.
+   * The confirm screen renders the same plan, so it says which before the
+   * click.
    */
   addrTo?: string;
 }
 
 /** The payout plan for a quote and the address the user is shown. */
 export function payoutPlanForQuote(
-  quote: Pick<SidecarQuote, "offer">,
+  quote: Pick<SidecarQuote, "offer" | "receiveConnection">,
   addrTo: string | null | undefined,
 ): PayoutPlan {
   return planPayout(
-    { receiveCoin: quote.offer.receiveCoin, swapType: quote.offer.raw?.swap_type },
+    {
+      receiveCoin: quote.offer.receiveCoin,
+      swapType: quote.offer.raw?.swap_type,
+      receiveConnection: quote.receiveConnection,
+    },
     addrTo,
   );
 }

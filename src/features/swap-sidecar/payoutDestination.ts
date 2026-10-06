@@ -26,13 +26,35 @@
  * node's own wallet for that coin, which the confirm screen says before the
  * user confirms.
  *
+ * # Only where the node can follow it (2026-10-06)
+ *
+ * The address is also sent only when the swap node can confirm a payment to
+ * an address outside its wallet for that coin. BTC, LTC and BCH are bought on
+ * a normal bid and paid by this node's chain-A redeem, which the engine reads
+ * again to settle a bid that errored after publishing it (PWNDA-PATCH-27, run
+ * by the wallet's janitor): an electrum connection finds any transaction, an
+ * RPC node finds a confirmed one only with txindex (which the engine neither
+ * turns on for these coins nor reports) or when it is its wallet's own (which
+ * a payment to the user's address is not). So they are sent only when the
+ * node reports `connection_type: "electrum"` for the coin, in the
+ * `/json/wallets` read the quote already makes
+ * (`SidecarQuote.receiveConnection`). DOGE and DASH have no electrum
+ * connection in this engine, so they are never sent. XMR, ZEPH and ZANO are
+ * bought on a reversed bid, which the engine completes as soon as its redeem
+ * to an outside address is submitted, so the connection decides nothing for
+ * them. The trace, with the engine's file:line, is in `swap_bid.rs` above
+ * `PAYOUT_CONNECTION_REQUIRED`.
+ *
  * # One rule, two places
  *
  * This decides what the confirm screen says and whether the address goes in
- * the bid. Rust re-checks it against the engine's own copy of the offer
- * (`payout_destination`) and refuses the bid on a mismatch, so a renderer bug
- * cannot send an address the engine would pay elsewhere. The two shape tables
- * are pinned equal by `payoutDestination.test.ts`.
+ * the bid. Rust re-checks it against the engine's own copy of the offer and
+ * the node's own report of the connection (`payout_destination`) and refuses
+ * the bid on a mismatch, so a renderer bug cannot send an address the engine
+ * would pay elsewhere or could not follow. Both sides run one ordered list of
+ * checks (`PAYOUT_CHECKS`, here and in `swap_bid.rs`): a new rule is one entry
+ * in each, and `payoutDestination.test.ts` pins the lists and the tables
+ * equal.
  */
 import { SWAP_TYPE_XMR } from "./offers";
 import { tickerForCoin } from "./types";
@@ -66,6 +88,24 @@ export const PAYOUT_ADDRESS_FORM: Readonly<Record<string, string>> = {
   ZANO: "Zx…",
 };
 
+/**
+ * How the swap node must reach a coin's chain before a payout to an outside
+ * address is sent (2026-10-06): `"electrum"`, or `"any"` for a coin whose
+ * outside payout the engine never reads again. A coin missing here is never
+ * sent. The same table as `swap_bid.rs::PAYOUT_CONNECTION_REQUIRED`, which
+ * the test compares source to source.
+ */
+export const PAYOUT_CONNECTION_REQUIRED: Readonly<Record<string, "electrum" | "any">> = {
+  BTC: "electrum",
+  LTC: "electrum",
+  BCH: "electrum",
+  DOGE: "electrum",
+  DASH: "electrum",
+  XMR: "any",
+  ZEPH: "any",
+  ZANO: "any",
+};
+
 /** Why a bid leaves the payout to the swap node's own wallet. */
 export type NodeWalletReason =
   /** No payout address was given. */
@@ -76,7 +116,12 @@ export type NodeWalletReason =
   /** A coin with no rule above. */
   | "coin"
   /** An address form the engine would pay somewhere else, or refuse. */
-  | "form";
+  | "form"
+  /** The node follows this coin through a full node (RPC), which can confirm
+   *  a payment only to its own wallet (2026-10-06). */
+  | "connection"
+  /** The node did not say how it reaches this coin's chain (2026-10-06). */
+  | "connection-unknown";
 
 export type PayoutPlan =
   /** Sent as `destination_address`; the engine pays exactly this address. */
@@ -90,6 +135,53 @@ export interface PayoutOffer {
   receiveCoin: string;
   /** The offer's `swap_type` (5 = the adaptor-signature protocol). */
   swapType: number | null | undefined;
+  /**
+   * How the swap node reports it reaches the chain of the coin bought:
+   * `connection_type` in `/json/wallets` (`"electrum"`, `"rpc"`), or `null`
+   * when that read failed or did not list the coin (2026-10-06).
+   */
+  receiveConnection: string | null;
+}
+
+/**
+ * What each check looks at. A rule that needs more of the swap (the fee rule,
+ * if it comes: a taker buying a scripted coin with a scriptless one while the
+ * licence fee is live) adds its input to {@link PayoutOffer} and is one more
+ * entry in {@link PAYOUT_CHECKS}.
+ */
+export interface PayoutCase {
+  offer: PayoutOffer;
+  /** The coin bought, as an UPPERCASE ticker. */
+  ticker: string;
+  /** The reviewed address, trimmed, a bare CashAddr given its prefix. */
+  address: string;
+}
+
+/**
+ * Every check an address passes before it is sent, in order; the first that
+ * refuses decides where the coin goes and why. `swap_bid.rs::PAYOUT_CHECKS`
+ * is the same list in the same order (`check_<name>` there), pinned by the
+ * test: a new rule is one entry in each.
+ */
+export const PAYOUT_CHECKS: readonly {
+  name: string;
+  refuse: (c: PayoutCase) => NodeWalletReason | null;
+}[] = [
+  { name: "protocol", refuse: (c) => (c.offer.swapType === SWAP_TYPE_XMR ? null : "protocol") },
+  { name: "coin", refuse: (c) => (PAYOUT_ADDRESS_SHAPES[c.ticker] ? null : "coin") },
+  {
+    name: "form",
+    refuse: (c) => (PAYOUT_ADDRESS_SHAPES[c.ticker]?.test(c.address) ? null : "form"),
+  },
+  { name: "connection", refuse: (c) => connectionRefusal(c.ticker, c.offer.receiveConnection) },
+];
+
+/** `null` when the node can follow a payout of `ticker` to an outside address. */
+function connectionRefusal(ticker: string, connection: string | null): NodeWalletReason | null {
+  const need = PAYOUT_CONNECTION_REQUIRED[ticker];
+  if (need === "any") return null;
+  if (need === "electrum" && connection === "electrum") return null;
+  return connection == null ? "connection-unknown" : "connection";
 }
 
 /** A CashAddr written without its prefix gets it: the engine's decoder
@@ -116,14 +208,12 @@ export function planPayout(
     .toUpperCase();
   const address = (reviewedAddress ?? "").trim();
   if (!address) return { to: "node-wallet", ticker, reason: "no-address", address: null };
-  if (offer.swapType !== SWAP_TYPE_XMR) {
-    return { to: "node-wallet", ticker, reason: "protocol", address };
+  const c: PayoutCase = { offer, ticker, address: normalize(ticker, address) };
+  for (const check of PAYOUT_CHECKS) {
+    const reason = check.refuse(c);
+    if (reason) return { to: "node-wallet", ticker, reason, address };
   }
-  const shape = PAYOUT_ADDRESS_SHAPES[ticker];
-  if (!shape) return { to: "node-wallet", ticker, reason: "coin", address };
-  const normalized = normalize(ticker, address);
-  if (!shape.test(normalized)) return { to: "node-wallet", ticker, reason: "form", address };
-  return { to: "address", ticker, address: normalized };
+  return { to: "address", ticker, address: c.address };
 }
 
 /**
@@ -140,6 +230,10 @@ export function nodeWalletPayoutNote(plan: PayoutPlan): string | null {
       return `${where}: this offer's swap protocol pays the node's own wallet whatever address is given.`;
     case "coin":
       return `${where}: the wallet has no payout rule for this coin.`;
+    case "connection":
+      return `${where}: your swap node follows ${plan.ticker} through a full node, which can confirm a payment only to its own wallet, so this address is not sent.`;
+    case "connection-unknown":
+      return `${where}: the wallet could not read how your swap node connects to ${plan.ticker}, so this address is not sent.`;
     case "no-address":
       return `${where}.`;
   }
