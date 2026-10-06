@@ -17,23 +17,49 @@
  * reports to the sink built here, `p2pSwapHistory`:
  *
  * - `placed`: the node returned a bid id for a bid this wallet placed. A
- *   pending row with the coins and amounts the user reviewed.
- * - `bidRead`: one `GET /json/bids/<id>` read. The state, the leg, and any
- *   transaction ids the node reported.
- * - `activeRead`: one `/json/active` read. A row for each bid this node SENT
- *   that is in progress (one placed from the node's own console, or before
- *   this change, appears too), and on the first answer of a session the
+ *   pending row with the coins and amounts the user reviewed, and where the
+ *   bid asked the engine to pay the bought coin.
+ * - `bidRead`: one `GET /json/bids/<id>` read. The state and the leg. When the
+ *   state has moved since the last time, the sink also reads the bid's
+ *   transactions (below).
+ * - `activeRead`: one `/json/active` read. A row for each swap in progress,
+ *   on either side of the bid, and on the first answer of a session the
  *   backfill below.
  *
  * The backfill reads `/json/sentbids` (every bid this node sent, finished ones
- * included) and writes the bids history lacks or still has as pending, after
- * reading each one's own record for its protocol state and leg. Read-only: it
- * places, accepts and cancels nothing.
+ * included) and `/json/bids` (every bid it received), and writes the swaps
+ * history lacks or still has as pending, after reading each one's own record
+ * for its protocol state, leg and transactions. Read-only: it places, accepts
+ * and cancels nothing.
  *
- * A bid this node RECEIVED (a swap on an offer it posted itself) is not
- * written: these lists show the swaps the user placed, and the backfill can
- * only see sent bids, so writing received ones from the in-progress list
- * alone would make history depend on whether the app happened to be open.
+ * # Transactions (2026-10-01)
+ *
+ * An adaptor-signature swap's transactions (any pair with XMR, ZEPH or ZANO)
+ * are listed by the engine only for a read that asks (`show_extra`), and the
+ * GET the tracker polls with cannot ask. `fetchBidTxns` is that read, a Rust
+ * command of its own (`swap_bid.rs::swap_sidecar_bid_txns`). The sink calls it
+ * once per state a bid reaches (a transaction appears with a state change),
+ * the backfill uses it for each bid's record, and the details call
+ * `refreshTxns` when opened, which is what fills a swap that ended unwatched.
+ *
+ * # Both sides of a bid (2026-10-01)
+ *
+ * Operator request: "Swaps where you were the maker (someone took your offer)
+ * aren't listed." A bid this node RECEIVED is a swap on an offer it posted,
+ * written in the user's own frame: the maker sends the offer's `coin_from`
+ * and receives its `coin_to` (`js_active` and `describeBid` report both in
+ * the offer's frame). Only one this node accepted gets a row: a bid that
+ * expired or was refused before acceptance is a request, not a swap
+ * (`makerSwapStarted`). The licence fee is charged on bids this node SENT
+ * only (`sidecar_fees`), and nothing here reads or writes it.
+ *
+ * Which side a bid is comes from the engine's own flags: a sent bid has
+ * `was_sent: true`; a received one `was_received: true` and `was_sent: null`
+ * (`basicswap.py:13033`, the received bid sets only `was_received`). Until
+ * 2026-10-01 the in-progress list's `null` read as "sent" (`was_sent !==
+ * false`), so a received swap in progress was written as a taker row with its
+ * legs swapped. Such a row is turned the right way round the first time a
+ * read of its record says it was received.
  *
  * # One row per bid
  *
@@ -63,6 +89,8 @@
  */
 import {
   fetchBid,
+  fetchBids,
+  fetchBidTxns,
   fetchSentBids,
   isApiError,
   type BasicSwapActiveSwap,
@@ -176,16 +204,20 @@ export function p2pBidStateToHistoryStatus(
 
 export type P2PBidTx = NonNullable<SwapHistoryEntry["bidTxns"]>[number];
 
+/** The user's side of a swap: what they sent and what they received. */
+export interface P2PFrame {
+  fromAsset: string;
+  toAsset: string;
+  fromAmount: string;
+  toAmount: string;
+}
+
 /** What one report says about one bid, before it is merged into a row. */
 export interface P2PObservation {
   bidId: string;
   /** Who and what: used to create a row that does not exist, and to fill a
    *  stored row's blanks. Never overrides what is stored. */
-  base?: {
-    fromAsset: string;
-    toAsset: string;
-    fromAmount: string;
-    toAmount: string;
+  base?: P2PFrame & {
     createdAt: string;
     offerId?: string;
     /** The state a NEW row starts in. */
@@ -203,7 +235,16 @@ export interface P2PObservation {
    *  wallet first read it: a backfilled swap that ended two days ago read
    *  "just now" in the lists (sandbox, 2026-10-01). */
   stateAt?: string;
-  /** A bid this node sent: a missing row may be created. */
+  /** Which side of the bid this node was (2026-10-01). */
+  role?: "taker" | "maker";
+  /** Present when the bid's own record named the role (`was_sent` /
+   *  `was_received`): the user's side as that record states it. A list row
+   *  or a tracker handle only infers the role. */
+  recordFrame?: P2PFrame;
+  /** Where the bid asked the engine to pay the bought coin: written when the
+   *  bid is placed, from what `submitSidecarBid` sent (2026-10-01). */
+  payout?: { to: "address" | "node-wallet"; address?: string };
+  /** A missing row may be created. */
   mayCreate: boolean;
 }
 
@@ -239,36 +280,133 @@ function usableState(raw: number | string | null | undefined): raw is number | s
   return classifyBidState(raw).surface;
 }
 
+/**
+ * The stages a bid this node RECEIVED reaches only once this node accepted
+ * it. The same on both legs: the leg readings of the asymmetric states
+ * (`timelock-unwinding`, `swiped`, `swiped-settling`) are listed with the
+ * neutral ones.
+ */
+const MAKER_STARTED_STAGES: ReadonlySet<BidStage> = new Set<BidStage>([
+  "accepted",
+  "locking",
+  "waiting-counterparty",
+  "finalising",
+  "done",
+  "refunding",
+  "refunded",
+  "timelock-unwinding",
+  "swiped-settling",
+  "swiped",
+  "claimed-after-swipe",
+  "counterparty-recovered",
+  "recovering",
+]);
+
+/**
+ * Is a bid this node RECEIVED a swap yet (2026-10-01)? Yes once this node
+ * accepted it, or once a lock transaction exists for it. A bid still waiting
+ * for acceptance, or one that expired, was rejected or failed before
+ * acceptance, is someone's request, not a swap the user made: no row.
+ * `BID_AACCEPT_DELAY` reads "accepted" to the tracker but is the pause
+ * BEFORE an automatic acceptance. `BID_ERROR` and the cancelled states count
+ * only with a lock: an error on an incoming request is not a swap, an error
+ * with coins locked is one the user must see.
+ */
+export function makerSwapStarted(
+  state: number | string | null | undefined,
+  lockSeen: boolean,
+): boolean {
+  if (lockSeen) return true;
+  if (state == null || state === "") return false;
+  const c = classifyBidState(state);
+  if (c.state === "BID_AACCEPT_DELAY") return false;
+  return MAKER_STARTED_STAGES.has(c.stage);
+}
+
+/** Lock states that mean a lock transaction exists (`strTxState`,
+ *  `basicswap_util.py:414-429`). A missing one reads `"Unknown"` in
+ *  `/json/bids` and `null` in `/json/active`; `"None"` is TX_NONE. */
+const LOCK_PRESENT = new Set(["sent", "confirmed", "redeemed", "refunded", "in mempool", "in chain"]);
+
+function lockSeenIn(row: { tx_state_a?: string | null; tx_state_b?: string | null }): boolean {
+  const seen = (s: unknown) => typeof s === "string" && LOCK_PRESENT.has(s.trim().toLowerCase());
+  return seen(row.tx_state_a) || seen(row.tx_state_b);
+}
+
 /** The bid this wallet just placed: what `adopt` was handed. */
 export function observePlaced(h: SidecarSwapHandle): P2PObservation {
+  const payout: P2PObservation["payout"] | undefined =
+    h.payoutTo === "address" && h.payoutAddress
+      ? { to: "address", address: h.payoutAddress }
+      : h.payoutTo === "node-wallet"
+        ? { to: "node-wallet" }
+        : undefined;
   return {
     bidId: h.bidId,
     // A bid the node has just accepted is, by definition, sent: the same
     // starting state `adopt` gives the tracker.
     base: { ...baseFromHandle(h), bidState: "BID_SENT" },
     ...(h.offerId ? { offerId: h.offerId } : {}),
+    role: "taker",
+    ...(payout ? { payout } : {}),
     mayCreate: true,
   };
 }
 
+/** Which side the bid's own record says this node was. The engine sets one
+ *  flag: `was_sent: true` on a bid this node sent (also on one it sent and
+ *  received, a self-bid), `was_received: true` with `was_sent: null` on one
+ *  it received (`postXmrBid` and `processXmrBid` in the deployed
+ *  `basicswap.py`, `:7180` and `:13033`). */
+function recordRole(d: BasicSwapBidDetail): "taker" | "maker" | null {
+  if (d.was_sent === true) return "taker";
+  if (d.was_received === true) return "maker";
+  return null;
+}
+
+/** The user's side of a bid as its own record states it. `describeBid`
+ *  reports in the offer's frame, `amt_from` belonging to the offer's
+ *  `coin_from` on a reversed bid too (`ui/util.py:192-200`). */
+function recordFrameOf(d: BasicSwapBidDetail, role: "taker" | "maker"): P2PFrame | null {
+  const from = tickerOf(d.coin_from);
+  const to = tickerOf(d.coin_to);
+  if (!from || !to) return null;
+  return role === "maker"
+    ? { fromAsset: from, toAsset: to, fromAmount: d.amt_from ?? "", toAmount: d.amt_to ?? "" }
+    : { fromAsset: to, toAsset: from, fromAmount: d.amt_to ?? "", toAmount: d.amt_from ?? "" };
+}
+
 /** Overlay what a bid's own record says: the protocol state (`bid_state_ind`,
- *  never reworded, unlike the display string), the leg, the transactions. */
+ *  never reworded, unlike the display string), the leg, the side, the
+ *  transactions. */
 export function withBidDetail(obs: P2PObservation, d: BasicSwapBidDetail): P2PObservation {
   const leg = swapLegOf(d);
   const raw = d.bid_state_ind ?? d.bid_state;
   const txns = bidTxnsFrom(d);
+  const merged = txns.length > 0 ? mergeTxns(obs.txns, txns) : obs.txns;
   const stateSec = d.state_time_timestamp;
+  const role = recordRole(d);
+  const frame = role ? recordFrameOf(d, role) : null;
+  const sideOf = role ?? obs.role;
+  const state = usableState(raw) ? raw : obs.bidState;
   return {
     ...obs,
+    // A handle that guessed the side wrong (the in-progress list's
+    // `was_sent: null` read as "sent" until 2026-10-06) gave a swapped
+    // frame; the record's own frame replaces it.
+    ...(obs.base && frame && role !== obs.role ? { base: { ...obs.base, ...frame } } : {}),
     ...(usableState(raw) ? { bidState: raw } : {}),
     ...(typeof stateSec === "number" && stateSec > 0
       ? { stateAt: isoFromUnixSeconds(stateSec) }
       : {}),
     ...(leg !== "unknown" ? { leg } : {}),
-    ...(txns.length > 0 ? { txns: mergeTxns(obs.txns, txns) } : {}),
+    ...(txns.length > 0 ? { txns: merged } : {}),
     ...(obs.offerId || !d.offer_id ? {} : { offerId: d.offer_id }),
-    // `was_sent` is upstream's own flag for "this node placed the bid".
-    mayCreate: obs.mayCreate && d.was_sent !== false,
+    ...(role ? { role } : {}),
+    ...(frame ? { recordFrame: frame } : {}),
+    // A bid this node received is a row only once it is a swap.
+    mayCreate:
+      obs.mayCreate && (sideOf !== "maker" || makerSwapStarted(state, (merged?.length ?? 0) > 0)),
   };
 }
 
@@ -285,19 +423,21 @@ export function observeBidRead(swap: SidecarSwapHandle, d: BasicSwapBidDetail): 
   );
 }
 
-/** One row of `/json/active`, or null for a bid this node RECEIVED. */
+/** One row of `/json/active`: a swap in progress on either side of a bid. */
 export function observeActive(r: BasicSwapActiveSwap): P2PObservation | null {
   if (!r || typeof r.bid_id !== "string" || !r.bid_id) return null;
-  if (r.was_sent === false) return null;
   // The tracker's own reading of which leg this node sends, so the row and
-  // the tracker cannot disagree about it.
+  // the tracker cannot disagree about it. `was_sent` is `true` on a sent bid
+  // and `null` on a received one (`activeSwapToTracked`).
   const t = activeSwapToTracked(r);
+  const role = r.was_sent === true ? "taker" : "maker";
   return {
     bidId: r.bid_id,
     base: { ...baseFromHandle(t), bidState: r.bid_state },
     ...(usableState(r.bid_state) ? { bidState: r.bid_state } : {}),
     ...(r.offer_id ? { offerId: r.offer_id } : {}),
-    mayCreate: true,
+    role,
+    mayCreate: role === "taker" || makerSwapStarted(r.bid_state, lockSeenIn(r)),
   };
 }
 
@@ -322,7 +462,36 @@ export function observeSentBid(b: BasicSwapBidSummary): P2PObservation | null {
     },
     ...(usableState(b.bid_state) ? { bidState: b.bid_state } : {}),
     ...(b.offer_id ? { offerId: b.offer_id } : {}),
+    role: "taker",
     mayCreate: true,
+  };
+}
+
+/**
+ * One row of `/json/bids`: a bid this node RECEIVED, on an offer it posted
+ * (2026-10-01). The maker sends the offer's `coin_from` and receives its
+ * `coin_to`. `formatBids` reports both in the offer's frame, `amount_from`
+ * being the `coin_from` amount on a reversed offer too (`listBids` swaps them
+ * back, deployed `basicswap.py:17093-17098`). A row only for a swap
+ * (`makerSwapStarted`).
+ */
+export function observeReceivedBid(b: BasicSwapBidSummary): P2PObservation | null {
+  if (!b || typeof b.bid_id !== "string" || !b.bid_id) return null;
+  return {
+    bidId: b.bid_id,
+    base: {
+      fromAsset: tickerOf(b.coin_from),
+      toAsset: tickerOf(b.coin_to),
+      fromAmount: b.amount_from ?? "",
+      toAmount: b.amount_to ?? "",
+      createdAt: isoFromUnixSeconds(b.created_at),
+      ...(b.offer_id ? { offerId: b.offer_id } : {}),
+      bidState: b.bid_state,
+    },
+    ...(usableState(b.bid_state) ? { bidState: b.bid_state } : {}),
+    ...(b.offer_id ? { offerId: b.offer_id } : {}),
+    role: "maker",
+    mayCreate: makerSwapStarted(b.bid_state, lockSeenIn(b)),
   };
 }
 
@@ -340,12 +509,13 @@ const TXID = /^[0-9a-f]{64}$/;
  *   the engine's names "Chain A Lock", "Chain A Lock Spend", "Chain B Lock",
  *   "Chain B Lock Spend", then the timelock path ("Chain A Lock Refund Tx",
  *   "Chain A Lock Refund Spend Tx", "Chain A Lock Refund Swipe Tx", "Mercy
- *   Tx", …). The engine lists them ONLY when the request asks
- *   (`show_txns`, set by a POST carrying `show_extra`, js_server.py:798-800).
- *   The wallet reads a bid with a GET (the Rust allow-list keeps `bids/<id>`
- *   GET-only, because a POST body there can accept or abandon the bid), so on
- *   today's reads this field is absent. Kept so the ids are recorded the
- *   moment a read carries them.
+ *   Tx", "Swipe Payout Sweep Tx"; `strTxType`, `basicswap_util.py:432-451`).
+ *   The engine lists them ONLY when the request asks (`show_txns`, set by a
+ *   POST carrying `show_extra`, deployed `js_server.py:845-846`). The
+ *   tracker's GET cannot ask (the Rust allow-list keeps `bids/<id>`
+ *   GET-only, because a POST body there can accept or abandon the bid), so
+ *   they come from `fetchBidTxns`, a Rust command whose only body is
+ *   `{"show_extra": true}` (2026-10-01).
  * - `initiate_tx` / `participate_tx`, for a scripted-to-scripted (HTLC) swap:
  *   always present, as "<txid> <TICKER>" or "None" (`getTxIdHex`). The two
  *   locks.
@@ -425,6 +595,14 @@ function txKind(type: string): string {
  * The transactions beside it say which.
  *
  * A scripted-to-scripted swap reports its two locks with the chain's ticker.
+ *
+ * Which chain is this node's comes from the bid's leg when a read of the bid
+ * named it (`swapLegOf`: "scripted" locked chain A, "scriptless" chain B),
+ * and only otherwise from which coin is XMR, ZEPH or ZANO. The leg is the
+ * engine's own answer and covers the pairs that coin list cannot: the engine
+ * puts DOGE and DASH on chain B too (`is_reverse_ads_bid`, deployed
+ * `basicswap.py:3992`), and on BTC↔LTC chain A is whichever coin the offer
+ * sells. Added 2026-10-06, when these ids started arriving.
  */
 export function p2pLegTransactions(row: SwapHistoryEntry): P2PLegTx[] {
   const txns = row.bidTxns ?? [];
@@ -432,7 +610,16 @@ export function p2pLegTransactions(row: SwapHistoryEntry): P2PLegTx[] {
   const from = row.fromAsset.toUpperCase();
   const to = row.toAsset.toUpperCase();
   // The chain this wallet locked on, for an adaptor swap.
-  const mine: "A" | "B" | null = SCRIPTLESS.has(from) ? "B" : SCRIPTLESS.has(to) ? "A" : null;
+  const mine: "A" | "B" | null =
+    row.bidLeg === "scripted"
+      ? "A"
+      : row.bidLeg === "scriptless"
+        ? "B"
+        : SCRIPTLESS.has(from)
+          ? "B"
+          : SCRIPTLESS.has(to)
+            ? "A"
+            : null;
   const assetOf = (chain: "A" | "B"): string | null =>
     mine == null ? null : chain === mine ? from : to;
   const kinds = new Set(txns.map((t) => txKind(t.type)));
@@ -468,6 +655,13 @@ export function p2pLegTransactions(row: SwapHistoryEntry): P2PLegTx[] {
         return { role: by("A", "you-refunded", "they-refunded"), asset: assetOf("A") };
       // The chain-B locker took the chain-A coin after the second timelock.
       case "chain a lock refund swipe":
+        return { role: by("B", "you-claimed", "they-claimed"), asset: assetOf("A") };
+      // The swiper's follow-ups on chain A: the key share handed back, and
+      // the sweep of the swipe payout into its wallet (`_spendSwipePayout`,
+      // `_sweepSwipePayout`, deployed `basicswap.py:9813-9889`).
+      case "mercy":
+        return { role: "other", asset: assetOf("A") };
+      case "swipe payout sweep":
         return { role: by("B", "you-claimed", "they-claimed"), asset: assetOf("A") };
       case "initiate":
       case "participate": {
@@ -532,6 +726,7 @@ export function applyP2PObservation(
       provider: P2P_HISTORY_PROVIDER,
       createdAt: obs.base.createdAt,
       bidId: obs.bidId,
+      ...(obs.role ? { bidRole: obs.role } : {}),
       ...(obs.base.offerId ? { offerId: obs.base.offerId } : {}),
       ...(obs.base.bidState != null && obs.base.bidState !== ""
         ? { bidState: obs.base.bidState }
@@ -549,6 +744,44 @@ export function applyP2PObservation(
   if (!row.bidId) row.bidId = obs.bidId;
   if (!row.offerId && obs.offerId) row.offerId = obs.offerId;
   if (obs.leg) row.bidLeg = obs.leg;
+
+  // Which side of the bid this node was (2026-10-01). The bid's own record
+  // decides; a list row or a tracker handle only fills a blank.
+  if (obs.recordFrame && obs.role) {
+    const rf = obs.recordFrame;
+    if (
+      prior &&
+      !prior.bidRole &&
+      obs.role === "maker" &&
+      prior.fromAsset === rf.toAsset &&
+      prior.toAsset === rf.fromAsset
+    ) {
+      // A row with no side, legs the wrong way round for a bid its record
+      // says this node RECEIVED: written from the in-progress list before
+      // 2026-10-01, which read the engine's `was_sent: null` as "sent", the
+      // taker frame. Turned the right way round once, and the two hashes
+      // derived from that frame are worked out again below.
+      row.fromAsset = rf.fromAsset;
+      row.toAsset = rf.toAsset;
+      row.fromAmount = rf.fromAmount;
+      row.toAmount = rf.toAmount;
+      row.sourceTxHash = "";
+      row.sourceExplorerUrl = "";
+      delete row.destTxHash;
+      delete row.destExplorerUrl;
+    }
+    row.bidRole = obs.role;
+  } else if (obs.role && !row.bidRole) {
+    row.bidRole = obs.role;
+  }
+
+  // Where the bid asked the engine to pay the bought coin, as placed.
+  if (obs.payout && !row.payoutTo) {
+    row.payoutTo = obs.payout.to;
+    if (obs.payout.to === "address" && obs.payout.address && !row.recipient) {
+      row.recipient = obs.payout.address;
+    }
+  }
 
   const candidate = obs.bidState ?? row.bidState;
   if (candidate != null && candidate !== "") {
@@ -597,13 +830,17 @@ export function applyP2PObservation(
   return row;
 }
 
-// ─── Writing ──────────────────────────────────────────────────────────
+/// ─── Writing ──────────────────────────────────────────────────────────
 
 export interface P2PHistoryDeps {
   modify: typeof modifySwapHistory;
   load: typeof loadSwapHistory;
   fetchSentBids: typeof fetchSentBids;
+  /** Bids this node RECEIVED, for the backfill's maker rows (2026-10-01). */
+  fetchBids: typeof fetchBids;
   fetchBid: typeof fetchBid;
+  /** One bid's record with its transactions (2026-10-01). */
+  fetchBidTxns: typeof fetchBidTxns;
   now: () => number;
 }
 
@@ -611,7 +848,9 @@ const DEFAULT_DEPS: P2PHistoryDeps = {
   modify: modifySwapHistory,
   load: loadSwapHistory,
   fetchSentBids,
+  fetchBids,
   fetchBid,
+  fetchBidTxns,
   now: () => Date.now(),
 };
 
@@ -652,39 +891,83 @@ export async function writeP2PObservations(
 }
 
 /**
- * Write the bids the node already sent that history does not have, or has
+ * One bid's own record, with its transactions when the node gives them:
+ * `fetchBidTxns` first, the plain GET when that read is missing (a Rust build
+ * without the command) or fails. The GET still has the state and the leg.
+ * `null` when neither answered with a record.
+ */
+async function readBidRecord(
+  d: P2PHistoryDeps,
+  bidId: string,
+): Promise<BasicSwapBidDetail | null> {
+  try {
+    const r = await d.fetchBidTxns(bidId);
+    if (r && !isApiError(r)) return r;
+  } catch {
+    // The plain read below.
+  }
+  try {
+    const r = await d.fetchBid(bidId);
+    if (r && !isApiError(r)) return r;
+  } catch {
+    // The list row alone still makes a row.
+  }
+  return null;
+}
+
+/**
+ * Write the swaps the node already knows that history does not have, or has
  * as pending: the swaps from before this change, and ones that ended while
- * nothing was following them. Each bid's own record is read for its protocol
- * state and leg; when that read fails, the list row is used. Returns how many
- * bids were looked at. Read-only toward the node.
+ * nothing was following them. Both sides of the book: the bids this node
+ * SENT (`/json/sentbids`) and, since 2026-10-06, the ones it RECEIVED
+ * (`/json/bids`), the newest 100 of each. Each bid's own record is read for
+ * its protocol state, leg and transactions; when that read fails, the list
+ * row is used. A received bid that never became a swap (not accepted, no
+ * lock) is not read at all: its list row already says so. A bid on both
+ * lists, one this node sent and received itself, is the user's own bid: one
+ * row, the taker's. Returns how many bids were looked at. Read-only toward
+ * the node.
  */
 export async function backfillP2PHistory(
   deps: Partial<P2PHistoryDeps> = {},
 ): Promise<number> {
   const d = { ...DEFAULT_DEPS, ...deps };
-  const reply = await d.fetchSentBids({
+  const query = {
     limit: P2P_BACKFILL_LIMIT,
-    sort_by: "created_at",
-    sort_dir: "desc",
-  });
-  if (isApiError(reply)) throw new Error(reply.error);
-  if (!Array.isArray(reply)) throw new Error("the swap node's sent-bid list was not a list");
+    sort_by: "created_at" as const,
+    sort_dir: "desc" as const,
+  };
+  const sent = await d.fetchSentBids(query);
+  if (isApiError(sent)) throw new Error(sent.error);
+  if (!Array.isArray(sent)) throw new Error("the swap node's sent-bid list was not a list");
+  // Both lists or neither: a backfill marked done after only the sent half
+  // would not look at the received half again this session.
+  const received = await d.fetchBids(query);
+  if (isApiError(received)) throw new Error(received.error);
+  if (!Array.isArray(received)) {
+    throw new Error("the swap node's received-bid list was not a list");
+  }
   const stored = await d.load();
   const finished = new Set(
     stored.filter((r) => r.bidId && r.status !== "pending").map((r) => r.bidId),
   );
-  const list: P2PObservation[] = [];
-  for (const b of reply) {
+  const storedIds = new Set(stored.map((r) => r.bidId).filter(Boolean));
+  const sentIds = new Set(sent.map((b) => b?.bid_id).filter(Boolean));
+  const candidates: P2PObservation[] = [];
+  for (const b of sent) {
     const obs = observeSentBid(b);
-    if (!obs || finished.has(obs.bidId)) continue;
-    let full = obs;
-    try {
-      const detail = await d.fetchBid(obs.bidId);
-      if (detail && !isApiError(detail)) full = withBidDetail(obs, detail);
-    } catch {
-      // The list row alone still makes a row.
-    }
-    list.push(full);
+    if (obs && !finished.has(obs.bidId)) candidates.push(obs);
+  }
+  for (const b of received) {
+    const obs = observeReceivedBid(b);
+    if (!obs || sentIds.has(obs.bidId) || finished.has(obs.bidId)) continue;
+    if (!obs.mayCreate && !storedIds.has(obs.bidId)) continue;
+    candidates.push(obs);
+  }
+  const list: P2PObservation[] = [];
+  for (const obs of candidates) {
+    const detail = await readBidRecord(d, obs.bidId);
+    list.push(detail ? withBidDetail(obs, detail) : obs);
   }
   await writeP2PObservations(list, d);
   return list.length;
@@ -695,6 +978,14 @@ export interface P2PHistorySink extends SidecarHistorySink {
   placed(handle: SidecarSwapHandle): Promise<void>;
   bidRead(swap: SidecarSwapHandle, detail: BasicSwapBidDetail): Promise<void>;
   activeRead(rows: BasicSwapActiveSwap[]): Promise<void>;
+  /**
+   * Read one bid's transactions now and write them into its row; never
+   * creates a row. For the swap details when they open (2026-10-01), which
+   * is what fills a swap that ended while nothing was following it.
+   * `"read"`: the node answered with the bid's record. `"failed"`: it did not
+   * (not running, or no such bid).
+   */
+  refreshTxns(bidId: string): Promise<"read" | "failed">;
   reset(): void;
 }
 
@@ -703,18 +994,49 @@ export interface P2PHistorySink extends SidecarHistorySink {
  * failed write is logged and the next report tries again from the store.
  * The backfill runs on the first in-progress answer of a session; if it
  * fails, the next answer tries again.
+ *
+ * Transactions (2026-10-01): after a bid read, the bid's transactions are
+ * read too, once per state it reaches in a session. A transaction appears
+ * with a state change, so that is enough, and it is one extra read per step
+ * of a swap rather than one per poll. A bid still being requested has none.
+ * A read that fails is tried again on the next poll.
  */
 export function createP2PHistorySink(deps: Partial<P2PHistoryDeps> = {}): P2PHistorySink {
   const d = { ...DEFAULT_DEPS, ...deps };
   let backfill: "idle" | "running" | "done" = "idle";
   let session = 0;
+  /** The state each bid's transactions were last read at, this session. */
+  const txnsReadAt = new Map<string, string>();
   const write = (list: P2PObservation[]) =>
     writeP2PObservations(list, d).catch((e) => {
       console.warn("[p2p-history] swap history write failed", e);
     });
+  /** Read one bid's transactions and merge them into `obs`'s row. */
+  const readTxnsInto = async (obs: P2PObservation): Promise<boolean> => {
+    let detail: Awaited<ReturnType<typeof fetchBidTxns>>;
+    try {
+      detail = await d.fetchBidTxns(obs.bidId);
+    } catch {
+      return false;
+    }
+    if (!detail || isApiError(detail)) return false;
+    await write([withBidDetail(obs, detail)]);
+    return true;
+  };
   return {
     placed: (handle) => write([observePlaced(handle)]),
-    bidRead: (swap, detail) => write([observeBidRead(swap, detail)]),
+    bidRead: async (swap, detail) => {
+      const obs = observeBidRead(swap, detail);
+      await write([obs]);
+      // The protocol int; the display string from an engine that omits it.
+      const state = detail?.bid_state_ind ?? detail?.bid_state;
+      if (state == null || String(state).trim() === "") return;
+      if (classifyBidState(state).stage === "requesting") return;
+      const key = String(state);
+      if (txnsReadAt.get(swap.bidId) === key) return;
+      txnsReadAt.set(swap.bidId, key);
+      if (!(await readTxnsInto(obs))) txnsReadAt.delete(swap.bidId);
+    },
     activeRead: (rows) => {
       const list = (Array.isArray(rows) ? rows : [])
         .map(observeActive)
@@ -736,9 +1058,12 @@ export function createP2PHistorySink(deps: Partial<P2PHistoryDeps> = {}): P2PHis
         );
       return filled;
     },
+    refreshTxns: async (bidId) =>
+      (await readTxnsInto({ bidId, mayCreate: false })) ? "read" : "failed",
     reset: () => {
       session += 1;
       backfill = "idle";
+      txnsReadAt.clear();
     },
   };
 }
@@ -761,6 +1086,19 @@ const RECORDED_WORDS: Readonly<Record<SwapHistoryStatus, string>> = {
   success: "Completed",
   refunded: "Refunded",
   failed: "Failed",
+};
+
+/**
+ * The two stages whose tracker sentence is the TAKER's ("Your bid has been
+ * sent…", "The other user accepted your bid…"), as the maker reads them
+ * (2026-10-01). Every later stage is told by leg, not by side, and reads the
+ * same for a maker.
+ */
+const MAKER_WORDS: Readonly<Partial<Record<BidStage, string>>> = {
+  requesting:
+    "The other user's bid on your offer reached your node and is waiting to be accepted.",
+  accepted:
+    "Your node accepted the other user's bid on your offer. Both sides are exchanging the messages that set the swap up.",
 };
 
 /**
@@ -794,7 +1132,8 @@ export function p2pStageView(row: SwapHistoryEntry): P2PStageView {
       return {
         key: c.stage,
         label: c.label,
-        description: c.description,
+        description:
+          (row.bidRole === "maker" ? MAKER_WORDS[c.stage] : undefined) ?? c.description,
         severity: c.severity,
         terminal: c.terminal,
       };

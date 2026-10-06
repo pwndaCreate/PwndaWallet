@@ -58,6 +58,10 @@ vi.mock("../../api/basicswap", async (importOriginal) => {
     swapSidecarPlaceBid: vi.fn(),
     fetchSentBids: vi.fn(),
     fetchBid: vi.fn(),
+    // 2026-10-01: the received half of the book, and the read that lists a
+    // bid's transactions.
+    fetchBids: vi.fn(),
+    fetchBidTxns: vi.fn(),
   };
 });
 
@@ -122,9 +126,15 @@ beforeEach(() => {
   vi.mocked(api.swapSidecarPlaceBid).mockReset();
   vi.mocked(api.fetchSentBids).mockReset();
   vi.mocked(api.fetchBid).mockReset();
+  vi.mocked(api.fetchBids).mockReset();
+  vi.mocked(api.fetchBidTxns).mockReset();
   // The sink backfills on its first in-progress answer; by default the node
-  // has sent nothing else.
+  // has sent nothing else, and received nothing.
   vi.mocked(api.fetchSentBids).mockResolvedValue([]);
+  vi.mocked(api.fetchBids).mockResolvedValue([]);
+  // A node without the transactions read: the history falls back to the
+  // plain GET. Tests of the transactions say otherwise.
+  vi.mocked(api.fetchBidTxns).mockRejectedValue(new Error("no transactions read in this test"));
 });
 
 /** A tracked bid the way the confirm modal hands it to `adopt`: the node
@@ -329,7 +339,9 @@ describe("a row when the bid is placed", () => {
     vi.mocked(api.swapSidecarPlaceBid).mockResolvedValue(BID);
     const q = quote();
     const result = await submitSidecarBid({ quote: q, addrTo: "ltc1qinventedpayout000000000000000000000" });
-    expect(result).toEqual({ ok: true, bidId: BID });
+    // Since 2026-10-06 the answer also says where the bid asked to be paid
+    // (`payoutDestination.test.ts` pins which).
+    expect(result).toMatchObject({ ok: true, bidId: BID });
     if (!result.ok) return;
 
     // The handle exactly as SidecarConfirmModal builds it for `onSubmitted`.
@@ -651,11 +663,285 @@ describe("status updates from the tracker's reads", () => {
     expect(await rowFor(BID_2)).toMatchObject({ status: "failed", bidLeg: "scripted" });
   });
 
-  it("a bid this node RECEIVED is not a row", async () => {
+  // "A bid this node RECEIVED is not a row" stood here until 2026-10-06, with
+  // `was_sent: false`, a value the engine never sends for a received bid (it
+  // sends `null`, below). The operator asked for those swaps to be listed:
+  // see "swaps where this node was the maker".
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// The transactions of an adaptor swap (2026-10-01)
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("the transactions of an adaptor swap (2026-10-01)", () => {
+  /**
+   * The engine lists them only for a read with `show_extra`
+   * (`js_server.py:845-846`, deployed tree), which the tracker's GET cannot
+   * send. `fetchBidTxns` is that read (`swap_bid.rs::swap_sidecar_bid_txns`).
+   * Before it, every adaptor swap's details said the node had not reported
+   * its transactions, and `sourceTxHash`/`destTxHash` stayed empty.
+   */
+  it("a bid read fetches the transactions, and the row names what you sent and received", async () => {
+    vi.mocked(api.fetchBidTxns).mockResolvedValue(
+      detail({ bid_state: "Completed", bid_state_ind: 8, txns: SHOW_TXNS_COMPLETED }),
+    );
     const sink = createP2PHistorySink();
-    await sink.activeRead([activeRow({ was_sent: false })]);
-    await sink.bidRead(handle(), detail({ was_sent: false, was_received: true }));
+    await sink.placed(handle());
+    // The GET carries no `txns`.
+    await sink.bidRead(handle(), detail({ bid_state: "Completed", bid_state_ind: 8 }));
+    expect(api.fetchBidTxns).toHaveBeenCalledWith(BID);
+    const row = (await rowFor(BID))!;
+    expect(row.bidTxns).toHaveLength(4);
+    expect(row.sourceTxHash).toBe(txid("b1"));
+    expect(row.destTxHash).toBe(txid("a2"));
+  });
+
+  it("reads once per state the bid reaches, never while it is still being requested", async () => {
+    vi.mocked(api.fetchBidTxns).mockResolvedValue(detail());
+    const sink = createP2PHistorySink();
+    await sink.bidRead(handle(), detail({ bid_state: "Sent", bid_state_ind: 1 }));
+    expect(api.fetchBidTxns).not.toHaveBeenCalled();
+    await sink.bidRead(handle(), detail());
+    await sink.bidRead(handle(), detail());
+    expect(api.fetchBidTxns).toHaveBeenCalledTimes(1);
+    await sink.bidRead(handle(), detail({ bid_state: "Script tx redeemed", bid_state_ind: 13 }));
+    expect(api.fetchBidTxns).toHaveBeenCalledTimes(2);
+    // A new session reads again.
+    sink.reset();
+    await sink.bidRead(handle(), detail({ bid_state: "Script tx redeemed", bid_state_ind: 13 }));
+    expect(api.fetchBidTxns).toHaveBeenCalledTimes(3);
+  });
+
+  it("a read that fails is tried again on the next poll", async () => {
+    const locks = [
+      { type: "Chain A Lock", txid: txid("a1"), confirms: 3 },
+      { type: "Chain B Lock", txid: txid("b1"), confirms: 1 },
+    ];
+    vi.mocked(api.fetchBidTxns)
+      .mockRejectedValueOnce(new Error("the swap node is not running"))
+      .mockResolvedValue(detail({ txns: locks }));
+    const sink = createP2PHistorySink();
+    await sink.bidRead(handle(), detail());
+    expect((await rowFor(BID))!.bidTxns).toBeUndefined();
+    await sink.bidRead(handle(), detail());
+    expect(api.fetchBidTxns).toHaveBeenCalledTimes(2);
+    expect((await rowFor(BID))!.bidTxns).toHaveLength(2);
+  });
+
+  it("the backfill reads each bid with its transactions, and falls back to the plain read", async () => {
+    const fetchSentBids = vi.fn(async () => [
+      sentBid({ bid_id: BID_2, bid_state: "Completed" }),
+      sentBid({ bid_id: BID_3, bid_state: "Completed" }),
+    ]);
+    const fetchBidTxns = vi.fn(async (id: string) => {
+      if (id === BID_2) return detail({ bid_state: "Completed", bid_state_ind: 8, txns: SHOW_TXNS_COMPLETED });
+      // An older Rust build: no such command.
+      throw new Error("Command swap_sidecar_bid_txns not found");
+    });
+    const fetchBid = vi.fn(async (_id: string) => detail({ bid_state: "Completed", bid_state_ind: 8 }));
+    await backfillP2PHistory({ fetchSentBids, fetchBidTxns, fetchBid });
+    expect((await rowFor(BID_2))!.bidTxns).toHaveLength(4);
+    expect(fetchBid.mock.calls.map((c) => c[0])).toEqual([BID_3]);
+    expect(await rowFor(BID_3)).toMatchObject({ status: "success", bidState: 8 });
+  });
+
+  it("the details' refresh fills a row that ended unwatched, and never makes one", async () => {
+    vi.mocked(api.fetchBidTxns).mockResolvedValue(
+      detail({ bid_state: "Completed", bid_state_ind: 8, txns: SHOW_TXNS_COMPLETED }),
+    );
+    const sink = createP2PHistorySink();
+    expect(await sink.refreshTxns(BID)).toBe("read");
     expect(await rows()).toHaveLength(0);
+    await sink.placed(handle());
+    expect(await sink.refreshTxns(BID)).toBe("read");
+    expect((await rowFor(BID))!.bidTxns).toHaveLength(4);
+    vi.mocked(api.fetchBidTxns).mockResolvedValue({ error: "Unknown bid id" });
+    expect(await sink.refreshTxns(BID)).toBe("failed");
+  });
+
+  it("the details ask once when they open, and say why the list is empty", async () => {
+    const src = read("P2PSwapDetails.tsx");
+    expect(src).toMatch(
+      /useEffect\(\(\) => \{[\s\S]*?p2pSwapHistory\.refreshTxns\(bidId\)[\s\S]*?\}, \[bidId\]\);/,
+    );
+    await createP2PHistorySink().placed(handle());
+    const html = renderToStaticMarkup(
+      createElement(SwapDetailsModal, { entry: (await rowFor(BID))!, onClose: () => {} }),
+    );
+    expect(html).toContain('data-p2p-no-txns="reading"');
+    expect(html).not.toContain("has not reported this swap");
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Swaps where this node was the maker (2026-10-01)
+// ═══════════════════════════════════════════════════════════════════════
+
+/** `/json/active`'s row of a bid this node RECEIVED: the engine leaves
+ *  `was_sent` unset on one (`processXmrBid`, deployed `basicswap.py:13033`),
+ *  so the row says `null`. */
+function receivedActiveRow(over: Partial<BasicSwapActiveSwap> = {}): BasicSwapActiveSwap {
+  return activeRow({ was_sent: null as unknown as boolean, ...over });
+}
+
+/** `describeBid` of a bid this node received on its own LTC-for-XMR offer: a
+ *  normal bid, so this node, the offerer, locked chain A (the scripted leg). */
+function receivedDetail(over: Partial<BasicSwapBidDetail> & Record<string, unknown> = {}): BasicSwapBidDetail {
+  return detail({ was_sent: null as unknown as boolean, was_received: true, ...over });
+}
+
+describe("swaps where this node was the maker (2026-10-01)", () => {
+  it("a received swap in progress is a row, the maker's legs the right way round", async () => {
+    // Operator: "Swaps where you were the maker (someone took your offer)
+    // aren't listed." Before this, the in-progress list's `was_sent: null`
+    // read as "sent", and the row came out in the taker's frame, legs swapped.
+    await createP2PHistorySink().activeRead([receivedActiveRow()]);
+    expect(await rowFor(BID)).toMatchObject({
+      bidRole: "maker",
+      // The offer sold LTC for XMR: the maker sent the LTC, received the XMR.
+      fromAsset: "LTC",
+      toAsset: "XMR",
+      fromAmount: "0.09990000",
+      toAmount: "0.010000000000",
+      status: "pending",
+    });
+  });
+
+  it("its record names the maker's leg: the offerer of a normal offer locked chain A", async () => {
+    const sink = createP2PHistorySink();
+    await sink.activeRead([receivedActiveRow()]);
+    await sink.bidRead(
+      handle({ sendCoin: "Litecoin", receiveCoin: "Monero", sendAmount: "0.09990000", receiveAmount: "0.010000000000" }),
+      receivedDetail(),
+    );
+    expect(await rowFor(BID)).toMatchObject({ bidRole: "maker", bidLeg: "scripted", fromAsset: "LTC", toAsset: "XMR" });
+  });
+
+  it("a bid not yet accepted is a request, not a swap: no row; an error with coins locked is one", async () => {
+    const sink = createP2PHistorySink();
+    await sink.activeRead([
+      receivedActiveRow({ bid_id: BID, bid_state: "Received" }),
+      receivedActiveRow({ bid_id: BID_2, bid_state: "Auto accept delay" }),
+      receivedActiveRow({ bid_id: BID_3, bid_state: "Error" }),
+    ]);
+    expect(await rows()).toHaveLength(0);
+    await sink.activeRead([receivedActiveRow({ bid_id: BID_3, bid_state: "Error", tx_state_a: "Confirmed" })]);
+    expect(await rowFor(BID_3)).toMatchObject({ bidRole: "maker", status: "pending" });
+  });
+
+  it("the backfill finds finished maker swaps on the received list, and reads only swaps", async () => {
+    const fetchSentBids = vi.fn(async () => [sentBid({ bid_id: BID })]);
+    const fetchBids = vi.fn(async () => [
+      sentBid({ bid_id: BID_2, bid_state: "Completed", tx_state_a: "Redeemed", tx_state_b: "Redeemed" }),
+      // A request nobody accepted: `strTxState` of no lock reads "Unknown".
+      sentBid({ bid_id: BID_3, bid_state: "Expired", tx_state_a: "Unknown", tx_state_b: "Unknown" }),
+      // On both lists: a bid this node sent and received itself.
+      sentBid({ bid_id: BID }),
+    ]);
+    const fetchBidTxns = vi.fn(async (id: string) =>
+      id === BID_2
+        ? receivedDetail({ bid_state: "Completed", bid_state_ind: 8, txns: SHOW_TXNS_COMPLETED })
+        : detail(),
+    );
+    await backfillP2PHistory({ fetchSentBids, fetchBids, fetchBidTxns });
+    expect(fetchBids).toHaveBeenCalledWith({ limit: 100, sort_by: "created_at", sort_dir: "desc" });
+    expect(fetchBidTxns.mock.calls.map((c) => c[0]).sort()).toEqual([BID, BID_2].sort());
+
+    const maker = (await rowFor(BID_2))!;
+    expect(maker).toMatchObject({
+      bidRole: "maker",
+      fromAsset: "LTC",
+      toAsset: "XMR",
+      fromAmount: "0.09990000",
+      toAmount: "0.010000000000",
+      status: "success",
+      bidLeg: "scripted",
+    });
+    // The maker locked chain A (LTC) and claimed the taker's chain-B lock (XMR).
+    expect(maker.sourceTxHash).toBe(txid("a1"));
+    expect(maker.destTxHash).toBe(txid("b2"));
+    expect(await rowFor(BID_3)).toBeUndefined();
+    expect((await rows()).filter((r) => r.bidId === BID)).toHaveLength(1);
+    expect(await rowFor(BID)).toMatchObject({ bidRole: "taker", fromAsset: "XMR", toAsset: "LTC" });
+  });
+
+  it("a row written in the taker's frame before this change is turned round, once", async () => {
+    // What the in-progress reading wrote for a received bid until 2026-10-06.
+    mem.set("swapHistory", [
+      {
+        id: p2pHistoryId(BID),
+        fromAsset: "XMR",
+        toAsset: "LTC",
+        fromAmount: "0.010000000000",
+        toAmount: "0.09990000",
+        status: "pending",
+        sourceTxHash: "",
+        sourceExplorerUrl: "",
+        provider: P2P_HISTORY_PROVIDER,
+        createdAt: new Date(CREATED * 1000).toISOString(),
+        bidId: BID,
+        bidState: "Scriptless coin locked",
+      } satisfies SwapHistoryEntry,
+    ]);
+    vi.mocked(api.fetchBidTxns).mockResolvedValue(receivedDetail());
+    const sink = createP2PHistorySink();
+    expect(await sink.refreshTxns(BID)).toBe("read");
+    const fixed = (await rowFor(BID))!;
+    expect(fixed).toMatchObject({
+      bidRole: "maker",
+      fromAsset: "LTC",
+      toAsset: "XMR",
+      fromAmount: "0.09990000",
+      toAmount: "0.010000000000",
+    });
+    const saves = saveCount;
+    expect(await sink.refreshTxns(BID)).toBe("read");
+    expect(saveCount).toBe(saves);
+    expect(await rowFor(BID)).toEqual(fixed);
+  });
+
+  it("the details tell the maker's side of acceptance and call the offer theirs", async () => {
+    await createP2PHistorySink().activeRead([receivedActiveRow({ bid_state: "Accepted" })]);
+    const row = (await rowFor(BID))!;
+    expect(p2pStageView(row).description).toContain("Your node accepted the other user's bid");
+    const html = renderToStaticMarkup(createElement(SwapDetailsModal, { entry: row, onClose: () => {} }));
+    expect(html).toContain("your offer");
+    expect(html).not.toContain("the other user&#x27;s offer");
+  });
+
+  it("history keeps the licence fee out of it: nothing here reads or writes one", () => {
+    // The interface fee is a TAKER's (`sidecar_fees` sweeps `sentbids`
+    // only). A maker row must not grow one.
+    expect(read("p2p-history.ts")).not.toMatch(/sidecarFees|licenceFee|sidecar_fees_/);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Where the bought coin was paid (2026-10-01)
+// ═══════════════════════════════════════════════════════════════════════
+
+describe("where the bought coin was paid (2026-10-01)", () => {
+  const render = (entry: SwapHistoryEntry) =>
+    renderToStaticMarkup(createElement(SwapDetailsModal, { entry, onClose: () => {} }));
+
+  it("a bid that carried the user's address records it as the swap's payout address", async () => {
+    const ltc = "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh";
+    await createP2PHistorySink().placed(handle({ payoutAddress: ltc, payoutTo: "address" }));
+    const row = (await rowFor(BID))!;
+    expect(row).toMatchObject({ payoutTo: "address", recipient: ltc, bidRole: "taker" });
+    expect(render(row)).toContain("payout address");
+  });
+
+  it("one that left it to the node says so, and names no address", async () => {
+    await createP2PHistorySink().placed(
+      handle({ payoutAddress: "LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez", payoutTo: "node-wallet" }),
+    );
+    const row = (await rowFor(BID))!;
+    expect(row.payoutTo).toBe("node-wallet");
+    expect(row.recipient).toBeUndefined();
+    const html = render(row);
+    expect(html).toContain('data-p2p-payout="node-wallet"');
+    expect(html).toContain("your swap node&#x27;s LTC wallet");
   });
 });
 
@@ -717,6 +1003,23 @@ describe("which transaction is which", () => {
     ];
     const next = applyP2PObservation(p2pRow({}), { bidId: BID, txns, mayCreate: true }, "x")!;
     expect(next.destTxHash).toBe(txid("c3"));
+  });
+
+  it("a pair with no XMR, ZEPH or ZANO takes its chains from the bid's leg", () => {
+    // The engine puts DOGE on chain B (`is_reverse_ads_bid`, deployed
+    // `basicswap.py:3992`), and on BTC↔LTC chain A is whichever coin the offer
+    // sells: no coin list can say which lock is whose. The leg can. Before
+    // 2026-10-01 these rows named every transaction "other".
+    const r = p2pRow({ fromAsset: "BTC", toAsset: "DOGE", bidLeg: "scripted", bidTxns: SHOW_TXNS_COMPLETED });
+    expect(roles(r)).toEqual({
+      [txid("a1")]: "you-locked BTC",
+      [txid("a2")]: "they-claimed BTC",
+      [txid("b1")]: "they-locked DOGE",
+      [txid("b2")]: "you-claimed DOGE",
+    });
+    const flipped = p2pRow({ fromAsset: "LTC", toAsset: "BTC", bidLeg: "scriptless", bidTxns: SHOW_TXNS_COMPLETED });
+    expect(roles(flipped)[txid("b1")]).toBe("you-locked LTC");
+    expect(roles(flipped)[txid("a2")]).toBe("you-claimed BTC");
   });
 
   it("a scripted-to-scripted swap reports its two locks with the chain's ticker", () => {

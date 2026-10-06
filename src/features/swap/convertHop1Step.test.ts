@@ -360,7 +360,10 @@ describe("wired: the tracker reports what became of each re-bid", () => {
     expect(retry).toContain("async (dead: SidecarTrackedSwap): Promise<AutoRebidOutcome> =>");
     expect(retry).toContain('return { status: "placed", bidId: result.bidId };');
     expect(retry.indexOf("adopt({")).toBeLessThan(retry.indexOf('return { status: "placed"'));
-    expect(retry.match(/return \{ status: "none"|return \{\s*status: "none"/g)?.length).toBe(4);
+    // Five refusals since 2026-10-06: the fifth is a replacement offer that
+    // would pay the bought coin somewhere other than the user confirmed
+    // (`payoutDestination.ts`).
+    expect(retry.match(/return \{ status: "none"|return \{\s*status: "none"/g)?.length).toBe(5);
   });
 
   it("exposes the outcomes", () => {

@@ -506,6 +506,11 @@ export interface BasicSwapBidDetail {
   /** True when the on-chain roles are mirrored (scriptless `coin_from`). */
   reverse_bid: boolean;
   events?: unknown[];
+  /**
+   * An adaptor-signature swap's transactions, under the engine's own names
+   * ("Chain A Lock", "Chain B Lock Spend", …). Present only on a read with
+   * `show_extra` ({@link fetchBidTxns}); a GET never carries it.
+   */
   txns?: Array<{ type: string; txid: string; confirms?: number | null }>;
 }
 
@@ -821,7 +826,8 @@ export function fetchActiveSwaps(): Promise<
 /**
  * One bid in full. **GET only** — the same URL with a POST body carrying
  * `accept` / `abandon` commits funds, which is why the Rust allow-list makes
- * `bids/<id>` GET-only. Do not add a POST variant here.
+ * `bids/<id>` GET-only. Do not add a POST variant here: the one POST read
+ * the wallet needs is {@link fetchBidTxns}, a Rust command of its own.
  */
 export function fetchBid(
   bidId: string,
@@ -829,6 +835,30 @@ export function fetchBid(
   return swapSidecarApiGet<BasicSwapBidDetail | BasicSwapApiError>(
     `bids/${bidId}`,
   );
+}
+
+/**
+ * One bid's record WITH its transactions (`txns`), for the swap history and
+ * details (operator request, 2026-10-01).
+ *
+ * The engine lists an adaptor-signature swap's transactions only for a POST
+ * to `bids/<id>` whose body carries `show_extra` (`js_server.py:845-846`),
+ * and a POST body there can also accept, abandon or recover the bid, or hand
+ * out a key share. So this is not the generic proxy: it is
+ * `swap_bid.rs::swap_sidecar_bid_txns`, which takes the bid id and nothing
+ * else, posts a body built in Rust (`{"show_extra": true}`), and cuts the
+ * reply down to the fields below. The reply's `txns` holds `{type, txid,
+ * confirms}` only; with the engine's `debug_ui` on, the same read would carry
+ * key shares, which Rust drops.
+ *
+ * An unknown bid answers `{error}`, as `fetchBid` does.
+ */
+export function fetchBidTxns(
+  bidId: string,
+): Promise<BasicSwapBidDetail | BasicSwapApiError> {
+  return invoke<BasicSwapBidDetail | BasicSwapApiError>("swap_sidecar_bid_txns", {
+    bidId,
+  });
 }
 
 /** `[timestamp, stateName]` rows — the bid's own state history. */

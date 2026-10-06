@@ -139,6 +139,25 @@ export interface SwapHistoryEntry {
    *  (`swapLegOf`). Four states mean opposite things to the two sides. */
   bidLeg?: "scriptless" | "scripted";
   /**
+   * P2P only: which side of the bid this node was (2026-10-01). "taker": it
+   * placed the bid on someone else's offer, so it sent the offer's `coin_to`
+   * and received its `coin_from`. "maker": someone bid on an offer this node
+   * posted, so it sent the offer's `coin_from` and received its `coin_to`.
+   * `fromAsset`/`toAsset` are always the user's side, whichever it is.
+   * Absent on rows written before this field existed.
+   */
+  bidRole?: "taker" | "maker";
+  /**
+   * P2P only: where the bid asked the engine to pay the bought coin, as this
+   * wallet placed it (2026-10-01). "address": `recipient`, the address the
+   * user confirmed. "node-wallet": the swap node's own wallet for that coin,
+   * because that coin's address form is one the engine would not pay as
+   * written (`swap-sidecar/payoutDestination.ts`). Absent when this wallet did
+   * not place the bid in this session (backfilled, picked up from the node,
+   * or a maker row).
+   */
+  payoutTo?: "address" | "node-wallet";
+  /**
    * P2P only: the swap's transactions as the swap node reported them, each
    * under the engine's own name ("Chain A Lock", "Chain B Lock Spend", …, or
    * "Initiate Tx"/"Participate Tx" with the chain's ticker on a

@@ -14,19 +14,28 @@
  * - who the swap is with, as far as the bid record says: the other user's
  *   offer. The record carries no other name for them (its `addr_from` is this
  *   node's own bid address, not theirs), and the tracker shows no
- *   counterparty identity either;
+ *   counterparty identity either. On a swap where the user was the MAKER
+ *   (2026-10-01) the offer is their own;
+ * - where the bought coin was paid, when the bid paid the swap node's own
+ *   wallet rather than the user's address (`payoutTo`, 2026-10-01; the
+ *   address case is the shared details' "payout address" row);
  * - for an unfinished swap, a way to open the live tracker.
  *
- * Rendered only. Nothing here asks the swap node anything: the tracker does,
- * and the details re-read the row whenever it writes.
+ * One read of the swap node, when the details open (2026-10-01): the swap's
+ * transactions, through `p2pSwapHistory.refreshTxns`, which writes them into
+ * the row. The engine lists an adaptor swap's transactions only for a read
+ * that asks, and a swap that ended while nothing was following it was never
+ * asked. Everything else the tracker reads, and the details re-read the row
+ * whenever anything writes.
  */
-import { useState, type CSSProperties } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { Btn } from "../../components/PrimitivesV2";
 import { TxHashField } from "./TxHashField";
 import type { SwapHistoryEntry } from "./swap-history-store";
 import {
   p2pLegTransactions,
   p2pStageView,
+  p2pSwapHistory,
   p2pTrackerHandle,
   type P2PLegTx,
   type P2PTxRole,
@@ -108,6 +117,25 @@ const TRACKER_NOTES: Readonly<Record<Exclude<SidecarTrackerOutcome, "opened">, s
   "not-tracked": "The tracker could not follow this swap.",
 };
 
+/** Where the read of this swap's transactions is (2026-10-01). */
+type TxnsRead = "none" | "reading" | "read" | "failed";
+
+/** What "both legs" says when no transaction is listed, by why. */
+function noTxnsNote(read: TxnsRead, finished: boolean): string {
+  switch (read) {
+    case "reading":
+      return "Reading this swap's transactions from your swap node…";
+    case "failed":
+      return "Your swap node did not answer, so this swap's transactions could not be read. Open this again with the node running.";
+    case "read":
+      return finished
+        ? "None: this swap ended before either side locked coins."
+        : "None yet: neither side has locked coins.";
+    default:
+      return "The swap node has not reported this swap's transactions to the wallet. Its own console lists them under this bid.";
+  }
+}
+
 export function P2PSwapDetails({
   row,
   onClose,
@@ -117,9 +145,29 @@ export function P2PSwapDetails({
   onClose: () => void;
 }) {
   const [trackerNote, setTrackerNote] = useState<string | null>(null);
+  const bidId = row.bidId ?? null;
+  const [txnsRead, setTxnsRead] = useState<TxnsRead>(bidId ? "reading" : "none");
   const view = p2pStageView(row);
   const txs = p2pLegTransactions(row);
   const unfinished = row.status === "pending";
+  const maker = row.bidRole === "maker";
+
+  // The swap's transactions, once per opening (2026-10-01). Written into the
+  // row by the sink; `SwapDetailsModal` re-reads the row on that write.
+  useEffect(() => {
+    if (!bidId) {
+      setTxnsRead("none");
+      return;
+    }
+    let live = true;
+    setTxnsRead("reading");
+    void p2pSwapHistory.refreshTxns(bidId).then((outcome) => {
+      if (live) setTxnsRead(outcome);
+    });
+    return () => {
+      live = false;
+    };
+  }, [bidId]);
 
   const openTracker = () => {
     setTrackerNote(null);
@@ -179,19 +227,33 @@ export function P2PSwapDetails({
           />
         ))
       ) : (
-        <div data-p2p-no-txns style={{ ...NOTE, marginTop: 4 }}>
-          The swap node has not reported this swap's transactions to the wallet. Its own
-          console lists them under this bid.
+        <div data-p2p-no-txns={txnsRead} style={{ ...NOTE, marginTop: 4 }}>
+          {noTxnsNote(txnsRead, !unfinished)}
         </div>
       )}
 
-      {row.offerId && (
-        <TxHashField
-          label="with · the other user's offer"
-          value={row.offerId}
-          hint="The bid record names the other user only by the offer this bid was placed on."
-        />
+      {row.payoutTo === "node-wallet" && (
+        <div data-p2p-payout="node-wallet" style={{ ...NOTE, marginTop: 10 }}>
+          <span style={SMALL_CAPS}>payout · </span>
+          your swap node's {row.toAsset} wallet: this wallet's {row.toAsset} address is in a
+          form the swap engine does not pay as written, as the confirm screen said.
+        </div>
       )}
+
+      {row.offerId &&
+        (maker ? (
+          <TxHashField
+            label="your offer"
+            value={row.offerId}
+            hint="You were the maker: the other user's bid took this offer, which your swap node posted."
+          />
+        ) : (
+          <TxHashField
+            label="with · the other user's offer"
+            value={row.offerId}
+            hint="The bid record names the other user only by the offer this bid was placed on."
+          />
+        ))}
       {row.bidId && (
         <TxHashField
           label="bid id"

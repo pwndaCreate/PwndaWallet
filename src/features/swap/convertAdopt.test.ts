@@ -277,6 +277,7 @@ function pipeline(stage: ConvertStage): ConvertPipelineState {
     stage,
     hop1: null,
     hop2InputAmount: null,
+    hop2PaidTo: null,
     hop1Unwound: false,
     beginHop1: noop,
     beginHop2: noop,
@@ -329,5 +330,52 @@ describe("the CONVERSIONS panel lists the log", () => {
     );
     expect(html).toContain("no conversions yet");
     expect(html).not.toMatch(/\d+ total/);
+  });
+});
+
+/**
+ * Where hop 1 paid its LTC (2026-10-01). Hop 1's bid now carries the payout
+ * address in the field the engine reads, so a completed hop 1 pays this
+ * wallet's own LTC address, the one hop 2 spends from. Unless that address is
+ * in a form the engine does not pay as written (a legacy `L…`), when the bid
+ * leaves the payout to the swap node and the LTC is in the node's wallet.
+ * "Hop 1 settled: … is in your wallet" was true in neither case before (the
+ * node paid its own wallet whatever the screen said), and is false in the
+ * second now, so the line says which.
+ */
+describe("hop 2's line says where hop 1 paid", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const render = (paidTo: ConvertPipelineState["hop2PaidTo"]) => {
+    vi.stubGlobal("window", { localStorage: memoryStorage() });
+    return renderToStaticMarkup(
+      createElement(EarnConvertBody, {
+        variant: "landscape",
+        pipeline: { ...pipeline("hop2-ready"), hop2InputAmount: "0.09990000", hop2PaidTo: paidTo },
+        sourceBalance: 0.5,
+        pricesByTicker: { XMR: 162.3, LTC: 117, BTC: 62_000 },
+        mining: { active: false },
+        conversions: [],
+      }),
+    ).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
+  };
+
+  it("the swap node's wallet, when the bid left the payout to it", () => {
+    const text = render("node-wallet");
+    expect(text).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your swap node`);
+    expect(text).toContain(`not at this wallet`);
+  });
+
+  it("this wallet, when the bid paid its address", () => {
+    expect(render("address")).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your wallet.`);
+    expect(render(null)).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your wallet.`);
+  });
+
+  it("the pipeline keeps where hop 1 paid with its amount", () => {
+    const hook = read("useConvertPipeline.ts");
+    const settled = hook.slice(hook.indexOf('case "settled":'), hook.indexOf('case "follow":'));
+    expect(settled).toContain("setHop2PaidTo(hop1?.payoutTo ?? null);");
   });
 });

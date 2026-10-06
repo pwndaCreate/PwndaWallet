@@ -47,25 +47,32 @@ beforeEach(() => {
   mem.clear();
 });
 
-/** The two reads `api/basicswap.ts` makes, answered by the sandbox. */
+/** The reads `api/basicswap.ts` makes, answered by the sandbox. Since
+ *  2026-10-01 the received half of the book and the transactions read too. */
 const deps = {
   fetchSentBids: async (query: BidQuery = {}) =>
     getMock<BasicSwapBidSummary[]>("swap_sidecar_api_post", {
       path: "sentbids",
       body: { with_extra_info: true, ...query },
     }),
+  fetchBids: async (query: BidQuery = {}) =>
+    getMock<BasicSwapBidSummary[]>("swap_sidecar_api_post", {
+      path: "bids",
+      body: { with_extra_info: true, ...query },
+    }),
   fetchBid: async (bidId: string) =>
     getMock<BasicSwapBidDetail>("swap_sidecar_api_get", { path: `bids/${bidId}` }),
+  fetchBidTxns: async (bidId: string) => getMock<BasicSwapBidDetail>("swap_sidecar_bid_txns", { bidId }),
 };
 
 describe("the sandbox's swap node feeds the swap lists", () => {
-  it("the in-flight bid and a finished one only the backfill knows both become rows", async () => {
+  it("the in-flight bid, a finished one and a maker's swap only the backfill knows become rows", async () => {
     const active = getMock<BasicSwapActiveSwap[]>("swap_sidecar_api_get", { path: "active" });
     expect(active).toHaveLength(1);
     await createP2PHistorySink(deps).activeRead(active);
 
     const rows = await loadSwapHistory();
-    expect(rows).toHaveLength(2);
+    expect(rows).toHaveLength(3);
     for (const r of rows) expect(r.provider).toBe(P2P_HISTORY_PROVIDER);
 
     // The live 2026-09-08 shape: this node sent XMR and swiped the LTC lock
@@ -81,8 +88,19 @@ describe("the sandbox's swap node feeds the swap lists", () => {
       bidLeg: "scriptless",
     });
 
+    // The swipe's transactions, from the transactions read (2026-10-01):
+    // this node sent XMR, so its lock is chain B, and the swipe paid it.
+    expect(swiped.bidTxns?.map((t) => t.type)).toEqual([
+      "Chain A Lock",
+      "Chain B Lock",
+      "Chain A Lock Refund Tx",
+      "Chain A Lock Refund Swipe Tx",
+    ]);
+    expect(swiped.sourceTxHash).toBe(swiped.bidTxns![1].txid);
+    expect(swiped.destTxHash).toBe(swiped.bidTxns![3].txid);
+
     // The finished swap from two days ago, from `/json/sentbids` alone.
-    const backfilled = rows.find((r) => r.bidId !== active[0].bid_id)!;
+    const backfilled = rows.find((r) => r.bidId !== active[0].bid_id && r.bidRole === "taker")!;
     expect(backfilled).toMatchObject({
       fromAsset: "XMR",
       toAsset: "LTC",
@@ -91,9 +109,34 @@ describe("the sandbox's swap node feeds the swap lists", () => {
       status: "success",
       bidState: 8,
     });
+    expect(backfilled.bidTxns).toHaveLength(4);
+
+    // The maker's swap from three days ago, from `/json/bids` alone: this node
+    // posted the offer, so it SENT the LTC and RECEIVED the XMR.
+    const maker = rows.find((r) => r.bidRole === "maker")!;
+    expect(maker).toMatchObject({
+      fromAsset: "LTC",
+      toAsset: "XMR",
+      fromAmount: "0.30000000",
+      toAmount: "0.030000000000",
+      status: "success",
+      bidLeg: "scripted",
+    });
+    expect(maker.bidTxns).toHaveLength(4);
+    expect(maker.sourceTxHash).toBe(maker.bidTxns!.find((t) => t.type === "Chain A Lock")!.txid);
   });
 
-  it("the finished swap is not an in-flight one to the shared-coin send guard", () => {
+  it("the transactions read refuses what Rust refuses", () => {
+    expect(() => getMock("swap_sidecar_bid_txns", { bidId: "new" })).toThrow("not a valid bid id");
+    // Rust's allow-list: no key share, no view key, no event log.
+    const active = getMock<BasicSwapActiveSwap[]>("swap_sidecar_api_get", { path: "active" });
+    const rec = getMock<Record<string, unknown>>("swap_sidecar_bid_txns", { bidId: active[0].bid_id });
+    for (const k of ["events", "addr_from", "xmr_b_half_privatekey", "debug_ui"]) {
+      expect(rec[k], k).toBeUndefined();
+    }
+  });
+
+  it("the finished swaps are not in-flight ones to the shared-coin send guard", () => {
     const all = getMock<BasicSwapBidSummary[]>("swap_sidecar_api_post", {
       path: "sentbids",
       body: { with_extra_info: true },
@@ -105,5 +148,15 @@ describe("the sandbox's swap node feeds the swap lists", () => {
     expect(all).toHaveLength(2);
     expect(inFlight).toHaveLength(1);
     expect(inFlight[0].bid_state).toBe("Failed, swiped");
+    // The received half: the maker's finished swap, and nothing in flight.
+    expect(
+      getMock<BasicSwapBidSummary[]>("swap_sidecar_api_post", { path: "bids", body: {} }),
+    ).toHaveLength(1);
+    expect(
+      getMock<BasicSwapBidSummary[]>("swap_sidecar_api_post", {
+        path: "bids",
+        body: { with_available_or_active: true },
+      }),
+    ).toHaveLength(0);
   });
 });

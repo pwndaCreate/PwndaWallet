@@ -92,6 +92,15 @@ export interface ConvertPipelineState {
   hop1: SidecarTrackedSwap | null;
   /** LTC amount hop 1 produced — the input to hop 2. */
   hop2InputAmount: string | null;
+  /**
+   * Where hop 1 paid that LTC (2026-10-01): `"address"`, this wallet's LTC
+   * address, the one on hop 1's confirm screen; `"node-wallet"`, the swap
+   * node's own LTC wallet, when that address was in a form the swap engine
+   * does not pay as written (`swap-sidecar/payoutDestination.ts`). `null`
+   * when this session did not place hop 1 (it was picked up after a
+   * restart) and so cannot say. Hop 2 spends from this wallet's address.
+   */
+  hop2PaidTo: "address" | "node-wallet" | null;
 
   /**
    * True when hop 1 ended in a way that is not "settled": refunded,
@@ -393,6 +402,7 @@ export function useConvertPipeline({
   );
   const [stage, setStage] = useState<ConvertStage>("idle");
   const [hop2InputAmount, setHop2InputAmount] = useState<string | null>(null);
+  const [hop2PaidTo, setHop2PaidTo] = useState<"address" | "node-wallet" | null>(null);
   const [hop1Unwound, setHop1Unwound] = useState(false);
 
   const setTargetCoin = useCallback((ticker: string) => {
@@ -435,6 +445,9 @@ export function useConvertPipeline({
         return;
       case "settled":
         setHop2InputAmount(step.viaAmount);
+        // Kept with the amount: the tracker drops a finished swap once the
+        // node stops listing it, and with it the handle that says this.
+        setHop2PaidTo(hop1?.payoutTo ?? null);
         setHop1Unwound(false);
         setStage("hop2-ready");
         updateConversion(hop1BidId, { viaAmount: step.viaAmount });
@@ -489,6 +502,7 @@ export function useConvertPipeline({
     setStage("idle");
     setHop1BidId(null);
     setHop2InputAmount(null);
+    setHop2PaidTo(null);
     setHop1Unwound(false);
     writeStored(HOP1_STORAGE_KEY, null);
   }, []);
@@ -526,6 +540,7 @@ export function useConvertPipeline({
       stage,
       hop1,
       hop2InputAmount,
+      hop2PaidTo,
       hop1Unwound,
       beginHop1,
       beginHop2,
@@ -540,6 +555,7 @@ export function useConvertPipeline({
       stage,
       hop1,
       hop2InputAmount,
+      hop2PaidTo,
       hop1Unwound,
       beginHop1,
       beginHop2,

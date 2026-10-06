@@ -128,7 +128,7 @@ export function EarnConvertBody({
     : (CONVERT_QUICK_TARGETS as readonly string[]);
   const hiddenCount = Math.max(0, allTargets.length - CONVERT_QUICK_TARGETS.length);
 
-  const { targetCoin, stage, hop1, hop2InputAmount, hop1Unwound } = pipeline;
+  const { targetCoin, stage, hop1, hop2InputAmount, hop2PaidTo, hop1Unwound } = pipeline;
 
   /** LTC as a destination means one hop, not two. */
   const singleHop = targetCoin.toUpperCase() === CONVERT_ROUTE_HOP;
@@ -331,9 +331,16 @@ export function EarnConvertBody({
             lineHeight: 1.5,
           }}
         >
-          Hop 1 settled: {hop2InputAmount} {CONVERT_ROUTE_HOP} is in your
-          wallet. The second hop is priced when you start it, and you confirm
-          that rate.
+          {/* Where hop 1 paid (2026-10-01): the address on its confirm
+              screen, unless that address was in a form the swap engine does
+              not pay as written (`payoutDestination.ts`), when it paid the
+              swap node's own wallet. The second hop spends from this wallet's
+              own address, so that case is said plainly. */}
+          {hop2PaidTo === "node-wallet"
+            ? `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your swap node's ${CONVERT_ROUTE_HOP} wallet, not at this wallet's ${CONVERT_ROUTE_HOP} address.`
+            : `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your wallet.`}{" "}
+          The second hop is priced when you start it, and you confirm that
+          rate.
         </div>
       )}
 

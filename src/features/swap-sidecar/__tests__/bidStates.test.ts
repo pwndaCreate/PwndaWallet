@@ -433,7 +433,12 @@ describe("the same state means opposite things to the two legs", () => {
       expect(c.stage).toBe("swiped");
       const copy = `${c.label} ${c.description}`.toLowerCase();
       expect(copy).not.toContain("the other user took");
-      expect(copy).toContain("in your wallet");
+      // Where: the NODE's wallet. It read "in your wallet" until 2026-10-06,
+      // when bids began to carry the user's own payout address; the swipe
+      // pays the node's pool address all the same (`_spendSwipePayout`,
+      // deployed `basicswap.py:9834`), so "your wallet" now points the user
+      // at an address the coin is not at.
+      expect(copy).toContain("in your node's wallet");
       expect(c.terminal).toBe(true);
       expect(c.severity).toBe("normal");
     });

@@ -25,6 +25,7 @@ import { invoke } from "../lib/tauri";
 import {
   coinOptInsFrom,
   executeSweep,
+  fetchBidTxns,
   nextDepositAddr,
   prepareSweep,
   swapSidecarCoinStatus,
@@ -220,5 +221,22 @@ describe("command names are spelled the way Rust registers them", () => {
       "swap_bridge_execute_sweep",
       "swap_bridge_next_deposit_addr",
     ]);
+  });
+});
+
+/**
+ * A bid's transactions (operator request, 2026-10-01). The engine lists them
+ * only for a POST to `bids/<id>` carrying `show_extra`, and a POST body
+ * there can also accept, abandon or recover the bid. So the renderer hands
+ * Rust the bid id and NOTHING else: the body is built in Rust
+ * (`swap_bid.rs::bid_txns_body`, pinned there). If a field is ever added
+ * here "for flexibility", this goes red.
+ */
+describe("a bid's transactions", () => {
+  it("fetchBidTxns sends exactly {bidId} to swap_sidecar_bid_txns", async () => {
+    const id = "00000000" + "b1".repeat(24);
+    await fetchBidTxns(id);
+    expect(mockInvoke).toHaveBeenCalledWith("swap_sidecar_bid_txns", { bidId: id });
+    expect(argKeys()).toEqual(["bidId"]);
   });
 });

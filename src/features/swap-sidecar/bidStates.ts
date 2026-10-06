@@ -430,11 +430,17 @@ export const BID_STAGES: Readonly<Record<BidStage, BidStageInfo>> = {
     terminal: false,
     surface: true,
   },
+  // Where the swipe pays: the swap node's own wallet, whatever payout address
+  // the bid carried. `_spendSwipePayout` sends it to `getReceiveAddressFromPool`
+  // (deployed `basicswap.py:9834`), not to `dest_af`. It said "It is in your
+  // wallet" until 2026-10-06, when bids began to carry the user's own payout
+  // address and a completed swap began to pay it there; on this ending the
+  // coin is not at that address, so the sentence says where it is.
   swiped: {
     stage: "swiped",
     label: "Settled by the timelock",
     description:
-      "The other user never finished, so the timelock paid you the coin you were buying instead. It is in your wallet.",
+      "The other user never finished, so the timelock paid you the coin you were buying instead. It is in your node's wallet.",
     severity: "normal",
     terminal: true,
     surface: true,

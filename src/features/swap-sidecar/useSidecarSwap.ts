@@ -149,6 +149,7 @@ import {
   tickerForCoin,
   SIDECAR_SCRIPTLESS_TICKERS,
 } from "./types";
+import { planPayout, type PayoutPlan } from "./payoutDestination";
 
 // =========================================================================
 // Routability
@@ -200,7 +201,10 @@ const XMR_KEY = normalizeCoinKey("XMR");
  * generically (no swap_type branch), `protocolFloorForPair` derives its
  * floor from each coin's own decimals, and `swap_bid.rs::build_bid_body`
  * sends the same generic `{offer_id, amount_from, rate, addr_to}` body
- * upstream's `bids/new` accepts for every swap type. The one place this
+ * upstream's `bids/new` accepts for every swap type. (Corrected 2026-10-06:
+ * the payout key the engine reads is `destination_address`; `addr_to` was
+ * never read, and the payout address now goes out under the right key, see
+ * `payoutDestination.ts`.) The one place this
  * genuinely degrades: `bidStates.ts` only names `XMR_SWAP_*` stage strings,
  * so a scripted↔scripted bid's OWN protocol states (not researched — a
  * different name space upstream) fall through to `bidStates.ts`'s existing
@@ -1160,7 +1164,8 @@ function nodeErrorSentence(e: unknown): string {
 export const SIDECAR_WRITE_DENIED_MARKER = "is not reachable through the wallet";
 
 export type SidecarBidResult =
-  | { ok: true; bidId: string }
+  /** `payout`: where the bid asked the engine to pay the bought coin. */
+  | { ok: true; bidId: string; payout: PayoutPlan }
   /**
    * The Rust side refused the endpoint outright. No longer the normal outcome
    * (the reviewed command landed 2026-08-22) but kept as a distinct kind: a
@@ -1174,11 +1179,24 @@ export type SidecarBidResult =
 export interface SubmitSidecarBidArgs {
   quote: SidecarQuote;
   /**
-   * Where the bought coin should land. Optional: upstream defaults to the
-   * node's own wallet address for the receive coin when omitted, which is the
-   * correct behaviour for a sidecar whose wallets the user controls.
+   * Where the bought coin should land: the payout address the user reviewed.
+   * Sent as the bid's `destination_address` only when {@link planPayout} says
+   * the engine pays that form as written (2026-10-01); otherwise, or when
+   * omitted, the engine pays the node's own wallet for the receive coin. The
+   * confirm screen renders the same plan, so it says which before the click.
    */
   addrTo?: string;
+}
+
+/** The payout plan for a quote and the address the user is shown. */
+export function payoutPlanForQuote(
+  quote: Pick<SidecarQuote, "offer">,
+  addrTo: string | null | undefined,
+): PayoutPlan {
+  return planPayout(
+    { receiveCoin: quote.offer.receiveCoin, swapType: quote.offer.raw?.swap_type },
+    addrTo,
+  );
 }
 
 /**
@@ -1194,6 +1212,10 @@ export async function submitSidecarBid(
   args: SubmitSidecarBidArgs,
 ): Promise<SidecarBidResult> {
   const { quote } = args;
+  // Where the coin will be paid: the reviewed address only in a form the
+  // engine pays as written (2026-10-01). The confirm screen showed this same
+  // plan, and Rust re-checks it against the engine's copy of the offer.
+  const payout = payoutPlanForQuote(quote, args.addrTo);
   try {
     // Same gate as the quote path. Unreachable in practice — a quote had to
     // succeed to get here — but this function is exported and a future caller
@@ -1211,7 +1233,7 @@ export async function submitSidecarBid(
       // Pinned to the offer's own rate. Upstream rejects a bid more than
       // `RATE_TOLERANCE_FRACTION` (0.01%) away, and the user reviewed THIS rate.
       rate: formatAmount(quote.offer.effectiveRate, quote.sendDecimals),
-      addrTo: args.addrTo,
+      addrTo: payout.to === "address" ? payout.address : undefined,
       validForSeconds: 3600,
     });
     const trimmed = (bidId ?? "").trim();
@@ -1223,7 +1245,7 @@ export async function submitSidecarBid(
           "The swap node accepted the bid but did not return a bid id, so this wallet cannot track it. Check the advanced console before retrying, so the same bid is not placed twice.",
       };
     }
-    return { ok: true, bidId: trimmed };
+    return { ok: true, bidId: trimmed, payout };
   } catch (e) {
     const message =
       typeof e === "string"
@@ -1260,6 +1282,15 @@ export interface SidecarSwapHandle {
    * list does not carry it), which is exactly when a retry must not fire.
    */
   payoutAddress?: string;
+  /**
+   * Where this bid asked the engine to pay the bought coin (2026-10-01):
+   * `"address"`, the `payoutAddress` above, or `"node-wallet"`, the swap
+   * node's own wallet, when that address's form is one the engine would not
+   * pay as written (`payoutDestination.ts`). A re-bid that would land the
+   * coin somewhere else than this is not placed. Absent when this session did
+   * not place the bid.
+   */
+  payoutTo?: PayoutPlan["to"];
   /**
    * The maker of the offer this bid was placed on (the offer's `addr_from`),
    * so a bid that expires unanswered cools down the MAKER. Carried from the
@@ -1920,6 +1951,18 @@ export function useSidecarSwap(opts: {
       console.warn(`[useSidecarSwap] auto-retry declined: ${decision.reason}`);
       return { status: "none", reason: decision.reason };
     }
+    // The user confirmed where the coin lands (2026-10-01): the address, or
+    // the swap node's wallet. A replacement offer that would pay it somewhere
+    // else (another swap protocol) is not taken on their behalf.
+    const plan = payoutPlanForQuote(quote, payout);
+    if (dead.payoutTo && plan.to !== dead.payoutTo) {
+      const reason =
+        plan.to === "address"
+          ? "the replacement offer would pay your address, and you confirmed the swap node's wallet"
+          : "the replacement offer would pay the swap node's wallet, not the address you confirmed";
+      console.warn(`[useSidecarSwap] auto-retry declined: ${reason}`);
+      return { status: "none", reason };
+    }
     const result = await submitSidecarBid({ quote, addrTo: payout });
     if (!result.ok) {
       console.warn(`[useSidecarSwap] auto-retry bid refused: ${result.message}`);
@@ -1938,6 +1981,7 @@ export function useSidecarSwap(opts: {
       receiveAmount: formatAmount(quote.receiveAmount, quote.receiveDecimals),
       createdAt: Math.floor(Date.now() / 1000),
       payoutAddress: payout,
+      payoutTo: result.payout.to,
       makerAddress: quote.offer.makerAddress ?? null,
       retryOf: origin,
       retryAttempt: attempt,

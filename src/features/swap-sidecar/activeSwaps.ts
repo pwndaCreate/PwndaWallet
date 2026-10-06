@@ -39,13 +39,23 @@ import type { SidecarTrackedSwap } from "./useSidecarSwap";
  * from `offer.coin_from` / `offer.coin_to`), so the mapping depends on the
  * role:
  *
- * * `was_sent` — this node bid on someone else's offer. It SENDS `coin_to` and
- *   RECEIVES `coin_from`, the same mapping the `sentbids` rehydrate used.
+ * * `was_sent: true` — this node bid on someone else's offer. It SENDS
+ *   `coin_to` and RECEIVES `coin_from`, the same mapping the `sentbids`
+ *   rehydrate used.
  * * otherwise — this node posted the offer, so the legs are the other way up.
  *
  * Verified against the live 2026-09-05 row: `coin_from: Litecoin`,
  * `coin_to: Monero`, `was_sent: true`, and the operator sent 0.00999997 XMR to
  * receive 0.09992627 LTC.
+ *
+ * Only an explicit `true` means sent (corrected 2026-10-06). On a bid this
+ * node RECEIVED the engine sets `was_received` alone and leaves `was_sent`
+ * unset, so `js_active` reports `"was_sent": null`, not `false` (deployed
+ * `basicswap.py:13033`, `processXmrBid`; `:12596` for the other protocol).
+ * The test was `was_sent !== false`, which read that `null` as "sent": a
+ * received swap in progress was tracked with its legs swapped, and written
+ * to swap history the same way. Found while adding the maker's rows to swap
+ * history, from the engine's constructors rather than from a live row.
  *
  * # Whose address `addr_from` is
  *
@@ -61,7 +71,7 @@ import type { SidecarTrackedSwap } from "./useSidecarSwap";
  * record's `addr_from`: on a sent bid that is this node's own address.
  */
 export function activeSwapToTracked(row: BasicSwapActiveSwap): SidecarTrackedSwap {
-  const sent = row.was_sent !== false;
+  const sent = row.was_sent === true;
   const maker = row.was_sent === true ? (row.addr_from ?? "").trim() : "";
   return {
     bidId: row.bid_id,

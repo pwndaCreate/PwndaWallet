@@ -4375,6 +4375,11 @@ function sidecarBids(): unknown[] {
           addr_to: o.addr_to,
           tx_state_a: "Confirmed",
           tx_state_b: "Confirmed",
+          // A bid this node sent, as `js_active` says it: only an explicit
+          // `true` reads as sent since 2026-10-06 (`activeSwapToTracked`; a
+          // received bid reports `null`), so a row without it would now be
+          // tracked as one this node received.
+          was_sent: true,
         },
   ];
 }
@@ -4512,7 +4517,14 @@ function sidecarBidDetail(bidId: string): unknown {
           { at: now - 6 * 60, desc: "XMR lock tx confirmed" },
         ],
     debug_ui: false,
-    reverse_bid: false,
+    // The engine's own flag: an offer whose `coin_from` is XMR is a REVERSED
+    // bid (`is_reverse_ads_bid`, deployed `basicswap.py:3992`), so the
+    // default in-flight bid (XMR offered for LTC) is one, and the timelock
+    // scenarios' LTC offer is not. It read `false` for both until 2026-10-06,
+    // which put this node's leg on the wrong chain; nothing showed it while
+    // the sandbox had no transactions to name (`p2pLegTransactions` now reads
+    // the leg).
+    reverse_bid: !timelock,
     message_nets: ["smsg"],
     bid_id: bidId,
   };
@@ -4611,6 +4623,175 @@ function p2pHistoryBidDetail(bidId: string): unknown | null {
     message_nets: ["smsg"],
     bid_id: bidId,
   };
+}
+
+// ---------------------------------------------------------------------------
+// A swap where this node was the MAKER (operator request, 2026-10-01)
+// ---------------------------------------------------------------------------
+//
+// "Swaps where you were the maker (someone took your offer) aren't listed."
+// `/json/bids` lists the bids this node RECEIVED (`listBids(sent=False)`); the
+// swap history's backfill now reads it too (`swap/p2p-history.ts`). This block
+// gives the sandbox ONE: three days ago someone bid 0.0300 XMR on an offer this
+// node posted selling 0.3000 LTC, and it completed. So the maker SENT LTC and
+// RECEIVED XMR: in Activity -> Swaps it reads LTC -> XMR, and its details say
+// "your offer". Invented ids and amounts. Its record carries the engine's own
+// flags for a received bid: `was_received: true`, `was_sent: null`
+// (`processXmrBid`, deployed `basicswap.py:13033`).
+//
+// Excluded from `with_available_or_active`, like the finished sent bid above,
+// so the shared-coin send guard's in-flight count is unchanged.
+
+const P2P_MAKER_BID_SEED = "bid-maker-completed";
+
+function p2pHistoryReceivedBids(body: any): unknown[] {
+  if (body?.with_available_or_active) return [];
+  const created = Math.floor(Date.now() / 1000) - 3 * 86_400 - 5 * 3_600;
+  return [
+    {
+      bid_id: sidecarId(P2P_MAKER_BID_SEED),
+      offer_id: sidecarId("offer-maker-own"),
+      created_at: created,
+      expire_at: created + 3_600,
+      // The OFFER's frame, this node's own offer: it sold LTC (`coin_from`)
+      // for XMR (`coin_to`).
+      coin_from: "Litecoin",
+      coin_to: "Monero",
+      amount_from: "0.30000000",
+      amount_to: "0.030000000000",
+      bid_rate: "0.100000000000",
+      bid_state: "Completed",
+      // The bidder's SMSG address: on a received bid `bid_addr` is theirs.
+      addr_from: "pwndaSandboxOtherBidderAddrXXXXXXXX",
+      addr_to: "pwndaSandboxNetworkAddrXXXXXXXXXXXXX",
+      tx_state_a: "Redeemed",
+      tx_state_b: "Redeemed",
+    },
+  ];
+}
+
+/** `describeBid(..., for_api=True)` for the received bid above; null for any
+ *  other id. */
+function p2pReceivedBidDetail(bidId: string): unknown | null {
+  if (bidId !== sidecarId(P2P_MAKER_BID_SEED)) return null;
+  const row = p2pHistoryReceivedBids(undefined)[0] as Record<string, any>;
+  return {
+    coin_from: row.coin_from,
+    coin_to: row.coin_to,
+    amt_from: row.amount_from,
+    amt_to: row.amount_to,
+    bid_rate: row.bid_rate,
+    ticker_from: "LTC",
+    ticker_to: "XMR",
+    bid_state: "Completed",
+    bid_state_ind: 8,
+    state_description: "Swap completed successfully",
+    itx_state: "None",
+    ptx_state: "None",
+    offer_id: row.offer_id,
+    addr_from: row.addr_from,
+    addr_from_label: "",
+    addr_fund_proof: null,
+    created_at: row.created_at,
+    created_at_timestamp: row.created_at,
+    state_time_timestamp: row.created_at + 52 * 60,
+    expired_at: row.expire_at,
+    was_sent: null,
+    was_received: true,
+    initiate_tx: "None",
+    initiate_conf: "None",
+    participate_tx: "None",
+    participate_conf: "None",
+    show_txns: false,
+    can_abandon: false,
+    coin_a_lock_refund_tx_est_final: null,
+    coin_a_lock_refund_swipe_tx_est_final: null,
+    coin_a_last_median_time: null,
+    events: [],
+    debug_ui: false,
+    // LTC is the offer's `coin_from`, and LTC is neither scriptless nor
+    // segwit-less: a normal bid, so this node (the offerer) locked chain A.
+    reverse_bid: false,
+    message_nets: ["smsg"],
+    bid_id: bidId,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// A bid's transactions: `swap_sidecar_bid_txns` (operator request, 2026-10-01)
+// ---------------------------------------------------------------------------
+//
+// Stands in for the RUST command (`swap_bid.rs::swap_sidecar_bid_txns`), not
+// for the engine: `describeBid` with `show_txns` on (deployed
+// `ui/util.py:412-486`), cut down to Rust's allow-list
+// (`BID_TXNS_REPLY_FIELDS`), each `txns` entry reduced to `{type, txid,
+// confirms}`. The same refusals: a node that is not running, an id that is
+// not 56 hex. Any other id gets the scenario's in-flight record, as the GET
+// mock does. Which transactions each sandbox bid has follows its state; txids
+// are invented.
+
+const BID_TXNS_FIELDS = [
+  "offer_id",
+  "coin_from",
+  "coin_to",
+  "ticker_from",
+  "ticker_to",
+  "amt_from",
+  "amt_to",
+  "bid_rate",
+  "bid_state",
+  "bid_state_ind",
+  "state_description",
+  "created_at_timestamp",
+  "state_time_timestamp",
+  "expired_at",
+  "was_sent",
+  "was_received",
+  "reverse_bid",
+  "initiate_tx",
+  "participate_tx",
+];
+
+/** A 64-hex txid, stable per seed. */
+function sandboxTxid(seed: string): string {
+  return (sidecarId(`${seed}|1`) + sidecarId(`${seed}|2`)).slice(0, 64);
+}
+
+function sandboxTxns(bidId: string): { type: string; txid: string; confirms?: number | null }[] {
+  const tx = (type: string, confirms?: number | null) => ({
+    type,
+    txid: sandboxTxid(`${bidId}|${type}`),
+    ...(confirms !== undefined ? { confirms } : {}),
+  });
+  const completed = [
+    tx("Chain A Lock", 40),
+    tx("Chain A Lock Spend"),
+    tx("Chain B Lock", 25),
+    tx("Chain B Lock Spend"),
+  ];
+  if (bidId === sidecarId(P2P_HISTORY_BID_SEED) || bidId === sidecarId(P2P_MAKER_BID_SEED)) {
+    return completed;
+  }
+  // The scenario's in-flight bid, by its state.
+  const s = scenario();
+  const locks = [tx("Chain A Lock", 30), tx("Chain B Lock", 12)];
+  if (s === "swap_refunding") return [...locks, tx("Chain A Lock Refund Tx")];
+  if (s === "swap_swiped") {
+    return [...locks, tx("Chain A Lock Refund Tx"), tx("Chain A Lock Refund Swipe Tx")];
+  }
+  return locks;
+}
+
+function sidecarBidTxns(bidId: string): unknown {
+  if (sidecar().phase !== "healthy") throw new Error("the swap node is not running");
+  if (!/^[0-9a-fA-F]{56}$/.test(bidId)) throw new Error("that is not a valid bid id");
+  const record = (p2pHistoryBidDetail(bidId) ??
+    p2pReceivedBidDetail(bidId) ??
+    sidecarBidDetail(bidId)) as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const k of BID_TXNS_FIELDS) if (k in record) out[k] = record[k];
+  out.txns = sandboxTxns(bidId);
+  return out;
 }
 
 /** `/json/coins` (js_coins, js_server.py:103-131). Ids are upstream's `Coins`
@@ -4846,12 +5027,20 @@ function sidecarApi(method: "GET" | "POST", rawPath: unknown, body: any): unknow
     case "sentbids": {
       if (tail.length === 0 && (method === "GET" || method === "POST"))
         // `sentbids` also lists FINISHED bids: see "P2P swap history
-        // backfill" above `sidecarCoins`.
+        // backfill" above `sidecarCoins`. `bids` is the RECEIVED half of the
+        // book (`listBids(sent=False)`), so it lists the maker swap, not the
+        // bids this node sent; until 2026-10-06 it returned the sent ones,
+        // which no reader looked at closely enough to notice ("A swap where
+        // this node was the MAKER", above).
         return name === "sentbids"
           ? [...sidecarBids(), ...p2pHistorySentBids(body)]
-          : sidecarBids();
+          : p2pHistoryReceivedBids(body);
       if (tail.length === 1 && method === "GET")
-        return p2pHistoryBidDetail(tail[0]) ?? sidecarBidDetail(tail[0]);
+        return (
+          p2pHistoryBidDetail(tail[0]) ??
+          p2pReceivedBidDetail(tail[0]) ??
+          sidecarBidDetail(tail[0])
+        );
       if (tail.length === 2 && tail[1] === "states" && method === "GET") {
         const now = Math.floor(Date.now() / 1000);
         return [
@@ -5575,6 +5764,9 @@ const MOCKS: Record<string, (args: any) => unknown> = {
       capped: [],
     };
   },
+  // One bid's record with its transactions (2026-10-01): see "A bid's
+  // transactions" above `sidecarCoins`.
+  swap_sidecar_bid_txns: (args: any) => sidecarBidTxns(String(args?.bidId ?? "")),
   swap_sidecar_recover_bid: (args: any) => {
     const bidId = String(args?.bidId ?? "");
     if (!/^[0-9a-fA-F]+$/.test(bidId)) {

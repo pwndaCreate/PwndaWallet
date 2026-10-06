@@ -43,6 +43,23 @@ describe("activeSwapToTracked", () => {
     expect(s.receiveAmount).toBe("0.009999971468");
   });
 
+  /**
+   * What the engine actually reports on a bid this node RECEIVED is `null`,
+   * not `false`: `processXmrBid` sets `was_received=True` and leaves
+   * `was_sent` unset (deployed `basicswap.py:13033`), and `js_active` passes
+   * `bid.was_sent` through. The test was `was_sent !== false`, which read that
+   * `null` as "sent" and swapped a maker's legs (found 2026-10-06, adding the
+   * maker's swaps to history).
+   */
+  it("reads the engine's null was_sent as a bid this node received", () => {
+    for (const wasSent of [null, undefined]) {
+      const s = activeSwapToTracked({ ...LIVE, was_sent: wasSent });
+      expect(s.sendCoin, String(wasSent)).toBe("Litecoin");
+      expect(s.receiveCoin, String(wasSent)).toBe("Monero");
+      expect(s.makerAddress, String(wasSent)).toBeUndefined();
+    }
+  });
+
   it("resolves the wire label into a real stage", () => {
     const s = activeSwapToTracked(LIVE);
     expect(s.stage.state).toBe("XMR_SWAP_NOSCRIPT_COIN_LOCKED");

@@ -24,6 +24,8 @@ const COPY_FILES = [
   "src/features/swap-sidecar/SidecarSwapTracker.tsx",
   "src/features/swap-sidecar/bidStates.ts",
   "src/features/swap-sidecar/swapEta.ts",
+  // The confirm screen's sentence on where the coin lands (2026-10-01).
+  "src/features/swap-sidecar/payoutDestination.ts",
 ];
 
 const DASHES = /[–—]/;

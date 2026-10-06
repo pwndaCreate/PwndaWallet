@@ -65,12 +65,14 @@ import {
   formatBandNote,
 } from "./spread";
 import {
+  payoutPlanForQuote,
   sidecarBookDepth,
   sidecarSwapSentence,
   submitSidecarBid,
   type SidecarQuote,
   type SidecarSwapHandle,
 } from "./useSidecarSwap";
+import { nodeWalletPayoutNote } from "./payoutDestination";
 import { formatAmount } from "./types";
 
 /** ASCII-only source, per project convention — a money surface should not
@@ -98,7 +100,10 @@ export function SidecarConfirmModal({
   /**
    * Where the bought coin should land. Address semantics match the desk and
    * are FLIPPED versus the aggregators: this is the DESTINATION-side wallet,
-   * and it is a payout target, never a signing address.
+   * and it is a payout target, never a signing address. The engine is told
+   * to pay it only in the one form per coin it pays as written
+   * (`payoutDestination.ts`, 2026-10-01); otherwise the screen says the coin
+   * lands in the swap node's own wallet, and that is what happens.
    */
   payoutAddress: string;
   /** Handed the accepted swap so the app-level tracker can adopt it. */
@@ -193,6 +198,10 @@ export function SidecarConfirmModal({
   }
 
   const depth = sidecarBookDepth(book);
+  // Where the bought coin lands (2026-10-01): the same plan `submitSidecarBid`
+  // sends, so this row cannot promise an address the bid does not carry.
+  const payoutPlan = payoutPlanForQuote(book, payoutAddress);
+  const payoutNote = nodeWalletPayoutNote(payoutPlan);
   // Per PAIR, from the two chains' confirmation depths — the flat "30 to 90
   // minutes" this replaced overstates LTC↔XMR by about three times.
   const etaWin = etaWindow(book.offer.sendCoin, book.offer.receiveCoin);
@@ -233,6 +242,9 @@ export function SidecarConfirmModal({
         // Carried so an automatic re-bid pays the address the user reviewed
         // on THIS screen rather than re-deriving one later.
         payoutAddress,
+        // And where the bid asked the engine to pay it: that address, or the
+        // swap node's wallet (the row above said which).
+        payoutTo: result.payout.to,
         // The offer's maker, so an unanswered bid cools down the maker and
         // not this node's own bid address (2026-10-01).
         makerAddress: book.offer.makerAddress ?? null,
@@ -254,12 +266,27 @@ export function SidecarConfirmModal({
       {/* Payout only. There is no refund address to collect: on an atomic swap
           the timelock returns funds to the swap node's OWN wallet, which is
           why the tracker's refund copy points there rather than at a wallet
-          address the user chose. */}
-      <Row
-        label={`Payout (${toAsset})`}
-        value={truncate(payoutAddress)}
-        fullValue={payoutAddress}
-      />
+          address the user chose.
+
+          Since 2026-10-06 the bid carries this address in the field the
+          engine reads, so the engine pays it. Only in a form it pays as
+          written, though: for any other form the row says the coin lands in
+          the swap node's wallet, because that is where it goes. */}
+      {payoutPlan.to === "address" ? (
+        <Row
+          label={`Payout (${toAsset})`}
+          value={truncate(payoutPlan.address)}
+          fullValue={payoutPlan.address}
+        />
+      ) : (
+        <div data-payout-node-wallet style={PAYOUT_NODE_WALLET}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+            <span style={PAYOUT_LABEL}>{`Payout (${toAsset})`}</span>
+            <span>your swap node's wallet</span>
+          </div>
+          {payoutNote && <div style={{ ...NOTE, marginTop: 4 }}>{payoutNote}</div>}
+        </div>
+      )}
 
       {/* ── what the swap is ─────────────────────────────────────────── */}
       <div style={PANEL}>
@@ -736,6 +763,23 @@ const NOTE: React.CSSProperties = {
   fontSize: 10,
   lineHeight: 1.5,
   color: "var(--text-muted)",
+};
+
+/** The payout row when the coin lands in the swap node's wallet: the same box
+ *  as `Row`, without a copy button (there is no address to copy). */
+const PAYOUT_NODE_WALLET: React.CSSProperties = {
+  padding: "8px 12px",
+  background: "var(--surface)",
+  border: "1px solid var(--border)",
+  marginTop: 6,
+  fontSize: 11,
+};
+
+const PAYOUT_LABEL: React.CSSProperties = {
+  color: "var(--text-dim)",
+  letterSpacing: 1,
+  textTransform: "uppercase",
+  fontSize: 9,
 };
 
 const LIST: React.CSSProperties = {
