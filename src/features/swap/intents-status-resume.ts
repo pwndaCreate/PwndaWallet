@@ -36,6 +36,7 @@ import {
 } from "./swap-history-store";
 import type { IntentsStatusResponse } from "../../lib/proxy-types";
 import { defaultSettleDeps, settleStaleIntentsRows, type SettleDeps } from "./intents-stale-rows";
+import { followSourceReplacementsOnce } from "./swap-source-replacement";
 
 /** Rows older than this are not resumed: 1Click has long since decided them,
  *  and a stale row is better left for the user than polled forever. */
@@ -154,8 +155,17 @@ export async function resumePendingIntentsSwaps(
 
 let started = false;
 
-/** Start `resumePendingIntentsSwaps` once per session (idempotent). */
+/**
+ * Start `resumePendingIntentsSwaps` once per session (idempotent).
+ *
+ * Also starts following deposit replacements (2026-10-01): a BTC deposit
+ * sped up with replace-by-fee gets a new txid, and every swap row that names
+ * the old one as its source takes the new one (`swap-source-replacement.ts`).
+ * Here because this is the one swap routine that runs as soon as a wallet
+ * is open, before any swap or Activity screen is.
+ */
 export function resumePendingIntentsSwapsOnce(): void {
+  followSourceReplacementsOnce();
   if (started) return;
   started = true;
   void resumePendingIntentsSwaps().catch(() => undefined);

@@ -25,6 +25,7 @@ import { getAdapterByChain } from "../../wallets";
 import type { ChainTx, ChainType } from "../../wallets";
 import { dedupeTxRows, normalizeTxHash, txAssetKey, txRowKey } from "../../wallets/tx-row-key";
 import { accountTxHistory } from "../../wallets/utxo-account-history";
+import { onTxReplacement, withoutReplacedRows } from "../../wallets/tx-replacements";
 import {
   isDue,
   pollIntervalMs,
@@ -301,6 +302,27 @@ function key(chain: ChainType, address: string) {
 }
 
 /**
+ * The per-address lists of `chain` that lose a row to a replacement this
+ * wallet made ("Speed up", operator request 2026-10-01): each without the
+ * unconfirmed rows of replaced transactions (`withoutReplacedRows`). Only the
+ * lists that changed are returned, so the caller can lay them over what it
+ * holds. Exported for tests.
+ */
+export function prunedOfReplacements(
+  lists: Readonly<Record<string, ChainTx[]>>,
+  chain: ChainType,
+): Record<string, ChainTx[]> {
+  const prefix = `${chain}:`;
+  const out: Record<string, ChainTx[]> = {};
+  for (const [k, list] of Object.entries(lists)) {
+    if (!k.startsWith(prefix)) continue;
+    const next = withoutReplacedRows(chain, list);
+    if (next !== list) out[k] = next;
+  }
+  return out;
+}
+
+/**
  * `m` without the keys outside `live` — the SAME object when nothing is
  * dropped, so a state setter given it does not re-render. Exported for tests.
  */
@@ -480,11 +502,17 @@ export function useTxHistory(
           const adapter = getAdapterByChain(chain);
           // Full page, or small page merged (`readPairHistory`, which since
           // 2026-10-01 does not follow an empty poll of an empty list with a
-          // second, full read).
-          const items = await readPairHistory(
-            async (n) => (await adapter.getTransactionHistory(address, { limit: n })).items,
-            prev,
-            { full: userInitiated || !st.fullDone, limit, pollLimit },
+          // second, full read). Less any transaction this wallet replaced
+          // while it is unconfirmed: an explorer that has not dropped it yet,
+          // or a merge that kept its held row, must not show it beside its
+          // replacement (2026-10-01, `tx-replacements.ts`).
+          const items = withoutReplacedRows(
+            chain,
+            await readPairHistory(
+              async (n) => (await adapter.getTransactionHistory(address, { limit: n })).items,
+              prev,
+              { full: userInitiated || !st.fullDone, limit, pollLimit },
+            ),
           );
           st.fullDone = true;
           st.failures = 0;
@@ -544,7 +572,7 @@ export function useTxHistory(
         for (const p of pairs) {
           const k = key(p.chain, p.address);
           const cached = await store.get<CacheEntry>(k);
-          if (cached?.items) next[k] = cached.items;
+          if (cached?.items) next[k] = withoutReplacedRows(p.chain, cached.items);
         }
         if (!cancelled && Object.keys(next).length > 0) {
           heldTx.current = { ...next, ...heldTx.current };
@@ -588,6 +616,31 @@ export function useTxHistory(
       window.clearInterval(id);
     };
   }, [sig, pollMs, backgroundPollMs, active, fetchOne]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // A transaction this wallet replaced ("Speed up", operator request
+  // 2026-10-01) leaves the history at once, and its chain is read again so
+  // the replacement appears. Without this, the original's mempool row stayed
+  // beside the replacement's — two pending sends for one payment — because a
+  // routine poll merges a small page into what is held and keeps the held
+  // rows the page does not list (`mergeHistoryPage`).
+  useEffect(
+    () =>
+      onTxReplacement((r) => {
+        const changed = {
+          ...prunedOfReplacements(heldTx.current, r.chain),
+          ...prunedOfReplacements(pendingTx.current, r.chain),
+        };
+        if (Object.keys(changed).length > 0) {
+          pendingTx.current = { ...pendingTx.current, ...changed };
+          flushNow();
+        }
+        const prefix = `${r.chain}:`;
+        for (const k of liveKeys.current) {
+          if (k.startsWith(prefix)) void fetchOne(r.chain, k.slice(prefix.length), true);
+        }
+      }),
+    [fetchOne, flushNow],
+  );
 
   // Deliver anything still held when the hook goes away.
   useEffect(() => () => flushNow(), [flushNow]);

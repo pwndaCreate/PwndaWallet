@@ -427,6 +427,159 @@ function strandedEsploraUtxos(
   return [];
 }
 
+// ---------------------------------------------------------------------------
+// BTC "Speed up" fixture (operator request, 2026-10-01) — `wallet_populated`
+// ---------------------------------------------------------------------------
+//
+// One UNCONFIRMED, replace-by-fee BTC send of the sandbox's public test seed,
+// so the "Speed up" panel (`components/SpeedUpPanel.tsx`) can be seen: in the
+// BTC row's transaction details (Activity, and the wallet's Recent rows, both
+// layouts) and in the swap details of a pending BTC → USDC-ETH NEAR Intents
+// swap whose deposit it is.
+//
+// The transaction is real and self-consistent — built and signed offline with
+// bitcoinjs-lib by `m/84'/0'/0'/0/0` of the test seed (sequence 0xfffffffd,
+// 2 sat/vB, 141 vB) — but it spends an INVENTED outpoint (`c1…c1:0`), so it
+// is nothing any node would accept. 0.01 BTC to an invented deposit address
+// (P2WPKH of sha256("pwnda sandbox near-intents btc deposit")[0..20]), change
+// 0.00999718 BTC to `m/84'/0'/0'/1/0` (BIP-84's own first change vector).
+// Regenerate with the same construction if any field changes; a hand-edited
+// hex no longer hashes to its txid and the panel (rightly) refuses it.
+//
+// What the panel then reads, all answered here: Esplora `/tx/:txid`, its
+// `/hex` and `/outspends`, the fee estimate (fast 14 sat/vB, below), and the
+// app's own-transaction record (`btc-own-txs.json`, plugin-store branch). A
+// confirmed press "broadcasts" to this mock's `POST /tx`, which accepts it; the
+// original then leaves the history (the mock keeps listing it, and the
+// wallet's replacement filter hides it), and the swap row takes the
+// replacement's hash. Nothing reaches a network.
+const RBF_FIXTURE = {
+  txid: "317a82a5ddce9b6c997ae6fd6491d0e6e010f2db84ebcf5b0b32d9918615d703",
+  hex:
+    "02000000000101c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1" +
+    "c10000000000fdffffff0240420f0000000000160014cd0d68a8a6b5169147ed6240601bb7ec" +
+    "9aced25f26410f00000000001600143e34985dca6fddc9fb369940e4c7d8e2873f529c024830" +
+    "45022100afd0f0d6597f0dd7f42439e140bd6d1400d1363b6ad60436715b9ae30407e6490220" +
+    "1ef248ff681f3659f4c328edcf25cfbddb9da664a86775222da3a39179c9d96601210330d54f" +
+    "d0dd420a6e5f8d3624f5f3482cae350f79d5f0753bf5beef9c2d91af3c00000000",
+  from: "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu",
+  fromScript: "0014c0cebcd6c3d3ca8c75dc5ec62ebe55330ef910e2",
+  change: "bc1q8c6fshw2dlwun7ekn9qwf37cu2rn755upcp6el",
+  changeScript: "00143e34985dca6fddc9fb369940e4c7d8e2873f529c",
+  deposit: "bc1qe5xk329xk5tfz3ldvfqxqxahajdva5jl4jzcmy",
+  depositScript: "0014cd0d68a8a6b5169147ed6240601bb7ec9aced25f",
+  inputTxid: "c1".repeat(32),
+  inputSat: 2_000_000,
+  sendSat: 1_000_000,
+  changeSat: 999_718,
+  feeSat: 282,
+  weight: 562,
+  size: 223,
+} as const;
+
+function rbfFixtureOn(): boolean {
+  return scenario() === "wallet_populated";
+}
+
+/** The fixture as Esplora's `/tx/:txid` (and `/address/:a/txs`) shows it. */
+function rbfEsploraTx(): unknown {
+  const f = RBF_FIXTURE;
+  return {
+    txid: f.txid,
+    version: 2,
+    locktime: 0,
+    vin: [
+      {
+        txid: f.inputTxid,
+        vout: 0,
+        prevout: {
+          scriptpubkey: f.fromScript,
+          scriptpubkey_type: "v0_p2wpkh",
+          scriptpubkey_address: f.from,
+          value: f.inputSat,
+        },
+        scriptsig: "",
+        is_coinbase: false,
+        sequence: 0xfffffffd,
+      },
+    ],
+    vout: [
+      { scriptpubkey: f.depositScript, scriptpubkey_type: "v0_p2wpkh", scriptpubkey_address: f.deposit, value: f.sendSat },
+      { scriptpubkey: f.changeScript, scriptpubkey_type: "v0_p2wpkh", scriptpubkey_address: f.change, value: f.changeSat },
+    ],
+    size: f.size,
+    weight: f.weight,
+    fee: f.feeSat,
+    status: { confirmed: false },
+  };
+}
+
+/** Esplora answers for the fixture; null for every other URL. */
+function rbfEsploraAnswer(url: string): { status: number; json?: unknown; text?: string } | null {
+  if (!rbfFixtureOn()) return null;
+  const f = RBF_FIXTURE;
+  const path = url.split("?")[0];
+  if (path.endsWith(`/tx/${f.txid}`)) return { status: 200, json: rbfEsploraTx() };
+  if (path.endsWith(`/tx/${f.txid}/hex`)) return { status: 200, text: f.hex };
+  if (path.endsWith(`/tx/${f.txid}/outspends`)) return { status: 200, json: [{ spent: false }, { spent: false }] };
+  if (path.endsWith(`/tx/${f.txid}/status`)) return { status: 200, json: { confirmed: false } };
+  // The change address: USED (a mempool transaction touches it), so the
+  // account scan lists it and its history is read — which is what nets the
+  // row to the 0.01 BTC that left, rather than the whole 0.02 input. No
+  // balance is reported for it, so `wallet_populated`'s documented totals
+  // stay what they were.
+  if (path.endsWith(`/address/${f.change}/txs`)) return { status: 200, json: [rbfEsploraTx()] };
+  if (path.endsWith(`/address/${f.change}/utxo`)) return { status: 200, json: [] };
+  if (path.endsWith(`/address/${f.change}`)) {
+    const none = { funded_txo_count: 0, funded_txo_sum: 0, spent_txo_count: 0, spent_txo_sum: 0, tx_count: 0 };
+    return {
+      status: 200,
+      json: { address: f.change, chain_stats: none, mempool_stats: { ...none, tx_count: 1 } },
+    };
+  }
+  return null;
+}
+
+/** haskoin's batch-probe row for the fixture's change address (used, no
+ *  balance counted — see `rbfEsploraAnswer`); null otherwise. */
+function rbfHaskoinRow(address: string): {
+  address: string;
+  confirmed: number;
+  unconfirmed: number;
+  utxo: number;
+  txs: number;
+  received: number;
+} | null {
+  if (!rbfFixtureOn() || address !== RBF_FIXTURE.change) return null;
+  return { address, confirmed: 0, unconfirmed: 0, utxo: 0, txs: 1, received: 0 };
+}
+
+/** The pending BTC → USDC-ETH swap whose deposit the fixture is (swap history, `wallet.dat`). */
+function rbfSwapHistory(): unknown[] {
+  const now = Date.now();
+  const f = RBF_FIXTURE;
+  return [
+    {
+      id: "sandbox-btc-rbf-swap",
+      fromAsset: "BTC",
+      toAsset: "USDC-ETH",
+      fromAmount: "0.01",
+      toAmount: "947.21",
+      status: "pending",
+      sourceTxHash: f.txid,
+      sourceExplorerUrl: `https://mempool.space/tx/${f.txid}`,
+      provider: "NEAR Intents",
+      createdAt: new Date(now - 40 * 60_000).toISOString(),
+      depositAddress: f.deposit,
+      // The 120-minute window a BTC deposit gets, 40 minutes in.
+      depositDeadline: new Date(now + 80 * 60_000).toISOString(),
+      minReceived: "937.74",
+      recipient: "0x9858EfFD232B4033E47d90003D41EC34EcaEda94",
+      refundTo: f.from,
+    },
+  ];
+}
+
 
 /** Per-swap call counter driving the desk_status state advance. */
 const deskStatusCalls = new Map<string, number>();
@@ -643,6 +796,15 @@ function pluginStore(cmd: string, args: any): unknown {
       // hardcoded scenario reads (this is how the seeded vault round-trips).
       const mem = memStore.get(path);
       if (mem && mem.has(key)) return [mem.get(key), true];
+      // The BTC "Speed up" fixture (2026-10-01, `RBF_FIXTURE`): the app's
+      // own-transaction record names it — without that the panel (rightly)
+      // offers nothing — and a pending NEAR Intents swap's deposit is it.
+      if (rbfFixtureOn() && path.endsWith("btc-own-txs.json") && key === "txids") {
+        return [[{ txid: RBF_FIXTURE.txid, at: Date.now() - 40 * 60_000 }], true];
+      }
+      if (rbfFixtureOn() && path.endsWith("wallet.dat") && key === "swapHistory") {
+        return [rbfSwapHistory(), true];
+      }
       // Swap-sidecar opt-in (2026-08-19, found by the P4 Playwright pass).
       // The sidecar scenarios were unreachable without this: the mock
       // answered `swap_sidecar_opt_in_status`, but the UI does NOT read
@@ -1968,6 +2130,10 @@ function dispatchUrl(
   if (url.includes("blockstream.info/api") || url.includes("mempool.space/api") || url.includes("litecoinspace.org/api")) {
     const isLtc = url.includes("litecoinspace");
     const bal = isLtc ? 320_000_000 : 5_000_000; // 3.2 LTC / 0.05 BTC
+    // The BTC "Speed up" fixture (2026-10-01): its transaction, and its change
+    // address. Answered first; null for everything else.
+    const rbf = isLtc ? null : rbfEsploraAnswer(url);
+    if (rbf) return rbf;
     if (url.includes("/fee-estimates")) return { status: 200, json: { "1": 14, "3": 10, "6": 8, "144": 2 } };
     if (url.includes("/v1/fees/recommended")) return { status: 200, json: { fastestFee: 14, halfHourFee: 10, hourFee: 8, economyFee: 3, minimumFee: 1 } };
     const utxoM = /\/address\/([^/]+)\/utxo/.exec(url);
@@ -1985,7 +2151,16 @@ function dispatchUrl(
       return { status: 200, json: utxoFunded ? [{ txid: "ab".repeat(32), vout: 0, value: bal, status: { confirmed: true, block_height: 850_000 } }] : [] };
     }
     const txsM = /\/address\/([^/]+)\/txs/.exec(url);
-    if (txsM) return { status: 200, json: funded && isFundedAccountAddress(txsM[1]) ? esploraTxs(txsM[1]) : [] };
+    if (txsM) {
+      const list = funded && isFundedAccountAddress(txsM[1]) ? esploraTxs(txsM[1]) : [];
+      // The "Speed up" fixture's pending send (2026-10-01), on the first page
+      // only: that is where Esplora lists the mempool.
+      const pending =
+        !isLtc && rbfFixtureOn() && txsM[1] === RBF_FIXTURE.from && !/\/txs\/chain\//.test(url)
+          ? [rbfEsploraTx()]
+          : [];
+      return { status: 200, json: [...pending, ...list] };
+    }
     const addrM = /\/address\/([^/?]+)/.exec(url);
     if (addrM) {
       // `utxo_change_stranded` reproduces the 2026-08-22 mainnet incident on
@@ -2145,6 +2320,10 @@ function dispatchUrl(
             ? { address: addr, confirmed: 0, unconfirmed: 0, utxo: 0, txs: 2, received: hit.fixture.receiveFundedSat }
             : { address: addr, confirmed: hit.fixture.changeSat, unconfirmed: 0, utxo: 1, txs: 1, received: hit.fixture.changeSat };
         }
+        // The "Speed up" fixture's change address (2026-10-01): used, so the
+        // account scan lists it.
+        const rbfRow = chain === "bitcoin" ? rbfHaskoinRow(addr) : null;
+        if (rbfRow) return rbfRow;
         return funded && isFundedAccountAddress(addr)
           ? { address: addr, confirmed: defaultSat, unconfirmed: 0, utxo: 1, txs: 2, received: defaultSat }
           : { address: addr, confirmed: 0, unconfirmed: 0, utxo: 0, txs: 0, received: 0 };

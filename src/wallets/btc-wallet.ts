@@ -42,6 +42,8 @@ import {
   type BroadcastEndpoint,
 } from "./utxo-send";
 import { esploraTxToChainTx, type EsploraTx } from "./esplora-history";
+import { BTC_RBF_SEQUENCE } from "./btc-rbf-policy";
+import { rememberOwnBtcTx } from "./btc-own-txs";
 import { errorText } from "../lib/errorText";
 import {
   parseEsploraStats,
@@ -54,7 +56,8 @@ import {
 bitcoin.initEccLib(tinysecp);
 const ECPair = ECPairFactory(tinysecp);
 
-const BTC_API_URLS = [
+/** The Esplora hosts every BTC read and broadcast goes to, in order. */
+export const BTC_API_URLS = [
   "https://blockstream.info/api",
   "https://mempool.space/api",
 ];
@@ -67,7 +70,7 @@ const BTC_API_URLS = [
  * send-safety audit). Reads only: broadcasting goes through
  * `broadcastBtc`, which must never treat a lost reply as a failure.
  */
-async function btcFetch(path: string, init?: RequestInit): Promise<Response> {
+export async function btcFetch(path: string, init?: RequestInit): Promise<Response> {
   const failures: string[] = [];
   for (const base of BTC_API_URLS) {
     const host = new URL(base).host;
@@ -115,11 +118,21 @@ const BTC_LOOKUPS = BTC_API_URLS.map((base) =>
   fetchTxLookup(new URL(base).host, (txid) => `${base}/tx/${txid}`, (j) => j?.txid),
 );
 
-/** Broadcast a signed BTC transaction: once, with an honest outcome. */
-function broadcastBtc(tx: bitcoin.Transaction): Promise<TxResult> {
+/**
+ * Broadcast a signed BTC transaction: once, with an honest outcome.
+ *
+ * Every BTC transaction this app signs passes here — a send, a swap deposit,
+ * the legacy sweep, a speed-up's replacement — so this is where it is
+ * recorded as the app's own (`btc-own-txs.ts`), before the first push: only a
+ * transaction on that record is offered "Speed up" (operator request,
+ * 2026-10-01).
+ */
+export function broadcastBtc(tx: bitcoin.Transaction): Promise<TxResult> {
+  const txid = tx.getId();
+  rememberOwnBtcTx(txid);
   return broadcastSignedTx({
     ticker: "BTC",
-    txid: tx.getId(),
+    txid,
     rawHex: tx.toHex(),
     endpoints: BTC_BROADCAST,
     lookups: BTC_LOOKUPS,
@@ -274,10 +287,10 @@ async function fetchBtcPrevTx(txid: string): Promise<bitcoin.Transaction> {
 }
 
 /** One coin to spend: an outpoint, its value, and the address that holds it. */
-type BtcCoin = { txid: string; vout: number; valueSat: number; address: string };
+export type BtcCoin = { txid: string; vout: number; valueSat: number; address: string };
 
 /** The previous transaction of every P2PKH coin in `coins`, one fetch per txid. */
-async function prevTxsForLegacy(
+export async function prevTxsForLegacy(
   coins: ReadonlyArray<BtcCoin>,
 ): Promise<Map<string, bitcoin.Transaction>> {
   const out = new Map<string, bitcoin.Transaction>();
@@ -305,8 +318,16 @@ async function prevTxsForLegacy(
  * The type is read from the address being spent, not assumed from the
  * account, so one transaction can mix types, and the key is checked against
  * the script before anything is signed.
+ *
+ * Every input carries nSequence {@link BTC_RBF_SEQUENCE} (0xfffffffd, BIP125
+ * opt-in replace-by-fee) since 2026-10-01 (operator request). bitcoinjs-lib's
+ * default was 0xffffffff, so no BTC transaction this wallet built could ever
+ * be replaced: a deposit that sat unconfirmed past its swap's deadline could
+ * only wait for NEAR to refund it. Nothing here sets an nLockTime (it stays
+ * 0) and the version stays 2, and 0xfffffffd has BIP68's disable bit set, so
+ * the transaction is final and has no relative lock exactly as before.
  */
-function addBtcInput(
+export function addBtcInput(
   psbt: bitcoin.Psbt,
   coin: BtcCoin,
   pubkey: Uint8Array,
@@ -326,6 +347,7 @@ function addBtcInput(
     psbt.addInput({
       hash: coin.txid,
       index: coin.vout,
+      sequence: BTC_RBF_SEQUENCE,
       witnessUtxo: { script: own, value: BigInt(coin.valueSat) },
     });
     return;
@@ -337,6 +359,7 @@ function addBtcInput(
     psbt.addInput({
       hash: coin.txid,
       index: coin.vout,
+      sequence: BTC_RBF_SEQUENCE,
       witnessUtxo: { script: own, value: BigInt(coin.valueSat) },
       redeemScript: redeem.output!,
     });
@@ -354,7 +377,12 @@ function addBtcInput(
         `the explorer listed ${coin.valueSat} sat, the transaction that created it says ${out.value}`,
       );
     }
-    psbt.addInput({ hash: coin.txid, index: coin.vout, nonWitnessUtxo: prev.toBuffer() });
+    psbt.addInput({
+      hash: coin.txid,
+      index: coin.vout,
+      sequence: BTC_RBF_SEQUENCE,
+      nonWitnessUtxo: prev.toBuffer(),
+    });
     return;
   }
   throw refuse(`${kind ?? "a non-standard"} output is not a type this wallet signs`);
@@ -906,6 +934,11 @@ export async function sweepLegacyBtcToAddress(
     psbt.addInput({
       hash: utxo.txid,
       index: utxo.vout,
+      // Replaceable like every BTC transaction the wallet builds (2026-10-01;
+      // see `addBtcInput`). A sweep has one output and no change, so this
+      // wallet's "Speed up" refuses it and says why; signalling still lets a
+      // wallet that adds inputs (the same seed in Sparrow, say) bump it.
+      sequence: BTC_RBF_SEQUENCE,
       witnessUtxo: {
         script: bitcoin.payments.p2wpkh({
           pubkey: keyPair.publicKey,

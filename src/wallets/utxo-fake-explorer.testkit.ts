@@ -14,6 +14,11 @@
  * parseable funding transactions, so legacy inputs can carry `nonWitnessUtxo`,
  * and a verifier that checks every signature against a sighash computed by
  * bitcoinjs-lib itself — not by the adapter under test.
+ *
+ * Since 2026-10-01 (BTC speed-up) a transaction the network accepts is kept
+ * whole: Esplora's `/tx/:txid` answers with its prevouts, nSequence, fee and
+ * status (funding transactions mined, pushed ones in the mempool), and
+ * `/tx/:txid/outspends` says which pushed transaction spends each output.
  */
 import * as bitcoin from "bitcoinjs-lib";
 import * as tinysecp from "tiny-secp256k1";
@@ -67,6 +72,12 @@ export class FakeExplorer {
   prevOut = new Map<string, { script: Uint8Array; value: number }>();
   /** txids the network knows about — what a lookup can find. */
   mempool = new Set<string>();
+  /**
+   * txids that are mined (Esplora's `status.confirmed`). Funding transactions
+   * are; a pushed transaction is not until a test says so. Added 2026-10-01
+   * for the BTC speed-up, which must not offer to replace a mined one.
+   */
+  confirmed = new Set<string>();
   pushes: PushRecord[] = [];
   requests: string[] = [];
   unknown: string[] = [];
@@ -98,6 +109,7 @@ export class FakeExplorer {
     const txid = tx.getId();
     this.raw.set(txid, tx.toHex());
     this.mempool.add(txid);
+    this.confirmed.add(txid);
     const u: FakeUtxo = { txid, vout: 0, value, script };
     const k = addrKey(address);
     this.used.add(k);
@@ -108,6 +120,90 @@ export class FakeExplorer {
 
   markUsed(address: string) {
     this.used.add(addrKey(address));
+  }
+
+  /**
+   * The network takes a transaction into its mempool: it can be looked up,
+   * read whole (`/tx/:txid` with its prevouts, `/tx/:txid/hex`), and its
+   * outputs can be spent by another. Unconfirmed. Returns its txid.
+   */
+  relay(hexTx: string): string {
+    const tx = bitcoin.Transaction.fromHex(hexTx);
+    const txid = tx.getId();
+    this.mempool.add(txid);
+    this.raw.set(txid, hexTx);
+    tx.outs.forEach((o, vout) => this.prevOut.set(`${txid}:${vout}`, { script: o.script, value: Number(o.value) }));
+    return txid;
+  }
+
+  /**
+   * One transaction as Esplora's `GET /tx/:txid` gives it: inputs with their
+   * prevouts and nSequence, outputs, size, weight, fee, status. Addresses are
+   * encoded for the host's chain (BTC, or LTC on litecoinspace).
+   */
+  private esploraTx(txid: string, host: string) {
+    const network: bitcoin.Network =
+      host === "litecoinspace.org"
+        ? { ...bitcoin.networks.bitcoin, bech32: "ltc", pubKeyHash: 0x30, scriptHash: 0x32, wif: 0xb0 }
+        : bitcoin.networks.bitcoin;
+    const addressOf = (script: Uint8Array) => {
+      try {
+        return bitcoin.address.fromOutputScript(script, network);
+      } catch {
+        return undefined;
+      }
+    };
+    const tx = bitcoin.Transaction.fromHex(this.raw.get(txid)!);
+    let inSum = 0;
+    let complete = true;
+    const vin = tx.ins.map((inp) => {
+      const prevTxid = txidOfInput(inp);
+      const prev = this.prevOut.get(`${prevTxid}:${inp.index}`);
+      if (prev) inSum += prev.value;
+      else complete = false;
+      return {
+        txid: prevTxid,
+        vout: inp.index,
+        sequence: inp.sequence,
+        is_coinbase: false,
+        prevout: prev
+          ? { scriptpubkey: hex(prev.script), scriptpubkey_address: addressOf(prev.script), value: prev.value }
+          : null,
+      };
+    });
+    const vout = tx.outs.map((o) => ({
+      scriptpubkey: hex(o.script),
+      scriptpubkey_address: addressOf(o.script),
+      value: Number(o.value),
+    }));
+    const outSum = vout.reduce((s, o) => s + o.value, 0);
+    return {
+      txid,
+      version: tx.version,
+      locktime: tx.locktime,
+      vin,
+      vout,
+      size: tx.byteLength(),
+      weight: tx.weight(),
+      ...(complete ? { fee: inSum - outSum } : {}),
+      status: this.confirmed.has(txid) ? { confirmed: true, block_height: 900_000 } : { confirmed: false },
+    };
+  }
+
+  /** Esplora's `GET /tx/:txid/outspends`: which transaction, if any, spends each output. */
+  private outspends(txid: string) {
+    const tx = bitcoin.Transaction.fromHex(this.raw.get(txid)!);
+    return tx.outs.map((_o, vout) => {
+      for (const [otherId, otherHex] of this.raw) {
+        if (otherId === txid) continue;
+        const other = bitcoin.Transaction.fromHex(otherHex);
+        const at = other.ins.findIndex((i) => txidOfInput(i) === txid && i.index === vout);
+        if (at >= 0) {
+          return { spent: true, txid: otherId, vin: at, status: { confirmed: this.confirmed.has(otherId) } };
+        }
+      }
+      return { spent: false };
+    });
   }
 
   private list(a: string) {
@@ -139,11 +235,11 @@ export class FakeExplorer {
     }
     const outcome = this.onPush(via, hexTx, txid);
     if (outcome === "accept") {
-      this.mempool.add(txid);
+      this.relay(hexTx);
       return ok(txid);
     }
     if (outcome === "relay-then-drop") {
-      this.mempool.add(txid);
+      this.relay(hexTx);
       return "drop";
     }
     if (outcome === "drop") return "drop";
@@ -186,8 +282,13 @@ export class FakeExplorer {
       }
       m = /^\/tx\/([0-9a-f]{64})\/hex$/.exec(base);
       if (m) return this.raw.has(m[1]) ? { status: 200, body: this.raw.get(m[1])! } : notFound;
+      m = /^\/tx\/([0-9a-f]{64})\/outspends$/.exec(base);
+      if (m) return this.raw.has(m[1]) ? J(this.outspends(m[1])) : notFound;
       m = /^\/tx\/([0-9a-f]{64})$/.exec(base);
-      if (m) return this.mempool.has(m[1]) ? J({ txid: m[1], status: { confirmed: false } }) : notFound;
+      if (m) {
+        if (this.raw.has(m[1])) return J(this.esploraTx(m[1], host));
+        return this.mempool.has(m[1]) ? J({ txid: m[1], status: { confirmed: false } }) : notFound;
+      }
     }
 
     // ── BlockCypher (LTC / DOGE / DASH) ──────────────────────────────────────

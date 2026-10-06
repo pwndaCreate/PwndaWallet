@@ -34,8 +34,12 @@ import { Backdrop, Stat } from "./modal-parts";
 import { Btn } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
 import { TxHashField } from "./TxHashField";
+import { SpeedUpPanel } from "../../components/SpeedUpPanel";
 import { useTxParties, type TxPartiesState } from "../../lib/txParties";
 import { useUtxoAccountSummaries } from "../../lib/utxoAccountRegistry";
+import { secretOf } from "../../lib/btcSpeedUp";
+import { useAppStateOptional } from "../../state/AppStateContext";
+import { latestReplacementOf } from "../../wallets/tx-replacements";
 import type { ChainType } from "../../wallets";
 import {
   loadSwapHistory,
@@ -229,6 +233,17 @@ export function SwapDetailsModal({
       : current?.destTxHash ?? echo?.destinationTxHashes[0] ?? null;
   const payoutParties = useTxParties(toChain, payoutHash, recipient ?? undefined, !!payoutHash);
   const utxoSummaries = useUtxoAccountSummaries();
+  // What signs a speed-up of a stuck BTC deposit (2026-10-01).
+  const btcWallet = useAppStateOptional()?.walletsByChain.bitcoin ?? null;
+  // The deposit hash the row had when it was opened. After a speed-up the
+  // row takes the replacement's hash at once (`swap-source-replacement.ts`);
+  // the panel stays on the transaction it replaced, so "Replacement sent"
+  // stays on screen instead of a fresh panel for the replacement.
+  const [pinnedDeposit, setPinnedDeposit] = useState<{ id: string; txid: string } | null>(null);
+  useEffect(() => {
+    setPinnedDeposit(entry?.sourceTxHash ? { id: entry.id, txid: entry.sourceTxHash } : null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [entry?.id]);
 
   // A pending row with no deposit address is settled by its source
   // transaction, read above (`intents-stale-rows.ts`, 2026-10-01): not on
@@ -278,6 +293,24 @@ export function SwapDetailsModal({
   // Worth saying only while the swap can still be decided by it.
   const deadlinePassed =
     !finished && !!shown.depositDeadline && Date.parse(shown.depositDeadline) < Date.now();
+  // A NEAR Intents swap whose BTC deposit may still be in the mempool gets
+  // the shared "Speed up" panel (operator request, 2026-10-01): the panel
+  // reads the deposit from the chain and says nothing unless it can be
+  // replaced. The replacement keeps the deposit's address and amount, so the
+  // swap is unaffected; the row takes the new hash (`swap-source-replacement.ts`).
+  const speedUpDeposit =
+    route === "intents" &&
+    fromChain === "bitcoin" &&
+    !!shown.sourceTxHash &&
+    !finished &&
+    view.key !== "not-sent" &&
+    secretOf(btcWallet) !== null;
+  const speedUpTxid =
+    pinnedDeposit &&
+    pinnedDeposit.id === shown.id &&
+    latestReplacementOf("bitcoin", pinnedDeposit.txid) === shown.sourceTxHash.trim().toLowerCase()
+      ? pinnedDeposit.txid
+      : shown.sourceTxHash;
 
   // The source hash is the wallet's own record. When the wallet has none (an
   // unknown outcome with no hash), 1Click's registered deposit is shown for
@@ -522,6 +555,11 @@ export function SwapDetailsModal({
               isOwn={ownOn(fromChain, refundTo)}
               depositAddress={shown.depositAddress ?? null}
             />
+            {speedUpDeposit && (
+              <div style={{ marginTop: 6 }}>
+                <SpeedUpPanel key={speedUpTxid} txid={speedUpTxid} wallet={btcWallet} />
+              </div>
+            )}
           </>
         ) : reportedDeposit ? (
           <TxHashField

@@ -130,3 +130,13 @@ export function useAppState(): AppState {
   }
   return ctx;
 }
+
+/**
+ * The app state, or null outside `<AppStateProvider>`. For a shared view that
+ * is also rendered on its own — the transaction details, which tests render
+ * bare — and needs the state only for an optional part of it (2026-10-01:
+ * the wallet entry that signs a BTC speed-up).
+ */
+export function useAppStateOptional(): AppState | null {
+  return useContext(AppStateContext);
+}

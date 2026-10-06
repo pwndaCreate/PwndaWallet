@@ -46,6 +46,8 @@ import { httpProxyCall, proxyGetJson, proxyPostJson } from "../../wallets/_proxy
 // module was already a static import, so there was none.
 import { decodeCashAddr, encodeCashAddr } from "../../wallets/bch-wallet";
 import { atomicToDecimal, decimalToAtomic } from "../../wallets/decimal-amount";
+import { BTC_RBF_SEQUENCE } from "../../wallets/btc-rbf-policy";
+import { rememberOwnBtcTx } from "../../wallets/btc-own-txs";
 import { SendOutcomeUnknownError } from "../../wallets/send-outcome";
 import type { ChainAdapter, ChainType } from "../../wallets/types";
 import {
@@ -1010,6 +1012,12 @@ export async function executeUtxoTransfer(args: {
     psbt.addInput({
       hash: u.txid,
       index: u.vout,
+      // A BTC deposit signals replace-by-fee like every BTC transaction the
+      // wallet builds (operator request, 2026-10-01; `addBtcInput`), so a
+      // deposit stuck past the quote's deadline can be sped up. The Rust
+      // signer signs the sequence it is given. LTC keeps 0xffffffff: Litecoin
+      // nodes refuse replacements by default (`btc-rbf-policy.ts`).
+      ...(args.chain === "btc" ? { sequence: BTC_RBF_SEQUENCE } : {}),
       witnessUtxo: {
         script: Buffer.from(scriptHex, "hex"),
         value: u.value,
@@ -1054,6 +1062,9 @@ export async function executeUtxoTransfer(args: {
   //    bytes, so an ambiguous failure is resolved by looking it up (F2).
   const broadcastChain = args.chain === "ltc" ? "LTC" : "BTC";
   const txid = utxoTxId(bitcoinjs, signed.rawTx);
+  // The app's own BTC transaction, recorded before its first push: the only
+  // kind "Speed up" offers to replace (`btc-own-txs.ts`).
+  if (args.chain === "btc" && txid) rememberOwnBtcTx(txid);
   try {
     const txHash = await broadcastTx(broadcastChain, args.rpcUrl, signed.rawTx);
     return { txHash };

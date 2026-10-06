@@ -34,7 +34,10 @@ import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
 import { ModalBackdrop } from "../../components/ModalBackdrop";
+import { SpeedUpPanel } from "../../components/SpeedUpPanel";
 import { useTxParties, type TxPartiesState } from "../../lib/txParties";
+import { secretOf, speedUpCandidate } from "../../lib/btcSpeedUp";
+import { useAppStateOptional } from "../../state/AppStateContext";
 
 /** Confirmations at which a counted row reads "confirmed" (display only). */
 export const CONFIRMED_AT = 6;
@@ -565,10 +568,13 @@ export interface TxDetailsViewProps {
   tx: ChainTx;
   model: TxDetailsModel;
   onExplorer: () => void;
+  /** The "Speed up" panel for an unconfirmed BTC send (2026-10-01), above
+   *  the buttons; built by `TxDetails`, absent everywhere else. */
+  speedUp?: ReactNode;
 }
 
 /** The details, as elements. No hooks: tests call it and walk the tree. */
-export function TxDetailsView({ tx, model: m, onExplorer }: TxDetailsViewProps) {
+export function TxDetailsView({ tx, model: m, onExplorer, speedUp }: TxDetailsViewProps) {
   const toneColor = TONE_COLOR[m.tone];
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
@@ -638,6 +644,8 @@ export function TxDetailsView({ tx, model: m, onExplorer }: TxDetailsViewProps) 
 
       {m.note && <div style={{ ...mono, fontSize: 9, color: "var(--text-dim)", lineHeight: 1.5 }}>{m.note}</div>}
 
+      {speedUp}
+
       <div style={{ display: "flex", gap: 8 }}>
         <CopyHashButton key={`${tx.chain}:${tx.hash}`} tx={tx} />
         <Btn
@@ -664,12 +672,13 @@ export interface TxDetailsProps extends TxDetailsContext {
  * hooks, so a test can call it and follow the explorer button to
  * `openExternal`.
  */
-export function TxDetailsStatic({ tx, ...ctx }: TxDetailsProps) {
+export function TxDetailsStatic({ tx, speedUp, ...ctx }: TxDetailsProps & { speedUp?: ReactNode }) {
   const model = txDetailsModel(tx, ctx);
   return (
     <TxDetailsView
       tx={tx}
       model={model}
+      speedUp={speedUp}
       onExplorer={() => {
         openTxInExplorer(tx);
       }}
@@ -682,12 +691,27 @@ export function TxDetailsStatic({ tx, ...ctx }: TxDetailsProps) {
  * portrait inside `TxDetailsSheet`. When the row does not name both sides
  * (or, for SPL, which way it went), it asks the chain once, by hash
  * (`useTxParties`, 2026-09-30).
+ *
+ * An unconfirmed BTC send gets the shared "Speed up" panel (operator request,
+ * 2026-10-01; `components/SpeedUpPanel.tsx`), signed with the open wallet's
+ * Bitcoin entry. The panel itself reads whether the transaction can be
+ * replaced and shows nothing when it cannot.
  */
 export function TxDetails(props: TxDetailsProps) {
   const { tx, ownAddress, ownAddresses } = props;
   const need = txDetailsModel(tx, { ownAddress, ownAddresses }).needsParties;
   const parties = useTxParties(tx.chain, tx.hash, ownAddress, need);
-  return <TxDetailsStatic {...props} parties={parties} />;
+  const btcWallet = useAppStateOptional()?.walletsByChain.bitcoin ?? null;
+  const speedUp =
+    speedUpCandidate(tx) && secretOf(btcWallet) ? (
+      <SpeedUpPanel
+        key={tx.hash}
+        txid={tx.hash}
+        wallet={btcWallet}
+        usdPrice={props.pricesByTicker?.BTC ?? null}
+      />
+    ) : null;
+  return <TxDetailsStatic {...props} parties={parties} speedUp={speedUp} />;
 }
 
 /**
