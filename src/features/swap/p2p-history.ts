@@ -41,6 +41,10 @@
  * once per state a bid reaches (a transaction appears with a state change),
  * the backfill uses it for each bid's record, and the details call
  * `refreshTxns` when opened, which is what fills a swap that ended unwatched.
+ * The details open on any P2P row, so that read first checks the user has
+ * switched peer-to-peer swaps on (2026-10-06): the tracker and the backfill
+ * only ever run after the opt-in, and the details must not be the one
+ * `swap_sidecar_*` command that does not.
  *
  * # Both sides of a bid (2026-10-01)
  *
@@ -100,6 +104,7 @@ import {
 import {
   activeSwapToTracked,
   classifyBidState,
+  readSwapSidecarOptIn,
   stageForBidState,
   swapLegOf,
   tickerForCoin,
@@ -841,6 +846,9 @@ export interface P2PHistoryDeps {
   fetchBid: typeof fetchBid;
   /** One bid's record with its transactions (2026-10-01). */
   fetchBidTxns: typeof fetchBidTxns;
+  /** Whether the user switched peer-to-peer swaps on: the details' read
+   *  asks the node nothing before that (2026-10-06). */
+  optedIn: () => Promise<boolean>;
   now: () => number;
 }
 
@@ -851,6 +859,14 @@ const DEFAULT_DEPS: P2PHistoryDeps = {
   fetchBids,
   fetchBid,
   fetchBidTxns,
+  optedIn: async () => {
+    try {
+      return (await readSwapSidecarOptIn()) != null;
+    } catch {
+      // Fail closed: an unreadable store is not evidence of consent.
+      return false;
+    }
+  },
   now: () => Date.now(),
 };
 
@@ -983,9 +999,11 @@ export interface P2PHistorySink extends SidecarHistorySink {
    * creates a row. For the swap details when they open (2026-10-01), which
    * is what fills a swap that ended while nothing was following it.
    * `"read"`: the node answered with the bid's record. `"failed"`: it did not
-   * (not running, or no such bid).
+   * (not running, or no such bid). `"off"`: peer-to-peer swaps are switched
+   * off on this wallet, so the node was not asked (2026-10-06: no
+   * `swap_sidecar_*` command before the opt-in, as the tracker's own reads).
    */
-  refreshTxns(bidId: string): Promise<"read" | "failed">;
+  refreshTxns(bidId: string): Promise<"read" | "failed" | "off">;
   reset(): void;
 }
 
@@ -1058,8 +1076,10 @@ export function createP2PHistorySink(deps: Partial<P2PHistoryDeps> = {}): P2PHis
         );
       return filled;
     },
-    refreshTxns: async (bidId) =>
-      (await readTxnsInto({ bidId, mayCreate: false })) ? "read" : "failed",
+    refreshTxns: async (bidId) => {
+      if (!(await d.optedIn())) return "off";
+      return (await readTxnsInto({ bidId, mayCreate: false })) ? "read" : "failed";
+    },
     reset: () => {
       session += 1;
       backfill = "idle";

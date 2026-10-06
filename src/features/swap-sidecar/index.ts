@@ -18,6 +18,9 @@
 export {
   SWAP_SIDECAR_OPT_IN_STORE_KEY,
   useSwapSidecarOptIn,
+  // The swap details ask the node for a swap's transactions only after this
+  // (2026-10-06): no `swap_sidecar_*` command before the user opted in.
+  readSwapSidecarOptIn,
 } from "./swapSidecarOptIn";
 
 // ── In-flight swap ownership (mount ABOVE the view router) ───────────

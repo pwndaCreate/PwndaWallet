@@ -118,7 +118,7 @@ const TRACKER_NOTES: Readonly<Record<Exclude<SidecarTrackerOutcome, "opened">, s
 };
 
 /** Where the read of this swap's transactions is (2026-10-01). */
-type TxnsRead = "none" | "reading" | "read" | "failed";
+type TxnsRead = "none" | "reading" | "read" | "failed" | "off";
 
 /** What "both legs" says when no transaction is listed, by why. */
 function noTxnsNote(read: TxnsRead, finished: boolean): string {
@@ -127,6 +127,8 @@ function noTxnsNote(read: TxnsRead, finished: boolean): string {
       return "Reading this swap's transactions from your swap node…";
     case "failed":
       return "Your swap node did not answer, so this swap's transactions could not be read. Open this again with the node running.";
+    case "off":
+      return "Peer-to-peer swaps are switched off on this wallet, so the swap node was not asked for this swap's transactions. Turn them on in Settings.";
     case "read":
       return finished
         ? "None: this swap ended before either side locked coins."

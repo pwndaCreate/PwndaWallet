@@ -759,6 +759,29 @@ describe("the transactions of an adaptor swap (2026-10-01)", () => {
     expect(await sink.refreshTxns(BID)).toBe("failed");
   });
 
+  it("the details ask the swap node nothing before P2P is switched on (2026-10-06)", async () => {
+    // `swap-sidecar/index.ts`: nothing invokes a `swap_sidecar_*` command until
+    // the user has accepted the setup screen. The details open on any P2P row,
+    // switched on or not, so their read checks first.
+    vi.mocked(api.fetchBidTxns).mockResolvedValue(
+      detail({ bid_state: "Completed", bid_state_ind: 8, txns: SHOW_TXNS_COMPLETED }),
+    );
+    const optedIn = vi.fn(async () => false);
+    const sink = createP2PHistorySink({ optedIn });
+    await sink.placed(handle());
+    vi.mocked(api.fetchBidTxns).mockClear();
+    vi.mocked(api.fetchBid).mockClear();
+    expect(await sink.refreshTxns(BID)).toBe("off");
+    expect(optedIn).toHaveBeenCalledTimes(1);
+    expect(api.fetchBidTxns).not.toHaveBeenCalled();
+    expect(api.fetchBid).not.toHaveBeenCalled();
+    expect((await rowFor(BID))!.bidTxns).toBeUndefined();
+    // And the details say so, rather than "the node did not answer".
+    expect(read("P2PSwapDetails.tsx")).toMatch(
+      /case "off":\s*return "Peer-to-peer swaps are switched off/,
+    );
+  });
+
   it("the details ask once when they open, and say why the list is empty", async () => {
     const src = read("P2PSwapDetails.tsx");
     expect(src).toMatch(
