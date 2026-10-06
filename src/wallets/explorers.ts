@@ -35,6 +35,7 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
       return `https://base.blockscout.com/tx/0x${h}`;
     case "optimism":
     case "usdt-op":
+    case "usdt0-op":
     case "usdc-op":
       return `https://explorer.optimism.io/tx/0x${h}`;
     case "bsc":
@@ -46,7 +47,12 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
       return `https://explorer.solana.com/tx/${hash}`;
     case "usdt-tron":
       return `https://tronscan.org/#/transaction/${hash}`;
+    // A NEP-141 transfer is a NEAR transaction to the token contract, and an
+    // Aptos fungible-asset transfer an Aptos transaction (2026-10-06): their
+    // legs open the parent chain's explorer, like every other token leg.
     case "near":
+    case "usdt-near":
+    case "usdc-near":
       return `https://nearblocks.io/txns/${hash}`;
     case "stellar":
       return `https://stellar.expert/explorer/public/tx/${h}`;
@@ -55,6 +61,8 @@ export function explorerTxUrl(chain: ChainType, hash: string): string | null {
     case "ergo":
       return `https://explorer.ergoplatform.com/en/transactions/${h}`;
     case "aptos":
+    case "usdt-aptos":
+    case "usdc-aptos":
       return `https://explorer.aptoslabs.com/txn/0x${h}?network=mainnet`;
     case "dash":
       return `https://insight.dash.org/insight/tx/${h}`;

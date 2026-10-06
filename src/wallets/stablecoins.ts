@@ -1,6 +1,7 @@
 /**
- * Stablecoin registry — USDC / USDT / USDT0 across every EVM chain this
- * wallet can already sign for.
+ * Stablecoin registry — USDC / USDT / USDT0 across every chain this wallet
+ * can already sign for: the EVM chains, Solana, TRON, and since 2026-10-06
+ * NEAR and Aptos.
  *
  * # Why a registry and not thirteen loose adapters
  *
@@ -38,6 +39,25 @@
  * Decimals are per-contract, never assumed: BSC's USDC and USDT are **18**,
  * everywhere else is 6.
  *
+ * # Not only EVM (2026-09-02, 2026-10-06)
+ *
+ * `contract` is whatever the chain calls the token: an ERC-20 address, an SPL
+ * mint, a TRC-20 address, a NEP-141 contract ACCOUNT on NEAR
+ * (`usdt.tether-token.near`), or the fungible-asset METADATA OBJECT on Aptos
+ * (`0x357b…dc2b`). The NEAR and Aptos rows were added 2026-10-06 (operator
+ * request, 2026-10-01) and checked the same way: NEAR's `ft_metadata` view and
+ * Aptos's `0x1::fungible_asset::Metadata` resource, read live, each against
+ * the asset 1Click lists for that chain.
+ *
+ * # USD₮0 is shown as USDT (operator request, 2026-10-01)
+ *
+ * The USD₮0 family stays its own family HERE, because that is what the
+ * contracts are (they answer `symbol() = "USD₮0"` / `"USDT0"`). Everywhere the
+ * wallet SHOWS a leg it files under USDT and reads "USDT", with "USD₮0" as a
+ * small note beside it — `stablecoinLegLabel`. On Arbitrum, Polygon and Monad
+ * it is the only USDT there is; on Optimism it sits beside the older bridged
+ * USDT, and the note is what tells the two apart.
+ *
  * # Adding a network
  *
  * Verify first. `scripts/verify-stablecoins.mjs` reads symbol/name/decimals
@@ -55,7 +75,11 @@ export interface StablecoinNetwork {
   parent: ChainType;
   /** Short label for the network row ("Ethereum", "BNB Smart Chain"). */
   network: string;
-  /** ERC-20 contract. Verified on-chain — see the header. */
+  /**
+   * The token, as its chain names it: ERC-20 / TRC-20 address, SPL mint,
+   * NEP-141 contract account, or Aptos fungible-asset metadata object.
+   * Verified on-chain — see the header.
+   */
   contract: string;
   /** Verified via `decimals()`. BSC is 18; everything else is 6. */
   decimals: number;
@@ -94,6 +118,15 @@ export const STABLECOINS: StablecoinFamily[] = [
       { chain: "usdc-sol",  parent: "solana",    network: "Solana",          contract: "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v", decimals: 6, nearIntents: true },
       // Monad (2026-09-29), verified on chain: symbol() "USDC", decimals 6.
       { chain: "usdc-monad", parent: "monad",   network: "Monad",           contract: "0x754704bc059f8c67012fed69bc8a327a5aafb603", decimals: 6, nearIntents: true },
+      // NEAR (2026-10-06): Circle's native USDC, a NEP-141 contract whose
+      // account id is this hex string. `ft_metadata` read live: name "USDC",
+      // symbol "USDC", decimals 6. 1Click: `nep141:<this id>`.
+      { chain: "usdc-near",  parent: "near",    network: "NEAR",            contract: "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1", decimals: 6, nearIntents: true },
+      // Aptos (2026-10-06): Circle's native USDC, a fungible asset; this is its
+      // metadata object. `0x1::fungible_asset::Metadata` read live: name
+      // "USDC", symbol "USDC", decimals 6, project_uri circle.com/usdc. 1Click
+      // lists it as `nep141:aptos-34ee497f…omft.near` with this contract.
+      { chain: "usdc-aptos", parent: "aptos",   network: "Aptos",           contract: "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b", decimals: 6, nearIntents: true },
     ],
   },
   {
@@ -117,6 +150,14 @@ export const STABLECOINS: StablecoinFamily[] = [
       // (`trc20-wallet.ts` builds and signs the `transfer(address,uint256)`
       // call, the same path the Send button uses).
       { chain: "usdt-tron", parent: "tron",      network: "Tron",            contract: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t", decimals: 6, nearIntents: true },
+      // NEAR (2026-10-06): Tether's own NEP-141 contract. `ft_metadata` read
+      // live: name "Tether USD", symbol "USDt", decimals 6. 1Click:
+      // `nep141:usdt.tether-token.near`.
+      { chain: "usdt-near",  parent: "near",     network: "NEAR",            contract: "usdt.tether-token.near", decimals: 6, nearIntents: true },
+      // Aptos (2026-10-06): Tether's native USDt fungible asset (metadata
+      // object). Read live: name "Tether USD", symbol "USDt", decimals 6,
+      // project_uri tether.to. 1Click: `nep141:aptos-88cb7619…omft.near`.
+      { chain: "usdt-aptos", parent: "aptos",    network: "Aptos",           contract: "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b", decimals: 6, nearIntents: true },
     ],
   },
   {
@@ -133,6 +174,12 @@ export const STABLECOINS: StablecoinFamily[] = [
       { chain: "usdt0-pol", parent: "polygon",  network: "Polygon",  contract: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F", decimals: 6, nearIntents: true },
       // Monad (2026-09-29), verified on chain: symbol() "USDT0", decimals 6.
       { chain: "usdt0-monad", parent: "monad", network: "Monad",    contract: "0xe7cd86e13ac4309349f30b3435a9d337750fc82d", decimals: 6, nearIntents: true },
+      // Optimism (2026-10-06). NOT the `usdt-op` row: Optimism's bridged USDT
+      // (0x94b0…8e58, symbol "USDT", name "Tether USD") was never upgraded in
+      // place, and USD₮0 launched beside it as a separate contract. Read live
+      // via mainnet.optimism.io: symbol() "USD₮0", name() "USD₮0", decimals 6.
+      // 1Click lists it as `nep245:v2_1.omni.hot.tg:10_2R1RXDBxCyJTeMEsdXydh7xsHmz`.
+      { chain: "usdt0-op",   parent: "optimism", network: "Optimism", contract: "0x01bFF41798a0BcF287b996046Ca68b395DbC1071", decimals: 6, nearIntents: true },
     ],
   },
 ];
@@ -172,11 +219,66 @@ const FILES_UNDER: Partial<Record<StablecoinSymbol, StablecoinSymbol>> = {
   USDT0: "USDT",
 };
 
+/** How the wallet names one leg: the symbol it reads as, its network, and a note. */
+export interface StablecoinLegLabel {
+  /** The symbol the row READS as: "USDT" for a USD₮0 leg too. */
+  symbol: string;
+  /** The network, alone: "Arbitrum", never "Arbitrum · USD₮0". */
+  network: string;
+  /**
+   * The token's own name when it differs from {@link symbol} — "USD₮0" on
+   * the USD₮0 legs — drawn small beside the row, never as its name.
+   * Undefined for every other leg.
+   */
+  note?: string;
+}
+
+/**
+ * How every surface names a stablecoin leg (operator request, 2026-10-01:
+ * "the row reads USDT, with USD₮0 as a small note").
+ *
+ * Until 2026-10-06 a USD₮0 leg's network read "Arbitrum · USD₮0" in the rail
+ * and the tokens strip, its ticker "USDT0" in the coin panel, the Send title
+ * and Activity, and its name "USD₮0 (Arbitrum)". One function now answers for
+ * all of them, so the two Optimism rows — bridged USDT and USD₮0 — can only be
+ * told apart the same way everywhere: by the note.
+ */
+export function stablecoinLegLabel(chain: ChainType): StablecoinLegLabel | undefined {
+  const leg = stablecoinNetworkFor(chain);
+  if (!leg) return undefined;
+  const filedUnder = FILES_UNDER[leg.symbol];
+  if (!filedUnder) return { symbol: leg.symbol, network: leg.network };
+  return { symbol: filedUnder, network: leg.network, note: familyFor(leg.symbol)?.displayName };
+}
+
+/**
+ * A leg's name as plain text — "USDT (Arbitrum · USD₮0)" — for the places
+ * that print a chain's name as a string (the adapters' `displayName`, the
+ * Activity status line). The note goes AFTER the network, inside the
+ * parentheses, so the text reads "USDT" first. Exported for the tests that
+ * keep `coin-metadata.ts` and the adapters on this one wording.
+ */
+export function stablecoinLegName(chain: ChainType): string | undefined {
+  const l = stablecoinLegLabel(chain);
+  if (!l) return undefined;
+  return `${l.symbol} (${l.network}${l.note ? ` · ${l.note}` : ""})`;
+}
+
+/**
+ * The `CoinIcon` symbol for a chain's mark. A USD₮0 leg reads "USDT" but keeps
+ * the USD₮0 glyph — the ₮ with a "0" badge, which is the icon's form of the
+ * small note (2026-10-06). Every other chain: `ticker` unchanged.
+ */
+export function coinMarkFor(chain: ChainType, ticker: string): string {
+  return stablecoinNetworkFor(chain)?.symbol ?? ticker;
+}
+
 /**
  * The stablecoin rows the wallet lists — ONE rule for both layouts
  * (portrait `DashboardView`, landscape `WalletLandscapeView`):
  *  - every family, held or not, at 0 when nothing is held;
- *  - USD₮0's networks inside USDT, labelled "Arbitrum · USD₮0".
+ *  - USD₮0's networks inside USDT, each row naming its network ("Arbitrum")
+ *    with "USD₮0" as its `note` (2026-10-06; it read "Arbitrum · USD₮0").
  *
  * Both layouts used to list a family only once something was held ("a fresh
  * wallet should not grow permanent $0.00 rows"). A wallet that had never held
@@ -194,10 +296,10 @@ export function stablecoinRailGroups(
     const src = groups.get(from);
     const dst = groups.get(to);
     if (!src || !dst) continue;
-    dst.rows = [
-      ...dst.rows,
-      ...src.rows.map((r) => ({ ...r, network: `${r.network} · ${src.displayName}` })),
-    ];
+    // The note, not the network, carries "USD₮0" (operator request,
+    // 2026-10-01): the row reads as the network it is on, and the views draw
+    // the note small beside it.
+    dst.rows = [...dst.rows, ...src.rows.map((r) => ({ ...r, note: src.displayName }))];
     if (src.total != null) dst.total = (dst.total ?? 0) + src.total;
     groups.delete(from);
   }
@@ -243,6 +345,9 @@ export interface StablecoinGroup {
   rows: Array<{
     chain: ChainType;
     network: string;
+    /** "USD₮0" on a USD₮0 leg filed under USDT (`stablecoinRailGroups`);
+     *  absent otherwise. Drawn small, never as the row's name. */
+    note?: string;
     /** Raw decimal string as the adapter reported it, or undefined. */
     balance: string | undefined;
     amount: number | null;

@@ -605,6 +605,125 @@ export function assertNearTransferShape(args: {
   }
 }
 
+/**
+ * A NEP-141 send must be exactly this transaction (2026-10-06, the USDT/USDC
+ * legs on NEAR), read back from the bytes about to be signed:
+ *
+ *  - its receiver is the TOKEN CONTRACT (a FunctionCall to anything else
+ *    would be a different contract's method);
+ *  - optionally first, `storage_deposit({ account_id: <receiver>,
+ *    registration_only: true })` attaching exactly `storageDeposit`, present
+ *    only when the caller decided the receiver needs registering;
+ *  - last, `ft_transfer({ receiver_id: <receiver>, amount: "<amount>" })`
+ *    attaching exactly 1 yoctoNEAR — no memo, no other key;
+ *  - and no other action.
+ *
+ * Reuses the NEAR ids: NEAR_RECIPIENT_DRIFT for a wrong contract or
+ * receiver, TX_VALUE_VS_QUOTE for a wrong amount, NEAR_ACTION_NOT_TRANSFER
+ * for anything else in the wrong shape.
+ */
+export function assertNearTokenTransferShape(args: {
+  decoded: {
+    receiverId: string;
+    actions: Array<{ tag: number; methodName?: string; args?: Uint8Array; deposit: bigint }>;
+  };
+  tokenContract: string;
+  receiverId: string;
+  amountAtomic: bigint;
+  /** The registration deposit, or null when no registration was decided. */
+  storageDeposit: bigint | null;
+  ticker: string;
+}): void {
+  const { decoded } = args;
+  const shape = (message: string, context: Record<string, string> = {}): never => {
+    throw new SafetyInvariantError({
+      invariant: "NEAR_ACTION_NOT_TRANSFER",
+      message: `${message} Refusing to sign.`,
+      context: { ticker: args.ticker, tokenContract: args.tokenContract, ...context },
+    });
+  };
+  if (decoded.receiverId !== args.tokenContract) {
+    throw new SafetyInvariantError({
+      invariant: "NEAR_RECIPIENT_DRIFT",
+      message:
+        `The ${args.ticker} transaction is addressed to ${decoded.receiverId}, not the token contract ` +
+        `${args.tokenContract}. Refusing to sign.`,
+      context: { txReceiver: decoded.receiverId, tokenContract: args.tokenContract },
+    });
+  }
+  const expectedCount = args.storageDeposit === null ? 1 : 2;
+  if (decoded.actions.length !== expectedCount) {
+    shape(`The ${args.ticker} transaction has ${decoded.actions.length} actions; it should have ${expectedCount}.`);
+  }
+  const argsOf = (a: { args?: Uint8Array }): Record<string, unknown> => {
+    try {
+      const v = JSON.parse(new TextDecoder().decode(a.args ?? new Uint8Array()));
+      return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+    } catch {
+      return {};
+    }
+  };
+  const keys = (o: Record<string, unknown>) => Object.keys(o).sort().join(",");
+  if (args.storageDeposit !== null) {
+    const reg = decoded.actions[0];
+    const a = argsOf(reg);
+    if (
+      reg.tag !== 2 ||
+      reg.methodName !== "storage_deposit" ||
+      keys(a) !== "account_id,registration_only" ||
+      a.registration_only !== true
+    ) {
+      shape(`The ${args.ticker} transaction's first action is not a registration-only storage_deposit.`);
+    }
+    if (a.account_id !== args.receiverId) {
+      throw new SafetyInvariantError({
+        invariant: "NEAR_RECIPIENT_DRIFT",
+        message:
+          `The ${args.ticker} registration is for ${String(a.account_id)}, not the receiver ` +
+          `${args.receiverId}. Refusing to sign.`,
+        context: { registered: String(a.account_id), receiver: args.receiverId },
+      });
+    }
+    if (reg.deposit !== args.storageDeposit) {
+      shape(`The ${args.ticker} registration attaches ${reg.deposit} yoctoNEAR, not ${args.storageDeposit}.`, {
+        attached: reg.deposit.toString(),
+        expected: args.storageDeposit.toString(),
+      });
+    }
+  }
+  const xfer = decoded.actions[decoded.actions.length - 1];
+  const a = argsOf(xfer);
+  if (xfer.tag !== 2 || xfer.methodName !== "ft_transfer" || keys(a) !== "amount,receiver_id") {
+    shape(`The ${args.ticker} transaction does not end in a plain ft_transfer.`, {
+      method: String(xfer.methodName ?? `(action ${xfer.tag})`),
+    });
+  }
+  if (xfer.deposit !== 1n) {
+    shape(`The ${args.ticker} ft_transfer attaches ${xfer.deposit} yoctoNEAR, not exactly 1.`);
+  }
+  if (a.receiver_id !== args.receiverId) {
+    throw new SafetyInvariantError({
+      invariant: "NEAR_RECIPIENT_DRIFT",
+      message:
+        `The ${args.ticker} ft_transfer pays ${String(a.receiver_id)}, not ${args.receiverId}. Refusing to sign.`,
+      context: { txReceiver: String(a.receiver_id), expectedReceiver: args.receiverId },
+    });
+  }
+  if (a.amount !== args.amountAtomic.toString()) {
+    throw new SafetyInvariantError({
+      invariant: "TX_VALUE_VS_QUOTE",
+      message:
+        `The ${args.ticker} ft_transfer moves ${String(a.amount)} units, not ${args.amountAtomic}. ` +
+        `Refusing to sign.`,
+      context: {
+        ticker: args.ticker,
+        txValueAtomic: String(a.amount),
+        quoteAmountAtomic: args.amountAtomic.toString(),
+      },
+    });
+  }
+}
+
 export function assertPsbtOutputShape(args: {
   outputs: Array<{ address: string; valueSat: bigint }>;
   expectedRecipient: string;

@@ -121,6 +121,10 @@ const SUPPORTED_BLOCKCHAINS = new Set([
   "cardano",
   "stellar",
   "sui",
+  // 2026-10-06: the wallet holds USDT and USDC on Aptos (operator request,
+  // 2026-10-01). Without this, the next sync drops both rows and the union
+  // member below, as it dropped eight chains on 2026-08-19.
+  "aptos",
 ]);
 
 function normalize(row) {
@@ -237,7 +241,8 @@ export type IntentsBlockchain =
   | "ton"
   | "cardano"
   | "stellar"
-  | "sui";
+  | "sui"
+  | "aptos";
 
 export interface IntentsAsset {
   assetId: string;
@@ -295,6 +300,7 @@ export const BLOCKCHAIN_DISPLAY_NAME: Record<IntentsBlockchain, string> = {
   cardano: "Cardano",
   stellar: "Stellar",
   sui: "Sui",
+  aptos: "Aptos",
 };
 `;
 

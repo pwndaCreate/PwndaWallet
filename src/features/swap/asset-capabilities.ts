@@ -78,7 +78,10 @@ export type SwapChainKind =
   | "ZANO"
   | "CARDANO"
   | "XRP"
-  | "TRON";
+  | "TRON"
+  // 2026-10-06: the USDT/USDC legs on Aptos. Their deposit is the leg's own
+  // adapter send (TS-signed, `tsSourceSigner: "aptos"`), like XRP and TRON.
+  | "APTOS";
 
 /**
  * Per-asset capability record. Subsumes the legacy `SwapCoinMeta`
@@ -162,8 +165,13 @@ export interface AssetCapability {
    * different assets with different transaction shapes (a native transfer
    * versus a contract call). The executor tells them apart by
    * `walletsByChainKey`, which resolves each to its own adapter.
+   *
+   *  - `aptos` (2026-10-06) — the USDT/USDC legs on Aptos: a
+   *    `primary_fungible_store::transfer` built, simulated and signed by the
+   *    leg's adapter (`aptos-fa-wallet.ts`) with the Aptos private key, the
+   *    same call its Send button makes. No Rust signer exists for Aptos.
    */
-  tsSourceSigner?: "cardano" | "xrp" | "tron" | "utxo-account";
+  tsSourceSigner?: "cardano" | "xrp" | "tron" | "utxo-account" | "aptos";
 
   /**
    * True when `defaultRpcUrl` is set OR `rpcFallbacks` is non-empty.
@@ -260,6 +268,7 @@ import {
   ETH_RPCS,
   FLR_RPCS,
   MONAD_RPCS,
+  NEAR_RPCS,
   OP_RPCS,
   POL_RPCS,
 } from "../../wallets/chain-rpcs";
@@ -1122,6 +1131,27 @@ const REGISTRY_ENTRIES: Record<string, AssetCapability> = {
     explorerTxUrl: (h) => `https://arbiscan.io/tx/${h}`,
     explorerAddressUrl: (a) => `https://arbiscan.io/address/${a}`,
   },
+  // Optimism's USD₮0 (2026-10-06, operator request 2026-10-01). A different
+  // token from `USDT-OP` (the bridged USDT, 0x94b0…8e58): its own contract
+  // and its own 1Click id, matched on contract like every USD₮0 row. The
+  // picker files it under USDT with the network row's "USD₮0" note, which is
+  // what tells the two Optimism rows apart.
+  "USDT0-OP": {
+    ticker: "USDT0",
+    network: "Optimism",
+    chainKind: "EVM",
+    chainId: 10,
+    decimals: 6,
+    walletsByChainKey: "usdt0-op",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep245:v2_1.omni.hot.tg:10_2R1RXDBxCyJTeMEsdXydh7xsHmz",
+    defaultRpcUrl: OP_RPCS()[0],
+    rpcFallbacks: OP_RPCS(),
+    explorerTxUrl: (h) => `https://optimistic.etherscan.io/tx/${h}`,
+    explorerAddressUrl: (a) => `https://optimistic.etherscan.io/address/${a}`,
+  },
 
   // Solana SPL legs. `chainKind: "SOLANA"` routes them through the same
   // signer the native SOL leg uses; the mint lives in `wallets/stablecoins.ts`
@@ -1180,6 +1210,85 @@ const REGISTRY_ENTRIES: Record<string, AssetCapability> = {
       "nep141:tron-d28a265909efecdcee7c5028585214ea0b96f015.omft.near",
     explorerTxUrl: (h) => `https://tronscan.org/#/transaction/${h}`,
     explorerAddressUrl: (a) => `https://tronscan.org/#/address/${a}`,
+  },
+
+  // NEP-141 legs on NEAR (2026-10-06, operator request 2026-10-01). Signed
+  // in the Rust swap session like native NEAR (`swap_sign_near_tx` signs the
+  // transaction hash the TypeScript side builds), so a FunctionCall needed no
+  // Rust change. The deposit is `ft_transfer` to 1Click's deposit address —
+  // an implicit account, as NEAR's own 1Click example shows — with a
+  // `storage_deposit` for it first when the token contract has not
+  // registered it (`swap-sources.ts::executeNearTokenTransfer`).
+  "USDT-NEAR": {
+    ticker: "USDT",
+    network: "NEAR",
+    chainKind: "NEAR",
+    decimals: 6,
+    walletsByChainKey: "usdt-near",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:usdt.tether-token.near",
+    sourcePrerequisiteHint:
+      "Fees for USDT on NEAR are paid in NEAR: keep about 0.01 NEAR on the account.",
+    defaultRpcUrl: NEAR_RPCS()[0],
+    rpcFallbacks: NEAR_RPCS(),
+    explorerTxUrl: (h) => `https://nearblocks.io/txns/${h}`,
+    explorerAddressUrl: (a) => `https://nearblocks.io/address/${a}`,
+  },
+  "USDC-NEAR": {
+    ticker: "USDC",
+    network: "NEAR",
+    chainKind: "NEAR",
+    decimals: 6,
+    walletsByChainKey: "usdc-near",
+    signerInRustCore: true,
+    rpcsAvailable: true,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+    sourcePrerequisiteHint:
+      "Fees for USDC on NEAR are paid in NEAR: keep about 0.01 NEAR on the account.",
+    defaultRpcUrl: NEAR_RPCS()[0],
+    rpcFallbacks: NEAR_RPCS(),
+    explorerTxUrl: (h) => `https://nearblocks.io/txns/${h}`,
+    explorerAddressUrl: (a) => `https://nearblocks.io/address/${a}`,
+  },
+
+  // Fungible-asset legs on Aptos (2026-10-06). TS-signed through the leg's
+  // adapter (`tsSourceSigner: "aptos"`), the Send button's own
+  // `primary_fungible_store::transfer`; there is no Rust Aptos signer, and the
+  // adapter reaches the chain itself, so no RPC list here (like USDT-TRON).
+  "USDT-APTOS": {
+    ticker: "USDT",
+    network: "Aptos",
+    chainKind: "APTOS",
+    decimals: 6,
+    walletsByChainKey: "usdt-aptos",
+    signerInRustCore: false,
+    tsSourceSigner: "aptos",
+    rpcsAvailable: false,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near",
+    sourcePrerequisiteHint:
+      "Fees for USDT on Aptos are paid in APT: keep about 0.01 APT on the account.",
+    explorerTxUrl: (h) => `https://explorer.aptoslabs.com/txn/${h}?network=mainnet`,
+    explorerAddressUrl: (a) => `https://explorer.aptoslabs.com/account/${a}?network=mainnet`,
+  },
+  "USDC-APTOS": {
+    ticker: "USDC",
+    network: "Aptos",
+    chainKind: "APTOS",
+    decimals: 6,
+    walletsByChainKey: "usdc-aptos",
+    signerInRustCore: false,
+    tsSourceSigner: "aptos",
+    rpcsAvailable: false,
+    swapKitAsset: null,
+    nearIntentsAsset: "nep141:aptos-34ee497f210c5a511e8d5b53bc56d75b63612bb5.omft.near",
+    sourcePrerequisiteHint:
+      "Fees for USDC on Aptos are paid in APT: keep about 0.01 APT on the account.",
+    explorerTxUrl: (h) => `https://explorer.aptoslabs.com/txn/${h}?network=mainnet`,
+    explorerAddressUrl: (a) => `https://explorer.aptoslabs.com/account/${a}?network=mainnet`,
   },
 };
 
@@ -1249,6 +1358,9 @@ export const INTENTS_EXECUTABLE_SOURCE_KINDS: ReadonlySet<SwapChainKind> =
     "TRON",
     "STELLAR",
     "SUI",
+    // 2026-10-06, in the same change as the executor's APTOS branch (the
+    // leg adapter's send, like XRP and TRON).
+    "APTOS",
   ]);
 
 /** True when a NEAR Intents deposit FROM `ticker` can actually be executed. */
@@ -1309,9 +1421,10 @@ export function sourceSecretFor(
     const m = walletsByChain[cap.walletsByChainKey]?.mnemonic;
     return m ? { kind: "mnemonic", value: m } : undefined;
   }
-  // xrp / tron — one chain key, which is what those adapters take. Read
-  // through `walletsByChainKey` rather than the signer name, because TRX and
-  // USDT-TRON share the signer and hold separate wallet entries.
+  // xrp / tron / aptos — one chain key, which is what those adapters take.
+  // Read through `walletsByChainKey` rather than the signer name, because TRX
+  // and USDT-TRON share the signer and hold separate wallet entries (and so do
+  // USDT-APTOS and USDC-APTOS, 2026-10-06).
   const pk = walletsByChain[cap.walletsByChainKey]?.privateKey;
   return pk ? { kind: "privateKey", value: pk } : undefined;
 }

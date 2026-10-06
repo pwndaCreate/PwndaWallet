@@ -43,6 +43,7 @@ import { minPresetTitle, planMinPreset } from "./minPreset";
 import { coinAmountFromUsd } from "../../lib/usdAmount";
 import {
   isGrouped,
+  legDisplayName,
   networkLabelFor,
   pickerRows,
   symbolFor,
@@ -453,8 +454,18 @@ export function SwapForm({
     intentsMinimum?.source === "usd-limit" && intentsMinimum.usdFloor
       ? `$${Number(intentsMinimum.usdFloor).toLocaleString("en-US")}`
       : null;
+  // The pair as the wallet names it (2026-10-06, operator request 2026-10-01):
+  // a unit is the symbol the picker files the leg under ("USDT"; the closed
+  // picker button carries the network), a pair is the leg's full name. The
+  // form used to print the KEY ("min 1.5 USDT0-ARB", "1 USDT0-ARB = …") and
+  // the hook's registry ticker ("USDT0"), bringing back the name the picker
+  // had just dropped. `fromCoin`/`toCoin` stay the keys for everything else.
+  const fromSym = symbolFor(fromCoin);
+  const toSym = symbolFor(toCoin);
+  const fromName = legDisplayName(fromCoin);
+  const toName = legDisplayName(toCoin);
   const usdLimitAmount = intentsMinimum
-    ? `about ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}`
+    ? `about ${intentsMinimum.displayAmount} ${fromSym}`
     : "";
   // Form-level warning: even MAX of the user's balance is below the
   // minimum. balanceFor returns a number; convert to atomic for the
@@ -719,14 +730,14 @@ export function SwapForm({
         // Never reached NEAR, so neither "did not quote at any size" nor
         // "NEAR said" is true (2026-09-29, LTC → TRX).
         onSwapToast?.(
-          `Could not look up NEAR's minimum for ${fromCoin} → ${toCoin}: ${(detail ?? "unknown reason").slice(0, 220)}`,
+          `Could not look up NEAR's minimum for ${fromName} → ${toName}: ${(detail ?? "unknown reason").slice(0, 220)}`,
         );
       } else {
         const said = detail ? ` NEAR said: ${detail.replace(/^Quote request rejected by upstream: /, "").slice(0, 220)}` : "";
         onSwapToast?.(
           hi
-            ? `NEAR Intents did not quote ${fromCoin} → ${toCoin} at any size up to ${hi} ${fromCoin}.${said}`
-            : `NEAR Intents found no fillable size for ${fromCoin} → ${toCoin} — enter any amount or fund the wallet so MIN has a size to search from.${said}`,
+            ? `NEAR Intents did not quote ${fromName} → ${toName} at any size up to ${hi} ${fromSym}.${said}`
+            : `NEAR Intents found no fillable size for ${fromName} → ${toName} — enter any amount or fund the wallet so MIN has a size to search from.${said}`,
         );
       }
     } finally {
@@ -767,7 +778,7 @@ export function SwapForm({
       // so, or the user reads a big number as a bug (2026-09-05).
       if (result.allOrNothing) {
         onSwapToast?.(
-          `The cheapest offer is all-or-nothing: ${formatAmount(result.sendAmount, result.sendDecimals)} ${fromCoin} exactly, or nothing. ` +
+          `The cheapest offer is all-or-nothing: ${formatAmount(result.sendAmount, result.sendDecimals)} ${fromSym} exactly, or nothing. ` +
             (result.anyPartialFillOffered
               ? "Other offers accept part of their size — raise the amount to reach one."
               : "Every offer on this book is take-it-all right now."),
@@ -805,7 +816,7 @@ export function SwapForm({
       onOpenDeskConfirm?.();
     } else if (deskRoutable && deskAddressesMissing) {
       onSwapToast?.(
-        `A ${toCoin} address (to receive) and a ${fromCoin} address (to refund to if the swap fails) are both required — open those chains in the dashboard first.`
+        `A ${toName} address (to receive) and a ${fromName} address (to refund to if the swap fails) are both required — open those chains in the dashboard first.`
       );
     } else if (swapKitReady || intentsReady) {
       // Both routers funnel through `SwapConfirmModal` — it dispatches on
@@ -820,7 +831,7 @@ export function SwapForm({
       );
     } else {
       onSwapToast?.(
-        `${fromCoin} → ${toCoin} atomic swap isn't wired yet — feature in development.`
+        `${fromName} → ${toName} atomic swap isn't wired yet — feature in development.`
       );
     }
   };
@@ -1003,14 +1014,14 @@ export function SwapForm({
               {belowMinimum ? "✗" : intentsMinimum.source === "loading" ? "…" : "ⓘ"}
             </span>
             {intentsMinimum.source === "loading"
-              ? `Finding minimum for ${fromCoin} → ${toCoin}…`
+              ? `Finding minimum for ${fromName} → ${toName}…`
               : usdLimit
                 ? belowMinimum
                   ? `Below NEAR Intents temporary limit: ${usdLimit} per swap (${usdLimitAmount})`
                   : `Temporary NEAR Intents limit: ${usdLimit} per swap (${usdLimitAmount})`
                 : belowMinimum
-                  ? `Below NEAR Intents minimum: ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}${minimumUsdSuffix}`
-                  : `Min: ${intentsMinimum.displayAmount} ${intentsMinimum.ticker}${minimumUsdSuffix} for ${fromCoin} → ${intentsMinimum.destinationDisplayName ?? toCoin}`}
+                  ? `Below NEAR Intents minimum: ${intentsMinimum.displayAmount} ${fromSym}${minimumUsdSuffix}`
+                  : `Min: ${intentsMinimum.displayAmount} ${fromSym}${minimumUsdSuffix} for ${fromName} → ${toName}`}
           </div>
           {/* Why the floor is this large, and why changing the amount is the
               only lever. Without it the hint reads as a wallet rule, and the
@@ -1045,7 +1056,7 @@ export function SwapForm({
                   paddingLeft: 14,
                 }}
               >
-                (receives ~${formatUsdSubLine(intentsMinimum.expectedAmountOutUsd)} of {intentsMinimum.destinationDisplayName ?? toCoin}; send more to receive more)
+                (receives ~${formatUsdSubLine(intentsMinimum.expectedAmountOutUsd)} of {toName}; send more to receive more)
               </div>
             )}
         </div>
@@ -1141,8 +1152,8 @@ export function SwapForm({
                   }}
                 >
                   {belowMinimum
-                    ? `below minimum (${minDisplay} ${fromCoin})`
-                    : `min ${minDisplay} ${fromCoin}`}
+                    ? `below minimum (${minDisplay} ${fromSym})`
+                    : `min ${minDisplay} ${fromSym}`}
                 </div>
               )}
 
@@ -1161,8 +1172,8 @@ export function SwapForm({
                     lineHeight: 1.5,
                   }}
                 >
-                  ⚠ Your {fromCoin} balance ({fmtBal(fromBalance)} {fromCoin})
-                  is below the minimum ({minDisplay} {fromCoin}) for this
+                  ⚠ Your {fromSym} balance ({fmtBal(fromBalance)} {fromSym})
+                  is below the minimum ({minDisplay} {fromSym}) for this
                   route. Add funds or pick a different source asset.
                 </div>
               )}
@@ -1217,7 +1228,7 @@ export function SwapForm({
                   const disabled = fromBalance == null || percentBelowMin;
                   const tooltip =
                     percentBelowMin && minDisplay
-                      ? `Below minimum (${minDisplay} ${fromCoin})`
+                      ? `Below minimum (${minDisplay} ${fromSym})`
                       : undefined;
                   return (
                     <button
@@ -1353,7 +1364,7 @@ export function SwapForm({
             </strong>
             <br />
             Switch to <strong>NEAR</strong> or <strong>Auto Best</strong> to
-            find a route for {fromCoin} → {toCoin}.
+            find a route for {fromName} → {toName}.
           </div>
         </div>
       )}
@@ -1384,7 +1395,7 @@ export function SwapForm({
                   value: swapKitMispicked
                     ? "—"
                     : rate > 0
-                      ? `1 ${fromCoin} = ${fmtBal(rate)} ${toCoin}`
+                      ? `1 ${fromSym} = ${fmtBal(rate)} ${toSym}`
                       : "—",
                   accent: true,
                   marker: liveQuote ? "LIVE" : liveRate ? undefined : "STATIC",
@@ -1395,7 +1406,7 @@ export function SwapForm({
                   value: swapKitMispicked
                     ? "—"
                     : liveQuote
-                      ? `${liveQuote.minReceived} ${toCoin}`
+                      ? `${liveQuote.minReceived} ${toSym}`
                       : "—",
                 },
                 {
@@ -1403,8 +1414,8 @@ export function SwapForm({
                   value: swapKitMispicked
                     ? "—"
                     : liveQuote
-                      ? `${fmtBal(feeAmt)} ${fromCoin}`
-                      : `${meta.fee}% · ${fmtBal(feeAmt)} ${fromCoin}`,
+                      ? `${fmtBal(feeAmt)} ${fromSym}`
+                      : `${meta.fee}% · ${fmtBal(feeAmt)} ${fromSym}`,
                 },
                 {
                   label: "time",
@@ -1494,7 +1505,7 @@ export function SwapForm({
       <span
         title={
           belowMinimum && minDisplay
-            ? `Below minimum swap amount for this asset (${minDisplay} ${fromCoin})`
+            ? `Below minimum swap amount for this asset (${minDisplay} ${fromSym})`
             : undefined
         }
         style={{ display: "block" }}
@@ -1916,7 +1927,29 @@ function CoinPickerButton({
                           e.currentTarget.style.background = "transparent";
                         }}
                       >
-                        <span style={{ flex: 1 }}>{n.network}</span>
+                        <span style={{ flex: 1 }}>
+                          {n.network}
+                          {/* The token's own name, small, when it files
+                              under another symbol: "USD₮0" on Arbitrum,
+                              Polygon, Monad and Optimism (2026-10-06). On
+                              Optimism it is all that tells the bridged
+                              USDT row from the USD₮0 one. */}
+                          {n.note && (
+                            <span
+                              data-leg-note
+                              style={{
+                                marginLeft: 6,
+                                padding: "0 4px",
+                                border: "1px solid var(--border)",
+                                color: "var(--text-dim)",
+                                fontSize: 8,
+                                letterSpacing: 0.4,
+                              }}
+                            >
+                              {n.note}
+                            </span>
+                          )}
+                        </span>
                         {legBal != null ? (
                           <span
                             className="tnum"

@@ -17,6 +17,7 @@ import {
   usdt0PolAdapter,
   usdcMonadAdapter,
   usdt0MonadAdapter,
+  usdt0OpAdapter,
   polygonAdapter,
   flareAdapter,
   arbitrumAdapter,
@@ -50,6 +51,8 @@ import { zanoAdapter } from "./zano-wallet";
 import { xelisAdapter } from "./xelis-wallet";
 import { usdcSolAdapter, usdtSolAdapter } from "./spl-token-wallet";
 import { usdtTronAdapter } from "./trc20-wallet";
+import { usdcNearAdapter, usdtNearAdapter } from "./nep141-wallet";
+import { usdcAptosAdapter, usdtAptosAdapter } from "./aptos-fa-wallet";
 
 const adapters: Record<ChainType, ChainAdapter> = {
   ethereum: ethAdapter,
@@ -69,9 +72,14 @@ const adapters: Record<ChainType, ChainAdapter> = {
   "usdc-bsc": usdcBscAdapter,
   "usdt0-arb": usdt0ArbAdapter,
   "usdt0-pol": usdt0PolAdapter,
+  "usdt0-op": usdt0OpAdapter,
   "usdc-sol": usdcSolAdapter,
   "usdt-sol": usdtSolAdapter,
   "usdt-tron": usdtTronAdapter,
+  "usdt-near": usdtNearAdapter,
+  "usdc-near": usdcNearAdapter,
+  "usdt-aptos": usdtAptosAdapter,
+  "usdc-aptos": usdcAptosAdapter,
   polygon: polygonAdapter,
   flare: flareAdapter,
   bitcoin: btcAdapter,
@@ -129,9 +137,14 @@ export const ALL_CHAINS: ChainType[] = [
   "usdt0-pol",
   "usdc-monad",
   "usdt0-monad",
+  "usdt0-op",
   "usdc-sol",
   "usdt-sol",
   "usdt-tron",
+  "usdt-near",
+  "usdc-near",
+  "usdt-aptos",
+  "usdc-aptos",
   "polygon",
   "flare",
   "bitcoin",

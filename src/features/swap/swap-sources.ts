@@ -8,7 +8,9 @@
  * Scope of v1.x:
  *   - EVM: implemented inline in `executeIntentsTrade` (legacy reasons).
  *   - SOL: this file — Solana SystemProgram::transfer via @solana/web3.js.
- *   - NEAR: this file — hand-rolled borsh-encoded Transfer action.
+ *   - NEAR: this file — hand-rolled borsh-encoded Transfer action; since
+ *     2026-10-06 also NEP-141 tokens (`executeNearTokenTransfer`: FunctionCall
+ *     `ft_transfer`, with `storage_deposit` for an unregistered receiver).
  *   - BTC / LTC / DOGE / BCH / DASH: since 2026-09-29 (F10) through the
  *     wallet adapter's ACCOUNT-WIDE send (`executeAccountUtxoTransfer`),
  *     the call the Send button makes. The single-address Rust PSBT builders
@@ -26,13 +28,25 @@ import { invoke } from "../../lib/tauri";
 import { broadcastTx, signEvm, signPsbt, type UtxoChain } from "../../api/swap-rust";
 import {
   isNearCause,
+  nearAvailableYocto,
+  nearGasPrice,
   nearRpcAny,
   nearRpcCall,
   parseNearRecipient,
   viewNearAccount,
 } from "../../wallets/near-wallet";
+import {
+  NEP141_CALL_GAS,
+  clearNep141Caches,
+  nep141Balance,
+  nep141NeedsRegistration,
+  nep141SendCostYocto,
+  nep141StorageBalance,
+  nep141StorageMinimum,
+} from "../../wallets/nep141-wallet";
 import { NEAR_RPCS } from "../../wallets/chain-rpcs";
 import {
+  assertNearTokenTransferShape,
   assertNearTransferShape,
   assertPsbtOutputShape,
   assertSolTransferShape,
@@ -479,6 +493,41 @@ export async function executeNearNativeTransfer(args: {
     actionTag: decoded.actionTag,
   });
 
+  // 3–6. Sign the transaction HASH once, broadcast, and ask NEAR what
+  //      happened (`signSubmitAndConfirmNear`).
+  return signSubmitAndConfirmNear({
+    sessionId: args.sessionId,
+    txBytes,
+    publicKeyBytes,
+    rpcUrls,
+    senderId: args.fromAccountId,
+    what: "transfer",
+  });
+}
+
+/**
+ * Sign a built NEAR transaction ONCE, broadcast those bytes, and ask NEAR
+ * what happened (steps 3–6 of `executeNearNativeTransfer`, moved here on
+ * 2026-10-06 so the NEP-141 transfer goes through the same steps, not a
+ * copy of them):
+ *  - the 32-byte transaction hash is what Rust signs (`swap_sign_near_tx`
+ *    signs whatever it is handed), and the signature is verified against the
+ *    account's key before anything is broadcast;
+ *  - only these identical signed bytes are ever re-sent;
+ *  - `broadcast_tx_async` answers before validation, so the outcome is
+ *    asked of `tx` until it executed, failed, or the wait ran out.
+ *
+ * `what` names the transaction in errors ("transfer", "USDT transfer").
+ */
+async function signSubmitAndConfirmNear(args: {
+  sessionId: string;
+  txBytes: Uint8Array;
+  publicKeyBytes: Uint8Array;
+  rpcUrls: string[];
+  senderId: string;
+  what: string;
+}): Promise<{ txHash: string; confirmed: boolean }> {
+  const { txBytes, publicKeyBytes, rpcUrls } = args;
   // 3. Sign the transaction HASH, sha256(borsh(Transaction)) — NEAR's
   //    convention, and also the transaction's id on chain.
   const txHash32 = nearTxHash(txBytes);
@@ -494,7 +543,7 @@ export async function executeNearNativeTransfer(args: {
   // Nothing leaves the machine unless NEAR would accept the signature.
   if (!ed25519.verify(sigBytes, txHash32, publicKeyBytes)) {
     throw new Error(
-      "The NEAR signature does not match this account's key, so NEAR would reject the transfer. Nothing was sent.",
+      `The NEAR signature does not match this account's key, so NEAR would reject the ${args.what}. Nothing was sent.`,
     );
   }
 
@@ -523,11 +572,11 @@ export async function executeNearNativeTransfer(args: {
   // 6. `broadcast_tx_async` answers before validation, so a hash proves
   //    nothing: ask NEAR what happened to it. Asked even when every broadcast
   //    threw — a dropped connection can still have delivered the transaction.
-  const outcome = await waitForNearOutcome(rpcUrls, txHash, args.fromAccountId);
+  const outcome = await waitForNearOutcome(rpcUrls, txHash, args.senderId);
   if (outcome.kind === "success") return { txHash, confirmed: true };
   if (outcome.kind === "failure") {
     throw new Error(
-      `NEAR ran the transfer and it failed (${outcome.detail}). The amount was not transferred; ` +
+      `NEAR ran the ${args.what} and it failed (${outcome.detail}). The amount was not transferred; ` +
         `at most the network fee was spent. Hash: ${txHash}`,
     );
   }
@@ -535,6 +584,304 @@ export async function executeNearNativeTransfer(args: {
     console.warn(`[near] broadcast did not answer cleanly (${broadcastProblem}); outcome unknown`);
   }
   return { txHash, confirmed: false };
+}
+
+// ─── NEP-141 tokens on NEAR (2026-10-06) ────────────────────────────────
+
+/** The 1 yoctoNEAR the NEP-141 standard requires attached to `ft_transfer`. */
+const FT_TRANSFER_DEPOSIT = 1n;
+
+/**
+ * One NEAR action this wallet builds (2026-10-06): the native Transfer, or a
+ * FunctionCall — what a NEP-141 send is.
+ */
+export type NearAction =
+  | { kind: "transfer"; deposit: bigint }
+  | { kind: "functionCall"; methodName: string; args: Uint8Array; gas: bigint; deposit: bigint };
+
+/**
+ * A NEAR `Transaction`, borsh-encoded: the bytes whose sha256 is the hash
+ * that is signed. Action tags are nearcore's: 2 = FunctionCall
+ * { method_name: String, args: Vec<u8>, gas: u64, deposit: u128 },
+ * 3 = Transfer { deposit: u128 }. Pinned against a real mainnet
+ * `storage_deposit` + `ft_transfer` transaction in `nep141Send.test.ts`, whose
+ * hash this reproduces. Exported for tests.
+ */
+export function encodeNearTransaction(args: {
+  signerId: string;
+  publicKeyEd25519Base58: string;
+  nonce: bigint;
+  receiverId: string;
+  blockHashB58: string;
+  actions: NearAction[];
+}): Uint8Array {
+  const enc = new BorshWriter();
+  enc.string(args.signerId);
+  enc.u8(0); // ed25519
+  enc.fixed(decodeBase58(args.publicKeyEd25519Base58, 32));
+  enc.u64(args.nonce);
+  enc.string(args.receiverId);
+  enc.fixed(decodeBase58(args.blockHashB58, 32));
+  enc.u32(args.actions.length);
+  for (const a of args.actions) {
+    if (a.kind === "transfer") {
+      enc.u8(3);
+      enc.u128(a.deposit);
+      continue;
+    }
+    enc.u8(2);
+    enc.string(a.methodName);
+    enc.u32(a.args.length);
+    enc.fixed(a.args);
+    enc.u64(a.gas);
+    enc.u128(a.deposit);
+  }
+  return enc.toBytes();
+}
+
+/** One decoded action. `methodName`/`args`/`gas` only on a FunctionCall (tag 2). */
+export interface DecodedNearAction {
+  tag: number;
+  methodName?: string;
+  args?: Uint8Array;
+  gas?: bigint;
+  deposit: bigint;
+}
+
+/**
+ * Read back the transaction `encodeNearTransaction` writes — every byte of
+ * it, so the safety layer checks what will be signed, not what was meant.
+ * Throws on an action kind this wallet never builds and on trailing bytes.
+ * Exported for tests.
+ */
+export function decodeNearTransaction(bytes: Uint8Array): {
+  signerId: string;
+  receiverId: string;
+  actions: DecodedNearAction[];
+} {
+  const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  let off = 0;
+  const need = (n: number) => {
+    if (off + n > bytes.length) throw new Error("NEAR transaction ends early");
+  };
+  const u8 = () => {
+    need(1);
+    return bytes[off++];
+  };
+  const u32 = () => {
+    need(4);
+    const v = view.getUint32(off, true);
+    off += 4;
+    return v;
+  };
+  const u64 = () => {
+    need(8);
+    const v = view.getBigUint64(off, true);
+    off += 8;
+    return v;
+  };
+  const u128 = () => {
+    need(16);
+    const lo = view.getBigUint64(off, true);
+    const hi = view.getBigUint64(off + 8, true);
+    off += 16;
+    return (hi << 64n) | lo;
+  };
+  const raw = () => {
+    const n = u32();
+    need(n);
+    const out = bytes.subarray(off, off + n);
+    off += n;
+    return out;
+  };
+  const str = () => new TextDecoder().decode(raw());
+  const signerId = str();
+  if (u8() !== 0) throw new Error("NEAR transaction key is not ed25519");
+  need(32);
+  off += 32; // public key
+  u64(); // nonce
+  const receiverId = str();
+  need(32);
+  off += 32; // block hash
+  const count = u32();
+  const actions: DecodedNearAction[] = [];
+  for (let i = 0; i < count; i++) {
+    const tag = u8();
+    if (tag === 3) {
+      actions.push({ tag, deposit: u128() });
+    } else if (tag === 2) {
+      const methodName = str();
+      const args = raw();
+      const gas = u64();
+      actions.push({ tag, methodName, args, gas, deposit: u128() });
+    } else {
+      throw new Error(`NEAR transaction carries action ${tag}, which this wallet never builds`);
+    }
+  }
+  if (off !== bytes.length) throw new Error("NEAR transaction has trailing bytes");
+  return { signerId, receiverId, actions };
+}
+
+/**
+ * Build, sign ONCE and broadcast a NEP-141 `ft_transfer`, then wait for NEAR
+ * to say it executed (2026-10-06; operator request 2026-10-01: USDT and USDC
+ * on NEAR). The dashboard Send (`session-send.ts::executeNearTokenSend`) and a
+ * NEAR Intents deposit of the token both come here.
+ *
+ * The transaction goes to the TOKEN CONTRACT, signed by the NEAR account:
+ *  - `storage_deposit({ account_id, registration_only: true })` with the
+ *    contract's `storage_balance_bounds().min` (0.00125 NEAR for USDT and
+ *    USDC), ONLY when the receiver is not registered with the contract — a
+ *    transfer to an unregistered account fails. It shares the transaction
+ *    (and so the receipt) with the transfer, so a failed transfer takes the
+ *    registration back with it. The Send modal shows the cost before Send
+ *    (`nep141-wallet.ts::getGasBudget`'s notice);
+ *  - `ft_transfer({ receiver_id, amount })` with exactly 1 yoctoNEAR.
+ * 30 Tgas each (near-api-js's default); the shape is the one the public test
+ * seed's own USDT arrived in (tx 8xvZKGz2…).
+ *
+ * A NEAR Intents deposit is this same `ft_transfer` to the quote's deposit
+ * address — an implicit account, as NEAR's own 1Click example sends native
+ * NEAR to — not `ft_transfer_call`, which is for depositing straight into
+ * `intents.near`, a different flow. A production wallet doing 1Click NEAR
+ * swaps builds the same pair (xchainjs `xchain-near` 0.3, used by Asgardex).
+ *
+ * Refused before anything is built (plain errors, safe to retry): an invalid
+ * or ETH-style receiver; a NAMED receiver that does not exist (tokens credited
+ * to a name anyone could still create); sending to the sender itself (the
+ * standard refuses it); an amount of 0; a token balance short of the amount;
+ * and NEAR short of the attached gas, the 1 yocto and any registration
+ * (`nep141SendCostYocto`). After the broadcast: as the native transfer
+ * (`signSubmitAndConfirmNear`).
+ */
+export async function executeNearTokenTransfer(args: {
+  sessionId: string;
+  /** 64-char hex implicit account, or named NEAR account ID. */
+  fromAccountId: string;
+  /** `ed25519:<base58>` form of the account's public key. */
+  fromPublicKey: string;
+  /** The NEP-141 contract account (`usdt.tether-token.near`). */
+  tokenContract: string;
+  /** Who receives the token: a recipient, or 1Click's deposit address. */
+  receiverId: string;
+  /** Atomic units of the token, as a decimal string. */
+  amountAtomic: string;
+  decimals: number;
+  ticker: string;
+  rpcUrl: string;
+}): Promise<{ txHash: string; confirmed: boolean; registered: boolean }> {
+  // 0. Everything decidable before building: plain errors, safe to retry.
+  const { accountId: receiverId, implicit } = parseNearRecipient(args.receiverId);
+  const amount = atomicStringToBigInt(args.amountAtomic);
+  if (amount <= 0n) throw new Error(`The ${args.ticker} amount must be greater than zero.`);
+  if (receiverId === args.fromAccountId) {
+    throw new Error(
+      `${args.ticker} cannot be sent to the NEAR account that holds it: the token contract refuses a ` +
+        `transfer to oneself. Nothing was sent.`,
+    );
+  }
+  const rpcUrls = nearRpcList(args.rpcUrl);
+  const [receiverExists, balance, storage, minimum, sender, gasPrice] = await Promise.all([
+    implicit ? Promise.resolve(true) : viewNearAccount(receiverId, rpcUrls).then((v) => v !== null),
+    nep141Balance(args.tokenContract, args.fromAccountId, rpcUrls),
+    nep141StorageBalance(args.tokenContract, receiverId, rpcUrls),
+    nep141StorageMinimum(args.tokenContract, rpcUrls),
+    viewNearAccount(args.fromAccountId, rpcUrls),
+    nearGasPrice(rpcUrls),
+  ]);
+  if (!receiverExists) {
+    throw new Error(
+      `The NEAR account "${receiverId}" does not exist. ${args.ticker} sent to it would be credited to a ` +
+        `name anyone could still create. Check the name. Nothing was sent.`,
+    );
+  }
+  if (balance < amount) {
+    throw new Error(
+      `This NEAR account holds ${atomicToDecimal(balance, args.decimals)} ${args.ticker}; this send needs ` +
+        `${atomicToDecimal(amount, args.decimals)}. Nothing was sent.`,
+    );
+  }
+  const register = nep141NeedsRegistration(storage, minimum);
+  const storageDeposit = register ? minimum : 0n;
+  const needYocto = nep141SendCostYocto({ gasPrice, storageDeposit });
+  const availableYocto = sender ? nearAvailableYocto(sender) : 0n;
+  if (availableYocto < needYocto) {
+    throw new Error(
+      `Sending ${args.ticker} on NEAR is paid in NEAR: this send needs about ` +
+        `${atomicToDecimal(needYocto, 24)} NEAR for the network fee` +
+        (register
+          ? `, including ${atomicToDecimal(storageDeposit, 24)} NEAR to register the recipient with the ` +
+            `${args.ticker} contract`
+          : "") +
+        `. This account has ${atomicToDecimal(availableYocto, 24)} NEAR available. Add NEAR first. ` +
+        `Nothing was sent.`,
+    );
+  }
+  const publicKeyB58 = stripEd25519Prefix(args.fromPublicKey);
+  const publicKeyBytes = decodeBase58(publicKeyB58, 32);
+
+  // 1. The access key's nonce and a recent block hash.
+  const { nonce, blockHashB58 } = await fetchNearNonce(rpcUrls, args.fromAccountId, args.fromPublicKey);
+
+  // 2. The transaction. JSON key order is the one NEAR wallets send (and the
+  //    pinned mainnet transaction carries).
+  const json = (o: unknown) => new TextEncoder().encode(JSON.stringify(o));
+  const actions: NearAction[] = [];
+  if (register) {
+    actions.push({
+      kind: "functionCall",
+      methodName: "storage_deposit",
+      args: json({ account_id: receiverId, registration_only: true }),
+      gas: NEP141_CALL_GAS,
+      deposit: storageDeposit,
+    });
+  }
+  actions.push({
+    kind: "functionCall",
+    methodName: "ft_transfer",
+    args: json({ receiver_id: receiverId, amount: amount.toString() }),
+    gas: NEP141_CALL_GAS,
+    deposit: FT_TRANSFER_DEPOSIT,
+  });
+  const txBytes = encodeNearTransaction({
+    signerId: args.fromAccountId,
+    publicKeyEd25519Base58: publicKeyB58,
+    nonce: nonce + 1n,
+    receiverId: args.tokenContract,
+    blockHashB58,
+    actions,
+  });
+
+  // ─── SAFETY INVARIANT (NEP-141 post-build) ──────────────────────
+  // Read the bytes back: to the token contract, an optional registration of
+  // exactly this receiver for exactly the minimum, then `ft_transfer` of
+  // exactly this amount to exactly this receiver with 1 yocto — and nothing
+  // else.
+  assertNearTokenTransferShape({
+    decoded: decodeNearTransaction(txBytes),
+    tokenContract: args.tokenContract,
+    receiverId,
+    amountAtomic: amount,
+    storageDeposit: register ? storageDeposit : null,
+    ticker: args.ticker,
+  });
+
+  // 3–6. As the native transfer.
+  try {
+    const r = await signSubmitAndConfirmNear({
+      sessionId: args.sessionId,
+      txBytes,
+      publicKeyBytes,
+      rpcUrls,
+      senderId: args.fromAccountId,
+      what: `${args.ticker} transfer`,
+    });
+    return { ...r, registered: register };
+  } finally {
+    // Whatever happened, the NEAR balance and the receiver's registration the
+    // Send modal last saw may be stale.
+    clearNep141Caches();
+  }
 }
 
 /** `rpcUrl` first, then the configured NEAR RPCs, without repeats. */

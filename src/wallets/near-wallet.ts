@@ -190,6 +190,57 @@ export async function viewNearAccount(
 }
 
 /**
+ * A contract VIEW call (`query` / `call_function`), read from the first node
+ * that answers (2026-10-06, for the NEP-141 legs). `args` is sent as JSON;
+ * the answer's `result` is the method's return value as JSON bytes.
+ *
+ * A contract that PANICS answers with an error a second node would repeat, so
+ * that is not rotated past; any transport failure is. Throws when no node
+ * answered.
+ */
+export async function nearViewFunction<T>(
+  contract: string,
+  method: string,
+  args: Record<string, unknown>,
+  urls: string[] = NEAR_RPCS(),
+): Promise<T> {
+  const r = await nearRpcAny<{ result?: unknown }>(
+    urls,
+    "query",
+    {
+      request_type: "call_function",
+      finality: "final",
+      account_id: contract,
+      method_name: method,
+      args_base64: Buffer.from(JSON.stringify(args), "utf8").toString("base64"),
+    },
+    (e) => isNearCause(e, "CONTRACT_EXECUTION_ERROR") || isNearCause(e, "UNKNOWN_ACCOUNT"),
+  );
+  const bytes = r?.result;
+  if (!Array.isArray(bytes) || !bytes.every((b) => Number.isInteger(b) && b >= 0 && b <= 255)) {
+    throw new Error(`NEAR view ${contract}.${method}: the node's answer has no result bytes`);
+  }
+  const text = Buffer.from(bytes as number[]).toString("utf8");
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`NEAR view ${contract}.${method}: the result is not JSON (${text.slice(0, 80)})`);
+  }
+}
+
+/**
+ * The current gas price, yoctoNEAR per gas unit (`gas_price` for the latest
+ * block). 100,000,000 on mainnet when read on 2026-10-06. Throws when no node
+ * answered.
+ */
+export async function nearGasPrice(urls: string[] = NEAR_RPCS()): Promise<bigint> {
+  const r = await nearRpcAny<{ gas_price?: unknown }>(urls, "gas_price", [null]);
+  const p = r?.gas_price;
+  if (typeof p !== "string" || !/^\d+$/.test(p)) throw new Error("NEAR gas_price: no price in the answer");
+  return BigInt(p);
+}
+
+/**
  * Storage staking: every byte of account state keeps 10^19 yoctoNEAR
  * (1 NEAR per 100 kB) in the account, and that part of `amount` cannot be
  * sent. NEAR's `storage_amount_per_byte`; unchanged since 2020.

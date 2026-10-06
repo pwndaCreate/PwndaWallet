@@ -45,9 +45,10 @@
  *
  * Subset of the 32 upstream chains — only the ones Pwnda either
  * already integrates or is targeting in v2.x. Other upstream chains
- * (abs, adi, aleo, aptos, bera, cardano, gnosis, plasma, scroll,
+ * (abs, adi, aleo, bera, cardano, gnosis, plasma, scroll,
  * starknet, xlayer, zec) appear in the catalog page but are not
- * surfaced in PwndaWallet today.
+ * surfaced in PwndaWallet today. (Aptos left this list on 2026-10-06,
+ * for its USDT and USDC — see the union member below.)
  */
 export type IntentsBlockchain =
   | "eth" // Ethereum L1
@@ -77,7 +78,13 @@ export type IntentsBlockchain =
   // swap_sign_cardano). Per the upstream catalog
   // (wiki/concepts/near-intents-asset-catalog.md), Cardano is a
   // single-asset chain on NEAR Intents (native ADA only).
-  | "cardano";
+  | "cardano"
+  // 2026-10-06 — Aptos, for its USDT and USDC legs (operator request,
+  // 2026-10-01). 1Click's feed labels the chain `aptos`; the two assets are
+  // `nep141:aptos-<hash>.omft.near` with the fungible-asset metadata object as
+  // `contractAddress`. Source-capable through the leg's own adapter
+  // (`intents-source-capability.ts`).
+  | "aptos";
 
 export interface IntentsAsset {
   /** Asset id in any of the three NEAR Intents namespaces. */
@@ -411,6 +418,27 @@ export const NEAR_INTENTS_ASSETS: readonly IntentsAsset[] = [
     blockchain: "sui",
     contractAddress: "0xdba34672e30cb065b1f93e3ab55318768fd6fef66c15942c9f7cb846e2f900e7::usdc::USDC",
   },
+  // USDC on NEAR and on Aptos (2026-10-06), added by hand beside the curated
+  // rows for the reason the Monad USD₮0 row below gives. Ids, decimals and
+  // contracts copied from the live 1Click token list that day; each contract
+  // was also read on its own chain (NEAR `ft_metadata`, Aptos
+  // `fungible_asset::Metadata`) — see `wallets/stablecoins.ts`.
+  {
+    assetId: "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+    symbol: "USDC",
+    displayName: "USDC (NEAR)",
+    decimals: 6,
+    blockchain: "near",
+    contractAddress: "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+  },
+  {
+    assetId: "nep141:aptos-34ee497f210c5a511e8d5b53bc56d75b63612bb5.omft.near",
+    symbol: "USDC",
+    displayName: "USDC (Aptos)",
+    decimals: 6,
+    blockchain: "aptos",
+    contractAddress: "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b",
+  },
 
   // ───── USDT across major chains ─────
   {
@@ -459,6 +487,24 @@ export const NEAR_INTENTS_ASSETS: readonly IntentsAsset[] = [
     blockchain: "op",
     contractAddress: "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",
   },
+  // Optimism USD₮0 (2026-10-06), by hand like the Monad row above. A SECOND
+  // USDT-family asset on Optimism: the bridged USDT row above (0x94b0…8e58) is
+  // a different contract. The live list calls this one "USDT0"; it is filed
+  // under USDT like the other USD₮0 rows. Contract read on chain (symbol
+  // "USD₮0", 6 decimals).
+  //
+  // It stays AFTER the bridged row: `resolveAsset("USDT", "op")` takes the
+  // first match in file order, and a bare "USDT" on Optimism meant the bridged
+  // token before this row existed. The legs themselves are matched by asset
+  // id, never by symbol.
+  {
+    assetId: "nep245:v2_1.omni.hot.tg:10_2R1RXDBxCyJTeMEsdXydh7xsHmz",
+    symbol: "USDT",
+    displayName: "USDT (Optimism / USDT0)",
+    decimals: 6,
+    blockchain: "op",
+    contractAddress: "0x01bff41798a0bcf287b996046ca68b395dbc1071",
+  },
   // scope:v2x — Avalanche USDT under nep245.
   {
     assetId: "nep245:v2_1.omni.hot.tg:43114_372BeH7ENZieCaabwkbWkBiTTgXp",
@@ -495,6 +541,23 @@ export const NEAR_INTENTS_ASSETS: readonly IntentsAsset[] = [
     decimals: 6,
     blockchain: "tron",
     contractAddress: "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t",
+  },
+  // USDT on NEAR and on Aptos (2026-10-06), by hand like the USDC rows above.
+  {
+    assetId: "nep141:usdt.tether-token.near",
+    symbol: "USDT",
+    displayName: "USDT (NEAR)",
+    decimals: 6,
+    blockchain: "near",
+    contractAddress: "usdt.tether-token.near",
+  },
+  {
+    assetId: "nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near",
+    symbol: "USDT",
+    displayName: "USDT (Aptos)",
+    decimals: 6,
+    blockchain: "aptos",
+    contractAddress: "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b",
   },
 
   // ───── DAI on Ethereum (newly bridged 2026-05-08) ─────
@@ -596,4 +659,5 @@ export const BLOCKCHAIN_DISPLAY_NAME: Record<IntentsBlockchain, string> = {
   dash: "Dash",
   stellar: "Stellar",
   sui: "Sui",
+  aptos: "Aptos",
 };

@@ -3,6 +3,7 @@ import { ST } from "../../components/Primitives";
 import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
 import { txDisplayTicker } from "../../wallets/tx-display";
+import { coinMarkFor } from "../../wallets/stablecoins";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { dedupeTxRows, txRowKey } from "../../wallets/tx-row-key";
 import type { ChainTx, ChainType } from "../../wallets";
@@ -365,7 +366,8 @@ function TxRow({
       }
       onMouseLeave={(e) => (e.currentTarget.style.background = "transparent")}
     >
-      <CoinIcon sym={txDisplayTicker(tx, adapter.ticker)} size={22} glow={false} />
+      {/* A USD₮0 row keeps the USD₮0 mark (2026-10-06), as in landscape. */}
+      <CoinIcon sym={coinMarkFor(tx.chain, txDisplayTicker(tx, adapter.ticker))} size={22} glow={false} />
       <div style={{ flex: 1, minWidth: 0 }}>
         <div
           style={{

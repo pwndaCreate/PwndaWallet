@@ -31,7 +31,7 @@
  * form exactly (no float arithmetic), and such a row is marked
  * `meta.amountApprox` so the details view can say so.
  */
-import type { ChainTx, TxHistoryPage, TxParties } from "./types";
+import type { ChainTx, ChainType, TxHistoryPage, TxParties } from "./types";
 import { atomicToDecimal } from "./decimal-amount";
 import { dedupeTxRows } from "./tx-row-key";
 import { uniqueAddresses } from "./parties-b-common";
@@ -189,6 +189,178 @@ export async function fetchNearblocksTxn(hash: string): Promise<Record<string, u
   if (!Array.isArray(txns)) throw new Error("NEAR transaction: unexpected response from NearBlocks");
   const txn = txns.find((t) => (t as { transaction_hash?: unknown })?.transaction_hash === hash) ?? txns[0];
   return txn && typeof txn === "object" ? (txn as Record<string, unknown>) : null;
+}
+
+// =========================================================================
+// NEP-141 token history (2026-10-06, the USDT/USDC legs on NEAR)
+// =========================================================================
+//
+// NearBlocks indexes every NEP-141 `ft_transfer` EVENT the token contract logs
+// (NEP-297), per account: `/v1/account/<id>/ft-txns?contract=<token>`. Read
+// live for the public test seed's account (5510e2b4…ee412) and for
+// `intents.near` on 2026-10-06; each row is one balance change of the
+// account:
+//
+//   { affected_account_id, involved_account_id, delta_amount: "-148600459",
+//     cause: "TRANSFER" | "MINT" | "BURN", transaction_hash, block_timestamp
+//     (ns, string), block: { block_height }, outcomes: { status },
+//     outcomes_agg: { transaction_fee }, ft: { contract, symbol, decimals } }
+//
+// `delta_amount` is SIGNED: negative when the account paid, positive when it
+// received (both signs seen on intents.near's USDT rows). An event is only
+// logged by a transfer that executed, so these rows are never failures.
+
+/** One NearBlocks FT event as a `ChainTx`, or null when it is not a row. Exported for tests. */
+export function nearblocksFtRow(
+  raw: unknown,
+  me: string,
+  token: { chain: ChainType; contract: string; decimals: number },
+): ChainTx | null {
+  if (!raw || typeof raw !== "object") return null;
+  const r = raw as Record<string, any>;
+  const hash = typeof r.transaction_hash === "string" ? r.transaction_hash : "";
+  if (!hash) return null;
+  // Another token's event (the filter is the API's; never trusted alone).
+  if (r.ft?.contract !== undefined && r.ft?.contract !== token.contract) return null;
+  if (r.affected_account_id !== undefined && r.affected_account_id !== me) return null;
+  const delta = typeof r.delta_amount === "string" ? r.delta_amount.trim() : String(r.delta_amount ?? "");
+  const m = /^(-)?(\d+)$/.exec(delta);
+  if (!m || BigInt(m[2]) === 0n) return null;
+  const out = m[1] === "-";
+  const counterparty = typeof r.involved_account_id === "string" ? r.involved_account_id : "";
+  // The fee belongs to the transaction's signer: this wallet's only on a send.
+  const fee = out ? yoctoFromJson(r.outcomes_agg?.transaction_fee) : null;
+  return {
+    chain: token.chain,
+    hash,
+    direction: out ? "out" : "in",
+    amount: atomicToDecimal(BigInt(m[2]), token.decimals),
+    fee: fee ? atomicToDecimal(fee.yocto, NEAR_DECIMALS) : undefined,
+    timestamp: nsToSeconds(r.block_timestamp),
+    height: heightOf(r.block?.block_height),
+    counterparty,
+    meta: {
+      intended: out ? "out" : "in",
+      ...(typeof r.cause === "string" ? { cause: r.cause } : {}),
+      contract: token.contract,
+      source: NEARBLOCKS_HOST,
+    },
+  };
+}
+
+/**
+ * The account's transfers of ONE NEP-141 token, newest first, from NearBlocks
+ * (2026-10-06). Throws on a failed request — never an empty list for one.
+ */
+export async function fetchNep141History(
+  account: string,
+  token: { chain: ChainType; contract: string; decimals: number },
+  opts: { limit?: number; cursor?: string } | undefined,
+): Promise<TxHistoryPage> {
+  const limit = Math.max(1, Math.min(opts?.limit ?? 25, 100));
+  const cursor = opts?.cursor && /^\d+$/.test(opts.cursor) ? `&cursor=${opts.cursor}` : "";
+  const url =
+    `${NEARBLOCKS_API}/v1/account/${encodeURIComponent(account)}/ft-txns` +
+    `?contract=${encodeURIComponent(token.contract)}&per_page=${limit}&order=desc${cursor}`;
+  const ctl = typeof AbortController !== "undefined" ? new AbortController() : null;
+  const timer = ctl ? setTimeout(() => ctl.abort(), NEAR_HISTORY_TIMEOUT.ms) : null;
+  let body: unknown;
+  try {
+    const resp = await fetch(url, { signal: ctl?.signal });
+    if (!resp.ok) {
+      const text = await resp.text().catch(() => "");
+      throw new Error(`HTTP ${resp.status} from ${url}: ${text.slice(0, 200)}`);
+    }
+    body = await resp.json();
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+  const txns = (body as { txns?: unknown } | null)?.txns;
+  if (!Array.isArray(txns)) throw new Error("NEAR token history: unexpected response from NearBlocks");
+  const items = txns
+    .map((t) => nearblocksFtRow(t, account, token))
+    .filter((x): x is ChainTx => x !== null);
+  const next = (body as { cursor?: unknown }).cursor;
+  return {
+    items: dedupeTxRows(items),
+    cursor: txns.length >= limit && (typeof next === "string" || typeof next === "number") ? String(next) : undefined,
+  };
+}
+
+/**
+ * One transaction's NEP-141 parties for `contract`, from a NearBlocks `/full`
+ * transaction (2026-10-06): who the token left and who it reached, never the
+ * token contract (which is the transaction's RECEIVER, and what
+ * `nearblocksTxnParties` would name).
+ *
+ * The receipts' `fts` events first: they are what executed (seen live on
+ * 8xvZKGz2…, whose `fts` named the payer with `delta_amount: -9800000` and
+ * the payee as `involved_account_id`). When the indexer lists no event — a
+ * transfer that failed, or one not processed yet — the `ft_transfer` /
+ * `ft_transfer_call` action's own `receiver_id` and the signer. `null` when
+ * neither names a transfer of this token.
+ */
+export function nep141TxnParties(
+  txn: Record<string, unknown>,
+  contract: string,
+  own: string,
+  decimals: number,
+  source = NEARBLOCKS_HOST,
+): TxParties | null {
+  const receipts = (Array.isArray(txn.receipts) ? txn.receipts : []) as Array<Record<string, unknown>>;
+  const from: string[] = [];
+  const to: string[] = [];
+  let ownDelta = 0n;
+  for (const rc of receipts) {
+    for (const ev of (Array.isArray(rc?.fts) ? rc.fts : []) as Array<Record<string, any>>) {
+      if ((ev?.ft_meta?.contract ?? ev?.ft?.contract) !== contract) continue;
+      const d = typeof ev.delta_amount === "number" || typeof ev.delta_amount === "string"
+        ? String(ev.delta_amount)
+        : "";
+      const m = /^(-)?(\d+)/.exec(d);
+      if (!m) continue;
+      const affected = typeof ev.affected_account_id === "string" ? ev.affected_account_id : "";
+      if (!affected) continue;
+      (m[1] === "-" ? from : to).push(affected);
+      // NearBlocks serialises this field as a JSON number in `/full` (seen
+      // 2026-10-06: `-9800000`); a large one loses precision, so the amount is
+      // reported only from a digit string.
+      if (affected === own && typeof ev.delta_amount === "string") {
+        ownDelta += (m[1] === "-" ? -1n : 1n) * BigInt(m[2]);
+      }
+    }
+  }
+  if (from.length || to.length) {
+    return {
+      from: uniqueAddresses(from),
+      to: uniqueAddresses(to),
+      ...(ownDelta !== 0n
+        ? {
+            direction: ownDelta < 0n ? ("out" as const) : ("in" as const),
+            amount: atomicToDecimal(ownDelta < 0n ? -ownDelta : ownDelta, decimals),
+          }
+        : {}),
+      source,
+    };
+  }
+  if (txn.receiver_account_id !== contract) return null;
+  const actions = (Array.isArray(txn.actions) ? txn.actions : []) as Array<Record<string, any>>;
+  const receivers: string[] = [];
+  for (const a of actions) {
+    if (a?.method !== "ft_transfer" && a?.method !== "ft_transfer_call") continue;
+    let args: any = a?.args_full?.args_json;
+    if (!args && typeof a?.args === "string") {
+      try {
+        args = JSON.parse(a.args);
+      } catch {
+        args = null;
+      }
+    }
+    if (typeof args?.receiver_id === "string") receivers.push(args.receiver_id);
+  }
+  if (receivers.length === 0) return null;
+  const signer = typeof txn.signer_account_id === "string" ? txn.signer_account_id : "";
+  return { from: uniqueAddresses([signer]), to: uniqueAddresses(receivers), source };
 }
 
 /**

@@ -34,6 +34,7 @@ import { decimalToAtomic, atomicToDecimal } from "./decimal-amount";
 import { SendOutcomeUnknownError } from "./send-outcome";
 import type {
   ChainAdapter,
+  ChainType,
   WalletInfo,
   TxResult,
   NetworkInfo,
@@ -45,7 +46,8 @@ import type {
 import { errorText } from "../lib/errorText";
 import { uniqueAddresses, urlHost } from "./parties-b-common";
 
-const APTOS_API = "https://api.mainnet.aptoslabs.com/v1";
+/** The Aptos REST API (fullnode). Exported for the fungible-asset legs (2026-10-06). */
+export const APTOS_API = "https://api.mainnet.aptoslabs.com/v1";
 
 /**
  * The Aptos indexer, on the same host (Hasura GraphQL; answers CORS for the
@@ -213,6 +215,38 @@ export function aptosTransferOf(payload: unknown): { legs: AptosTransferLeg[]; a
       return many(args[1], args[2], metadataIsApt(args[0]));
     default:
       return null;
+  }
+}
+
+/**
+ * The fungible asset a framework FA transfer moves: its metadata object,
+ * padded, or `null` for any other payload (a coin transfer, APT's own
+ * `aptos_account::transfer`, any non-framework call). Exported for tests.
+ *
+ * Added 2026-10-06 for the USDT/USDC legs on Aptos, which are fungible assets
+ * moved by `primary_fungible_store::transfer(metadata, recipient, amount)`
+ * (the payload of every live USDt/USDC transfer read that day). Kept apart
+ * from `aptosTransferOf`, whose `{ legs, apt }` answer other tests pin.
+ */
+export function aptosFaMetadataOf(payload: unknown): string | null {
+  const p = (payload ?? {}) as { function?: unknown; arguments?: unknown };
+  const m = /^(0x[0-9a-fA-F]{1,64})::(\w+)::(\w+)$/.exec(typeof p.function === "string" ? p.function : "");
+  if (!m || readAptosAddress(m[1]) !== readAptosAddress("0x1")) return null;
+  const fn = `${m[2]}::${m[3]}`;
+  if (
+    fn !== "primary_fungible_store::transfer" &&
+    fn !== "aptos_account::transfer_fungible_assets" &&
+    fn !== "aptos_account::batch_transfer_fungible_assets"
+  ) {
+    return null;
+  }
+  const first = Array.isArray(p.arguments) ? p.arguments[0] : undefined;
+  const inner = first && typeof first === "object" ? (first as { inner?: unknown }).inner : first;
+  if (typeof inner !== "string") return null;
+  try {
+    return normalizeAptosAddress(inner);
+  } catch {
+    return null;
   }
 }
 
@@ -614,7 +648,14 @@ const APTOS_ACCOUNT_TXS_QUERY = `query ($address: String!, $limit: Int!) {
  * standard, `0x1::coin::DepositEvent` of `0x1::aptos_coin::AptosCoin`; a
  * failed send, only its gas event, with `is_transaction_success: false`.
  */
-export function aptosIndexerEntries(answer: unknown): AptosIndexerEntry[] {
+export function aptosIndexerEntries(
+  answer: unknown,
+  /**
+   * Which `asset_type` is the asset whose history this is: APT by default; a
+   * fungible-asset leg passes its metadata object (2026-10-06).
+   */
+  isAsset: (assetType: unknown) => boolean = isAptAssetType,
+): AptosIndexerEntry[] {
   const rows = (answer as { account_transactions?: unknown } | null)?.account_transactions;
   if (!Array.isArray(rows)) throw new Error("the indexer's answer has no account_transactions");
   const out: AptosIndexerEntry[] = [];
@@ -629,7 +670,7 @@ export function aptosIndexerEntries(answer: unknown): AptosIndexerEntry[] {
       if (a?.is_transaction_success === false && isAptosTransferFunction(a?.entry_function_id_str)) {
         failedTransfer = true;
       }
-      if (a?.is_gas_fee === true || !isAptAssetType(a?.asset_type)) continue;
+      if (a?.is_gas_fee === true || !isAsset(a?.asset_type)) continue;
       const kind = String(a?.type ?? "").split("::").pop() ?? "";
       const units = /^\d+$/.test(String(a?.amount ?? "")) ? BigInt(String(a.amount)) : 0n;
       if (/deposit/i.test(kind)) {
@@ -644,7 +685,11 @@ export function aptosIndexerEntries(answer: unknown): AptosIndexerEntry[] {
   return out;
 }
 
-async function aptosIndexedTransactions(addr: string, limit: number): Promise<AptosIndexerEntry[]> {
+async function aptosIndexedTransactions(
+  addr: string,
+  limit: number,
+  isAsset: (assetType: unknown) => boolean,
+): Promise<AptosIndexerEntry[]> {
   const r = await fetch(APTOS_INDEXER, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -655,7 +700,40 @@ async function aptosIndexedTransactions(addr: string, limit: number): Promise<Ap
   if (Array.isArray(j?.errors) && j.errors.length) {
     throw new Error(`${urlHost(APTOS_API)} indexer: ${j.errors.map((e: any) => e?.message).join("; ")}`);
   }
-  return aptosIndexerEntries(j?.data);
+  return aptosIndexerEntries(j?.data, isAsset);
+}
+
+/**
+ * Whose history a row builder is writing (2026-10-06): APT itself, or one
+ * fungible-asset leg (`usdt-aptos`, `usdc-aptos`). The rules are the same for
+ * every asset; only "is this transfer of my asset" and the decimals differ.
+ */
+export interface AptosHistoryAsset {
+  chain: ChainType;
+  decimals: number;
+  /** An indexer activity's `asset_type` is this asset. */
+  isAssetType: (assetType: unknown) => boolean;
+  /** A transaction's framework transfer moves this asset. */
+  movesAsset: (payload: unknown, xfer: { apt: boolean }) => boolean;
+}
+
+/** APT's own history — what the adapter read before the token legs existed. */
+export const APT_HISTORY_ASSET: AptosHistoryAsset = {
+  chain: "aptos",
+  decimals: APT_DECIMALS,
+  isAssetType: isAptAssetType,
+  movesAsset: (_payload, xfer) => xfer.apt,
+};
+
+/** A fungible-asset leg's history: transfers of exactly `metadata`. */
+export function aptosFaHistoryAsset(chain: ChainType, metadata: string, decimals: number): AptosHistoryAsset {
+  const meta = normalizeAptosAddress(metadata);
+  return {
+    chain,
+    decimals,
+    isAssetType: (t) => typeof t === "string" && readAptosAddress(t) === meta,
+    movesAsset: (payload) => aptosFaMetadataOf(payload) === meta,
+  };
 }
 
 /** `fn` over `items`, at most `size` at a time, results in order. */
@@ -686,8 +764,17 @@ async function inPool<T, R>(items: readonly T[], size: number, fn: (t: T) => Pro
  *    sender. Other calls the account sent are left out, as before.
  *  - An aborted transaction is `failed`, committed, its gas still the
  *    sender's (2026-09-30).
+ *
+ * `asset` (2026-10-06) is whose row this is: APT by default, or a
+ * fungible-asset leg (`aptosFaHistoryAsset`). The fee is APT either way —
+ * the gas — which is the leg's `gasToken`.
  */
-export function aptosHistoryRow(tx: unknown, addr: string, deposited = 0n): ChainTx | null {
+export function aptosHistoryRow(
+  tx: unknown,
+  addr: string,
+  deposited = 0n,
+  asset: AptosHistoryAsset = APT_HISTORY_ASSET,
+): ChainTx | null {
   const t = (tx ?? {}) as AptosTxRecord & Record<string, unknown>;
   if (t.type !== "user_transaction") return null;
   const sender = typeof t.sender === "string" ? readAptosAddress(t.sender) : "";
@@ -695,16 +782,17 @@ export function aptosHistoryRow(tx: unknown, addr: string, deposited = 0n): Chai
   // Covers the legacy coin path AND the post-migration fungible-asset one,
   // each read with its own argument order (`aptosTransferOf`). A transfer
   // of another coin or fungible asset is not listed as APT (2026-09-30).
-  const xfer = aptosTransferOf(t.payload);
+  const parsed = aptosTransferOf(t.payload);
+  const xfer = parsed && asset.movesAsset(t.payload, parsed) ? parsed : null;
   let intended: "in" | "out" | "self";
   let units: bigint;
   let counterparty: string;
-  if (xfer?.apt && outgoing) {
+  if (xfer && outgoing) {
     const toOthers = xfer.legs.filter((l) => readAptosAddress(l.to) !== addr);
     intended = toOthers.length === 0 ? "self" : "out";
     units = (toOthers.length ? toOthers : xfer.legs).reduce((sum, l) => sum + l.units, 0n);
     counterparty = toOthers[0]?.to ?? xfer.legs[0]?.to ?? "";
-  } else if (xfer?.apt && xfer.legs.some((l) => readAptosAddress(l.to) === addr)) {
+  } else if (xfer && xfer.legs.some((l) => readAptosAddress(l.to) === addr)) {
     intended = "in";
     units = xfer.legs.filter((l) => readAptosAddress(l.to) === addr).reduce((sum, l) => sum + l.units, 0n);
     counterparty = String(t.sender ?? "");
@@ -733,10 +821,10 @@ export function aptosHistoryRow(tx: unknown, addr: string, deposited = 0n): Chai
     }
   }
   return {
-    chain: "aptos",
+    chain: asset.chain,
     hash: String(t.hash ?? ""),
     direction: failed ? "failed" : intended,
-    amount: atomicToDecimal(units, APT_DECIMALS),
+    amount: atomicToDecimal(units, asset.decimals),
     fee,
     // Aptos timestamps are MICROseconds since epoch, not milliseconds.
     timestamp: t.timestamp ? Math.floor(Number(t.timestamp) / 1_000_000) : undefined,
@@ -752,6 +840,201 @@ export function aptosHistoryRow(tx: unknown, addr: string, deposited = 0n): Chai
       ...(failed ? { failure: String(t.vm_status ?? "aborted") } : {}),
     },
   };
+}
+
+/**
+ * The payload of an Aptos entry-function send, as the SDK's builder takes it:
+ * Move arguments in order, addresses as 0x-hex, amounts as bigint.
+ */
+export interface AptosEntryFunctionData {
+  function: `${string}::${string}::${string}`;
+  typeArguments?: string[];
+  functionArguments: Array<string | bigint>;
+}
+
+/**
+ * Build, price, sign ONCE, submit once, then settle by hash (2026-09-29
+ * send-safety audit). Moved out of `aptAdapter.sendTransaction` on
+ * 2026-10-06 so the fungible-asset legs (`aptos-fa-wallet.ts`) go through
+ * these exact steps instead of a copy of them.
+ *
+ * What changed on 2026-09-29, and why:
+ *  - The gas limit comes from a simulation ({@link aptMaxGasFor}); the SDK
+ *    default of 2,000,000 units made anyone holding under ~2 APT unable to
+ *    send.
+ *  - The SDK's `waitForTransaction` is gone. It throws on its own 20 s timeout
+ *    and on any non-404 4xx (a 429 included) even after the node accepted
+ *    the transaction, and that throw was reported as "Transaction failed" for
+ *    a transfer that had gone through — one more press paid twice. The hash
+ *    is now computed before the submit and the outcome looked up by it.
+ *
+ * Everything that can be refused without the network (the recipient, the
+ * amount) is the caller's to check first. `refusalText` words a simulation
+ * that says the send would fail: the caller's, because "not enough APT" is a
+ * different sentence on a token send.
+ */
+export async function aptosSubmitEntryFunction(args: {
+  privateKey: string;
+  data: AptosEntryFunctionData;
+  refusalText: (vmStatus: string) => string;
+}): Promise<TxResult> {
+  const { privateKey, data } = args;
+  // Lazy — keeps 6.35 MB out of the bundle for every user who never sends APT.
+  const {
+    Account,
+    Aptos,
+    AptosConfig,
+    Ed25519PrivateKey,
+    Network,
+    generateUserTransactionHash,
+  } = await import("@aptos-labs/ts-sdk");
+
+  const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }));
+  const signer = Account.fromPrivateKey({
+    privateKey: new Ed25519PrivateKey("0x" + privateKey.replace(/^0x/, "")),
+  });
+
+  // 1. Price it. The draft is only simulated, never signed. With
+  //    `estimateMaxGasAmount` the node simulates at what the account can
+  //    afford, so the SDK's 2-APT default cannot fail the simulation itself.
+  const draft = await aptos.transaction.build.simple({ sender: signer.accountAddress, data });
+  const [sim] = await aptos.transaction.simulate.simple({
+    signerPublicKey: signer.publicKey,
+    transaction: draft,
+    options: { estimateMaxGasAmount: true, estimateGasUnitPrice: true },
+  });
+  if (!sim) throw new Error("Aptos returned no simulation for this transfer. Nothing was sent.");
+  if (sim.success !== true) throw new Error(args.refusalText(String(sim.vm_status ?? "")));
+  const maxGasAmount = aptMaxGasFor(BigInt(sim.gas_used));
+  const gasUnitPrice = BigInt(sim.gas_unit_price);
+
+  // 2. The one transaction that is signed: the draft's sequence number, the
+  //    simulated price, and an expiry this code knows (see APT_CONFIRM).
+  const expireSecs = Math.floor(Date.now() / 1000) + APT_CONFIRM.expirySecs;
+  const transaction = await aptos.transaction.build.simple({
+    sender: signer.accountAddress,
+    data,
+    options: {
+      maxGasAmount: Number(maxGasAmount),
+      gasUnitPrice: Number(gasUnitPrice),
+      accountSequenceNumber: draft.rawTransaction.sequence_number,
+      expireTimestamp: expireSecs,
+    },
+  });
+
+  // 3. Sign once. The hash is known before anything leaves the machine, so
+  //    every outcome after this point can be looked up rather than guessed.
+  const senderAuthenticator = aptos.transaction.sign({ signer, transaction });
+  const hash = generateUserTransactionHash({ transaction, senderAuthenticator });
+
+  // 4. Submit once. Only a 4xx that is the node REFUSING the transaction is
+  //    a failure; a timeout, 408/409/429, a 5xx or a dropped connection may
+  //    have reached the mempool and is settled by hash like a success.
+  let accepted = false;
+  let submitProblem = "";
+  try {
+    const pending = await aptos.transaction.submit.simple({ transaction, senderAuthenticator });
+    accepted = true;
+    if (pending?.hash && pending.hash.toLowerCase() !== hash.toLowerCase()) {
+      // Inference: cannot happen for a correctly hashed transaction. Logged
+      // rather than trusted, and the locally computed hash is kept.
+      console.warn(`[aptos] node returned hash ${pending.hash}, computed ${hash}`);
+    }
+  } catch (e) {
+    const status = (e as { status?: unknown })?.status;
+    const detail = e instanceof Error ? e.message : String(e);
+    if (
+      typeof status === "number" &&
+      status >= 400 &&
+      status < 500 &&
+      status !== 408 &&
+      status !== 409 &&
+      status !== 429
+    ) {
+      throw new Error(`Aptos refused the transaction: ${detail}. Nothing was sent.`);
+    }
+    submitProblem = detail;
+  }
+
+  // 5. Settle by hash.
+  return settleAptosSend(hash, expireSecs, accepted, submitProblem);
+}
+
+/**
+ * What the account sent AND received, newest first (2026-10-01; see the
+ * "History" section above for why).
+ *
+ *  1. In parallel: the indexer's transactions for the account
+ *     (`aptosIndexedTransactions`) and the fullnode's sent list
+ *     (`aptosSentTransactions`, which also covers an indexer that lags
+ *     behind a send made a moment ago).
+ *  2. Each indexed transaction that moved the account's APT, and is not in
+ *     the sent list, is read whole by version (`aptosTxByVersion`, four at
+ *     a time, once per session).
+ *  3. One row per transaction (`aptosHistoryRow`), newest first, `limit`
+ *     of them.
+ *
+ * `asset` (2026-10-06): APT by default, or one fungible-asset leg
+ * (`aptosFaHistoryAsset`) — the steps are the same for every asset.
+ *
+ * Throws only when nothing could be read. Without the indexer, the sent
+ * list is the answer (what this showed before 2026-10-01), with a warning;
+ * a transaction that could not be read by version is left out this time and
+ * read on the next poll.
+ */
+export async function aptosAssetHistory(
+  address: string,
+  opts: { limit?: number } | undefined,
+  asset: AptosHistoryAsset = APT_HISTORY_ASSET,
+): Promise<TxHistoryPage> {
+  const limit = Math.max(1, Math.floor(opts?.limit ?? 25));
+  const addr = normalizeAptosAddress(address);
+  const [sent, indexed] = await Promise.allSettled([
+    aptosSentTransactions(addr, limit),
+    aptosIndexedTransactions(addr, limit, asset.isAssetType),
+  ]);
+  if (sent.status === "rejected" && indexed.status === "rejected") {
+    throw new Error(
+      `Aptos history could not be read: ${errorText(sent.reason)}; the indexer: ${errorText(indexed.reason)}`,
+    );
+  }
+
+  const txs = new Map<string, AptosTxRecord>();
+  if (sent.status === "fulfilled") for (const t of sent.value) txs.set(t.version, t);
+  const deposited = new Map<string, bigint>();
+  const failures: string[] = [];
+  if (indexed.status === "fulfilled") {
+    const wanted = indexed.value.filter((e) => e.wanted);
+    for (const e of wanted) deposited.set(e.version, e.deposited);
+    const toRead = wanted
+      .map((e) => e.version)
+      .filter((v) => !txs.has(v) && !aptosTxCache.has(v));
+    if (toRead.length > 0) await learnAptosOldestKept();
+    await inPool(
+      wanted.map((e) => e.version).filter((v) => !txs.has(v)),
+      4,
+      async (v) => {
+        try {
+          txs.set(v, await aptosTxByVersion(v));
+        } catch (e) {
+          failures.push(`version ${v}: ${errorText(e)}`);
+        }
+      },
+    );
+  } else {
+    console.warn(`[aptos] the indexer could not be read, so receipts are missing this time: ${errorText(indexed.reason)}`);
+  }
+
+  const items = [...txs.values()]
+    .map((t) => aptosHistoryRow(t, addr, deposited.get(t.version) ?? 0n, asset))
+    .filter((row): row is ChainTx => row !== null)
+    .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
+    .slice(0, limit);
+  if (failures.length > 0) {
+    if (items.length === 0) throw new Error(`Aptos history could not be read: ${failures.slice(0, 3).join("; ")}`);
+    console.warn(`[aptos] ${failures.length} transaction(s) could not be read this time; first: ${failures[0]}`);
+  }
+  return { items };
 }
 
 export const aptAdapter: ChainAdapter = {
@@ -821,20 +1104,12 @@ export const aptAdapter: ChainAdapter = {
   },
 
   /**
-   * Build, price, sign ONCE, submit once, then settle by hash (2026-09-29
-   * send-safety audit).
+   * `0x1::aptos_account::transfer` of APT, through
+   * {@link aptosSubmitEntryFunction}: priced by simulation, signed once,
+   * submitted once, settled by hash (2026-09-29 send-safety audit).
    *
-   * What changed, and why:
-   *  - The recipient must be exactly 64 hex characters ({@link
-   *    parseAptosRecipient}); it used to be zero-padded into an unowned address.
-   *  - The gas limit comes from a simulation ({@link aptMaxGasFor}); the SDK
-   *    default of 2,000,000 units made anyone holding under ~2 APT unable to
-   *    send.
-   *  - The SDK's `waitForTransaction` is gone. It throws on its own 20 s timeout
-   *    and on any non-404 4xx (a 429 included) even after the node accepted
-   *    the transaction, and that throw was reported as "Transaction failed" for
-   *    a transfer that had gone through — one more press paid twice. The hash
-   *    is now computed before the submit and the outcome looked up by it.
+   * The recipient must be exactly 64 hex characters ({@link
+   * parseAptosRecipient}); it used to be zero-padded into an unowned address.
    */
   async sendTransaction(
     privateKey: string,
@@ -845,95 +1120,15 @@ export const aptAdapter: ChainAdapter = {
     const recipient = parseAptosRecipient(to);
     const octas = decimalToAtomic(amount, APT_DECIMALS, "APT amount");
     if (octas <= 0n) throw new Error("Amount must be greater than zero.");
-
-    // Lazy — keeps 6.35 MB out of the bundle for every user who never sends APT.
-    const {
-      Account,
-      Aptos,
-      AptosConfig,
-      Ed25519PrivateKey,
-      Network,
-      generateUserTransactionHash,
-    } = await import("@aptos-labs/ts-sdk");
-
-    const aptos = new Aptos(new AptosConfig({ network: Network.MAINNET }));
-    const signer = Account.fromPrivateKey({
-      privateKey: new Ed25519PrivateKey("0x" + privateKey.replace(/^0x/, "")),
-    });
-
     // `0x1::aptos_account::transfer` (not `0x1::coin::transfer`) because it
     // CREATES the destination account if it does not exist yet. `coin::transfer`
     // aborts on an unfunded destination, which is the common case for a first
     // send to a fresh wallet.
-    const data = {
-      function: "0x1::aptos_account::transfer" as const,
-      functionArguments: [recipient, octas],
-    };
-
-    // 1. Price it. The draft is only simulated, never signed. With
-    //    `estimateMaxGasAmount` the node simulates at what the account can
-    //    afford, so the SDK's 2-APT default cannot fail the simulation itself.
-    const draft = await aptos.transaction.build.simple({ sender: signer.accountAddress, data });
-    const [sim] = await aptos.transaction.simulate.simple({
-      signerPublicKey: signer.publicKey,
-      transaction: draft,
-      options: { estimateMaxGasAmount: true, estimateGasUnitPrice: true },
+    return aptosSubmitEntryFunction({
+      privateKey,
+      data: { function: "0x1::aptos_account::transfer", functionArguments: [recipient, octas] },
+      refusalText: aptosRefusalText,
     });
-    if (!sim) throw new Error("Aptos returned no simulation for this transfer. Nothing was sent.");
-    if (sim.success !== true) throw new Error(aptosRefusalText(String(sim.vm_status ?? "")));
-    const maxGasAmount = aptMaxGasFor(BigInt(sim.gas_used));
-    const gasUnitPrice = BigInt(sim.gas_unit_price);
-
-    // 2. The one transaction that is signed: the draft's sequence number, the
-    //    simulated price, and an expiry this code knows (see APT_CONFIRM).
-    const expireSecs = Math.floor(Date.now() / 1000) + APT_CONFIRM.expirySecs;
-    const transaction = await aptos.transaction.build.simple({
-      sender: signer.accountAddress,
-      data,
-      options: {
-        maxGasAmount: Number(maxGasAmount),
-        gasUnitPrice: Number(gasUnitPrice),
-        accountSequenceNumber: draft.rawTransaction.sequence_number,
-        expireTimestamp: expireSecs,
-      },
-    });
-
-    // 3. Sign once. The hash is known before anything leaves the machine, so
-    //    every outcome after this point can be looked up rather than guessed.
-    const senderAuthenticator = aptos.transaction.sign({ signer, transaction });
-    const hash = generateUserTransactionHash({ transaction, senderAuthenticator });
-
-    // 4. Submit once. Only a 4xx that is the node REFUSING the transaction is
-    //    a failure; a timeout, 408/409/429, a 5xx or a dropped connection may
-    //    have reached the mempool and is settled by hash like a success.
-    let accepted = false;
-    let submitProblem = "";
-    try {
-      const pending = await aptos.transaction.submit.simple({ transaction, senderAuthenticator });
-      accepted = true;
-      if (pending?.hash && pending.hash.toLowerCase() !== hash.toLowerCase()) {
-        // Inference: cannot happen for a correctly hashed transaction. Logged
-        // rather than trusted, and the locally computed hash is kept.
-        console.warn(`[aptos] node returned hash ${pending.hash}, computed ${hash}`);
-      }
-    } catch (e) {
-      const status = (e as { status?: unknown })?.status;
-      const detail = e instanceof Error ? e.message : String(e);
-      if (
-        typeof status === "number" &&
-        status >= 400 &&
-        status < 500 &&
-        status !== 408 &&
-        status !== 409 &&
-        status !== 429
-      ) {
-        throw new Error(`Aptos refused the transaction: ${detail}. Nothing was sent.`);
-      }
-      submitProblem = detail;
-    }
-
-    // 5. Settle by hash.
-    return settleAptosSend(hash, expireSecs, accepted, submitProblem);
   },
 
   async getNetworkInfo(): Promise<NetworkInfo> {
@@ -951,77 +1146,12 @@ export const aptAdapter: ChainAdapter = {
     }
   },
 
-  /**
-   * What the account sent AND received, newest first (2026-10-01; see the
-   * "History" section above for why).
-   *
-   *  1. In parallel: the indexer's transactions for the account
-   *     (`aptosIndexedTransactions`) and the fullnode's sent list
-   *     (`aptosSentTransactions`, which also covers an indexer that lags
-   *     behind a send made a moment ago).
-   *  2. Each indexed transaction that moved the account's APT, and is not in
-   *     the sent list, is read whole by version (`aptosTxByVersion`, four at
-   *     a time, once per session).
-   *  3. One row per transaction (`aptosHistoryRow`), newest first, `limit`
-   *     of them.
-   *
-   * Throws only when nothing could be read. Without the indexer, the sent
-   * list is the answer (what this showed before 2026-10-01), with a warning;
-   * a transaction that could not be read by version is left out this time and
-   * read on the next poll.
-   */
+  /** APT's own history: {@link aptosAssetHistory} (sent AND received, 2026-10-01). */
   async getTransactionHistory(
     address: string,
     opts?: { limit?: number },
   ): Promise<TxHistoryPage> {
-    const limit = Math.max(1, Math.floor(opts?.limit ?? 25));
-    const addr = normalizeAptosAddress(address);
-    const [sent, indexed] = await Promise.allSettled([
-      aptosSentTransactions(addr, limit),
-      aptosIndexedTransactions(addr, limit),
-    ]);
-    if (sent.status === "rejected" && indexed.status === "rejected") {
-      throw new Error(
-        `Aptos history could not be read: ${errorText(sent.reason)}; the indexer: ${errorText(indexed.reason)}`,
-      );
-    }
-
-    const txs = new Map<string, AptosTxRecord>();
-    if (sent.status === "fulfilled") for (const t of sent.value) txs.set(t.version, t);
-    const deposited = new Map<string, bigint>();
-    const failures: string[] = [];
-    if (indexed.status === "fulfilled") {
-      const wanted = indexed.value.filter((e) => e.wanted);
-      for (const e of wanted) deposited.set(e.version, e.deposited);
-      const toRead = wanted
-        .map((e) => e.version)
-        .filter((v) => !txs.has(v) && !aptosTxCache.has(v));
-      if (toRead.length > 0) await learnAptosOldestKept();
-      await inPool(
-        wanted.map((e) => e.version).filter((v) => !txs.has(v)),
-        4,
-        async (v) => {
-          try {
-            txs.set(v, await aptosTxByVersion(v));
-          } catch (e) {
-            failures.push(`version ${v}: ${errorText(e)}`);
-          }
-        },
-      );
-    } else {
-      console.warn(`[aptos] the indexer could not be read, so receipts are missing this time: ${errorText(indexed.reason)}`);
-    }
-
-    const items = [...txs.values()]
-      .map((t) => aptosHistoryRow(t, addr, deposited.get(t.version) ?? 0n))
-      .filter((row): row is ChainTx => row !== null)
-      .sort((a, b) => (b.height ?? 0) - (a.height ?? 0))
-      .slice(0, limit);
-    if (failures.length > 0) {
-      if (items.length === 0) throw new Error(`Aptos history could not be read: ${failures.slice(0, 3).join("; ")}`);
-      console.warn(`[aptos] ${failures.length} transaction(s) could not be read this time; first: ${failures[0]}`);
-    }
-    return { items };
+    return aptosAssetHistory(address, opts);
   },
 
   /**

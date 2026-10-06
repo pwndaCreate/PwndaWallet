@@ -2,13 +2,18 @@ import { describe, it, expect } from "vitest";
 import {
   STABLECOINS,
   STABLECOIN_NETWORKS,
+  coinMarkFor,
   groupStablecoins,
   isStablecoinChain,
+  stablecoinLegLabel,
+  stablecoinLegName,
   stablecoinNetworkFor,
   stablecoinRailGroups,
   tokenLegsHeldBy,
 } from "./stablecoins";
 import { getAdapter, ALL_CHAINS } from "./index";
+import { COIN_METADATA } from "./coin-metadata";
+import { resolveCoinGlyph } from "../components/CoinIcon";
 import { deriveTrxAtPath, trxAdapter } from "./trx-wallet";
 import { usdtTronAdapter } from "./trc20-wallet";
 import { readFileSync } from "node:fs";
@@ -138,6 +143,8 @@ describe("groupStablecoins — stacking, and what a missing balance means", () =
       ethereum: "eth", arbitrum: "arb", base: "base", optimism: "op",
       polygon: "pol", avalanche: "avax", bsc: "bnb", monad: "monad",
       solana: "sol", tron: "tron", near: "near", stellar: "stellar",
+      // 2026-10-06: the USDT/USDC legs on Aptos.
+      aptos: "aptos",
     };
     for (const n of STABLECOIN_NETWORKS) {
       if (!n.nearIntents) continue;
@@ -232,7 +239,13 @@ describe("the stablecoin rows the wallet lists", () => {
       (g) => g.symbol === "USDT",
     )!;
     const arb = usdt.rows.find((r) => r.chain === "usdt0-arb")!;
-    expect(arb.network).toBe("Arbitrum · USD₮0");
+    // The row reads as its network, with "USD₮0" as a small note beside it
+    // (operator request 2026-10-01; until 2026-10-06 the network itself read
+    // "Arbitrum · USD₮0").
+    expect(arb.network).toBe("Arbitrum");
+    expect(arb.note).toBe("USD₮0");
+    // A plain USDT leg carries no note.
+    expect(usdt.rows.find((r) => r.chain === "usdt-tron")!.note).toBeUndefined();
     expect(usdt.total).toBe(13.5);
     // No separate USD₮0 family row left behind.
     expect(stablecoinRailGroups({ "usdt0-arb": "12.5" }).map((g) => g.symbol)).toEqual([
@@ -247,5 +260,121 @@ describe("the stablecoin rows the wallet lists", () => {
     for (const src of [portrait, landscape]) {
       expect(src).toContain("stablecoinRailGroups(balancesByChain)");
     }
+  });
+});
+
+/**
+ * USD₮0 reads as USDT, with "USD₮0" as a small note (operator request,
+ * 2026-10-01). On Arbitrum, Polygon and Monad USD₮0 IS the USDT; on Optimism
+ * it sits beside the older bridged USDT and the note is the difference.
+ */
+describe("USD₮0 legs read as USDT, with the note", () => {
+  const USDT0_LEGS: ChainType[] = ["usdt0-arb", "usdt0-pol", "usdt0-monad", "usdt0-op"];
+
+  it("every USD₮0 leg is labelled USDT + its network + the note", () => {
+    expect(stablecoinLegLabel("usdt0-arb")).toEqual({ symbol: "USDT", network: "Arbitrum", note: "USD₮0" });
+    expect(stablecoinLegLabel("usdt0-op")).toEqual({ symbol: "USDT", network: "Optimism", note: "USD₮0" });
+    for (const c of USDT0_LEGS) expect(stablecoinLegLabel(c)?.note, c).toBe("USD₮0");
+    // Everything else: no note, its own symbol; not a leg: nothing.
+    expect(stablecoinLegLabel("usdt-op")).toEqual({ symbol: "USDT", network: "Optimism" });
+    expect(stablecoinLegLabel("usdc-near")).toEqual({ symbol: "USDC", network: "NEAR" });
+    expect(stablecoinLegLabel("ethereum")).toBeUndefined();
+    expect(stablecoinLegName("usdt0-pol")).toBe("USDT (Polygon · USD₮0)");
+  });
+
+  it("the adapters and coin-metadata say USDT, with the note after the network", () => {
+    // Until 2026-10-06: ticker "USDT0", name "USD₮0 (Arbitrum)" — the token's
+    // own name as the row's name, which is what the operator asked to change.
+    for (const c of USDT0_LEGS) {
+      const a = getAdapter(c);
+      expect(a.ticker, c).toBe("USDT");
+      expect(a.displayName, c).toBe(stablecoinLegName(c));
+      expect(COIN_METADATA[c].ticker, c).toBe("USDT");
+      expect(COIN_METADATA[c].displayName, c).toBe(stablecoinLegName(c));
+    }
+  });
+
+  it("keeps the USD₮0 mark on the coin icon — the icon's note", () => {
+    for (const c of USDT0_LEGS) {
+      expect(coinMarkFor(c, getAdapter(c).ticker), c).toBe("USDT0");
+      expect(resolveCoinGlyph(coinMarkFor(c, "USDT"))?.badge?.t, c).toBe("0");
+    }
+    expect(coinMarkFor("usdt-op", "USDT")).toBe("USDT");
+    expect(resolveCoinGlyph(coinMarkFor("usdt-op", "USDT"))?.badge).toBeUndefined();
+    expect(coinMarkFor("bitcoin", "BTC")).toBe("BTC");
+  });
+
+  it("Optimism holds two USDT legs at two contracts, and the rail lists both, told apart by the note", () => {
+    const op = STABLECOIN_NETWORKS.filter((n) => n.parent === "optimism" && n.symbol !== "USDC");
+    expect(op.map((n) => [n.chain, n.contract.toLowerCase()]).sort()).toEqual([
+      ["usdt-op", "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58"],
+      ["usdt0-op", "0x01bff41798a0bcf287b996046ca68b395dbc1071"],
+    ]);
+    const usdt = stablecoinRailGroups({ "usdt-op": "0", "usdt0-op": "33" }).find((g) => g.symbol === "USDT")!;
+    const rows = usdt.rows.filter((r) => r.network === "Optimism");
+    expect(rows.map((r) => [r.chain, r.note ?? null])).toEqual([
+      ["usdt-op", null],
+      ["usdt0-op", "USD₮0"],
+    ]);
+  });
+});
+
+/**
+ * USDT and USDC on NEAR (NEP-141) and on Aptos (fungible assets), 2026-10-06.
+ * Contracts read live that day from each chain and matched to 1Click's list.
+ */
+describe("the NEAR and Aptos legs", () => {
+  const ABANDON =
+    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+
+  it("names the verified token on each chain", () => {
+    const row = (c: ChainType) => stablecoinNetworkFor(c)!;
+    expect(row("usdt-near")).toMatchObject({ parent: "near", symbol: "USDT", contract: "usdt.tether-token.near", decimals: 6, nearIntents: true });
+    expect(row("usdc-near")).toMatchObject({
+      parent: "near",
+      symbol: "USDC",
+      contract: "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+      decimals: 6,
+      nearIntents: true,
+    });
+    expect(row("usdt-aptos")).toMatchObject({
+      parent: "aptos",
+      symbol: "USDT",
+      contract: "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b",
+      decimals: 6,
+      nearIntents: true,
+    });
+    expect(row("usdc-aptos")).toMatchObject({
+      parent: "aptos",
+      symbol: "USDC",
+      contract: "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b",
+      decimals: 6,
+      nearIntents: true,
+    });
+  });
+
+  it("each leg is held by its parent's own account, and pays fees in the parent's coin", () => {
+    const near = getAdapter("near").deriveFromMnemonic(ABANDON);
+    const aptos = getAdapter("aptos").deriveFromMnemonic(ABANDON);
+    for (const c of ["usdt-near", "usdc-near"] as const) {
+      const w = getAdapter(c).deriveFromMnemonic(ABANDON);
+      expect(w.address, c).toBe(near.address);
+      expect(w.privateKey, c).toBe(near.privateKey);
+      expect(w.chain, c).toBe(c);
+      expect(getAdapter(c).gasToken, c).toEqual({ ticker: "NEAR", chainName: "NEAR" });
+    }
+    for (const c of ["usdt-aptos", "usdc-aptos"] as const) {
+      const w = getAdapter(c).deriveFromMnemonic(ABANDON);
+      expect(w.address, c).toBe(aptos.address);
+      expect(w.chain, c).toBe(c);
+      expect(getAdapter(c).gasToken, c).toEqual({ ticker: "APT", chainName: "Aptos" });
+    }
+  });
+
+  it("the rail lists them under their families at a zero balance", () => {
+    const groups = stablecoinRailGroups({});
+    const chains = (s: string) => groups.find((g) => g.symbol === s)!.rows.map((r) => r.chain);
+    expect(chains("USDT")).toEqual(expect.arrayContaining(["usdt-near", "usdt-aptos", "usdt0-op"]));
+    expect(chains("USDC")).toEqual(expect.arrayContaining(["usdc-near", "usdc-aptos"]));
   });
 });

@@ -21,6 +21,7 @@ import type { ChainType, WalletInfo } from "../../wallets/types";
 import { getAdapter } from "../../wallets";
 import {
   STABLECOIN_NETWORKS,
+  stablecoinLegLabel,
   stablecoinNetworkFor,
   stablecoinRailGroups,
 } from "../../wallets/stablecoins";
@@ -29,10 +30,38 @@ import { Card } from "../../components/PrimitivesV2";
 interface Row {
   chain: ChainType;
   label: string;
+  /** "USD₮0" on a USD₮0 leg: drawn small after the label, never as it. */
+  note?: string;
   sub?: string;
   ticker: string;
   balance?: string;
   active: boolean;
+}
+
+/**
+ * The small note a leg carries beside its name — "USD₮0" (operator request,
+ * 2026-10-01: the row reads USDT, with USD₮0 as a small note). Exported so
+ * the landscape rail draws the same mark.
+ */
+export function LegNote({ note }: { note?: string }) {
+  if (!note) return null;
+  return (
+    <span
+      data-leg-note
+      style={{
+        marginLeft: 6,
+        padding: "0 4px",
+        border: "1px solid var(--border-soft)",
+        color: "var(--text-dim)",
+        fontSize: 8,
+        letterSpacing: 0.4,
+        verticalAlign: "middle",
+        whiteSpace: "nowrap",
+      }}
+    >
+      {note}
+    </span>
+  );
 }
 
 export function TokenLegsCard({
@@ -53,8 +82,8 @@ export function TokenLegsCard({
 
   if (leg) {
     // The same grouping the rail shows (`stablecoinRailGroups`), so USDT's
-    // list includes "Arbitrum · USD₮0" exactly as the rail and the swap
-    // picker do, and a USD₮0 leg lists the USDT networks beside it.
+    // list includes Arbitrum (with its USD₮0 note) exactly as the rail and
+    // the swap picker do, and a USD₮0 leg lists the USDT networks beside it.
     const group = stablecoinRailGroups(balancesByChain).find((g) =>
       g.rows.some((r) => r.chain === activeChain),
     );
@@ -64,6 +93,7 @@ export function TokenLegsCard({
       .map((r) => ({
         chain: r.chain,
         label: r.network,
+        note: r.note,
         ticker: unit,
         balance: r.balance,
         active: r.chain === activeChain,
@@ -71,22 +101,31 @@ export function TokenLegsCard({
     title = `${unit} on other networks`;
     if (walletsByChain[leg.parent]) {
       const parent = getAdapter(leg.parent);
+      // "USDT (USD₮0) on Optimism", not "USDT0": the leg's own label.
+      const name = stablecoinLegLabel(activeChain);
+      const what = name ? `${name.symbol}${name.note ? ` (${name.note})` : ""}` : leg.symbol;
       feeNote = {
         chain: leg.parent,
-        text: `Fees for ${leg.symbol} on ${leg.network} are paid in ${parent.ticker} — open ${parent.displayName} ›`,
+        text: `Fees for ${what} on ${leg.network} are paid in ${parent.ticker} — open ${parent.displayName} ›`,
       };
     }
   } else {
     rows = STABLECOIN_NETWORKS.filter(
       (n) => n.parent === activeChain && !!walletsByChain[n.chain],
-    ).map((n) => ({
-      chain: n.chain,
-      label: n.symbol,
-      sub: `on ${n.network}`,
-      ticker: n.symbol,
-      balance: balancesByChain[n.chain],
-      active: false,
-    }));
+    ).map((n) => {
+      // A USD₮0 leg reads "USDT" with its note (2026-10-06), so Optimism's
+      // two USDT rows — bridged and USD₮0 — differ by the note alone.
+      const name = stablecoinLegLabel(n.chain);
+      return {
+        chain: n.chain,
+        label: name?.symbol ?? n.symbol,
+        note: name?.note,
+        sub: `on ${n.network}`,
+        ticker: name?.symbol ?? n.symbol,
+        balance: balancesByChain[n.chain],
+        active: false,
+      };
+    });
     title = "Tokens on this account";
   }
 
@@ -113,7 +152,11 @@ export function TokenLegsCard({
             data-token-leg={r.chain}
             onClick={() => onSelect(r.chain)}
             disabled={r.active}
-            title={r.active ? "You are viewing this network" : `Open ${r.ticker} ${r.sub ?? `on ${r.label}`}`}
+            title={
+              r.active
+                ? "You are viewing this network"
+                : `Open ${r.ticker}${r.note ? ` (${r.note})` : ""} ${r.sub ?? `on ${r.label}`}`
+            }
             style={{
               width: "100%",
               display: "flex",
@@ -133,6 +176,7 @@ export function TokenLegsCard({
           >
             <span style={{ minWidth: 0 }}>
               {r.label}
+              <LegNote note={r.note} />
               {r.sub && (
                 <span style={{ color: "var(--text-dim)", fontSize: 9 }}> {r.sub}</span>
               )}

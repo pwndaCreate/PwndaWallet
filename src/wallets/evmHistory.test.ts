@@ -189,7 +189,9 @@ describe("chains with no keyless source say so — never an error, never 'no tra
     [usdcBscAdapter, "USDC (BNB Chain)"],
     [monadAdapter, "Monad"],
     [usdcMonadAdapter, "USDC (Monad)"],
-    [usdt0MonadAdapter, "USD₮0 (Monad)"],
+    // Named "USDT (Monad · USD₮0)" since 2026-10-06 (operator request
+    // 2026-10-01: a USD₮0 leg reads USDT, with USD₮0 as its note).
+    [usdt0MonadAdapter, "USDT (Monad · USD₮0)"],
   ] as const;
 
   for (const [adapter, name] of unavailable) {

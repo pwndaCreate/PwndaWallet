@@ -95,6 +95,14 @@ export const SOURCE_CAPABLE_BLOCKCHAINS: ReadonlySet<IntentsBlockchain> =
     "xrp",
     "tron",
 
+    // 2026-10-06 (operator request 2026-10-01) — Aptos, for its USDT and USDC
+    // legs: the fourth TS-signed source. The deposit is the leg adapter's own
+    // `primary_fungible_store::transfer` (`aptos-fa-wallet.ts`), simulated,
+    // signed once and settled by hash, the call the Send button makes. Native
+    // APT is not a NEAR Intents asset in this wallet (1Click lists it; adding
+    // it is a separate change), so only the token legs ride this entry.
+    "aptos",
+
     // NOT source-capable (deliberate): ton. Address derivation works so the
     // user can RECEIVE on it, but no source-tx signer is wired, so it cannot
     // be the FROM side. Move it up when a signer lands.

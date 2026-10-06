@@ -30,6 +30,8 @@ const S = vi.hoisted(() => ({
   utxoRust: [] as any[],
   adapterSends: [] as any[],
   accountSends: [] as any[],
+  nearNative: [] as any[],
+  nearToken: [] as any[],
   supportsAccount: true,
   accountUtxos: { primary: 0n, change: 402_888_049n },
 }));
@@ -152,7 +154,15 @@ vi.mock("./swap-sources", async (importOriginal) => {
       S.spl.push(a);
       return { txHash: "spl-hash" };
     }),
-    executeNearNativeTransfer: vi.fn(async () => ({ txHash: "near-hash" })),
+    executeNearNativeTransfer: vi.fn(async (a: any) => {
+      S.nearNative.push(a);
+      return { txHash: "near-hash" };
+    }),
+    // 2026-10-06: the NEP-141 deposit (USDT/USDC on NEAR).
+    executeNearTokenTransfer: vi.fn(async (a: any) => {
+      S.nearToken.push(a);
+      return { txHash: "near-token-hash", confirmed: true, registered: true };
+    }),
     executeCardanoTransfer: vi.fn(async () => ({ txHash: "ada-hash" })),
     // The single-address Rust PSBT builder. F10: never used while the
     // adapter's account-wide send is available.
@@ -251,6 +261,8 @@ beforeEach(() => {
     "utxoRust",
     "adapterSends",
     "accountSends",
+    "nearNative",
+    "nearToken",
   ] as const) {
     (S as any)[k].length = 0;
   }
@@ -330,6 +342,76 @@ describe("F1: every EVM source on the NEAR tab builds the right transfer (2026-0
     ]);
     expect(S.spl.every((c) => c.amountAtomic === "250000000")).toBe(true);
     expect(S.sol).toHaveLength(1);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// The stablecoin legs on NEAR and Aptos deposit the TOKEN (2026-10-06)
+// ─────────────────────────────────────────────────────────────────────────
+
+describe("USDT and USDC on NEAR and Aptos deposit the token, per the catalog (2026-10-06)", () => {
+  const NEAR_ME = "ab".repeat(32); // what the mocked session reports
+  const APTOS_ME = "0xeb663b681209e7087d681c5d3eed12aaa8e1915e7c87794542c3f96e94b3d3bf";
+
+  it("all four, and Optimism's USD₮0, are offered as NEAR Intents sources", () => {
+    for (const leg of ["USDT-NEAR", "USDC-NEAR", "USDT-APTOS", "USDC-APTOS", "USDT0-OP"]) {
+      expect(intentsSources, leg).toContain(leg);
+    }
+  });
+
+  it("USDT-NEAR / USDC-NEAR: an ft_transfer of the catalog's contract to the deposit address — never a NEAR transfer", async () => {
+    for (const leg of ["USDT-NEAR", "USDC-NEAR"]) {
+      const deposit = (leg === "USDT-NEAR" ? "f" : "e").repeat(64);
+      const r = await executeIntentsTrade(
+        bound({ fromAsset: leg, amountIn: "12500000", depositAddress: deposit, sourceAddress: NEAR_ME }),
+      );
+      expect(r.sourceTxHash).toBe("near-token-hash");
+    }
+    // Without the NEAR token branch, the executor refused a NEAR token outright
+    // (TOKEN_DEPOSIT_KINDS) — and before that check existed, it would have sent
+    // 12.5 USDT as 0.0000000000000000125 NEAR.
+    expect(S.nearNative).toHaveLength(0);
+    expect(S.nearToken.map((c) => [c.tokenContract, c.receiverId, c.amountAtomic, c.decimals, c.fromAccountId])).toEqual([
+      [stableByKey.get("USDT-NEAR")!.contract, "f".repeat(64), "12500000", 6, NEAR_ME],
+      [stableByKey.get("USDC-NEAR")!.contract, "e".repeat(64), "12500000", 6, NEAR_ME],
+    ]);
+  });
+
+  it("native NEAR still deposits a NEAR transfer", async () => {
+    await executeIntentsTrade(
+      bound({ fromAsset: "NEAR", amountIn: "1000000000000000000000000", depositAddress: "d".repeat(64), sourceAddress: NEAR_ME }),
+    );
+    expect(S.nearNative).toHaveLength(1);
+    expect(S.nearToken).toHaveLength(0);
+  });
+
+  it("USDT-APTOS / USDC-APTOS: the leg adapter's own send, with the Aptos key, in token units", async () => {
+    for (const leg of ["USDT-APTOS", "USDC-APTOS"]) {
+      const deposit = "0x" + (leg === "USDT-APTOS" ? "c1" : "c2").repeat(32);
+      const r = await executeIntentsTrade(
+        bound({
+          fromAsset: leg,
+          amountIn: "12500000",
+          depositAddress: deposit,
+          sourceAddress: APTOS_ME,
+          sourceSecret: { kind: "privateKey", value: "aa".repeat(32) },
+        }),
+      );
+      expect(r.sourceTxHash).toBe(`${leg.toLowerCase()}-hash`);
+    }
+    expect(S.adapterSends).toEqual([
+      { chain: "usdt-aptos", to: "0x" + "c1".repeat(32), amount: "12.5" },
+      { chain: "usdc-aptos", to: "0x" + "c2".repeat(32), amount: "12.5" },
+    ]);
+  });
+
+  it("an Aptos deposit without the Aptos key is refused before anything is sent", async () => {
+    await expect(
+      executeIntentsTrade(
+        bound({ fromAsset: "USDT-APTOS", amountIn: "1000000", depositAddress: "0x" + "c3".repeat(32), sourceAddress: APTOS_ME }),
+      ),
+    ).rejects.toThrow(/private key/);
+    expect(S.adapterSends).toHaveLength(0);
   });
 });
 

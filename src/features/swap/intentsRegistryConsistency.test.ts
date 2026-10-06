@@ -32,6 +32,7 @@ import { ASSET_CAPABILITIES } from "./asset-capabilities";
 import { NEAR_INTENTS_ASSETS } from "./near-intents-assets.generated";
 import { SOURCE_CAPABLE_BLOCKCHAINS } from "./intents-source-capability";
 import { getDropdownTickers, isIntentsRoutable } from "./swap-data";
+import { resolveAsset } from "./intents-dedup";
 
 /** Every symbol the shipped upstream catalog carries, uppercased. */
 const CATALOG_SYMBOLS = new Set(
@@ -121,7 +122,7 @@ describe("intents capability matches the shipped catalog", () => {
     // the wallet calls them `USDT0`. Same contract, different label. Matching
     // on symbol reports them as absent from the catalog — a false negative
     // that would have left two real legs unroutable.
-    for (const leg of ["USDT0-ARB", "USDT0-POL"]) {
+    for (const leg of ["USDT0-ARB", "USDT0-POL", "USDT0-OP" /* 2026-10-06 */]) {
       const cap = ASSET_CAPABILITIES[leg];
       expect(cap.ticker).toBe("USDT0");
       const asset = NEAR_INTENTS_ASSETS.find(
@@ -130,6 +131,37 @@ describe("intents capability matches the shipped catalog", () => {
       expect(asset, `${leg} id not in catalog`).toBeDefined();
       expect(asset!.symbol.toUpperCase()).toBe("USDT");
     }
+  });
+
+  it("the legs added on 2026-10-06 each route to their own catalog asset", () => {
+    // Operator request 2026-10-01: USD₮0 on Optimism beside its bridged
+    // USDT, and USDT/USDC on NEAR and on Aptos. Ids from 1Click's public
+    // token list (1click.chaindefuser.com/v0/tokens, read 2026-10-01).
+    const want: Record<string, string> = {
+      "USDT0-OP": "nep245:v2_1.omni.hot.tg:10_2R1RXDBxCyJTeMEsdXydh7xsHmz",
+      "USDT-NEAR": "nep141:usdt.tether-token.near",
+      "USDC-NEAR": "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1",
+      "USDT-APTOS": "nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near",
+      "USDC-APTOS": "nep141:aptos-34ee497f210c5a511e8d5b53bc56d75b63612bb5.omft.near",
+    };
+    for (const [leg, id] of Object.entries(want)) {
+      expect(ASSET_CAPABILITIES[leg]?.nearIntentsAsset, leg).toBe(id);
+      expect(CATALOG_ASSET_IDS.has(id), `${leg} id not in the shipped catalog`).toBe(true);
+      expect(isIntentsRoutable(leg, "BTC"), leg).toBe(true);
+    }
+    // Optimism's two USDT legs are two assets, not one under two names.
+    expect(ASSET_CAPABILITIES["USDT-OP"].nearIntentsAsset).not.toBe(
+      ASSET_CAPABILITIES["USDT0-OP"].nearIntentsAsset,
+    );
+  });
+
+  it("a bare USDT on Optimism still resolves to the bridged token (2026-10-06)", () => {
+    // `resolveAsset` takes the first match in the catalog's order. USD₮0's
+    // row sits after the bridged one, so a symbol-level lookup keeps meaning
+    // what it meant before Optimism had two USDT assets.
+    expect(resolveAsset("USDT", "op")?.contractAddress).toBe(
+      "0x94b008aa00579c1307b0ef2c499ad98a8ce58e58",
+    );
   });
 
   it("LTC specifically is routable — the 2026-08-25 regression", () => {

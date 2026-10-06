@@ -398,6 +398,10 @@ export const PLACEHOLDER_ADDRESSES = {
   xrp: "rHsMGQEkVNJmpGWs8XUBoTBiAAbwxZN5v3",
   tron: "TPrkFhZ8LH8Mruco8vXyA496TaeFBrbmeU",
   usdtTron: "TPrkFhZ8LH8Mruco8vXyA496TaeFBrbmeU",
+  // Added 2026-10-06 with the resolver's Aptos branch (the USDT/USDC legs):
+  // the abandon mnemonic at m/44'/637'/0'/0'/0', the account `apt-wallet.ts`
+  // pins in its header.
+  aptos: "0xeb663b681209e7087d681c5d3eed12aaa8e1915e7c87794542c3f96e94b3d3bf",
   // `satisfies Required<…>`: a bundle field with no placeholder is now a type
   // error, not a pair whose minimum silently never loads (ADA on 2026-09-05,
   // XRP and TRON until 2026-09-29).

@@ -108,6 +108,7 @@ import {
   executeAdapterTransfer,
   executeCardanoTransfer,
   executeNearNativeTransfer,
+  executeNearTokenTransfer,
   executeSolanaTransfer,
   executeSplTransfer,
   executeUtxoTransfer,
@@ -617,6 +618,10 @@ const TOKEN_DEPOSIT_KINDS: ReadonlySet<SwapChainKind> = new Set<SwapChainKind>([
   "EVM",
   "SOLANA",
   "TRON",
+  // 2026-10-06: NEP-141 `ft_transfer` (`executeNearTokenTransfer`) and the
+  // Aptos legs' `primary_fungible_store::transfer` (their adapter's send).
+  "NEAR",
+  "APTOS",
 ]);
 
 /**
@@ -629,7 +634,9 @@ const TOKEN_DEPOSIT_KINDS: ReadonlySet<SwapChainKind> = new Set<SwapChainKind>([
  *     below — gas estimate, balance gates, `swap_sign_evm`, verified
  *     broadcast. Native coin or ERC-20 `transfer` per the 1Click catalog.
  *   - SOL: `executeSolanaTransfer`; SPL legs: `executeSplTransfer`.
- *   - NEAR: `executeNearNativeTransfer`.
+ *   - NEAR: `executeNearNativeTransfer`; the NEP-141 legs (USDT/USDC on
+ *     NEAR, 2026-10-06): `executeNearTokenTransfer`.
+ *   - USDT/USDC on Aptos (2026-10-06): `executeAdapterTransfer`, as XRP/TRON.
  *   - BTC / LTC / DOGE / BCH / DASH: `executeAccountUtxoTransfer` — the
  *     adapter's account-wide send (F10). The single-address Rust PSBT path
  *     (`executeUtxoTransfer`) is the fallback for BTC/LTC/DOGE/BCH when the
@@ -853,19 +860,36 @@ export async function executeIntentsTrade(
         const rpcUrl = input.rpcUrlOverride ?? fromMeta.defaultRpcUrl;
         if (!rpcUrl) throw new Error(`No RPC URL configured for ${input.fromAsset}`);
         const near = await getNearAddress(input.sessionId);
+        const fromAccountId =
+          input.sourceAddress && input.sourceAddress.length > 0
+            ? input.sourceAddress
+            : near.accountId;
         phase({ phase: "signing" });
-        // amountIn = yoctoNEAR (atomic) per 1Click's response shape.
-        const r = await executeNearNativeTransfer({
-          sessionId: input.sessionId,
-          fromAccountId:
-            input.sourceAddress && input.sourceAddress.length > 0
-              ? input.sourceAddress
-              : near.accountId,
-          fromPublicKey: near.publicKey,
-          depositAddress,
-          amountAtomic: amountIn,
-          rpcUrl,
-        });
+        // Token or native per the CATALOG (F1), as for Solana. A NEP-141 leg
+        // (USDT/USDC on NEAR, 2026-10-06) deposits with `ft_transfer` to the
+        // deposit address — registering it with the token contract first when
+        // it is not — not with a NEAR transfer of the token amount.
+        // amountIn is atomic: yoctoNEAR, or the token's own units.
+        const r = catalogContract
+          ? await executeNearTokenTransfer({
+              sessionId: input.sessionId,
+              fromAccountId,
+              fromPublicKey: near.publicKey,
+              tokenContract: catalogContract,
+              receiverId: depositAddress,
+              amountAtomic: amountIn,
+              decimals: fromMeta.decimals,
+              ticker: fromMeta.ticker,
+              rpcUrl,
+            })
+          : await executeNearNativeTransfer({
+              sessionId: input.sessionId,
+              fromAccountId,
+              fromPublicKey: near.publicKey,
+              depositAddress,
+              amountAtomic: amountIn,
+              rpcUrl,
+            });
         phase({ phase: "broadcasting" });
         sourceTxHash = r.txHash;
         break;
@@ -1036,8 +1060,12 @@ export async function executeIntentsTrade(
       }
 
       case "XRP":
-      case "TRON": {
+      case "TRON":
+      case "APTOS": {
         // XRP, native TRX and TRC-20 USDT — TS-signed sources (2026-09-09).
+        // Since 2026-10-06 also the USDT/USDC legs on Aptos, whose adapter
+        // sends `primary_fungible_store::transfer` with the Aptos key; the F1
+        // check below holds it to the catalog's metadata object.
         // All three go through the wallet's own chain adapter, which is the
         // same call the dashboard Send button makes, so a swap deposit and a
         // manual send cannot drift apart. No RPC URL: these adapters reach

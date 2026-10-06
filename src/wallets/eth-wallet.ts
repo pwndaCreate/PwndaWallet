@@ -215,10 +215,15 @@ export const usdcMonadAdapter = createEvmAdapter({
   explorerApis: MONAD_EXPLORERS,
 });
 
+// USD₮0 legs read as USDT with "USD₮0" as a note (operator request,
+// 2026-10-01): ticker "USDT", the note after the network in the name — the
+// wording of `stablecoins.ts::stablecoinLegName`. The swap registry keeps its
+// own `USDT0` keys and tickers; `wallet-surface.ts::homeChainOf` maps a leg to
+// its entry by wallet key, so the two need not spell the ticker alike.
 export const usdt0MonadAdapter = createEvmAdapter({
   chain: "usdt0-monad",
-  displayName: "USD₮0 (Monad)",
-  ticker: "USDT0",
+  displayName: "USDT (Monad · USD₮0)",
+  ticker: "USDT",
   color: "#26a17b",
   chainId: 143,
   rpcUrl: monadRpcs[0],
@@ -364,8 +369,8 @@ export const usdcBscAdapter = createEvmAdapter({
 
 export const usdt0ArbAdapter = createEvmAdapter({
   chain: "usdt0-arb",
-  displayName: "USD₮0 (Arbitrum)",
-  ticker: "USDT0",
+  displayName: "USDT (Arbitrum · USD₮0)",
+  ticker: "USDT",
   color: "#1e9e78",
   chainId: 42161,
   rpcUrl: arbRpcs[0],
@@ -378,8 +383,8 @@ export const usdt0ArbAdapter = createEvmAdapter({
 
 export const usdt0PolAdapter = createEvmAdapter({
   chain: "usdt0-pol",
-  displayName: "USD₮0 (Polygon)",
-  ticker: "USDT0",
+  displayName: "USDT (Polygon · USD₮0)",
+  ticker: "USDT",
   color: "#1e9e78",
   chainId: 137,
   rpcUrl: polRpcs[0],
@@ -387,4 +392,20 @@ export const usdt0PolAdapter = createEvmAdapter({
   tokenContract: "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
   tokenDecimals: 6,
   explorerApis: POLYGON_EXPLORERS,
+});
+
+// Optimism's USD₮0 (2026-10-06, operator request 2026-10-01). A separate
+// contract from `usdt-op`'s bridged USDT: read live via mainnet.optimism.io,
+// symbol() "USD₮0", name() "USD₮0", decimals 6. Same explorers as `usdt-op`.
+export const usdt0OpAdapter = createEvmAdapter({
+  chain: "usdt0-op",
+  displayName: "USDT (Optimism · USD₮0)",
+  ticker: "USDT",
+  color: "#1e9e78",
+  chainId: 10,
+  rpcUrl: opRpcs[0],
+  rpcFallbacks: opRpcs.slice(1),
+  tokenContract: "0x01bFF41798a0BcF287b996046Ca68b395DbC1071",
+  tokenDecimals: 6,
+  explorerApis: OP_EXPLORERS,
 });

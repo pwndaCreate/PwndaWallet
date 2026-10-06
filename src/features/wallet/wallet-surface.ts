@@ -24,6 +24,7 @@
  */
 import { ALL_CHAINS, getAdapter } from "../../wallets";
 import type { ChainType, WalletInfo } from "../../wallets";
+import { isStablecoinChain } from "../../wallets/stablecoins";
 import {
   ZPH_ASSETS,
   ZPH_ASSET_NAME,
@@ -304,6 +305,12 @@ export function hasSwapVenue(ticker: string): boolean {
  */
 function homeChainOf(ticker: string, walletKey: ChainType | undefined): ChainType | null {
   const t = ticker.toUpperCase();
+  // A stablecoin leg's wallet key IS its chain (`usdt0-pol` stores the leg,
+  // not a shared address). Trusted without comparing tickers since
+  // 2026-10-06: the USD₮0 legs read "USDT" in the wallet while their registry
+  // entries keep the token's own `USDT0`, and the comparison below would
+  // have taken Swap away from them (operator request 2026-10-01).
+  if (walletKey && isStablecoinChain(walletKey)) return walletKey;
   if (walletKey && getAdapter(walletKey).ticker.toUpperCase() === t) return walletKey;
   const owners = (ALL_CHAINS as readonly ChainType[]).filter(
     (c) => getAdapter(c).ticker.toUpperCase() === t,

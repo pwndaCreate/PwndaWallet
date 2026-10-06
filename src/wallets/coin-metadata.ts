@@ -122,9 +122,12 @@ export const COIN_METADATA: Record<ChainType, CoinMeta> = {
     color: "#2775ca",
     addressPlaceholder: "0x...",
   },
+  // USD₮0 legs read as USDT, with "USD₮0" after the network (operator
+  // request, 2026-10-01). Same wording as `stablecoinLegName` and the
+  // adapters; `stablecoins.test.ts` keeps the three together.
   "usdt0-monad": {
-    ticker: "USDT0",
-    displayName: "USD₮0 (Monad)",
+    ticker: "USDT",
+    displayName: "USDT (Monad · USD₮0)",
     color: "#26a17b",
     addressPlaceholder: "0x...",
   },
@@ -135,15 +138,48 @@ export const COIN_METADATA: Record<ChainType, CoinMeta> = {
     addressPlaceholder: "0x...",
   },
   "usdt0-arb": {
-    ticker: "USDT0",
-    displayName: "USD₮0 (Arbitrum)",
+    ticker: "USDT",
+    displayName: "USDT (Arbitrum · USD₮0)",
     color: "#1e9e78",
     addressPlaceholder: "0x...",
   },
   "usdt0-pol": {
-    ticker: "USDT0",
-    displayName: "USD₮0 (Polygon)",
+    ticker: "USDT",
+    displayName: "USDT (Polygon · USD₮0)",
     color: "#1e9e78",
+    addressPlaceholder: "0x...",
+  },
+  // Optimism's USD₮0, beside its bridged USDT (`usdt-op`, "USDT (Optimism)").
+  "usdt0-op": {
+    ticker: "USDT",
+    displayName: "USDT (Optimism · USD₮0)",
+    color: "#1e9e78",
+    addressPlaceholder: "0x...",
+  },
+  // NEP-141 and Aptos fungible-asset legs (2026-10-06). Placeholders are the
+  // parent chain's: the token lives on that account.
+  "usdt-near": {
+    ticker: "USDT",
+    displayName: "USDT (NEAR)",
+    color: "#26a17b",
+    addressPlaceholder: "<NEAR account>",
+  },
+  "usdc-near": {
+    ticker: "USDC",
+    displayName: "USDC (NEAR)",
+    color: "#2775ca",
+    addressPlaceholder: "<NEAR account>",
+  },
+  "usdt-aptos": {
+    ticker: "USDT",
+    displayName: "USDT (Aptos)",
+    color: "#26a17b",
+    addressPlaceholder: "0x...",
+  },
+  "usdc-aptos": {
+    ticker: "USDC",
+    displayName: "USDC (Aptos)",
+    color: "#2775ca",
     addressPlaceholder: "0x...",
   },
   "usdc-sol": {

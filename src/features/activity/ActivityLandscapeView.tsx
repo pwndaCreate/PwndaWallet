@@ -3,6 +3,7 @@ import { ST } from "../../components/Primitives";
 import { CoinIcon } from "../../components/CoinIcon";
 import { getAdapter } from "../../wallets";
 import { txDisplayTicker, txUsdPrice } from "../../wallets/tx-display";
+import { coinMarkFor } from "../../wallets/stablecoins";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { dedupeTxRows, txRowKey } from "../../wallets/tx-row-key";
 import { txFilterSide } from "./txFilters";
@@ -410,7 +411,9 @@ export function ActivityLandscapeView({
                     fontFamily: "var(--font-mono)",
                   }}
                 >
-                  <CoinIcon sym={rowTicker} size={22} glow={false} />
+                  {/* A USD₮0 row reads "USDT" and keeps the USD₮0 mark, so
+                      Optimism's two USDT legs differ here too (2026-10-06). */}
+                  <CoinIcon sym={coinMarkFor(tx.chain, rowTicker)} size={22} glow={false} />
                   <span
                     style={{
                       fontSize: 10,

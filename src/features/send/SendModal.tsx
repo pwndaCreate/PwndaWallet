@@ -10,6 +10,7 @@ import { feeNoteText, feeRateForSend, feeTotalFor, formatUsd } from "./feeDispla
 import { coinAmountFromUsd, usdTextFromCoin } from "../../lib/usdAmount";
 import { errorText } from "../../lib/errorText";
 import { sendAssetTicker, sendAssetUsdPrice } from "../../wallets/tx-display";
+import { stablecoinLegLabel } from "../../wallets/stablecoins";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { useSendQuote } from "./useSendQuote";
 import { ModalBackdrop } from "../../components/ModalBackdrop";
@@ -95,6 +96,9 @@ export function SendModal({
   assetUsdPrice,
 }: SendModalProps) {
   const sendTicker = assetLabel ?? sendAssetTicker(adapter.chain, adapter.ticker, assetType);
+  // The network (and USD₮0's note) of a stablecoin leg, for the line under
+  // the title. Undefined for every chain that is not a leg.
+  const legLabel = stablecoinLegLabel(adapter.chain);
 
   // ── USD entry (2026-09-12) ────────────────────────────────────────────────
   //
@@ -382,6 +386,38 @@ export function SendModal({
     <ModalBackdrop onClick={onClose}>
       <div className="modal-dialog send-modal" onClick={(e) => e.stopPropagation()}>
         <h3>Send {sendTicker}</h3>
+        {/* Which network's token this is (2026-10-06; operator request
+            2026-10-01). A USD₮0 leg reads "USDT" with "USD₮0" as its note,
+            so Optimism's bridged USDT and its USD₮0 open a "Send USDT" that
+            only this line tells apart. Every token leg says its network. */}
+        {legLabel && (
+          <div
+            data-send-leg
+            style={{
+              fontFamily: "var(--mono)",
+              fontSize: 10,
+              color: "var(--text-dim)",
+              marginTop: -6,
+              marginBottom: 10,
+            }}
+          >
+            on {legLabel.network}
+            {legLabel.note && (
+              <span
+                data-leg-note
+                style={{
+                  marginLeft: 6,
+                  padding: "0 4px",
+                  border: "1px solid var(--border-soft)",
+                  fontSize: 9,
+                  letterSpacing: 0.4,
+                }}
+              >
+                {legLabel.note}
+              </span>
+            )}
+          </div>
+        )}
         <div className="form-group">
           <label>Recipient</label>
           <input
@@ -714,6 +750,14 @@ export function SendModal({
           )}
         </div>
 
+        {/* A cost of THIS send beyond the fee, shown before Send whatever the
+            verdict (2026-10-06; operator request 2026-10-01): NEAR's storage
+            deposit when a NEP-141 send must register the recipient with the
+            token contract, and the store an Aptos token send creates for a
+            first-time recipient. The shortfall box below only appears when
+            the balance cannot cover it, which is too late to learn the cost. */}
+        <GasNotice notice={gas?.notice} />
+
         {/* The second balance. Rendered only when the adapter has told us the
             fee is paid in a different coin (`gasToken`), and only when the
             answer is a definite no — `sufficient: null` means the node would
@@ -848,6 +892,31 @@ export function SendModal({
         </div>
       </div>
     </ModalBackdrop>
+  );
+}
+
+/**
+ * A cost of the send beyond its fee (`GasBudget.notice`), shown whatever the
+ * verdict (2026-10-06). Exported so a test can render it: the modal reads
+ * the budget in an effect, which a static render does not run.
+ */
+export function GasNotice({ notice }: { notice?: string }) {
+  if (!notice) return null;
+  return (
+    <div
+      data-gas-notice
+      style={{
+        fontFamily: "var(--mono)",
+        fontSize: 10,
+        lineHeight: 1.6,
+        color: "var(--text-muted)",
+        border: "1px solid var(--border-soft)",
+        padding: "8px 10px",
+        marginBottom: 12,
+      }}
+    >
+      {notice}
+    </div>
   );
 }
 

@@ -1,6 +1,7 @@
 /**
  * Dashboard **Send** for the three chains whose signer lives in Rust behind a
- * swap session: Stellar, NEAR and Sui.
+ * swap session: Stellar, NEAR and Sui — and, since 2026-10-06, the NEP-141
+ * token legs on NEAR (`executeNearTokenSend`), signed by the same NEAR key.
  *
  * # Why these three were receive-only
  *
@@ -72,7 +73,7 @@ import {
   type SuiSendState,
 } from "../../wallets/sui-wallet";
 import { ed25519 } from "@noble/curves/ed25519.js";
-import { executeNearNativeTransfer } from "./swap-sources";
+import { executeNearNativeTransfer, executeNearTokenTransfer } from "./swap-sources";
 
 /** Rust's `SignedStellar`. */
 interface SignedStellar {
@@ -832,6 +833,57 @@ export async function executeNearSend(args: {
   if (!r.confirmed) {
     throw new SendOutcomeUnknownError(
       "NEAR has not confirmed the transfer yet; it may still go through.",
+      r.txHash,
+    );
+  }
+  return { hash: r.txHash };
+}
+
+/**
+ * A NEP-141 token send from the dashboard — USDT or USDC on NEAR (2026-10-06;
+ * operator request 2026-10-01). The same session and the same checks as
+ * `executeNearSend`: the session's NEAR account must be the one on screen, a
+ * zero amount is refused, and a transfer NEAR has not confirmed in the wait is
+ * an unknown outcome with its hash. The transfer itself, registration
+ * included, is `swap-sources.ts::executeNearTokenTransfer`, shared with NEAR
+ * Intents deposits of the token. Rust signs it unchanged: it is handed the
+ * transaction hash, whatever the actions.
+ */
+export async function executeNearTokenSend(args: {
+  sessionId: string;
+  fromAddress: string;
+  to: string;
+  /** Decimal token units as typed by the user. */
+  amount: string;
+  /** The NEP-141 contract account. */
+  tokenContract: string;
+  decimals: number;
+  ticker: string;
+  rpcUrl: string;
+}): Promise<TxResult> {
+  const atomic = decimalToAtomic(args.amount, args.decimals, `${args.ticker} amount`);
+  if (atomic <= 0n) throw new Error("Amount must be greater than zero.");
+
+  const near = await getNearAddress(args.sessionId);
+  const from = args.fromAddress.trim().toLowerCase();
+  if (near.accountId.toLowerCase() !== from) {
+    throw new Error(keyMismatchText("NEAR", from, near.accountId));
+  }
+
+  const r = await executeNearTokenTransfer({
+    sessionId: args.sessionId,
+    fromAccountId: near.accountId,
+    fromPublicKey: near.publicKey,
+    tokenContract: args.tokenContract,
+    receiverId: args.to,
+    amountAtomic: atomic.toString(),
+    decimals: args.decimals,
+    ticker: args.ticker,
+    rpcUrl: args.rpcUrl,
+  });
+  if (!r.confirmed) {
+    throw new SendOutcomeUnknownError(
+      `NEAR has not confirmed the ${args.ticker} transfer yet; it may still go through.`,
       r.txHash,
     );
   }

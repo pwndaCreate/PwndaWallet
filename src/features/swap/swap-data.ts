@@ -550,11 +550,14 @@ export function getRpcUrlsForBlockchain(blockchain: IntentsBlockchain): string[]
     case "tron":
     case "ton":
     case "cardano":
+    case "aptos":
       // Destination-only chains in v1.x. We never need to broadcast a
       // source tx for these, but return a sane default so the form's
       // "show explorer URL" path doesn't crash if it's hit by accident.
       // Cardano added 2026-05-25 — Pwnda has the CIP-1852 wallet adapter
-      // for receive, no Rust source signer yet.
+      // for receive, no Rust source signer yet. Aptos (2026-10-06): its
+      // token legs deposit through their own adapter, which reaches the
+      // chain itself, so nothing reads an RPC list for it.
       return [];
   }
 }
@@ -674,6 +677,11 @@ const EXPLORER_BY_BLOCKCHAIN: Record<
     tx: (h) => `https://cardanoscan.io/transaction/${h}`,
     address: (a) => `https://cardanoscan.io/address/${a}`,
   },
+  // 2026-10-06 — the USDT/USDC legs on Aptos.
+  aptos: {
+    tx: (h) => `https://explorer.aptoslabs.com/txn/${h}?network=mainnet`,
+    address: (a) => `https://explorer.aptoslabs.com/account/${a}?network=mainnet`,
+  },
 };
 
 /**
@@ -726,6 +734,9 @@ export function blockchainToChainKind(blockchain: IntentsBlockchain): SwapChainK
       return "XRP";
     case "tron":
       return "TRON";
+    case "aptos":
+      // 2026-10-06 — the USDT/USDC legs, deposited by their own adapter.
+      return "APTOS";
     case "ton":
       // No signer, no chain kind. Null makes `getSwapCoinMeta` refuse rather
       // than hand the executor an EVM meta with no chain id.
@@ -812,6 +823,9 @@ function staticEntryBlockchain(meta: SwapCoinMeta): IntentsBlockchain | null {
   if (meta.chainKind === "DASH") return "dash";
   if (meta.chainKind === "STELLAR") return "stellar";
   if (meta.chainKind === "SUI") return "sui";
+  // 2026-10-06: without it, `getSwapCoinMeta("USDT-APTOS", "aptos")` would
+  // skip the registry entry (and its `tsSourceSigner`) for a synthesized one.
+  if (meta.chainKind === "APTOS") return "aptos";
   if (meta.chainKind === "EVM") {
     // Map evmChainId back to an IntentsBlockchain key.
     const id = meta.evmChainId;
@@ -909,6 +923,15 @@ const PWNDA_INTENTS_SOURCE_TICKERS: readonly string[] = [
   "USDT0-POL",
   "USDC-MONAD",
   "USDT0-MONAD",
+  // 2026-10-06 (operator request 2026-10-01): Optimism's USD₮0, and USDT and
+  // USDC on NEAR and on Aptos. NEAR's sign in the Rust session (an
+  // `ft_transfer` to the deposit address, `executeNearTokenTransfer`);
+  // Aptos's through the leg's own adapter (`tsSourceSigner: "aptos"`).
+  "USDT0-OP",
+  "USDT-NEAR",
+  "USDC-NEAR",
+  "USDT-APTOS",
+  "USDC-APTOS",
   // Phase 3 (Monad): MON native + EVM-compatible signer (chainId 143).
   "MON",
   // Phase 4 (BSC + L2 surface): BNB native + ETH on Arbitrum/Base/Optimism.
@@ -1001,6 +1024,15 @@ const PWNDA_INTENTS_DESTINATION_TICKERS: readonly string[] = [
   "USDT0-POL",
   "USDC-MONAD",
   "USDT0-MONAD",
+  // 2026-10-06, as in the source list. A NEAR token payout to an account the
+  // token contract has not registered is registered by NEAR Intents itself:
+  // its payouts to new accounts arrive as `storage_deposit` + `ft_transfer`
+  // from `intents.near` (seen on usdt.tether-token.near's receipts that day).
+  "USDT0-OP",
+  "USDT-NEAR",
+  "USDC-NEAR",
+  "USDT-APTOS",
+  "USDC-APTOS",
   "MON",
   "BNB",
   "DASH",

@@ -2,9 +2,11 @@ import {
   openSendSession,
   closeSendSession,
   executeNearSend,
+  executeNearTokenSend,
   executeStellarTransfer,
   executeSuiTransfer,
 } from "./features/swap/session-send";
+import { stablecoinNetworkFor } from "./wallets/stablecoins";
 import { NEAR_RPCS } from "./wallets/chain-rpcs";
 import type { SendOptions, TxResult } from "./wallets/types";
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
@@ -1486,7 +1488,8 @@ function App() {
   }, [activeChain, swapOptedIn]);
 
   /**
-   * Dashboard Send for STELLAR / NEAR / SUI.
+   * Dashboard Send for STELLAR / NEAR / SUI, and since 2026-10-06 the NEP-141
+   * legs on NEAR (USDT, USDC), which sign with the same NEAR key.
    *
    * These three were receive-only, and not because the crypto was missing:
    * `swap_sign_stellar_tx` / `swap_sign_near_tx` / `swap_sign_sui_tx` have
@@ -1515,7 +1518,15 @@ function App() {
   const sessionSignedSendOverride = useMemo(():
     | ((to: string, amount: string, opts?: SendOptions) => Promise<TxResult>)
     | undefined => {
-    if (activeChain !== "stellar" && activeChain !== "near" && activeChain !== "sui") {
+    // The NEP-141 legs (USDT/USDC on NEAR, 2026-10-06) sign with the same
+    // session-gated NEAR key, so they take this path too: the registry row
+    // names the token contract, and `executeNearTokenSend` builds the
+    // `ft_transfer` (with the recipient's registration when it needs one).
+    const nearToken = (() => {
+      const leg = stablecoinNetworkFor(activeChain);
+      return leg?.parent === "near" ? leg : undefined;
+    })();
+    if (activeChain !== "stellar" && activeChain !== "near" && activeChain !== "sui" && !nearToken) {
       return undefined;
     }
     const from = walletsByChain[activeChain]?.address;
@@ -1526,6 +1537,18 @@ function App() {
       if (!encrypted) throw new Error("No saved vault found.");
       const sessionId = await openSendSession(encrypted, sessionPassword);
       try {
+        if (nearToken) {
+          return await executeNearTokenSend({
+            sessionId,
+            fromAddress: from,
+            to,
+            amount,
+            tokenContract: nearToken.contract,
+            decimals: nearToken.decimals,
+            ticker: nearToken.symbol,
+            rpcUrl: NEAR_RPCS()[0],
+          });
+        }
         if (activeChain === "stellar") {
           const r = await executeStellarTransfer({
             sessionId,

@@ -32,6 +32,7 @@ import { PLACEHOLDER_ADDRESSES } from "./useSwapQuote";
 import { deriveDashAtPath } from "../../wallets/dash-wallet";
 import { deriveTrxAtPath, trxAdapter } from "../../wallets/trx-wallet";
 import { deriveXrpAtPath, xrpAdapter } from "../../wallets/xrp-wallet";
+import { aptAdapter } from "../../wallets/apt-wallet";
 
 /** The standard BIP-39 test vector. World-public; holds nothing. */
 const ABANDON =
@@ -56,6 +57,12 @@ describe("probe placeholder addresses", () => {
     expect(PLACEHOLDER_ADDRESSES.tron).toBe(tron.address);
     // USDT on TRON is held by the TRON account itself.
     expect(PLACEHOLDER_ADDRESSES.usdtTron).toBe(tron.address);
+  });
+
+  it("uses the abandon mnemonic's real Aptos address (2026-10-06, the USDT/USDC legs)", () => {
+    // Without it the resolver's Aptos branch would throw for every probe of
+    // a USDT-APTOS or USDC-APTOS pair, and MIN would never load for them.
+    expect(PLACEHOLDER_ADDRESSES.aptos).toBe(aptAdapter.deriveFromMnemonic(ABANDON).address);
   });
 
   it("rejects the 2026-09-09 lookalike by name", () => {
@@ -84,6 +91,7 @@ describe("probe placeholder addresses", () => {
       "xrp",
       "tron",
       "usdtTron",
+      "aptos",
     ] as const) {
       expect(PLACEHOLDER_ADDRESSES[fam], `${fam} placeholder missing`)
         .toBeTruthy();

@@ -102,6 +102,25 @@ describe("the header names chains, not tickers, grouped by reason", () => {
     // Each chain's full error rides along for the tooltip.
     expect(s.failures[0].chains[0].message).toBe(OLD.ethereum);
   });
+
+  it("a USD₮0 leg reads as USDT with the note, so Optimism's two USDT legs stay apart (2026-10-06)", () => {
+    // Operator request 2026-10-01: "USDT0" is not the name people know the
+    // token by. Before, the header printed "USDT0 (Arbitrum)".
+    const errors = {
+      "usdt-op:0xme": OLD.ethereum,
+      "usdt0-op:0xme": OLD.ethereum,
+      "usdt0-arb:0xme": OLD.ethereum,
+      "usdt-near:abc": "every history source failed — api.nearblocks.io: HTTP 503",
+    };
+    const statuses = chainHistoryStatuses(["usdt-op", "usdt0-op", "usdt0-arb", "usdt-near"], {
+      txByChain: {},
+      errors,
+    });
+    expect(summarizeHistoryStatus(statuses).failures.map((f) => [f.label, f.chains.map((c) => c.name)])).toEqual([
+      ["rate limited", ["USDT (Optimism)", "USDT (Optimism · USD₮0)", "USDT (Arbitrum · USD₮0)"]],
+      ["explorer error", ["USDT (NEAR)"]],
+    ]);
+  });
 });
 
 describe("one status per chain — a UTXO chain's rows are listed once", () => {

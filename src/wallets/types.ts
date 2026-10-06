@@ -26,6 +26,18 @@ export type ChainType =
   // Monad (2026-09-29): an EVM L1 NEAR Intents carries USDC and USD₮0 on.
   | "usdc-monad"
   | "usdt0-monad"
+  // Optimism's USD₮0 (operator request, 2026-10-01). Optimism has BOTH: the
+  // old bridged USDT (`usdt-op`) and a separate USD₮0 contract. Unlike
+  // Arbitrum and Polygon, its USDT was not upgraded in place, so the two are
+  // different tokens at different contracts and each is its own leg.
+  | "usdt0-op"
+  // NEP-141 legs on NEAR and fungible-asset legs on Aptos (operator request,
+  // 2026-10-01). Both chains were in the wallet with no stablecoin leg while
+  // NEAR Intents lists USDT and USDC on each. See `wallets/stablecoins.ts`.
+  | "usdt-near"
+  | "usdc-near"
+  | "usdt-aptos"
+  | "usdc-aptos"
   // Non-EVM stablecoin legs (2026-09-02). SPL mints and the TRC-20 contract
   // were verified on chain the same way the ERC-20 rows were — see
   // `wallets/stablecoins.ts`. USDT-on-Tron is one of the most-held stablecoin
@@ -287,6 +299,16 @@ export interface GasBudget {
    * the 0.00001 XRP fee.
    */
   note?: string;
+  /**
+   * A cost of THIS send beyond the network fee, said whatever the verdict
+   * (operator request, 2026-10-01). `note` above is read only inside the
+   * shortfall box; this is shown under the fee even when the balance covers
+   * it, because the user must see it before pressing Send. Set for a NEP-141
+   * send to a NEAR account the token contract has not registered: the send
+   * also pays the contract's storage deposit (0.00125 NEAR for USDT and USDC,
+   * read live from `storage_balance_bounds`), which is spent, not a fee.
+   */
+  notice?: string;
 }
 
 /**
@@ -636,7 +658,9 @@ export interface ChainAdapter {
    * sent.
    *
    * Present on token adapters — ERC-20 (`usdc-arb`, `usdt-op`, …) and, since
-   * 2026-09-29, TRC-20 (`usdt-tron`, fees in TRX) — because they are the ones
+   * 2026-09-29, TRC-20 (`usdt-tron`, fees in TRX); since 2026-10-06 also
+   * NEP-141 (`usdt-near`, fees in NEAR) and Aptos fungible assets
+   * (`usdt-aptos`, fees in APT) — because they are the ones
    * where holding the full send amount still leaves you unable to send. On a
    * native adapter the fee comes out of the same balance the amount does, the
    * modal already shows it, and there is no second asset to warn about — so

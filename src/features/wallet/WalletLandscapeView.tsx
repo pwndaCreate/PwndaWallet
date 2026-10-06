@@ -3,6 +3,7 @@ import { usePausedChains } from "../../lib/sidecarIdle";
 import { HederaSetupPanel } from "./HederaSetupPanel";
 import { isHederaAccountMissing } from "../../wallets/hbar-wallet";
 import {
+  coinMarkFor,
   stablecoinRailGroups,
   isStablecoinChain,
   stablecoinNetworkFor,
@@ -33,7 +34,7 @@ import { AdaLegacyPanel } from "./AdaLegacyPanel";
 import { CardanoDerivationPanel } from "./CardanoDerivationPanel";
 import { SolanaDerivationPanel } from "./SolanaDerivationPanel";
 import { DerivationInfoCard } from "./DerivationInfoCard";
-import { TokenLegsCard } from "./TokenLegsCard";
+import { LegNote, TokenLegsCard } from "./TokenLegsCard";
 import { LitecoinDerivationPanel } from "./LitecoinDerivationPanel";
 import { AlgorandDerivationPanel } from "./AlgorandDerivationPanel";
 import { placeholderSparkFor } from "./spark-fallback";
@@ -493,9 +494,11 @@ export function WalletLandscapeView({
   const focalColor = focalZphRow
     ? ZPH_ASSET_COLOR[effectiveZphAsset as ZphAssetType]
     : activeAdapter.color;
+  // A USD₮0 leg reads "USDT" but keeps the USD₮0 mark — the ₮ with its "0"
+  // badge, the icon's form of the note (2026-10-06).
   const focalIconSym = focalZphRow
     ? (effectiveZphAsset as string)
-    : activeAdapter.ticker;
+    : coinMarkFor(activeChain, activeAdapter.ticker);
   const focalBalanceText = focalZphRow
     ? focalZphRow.balanceStr
     : fmtBalance(activeBalance);
@@ -739,7 +742,7 @@ export function WalletLandscapeView({
                   setActiveChain(r.chain);
                   setFocusedZphAsset(null);
                 }}
-                title={`${g.symbol} on ${r.network}`}
+                title={`${g.symbol}${r.note ? ` (${r.note})` : ""} on ${r.network}`}
                 style={{
                   width: "100%",
                   display: "flex",
@@ -762,7 +765,12 @@ export function WalletLandscapeView({
                 }}
               >
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <div style={{ fontSize: 10 }}>{r.network}</div>
+                  {/* The network, and "USD₮0" small beside it on a USD₮0
+                      leg (2026-10-06; it read "Arbitrum · USD₮0"). */}
+                  <div style={{ fontSize: 10 }}>
+                    {r.network}
+                    <LegNote note={r.note} />
+                  </div>
                   {r.nearIntents && (
                     <div
                       style={{

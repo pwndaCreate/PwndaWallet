@@ -17,6 +17,7 @@ import {
 } from "./swap-actual-received";
 import { SWAP_COIN_META } from "./swap-data";
 import { xrpPayoutBlockReason } from "./xrpPayoutGuard";
+import { networkLabelFor, symbolFor } from "./picker-rows";
 import { xrpAccountActivation } from "../../wallets/xrp-wallet";
 import {
   MockSwapAttemptedError,
@@ -845,20 +846,10 @@ export function SwapConfirmModal({
           }}
         >
           <CoinIcon sym={fromAsset} size={26} glow={false} />
-          <div style={{ flex: 1, minWidth: 0 }}>
-            <div style={{ fontSize: 9, color: "var(--text-dim)", letterSpacing: 1, textTransform: "uppercase" }}>you send</div>
-            <div className="tnum" style={{ fontSize: 16, marginTop: 2 }}>
-              {fromAmount} <span style={{ color: "var(--text-dim)" }}>{fromAsset}</span>
-            </div>
-          </div>
+          <AssetAmount label="you send" amount={fromAmount} asset={fromAsset} />
           <span style={{ color: "var(--text-dim)", fontSize: 14 }}>→</span>
           <CoinIcon sym={toAsset} size={26} glow={false} />
-          <div style={{ flex: 1, minWidth: 0, textAlign: "right" }}>
-            <div style={{ fontSize: 9, color: "var(--text-dim)", letterSpacing: 1, textTransform: "uppercase" }}>you receive</div>
-            <div className="tnum" style={{ fontSize: 16, marginTop: 2, color: "var(--accent)" }}>
-              ~{q.expectedReceive} <span style={{ color: "var(--text-dim)" }}>{toAsset}</span>
-            </div>
-          </div>
+          <AssetAmount label="you receive" amount={`~${q.expectedReceive}`} asset={toAsset} receive />
         </div>
 
         {/* Addresses. An account-wide UTXO deposit (F10) spends from every
@@ -899,8 +890,8 @@ export function SwapConfirmModal({
           }}
         >
           <RoutingRow modeInfo={modeInfo} quote={q} />
-          <Stat k="min received" v={`${q.minReceived} ${toAsset}`} />
-          <Stat k="network fees" v={`${q.totalFeesSource} ${fromAsset}`} />
+          <Stat k="min received" v={`${q.minReceived} ${symbolFor(toAsset)}`} />
+          <Stat k="network fees" v={`${q.totalFeesSource} ${symbolFor(fromAsset)}`} />
           {/* Pwnda fee — proxy-injected SwapKit affiliate fee, already
               deducted from `expectedReceive` by SwapKit before the route
               reaches us. Surface it explicitly: hiding it would mean the
@@ -909,7 +900,7 @@ export function SwapConfirmModal({
               affiliateFeeSource is "0" there — row collapses to a "—". */}
           <Stat
             k="Pwnda fee"
-            v={formatPwndaFee(q.affiliateFeeSource, fromAmount, fromAsset)}
+            v={formatPwndaFee(q.affiliateFeeSource, fromAmount, symbolFor(fromAsset))}
           />
           <Stat
             k="provider"
@@ -2009,6 +2000,42 @@ function MockStopFooter({
  * Exported (instead of file-local) so unit tests pin the format string
  * shape without rendering React.
  */
+/**
+ * One side of the confirm screen's "you send → you receive" (the modal is
+ * mounted by both layouts). The amount reads in the symbol the picker files
+ * the leg under, with its network beneath — "100 USDT" over
+ * "Optimism · USD₮0" — not the registry key: "100 USDT0-OP" brought back the
+ * name the picker had dropped, and left Optimism's two USDT legs a "0" apart
+ * (2026-10-06, operator request 2026-10-01).
+ */
+export function AssetAmount({
+  label,
+  amount,
+  asset,
+  receive = false,
+}: {
+  label: string;
+  amount: string;
+  /** A swap key: `BTC`, `USDC-ARB`, `USDT0-OP`. */
+  asset: string;
+  receive?: boolean;
+}) {
+  const network = networkLabelFor(asset);
+  return (
+    <div style={{ flex: 1, minWidth: 0, textAlign: receive ? "right" : undefined }}>
+      <div style={{ fontSize: 9, color: "var(--text-dim)", letterSpacing: 1, textTransform: "uppercase" }}>{label}</div>
+      <div className="tnum" style={{ fontSize: 16, marginTop: 2, color: receive ? "var(--accent)" : undefined }}>
+        {amount} <span style={{ color: "var(--text-dim)" }}>{symbolFor(asset)}</span>
+      </div>
+      {network && (
+        <div data-asset-network style={{ fontSize: 9, color: "var(--text-dim)", letterSpacing: 0.4, marginTop: 2 }}>
+          {network}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function formatPwndaFee(
   affiliateSource: string,
   sellAmount: string,

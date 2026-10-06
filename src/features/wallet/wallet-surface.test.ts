@@ -31,6 +31,7 @@ import {
   zephyrAssetRowsFrom,
 } from "./wallet-surface";
 import { atomicToZph } from "../../wallets/zph-rpc";
+import { isStablecoinChain } from "../../wallets/stablecoins";
 
 const wallet = (chain: ChainType, address: string): WalletInfo => ({
   chain,
@@ -381,8 +382,31 @@ describe("Swap seeds the Swap tab with the asset's own registry entry", () => {
       if (key == null) continue;
       const cap = ASSET_CAPABILITIES[key];
       expect(cap, `${c} → ${key} is not a registry key`).toBeDefined();
-      expect(cap.ticker.toUpperCase(), c).toBe(getAdapter(c).ticker.toUpperCase());
+      if (isStablecoinChain(c)) {
+        // A leg's entry is the one stored under the leg itself. Checked by
+        // wallet key since 2026-10-06: the USD₮0 legs read "USDT" in the
+        // wallet while their entries keep the token's own "USDT0", so the
+        // ticker no longer says which entry is theirs.
+        expect(cap.walletsByChainKey, c).toBe(c);
+      } else {
+        expect(cap.ticker.toUpperCase(), c).toBe(getAdapter(c).ticker.toUpperCase());
+      }
     }
+  });
+
+  it("keeps Swap on the USD₮0 legs, which read USDT while their entries say USDT0", () => {
+    // Operator request 2026-10-01 renamed the legs' ticker to USDT; matching
+    // on ticker alone took Swap away from all four (`homeChainOf`).
+    expect(swapAssetKeyFor("usdt0-arb")).toBe("USDT0-ARB");
+    expect(swapAssetKeyFor("usdt0-monad")).toBe("USDT0-MONAD");
+    expect(swapAssetKeyFor("usdt0-op")).toBe("USDT0-OP");
+    // …and the plain Optimism USDT keeps its own entry.
+    expect(swapAssetKeyFor("usdt-op")).toBe("USDT-OP");
+    // The NEAR and Aptos legs reach theirs.
+    expect(swapAssetKeyFor("usdt-near")).toBe("USDT-NEAR");
+    expect(swapAssetKeyFor("usdc-near")).toBe("USDC-NEAR");
+    expect(swapAssetKeyFor("usdt-aptos")).toBe("USDT-APTOS");
+    expect(swapAssetKeyFor("usdc-aptos")).toBe("USDC-APTOS");
   });
 
   it("seeds a stablecoin leg with its per-network key, not the bare ticker", () => {

@@ -1,6 +1,7 @@
 import { ST } from "../../components/Primitives";
 import { Card, MiniSpark } from "../../components/PrimitivesV2";
 import { CoinIcon } from "../../components/CoinIcon";
+import { coinMarkFor } from "../../wallets/stablecoins";
 import { placeholderSparkFor } from "./spark-fallback";
 import { AssetMarketBlock, priceSparkFor } from "./AssetMarketBlock";
 import { assetUsdValue, formatAssetBalance, formatAssetUsd } from "./wallet-surface";
@@ -285,7 +286,9 @@ export function AccountCard({
       })()}
 
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "8px 0" }}>
-        <CoinIcon sym={adapter.ticker} size={42} accent={adapter.color} />
+        {/* A USD₮0 leg reads "USDT" and keeps the USD₮0 mark (2026-10-06),
+            as landscape's focal icon does. */}
+        <CoinIcon sym={coinMarkFor(activeChain, adapter.ticker)} size={42} accent={adapter.color} />
         <div style={{ flex: 1, minWidth: 0 }}>
           <div
             style={{

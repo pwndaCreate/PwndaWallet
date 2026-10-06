@@ -355,4 +355,20 @@ describe("the signing session is locked when the send is over (#14)", () => {
     expect(body).not.toContain("executeNearNativeTransfer(");
     expect(body).toMatch(/finally \{\s*await closeSendSession\(sessionId\);\s*\}/);
   });
+
+  it("App.tsx sends the NEP-141 legs (USDT/USDC on NEAR) through executeNearTokenSend, with the registry's contract (2026-10-06)", () => {
+    const app = readFileSync(join(__dirname, "../../App.tsx"), "utf8").replace(/\r\n/g, "\n");
+    const start = app.indexOf("const sessionSignedSendOverride = useMemo(");
+    const end = app.indexOf("}, [activeChain, walletsByChain, sessionPassword]);", start);
+    const body = app.slice(start, end);
+    // Recognised by the registry row's parent, not a list of chain ids, so a
+    // later NEP-141 leg takes this path without an edit here.
+    expect(body).toContain('leg?.parent === "near"');
+    expect(body).toMatch(/&& !nearToken\)\s*\{\s*return undefined;/);
+    expect(body).toContain("tokenContract: nearToken.contract");
+    // Before the native branch, which would move NEAR instead of the token.
+    const token = body.indexOf("executeNearTokenSend({");
+    expect(token).toBeGreaterThan(-1);
+    expect(token).toBeLessThan(body.indexOf("executeNearSend({"));
+  });
 });

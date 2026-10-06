@@ -18,6 +18,10 @@
  *   nep141:pol.omft.near       →    EVM hex         (Polygon)
  *   nep141:sol.omft.near       →    SOL base58
  *   nep141:wrap.near           →    NEAR account    (*.near or 64-hex)
+ *   nep141:usdt.tether-token.near, nep141:17208628…  →  NEAR account
+ *                                   (the USDT/USDC legs, 2026-10-06)
+ *   nep141:aptos-<hash>.omft.near →  Aptos account  (0x + 64 hex; the
+ *                                   USDT/USDC legs only, 2026-10-06)
  *   nep141:xrp.omft.near       →    XRP classic     (r…)
  *   nep141:tron.omft.near      →    TRON base58     (T…)  — the TRX entry
  *   nep141:tron-<usdt>.omft.near →  TRON base58     (T…)  — the USDT-TRON entry
@@ -91,6 +95,10 @@ export interface WalletAddresses {
    *  but it is read from the `usdt-tron` wallet entry: a swap must deliver
    *  USDT to exactly the address the dashboard shows USDT under. */
   usdtTron?: string;
+  /** Aptos account (0x + 64 hex) that holds the USDT/USDC fungible-asset
+   *  legs (2026-10-06). Read from those legs' wallet entries; native APT is
+   *  not a NEAR Intents asset here. */
+  aptos?: string;
 }
 
 /** Thrown by the resolver and the format validators. The confirm modal
@@ -103,6 +111,21 @@ export class IntentsValidationError extends Error {
     Object.setPrototypeOf(this, IntentsValidationError.prototype);
   }
 }
+
+/**
+ * The NEP-141 and Aptos fungible-asset ids the wallet holds a leg for
+ * (2026-10-06), from the registry rather than a second hand-kept list: a token
+ * entry on the chain kind, with the contract `withStablecoinContracts` gave it.
+ */
+function tokenAssetIdsOn(kind: "NEAR" | "APTOS"): ReadonlySet<string> {
+  return new Set(
+    Object.values(ASSET_CAPABILITIES)
+      .filter((c) => c.chainKind === kind && !!c.tokenContract && !!c.nearIntentsAsset)
+      .map((c) => c.nearIntentsAsset as string),
+  );
+}
+const NEAR_TOKEN_ASSET_IDS = tokenAssetIdsOn("NEAR");
+const APTOS_TOKEN_ASSET_IDS = tokenAssetIdsOn("APTOS");
 
 /**
  * HOT-Omni chain id → chain key for the `nep245:v2_1.omni.hot.tg:<id>_…`
@@ -291,12 +314,13 @@ export function addressForAssetId(
     return wallet.sol;
   }
 
-  // NEAR mainnet native — `wrap.near`. Other on-NEAR NEP-141 tokens
-  // would also resolve to the user's NEAR account address, but the
-  // current asset table doesn't include any (every other asset id has
-  // a `*.omft.near` suffix or a `<chain>-<contract>.omft.near` shape).
-  // Add a second branch when the sync script picks up on-NEAR tokens.
-  if (body === "wrap.near") {
+  // NEAR mainnet native — `wrap.near` — and, since 2026-10-06, the NEP-141
+  // tokens the wallet has a leg for (USDT `usdt.tether-token.near`, USDC
+  // `17208628…6133a1`): each is held BY the NEAR account, so it is delivered
+  // to it. Matched against the registry's own ids, like the TRON tokens
+  // below: any other NEP-141 token would land on an account where no balance
+  // row ever shows it.
+  if (body === "wrap.near" || NEAR_TOKEN_ASSET_IDS.has(id)) {
     if (!wallet.near) {
       throw new IntentsValidationError(
         `No derived NEAR address — make sure your NEAR account has been derived (Settings → swap unlock).`
@@ -304,6 +328,24 @@ export function addressForAssetId(
     }
     assertValidNearAddress(wallet.near);
     return wallet.near;
+  }
+
+  // Aptos fungible assets (2026-10-06): `nep141:aptos-<hash>.omft.near`.
+  // Only the USDT and USDC legs resolve, for the reason the NEAR tokens
+  // above give.
+  if (body.startsWith("aptos-") || body === "aptos.omft.near") {
+    if (!APTOS_TOKEN_ASSET_IDS.has(id)) {
+      throw new IntentsValidationError(
+        `"${assetId}" is an Aptos asset PwndaWallet has no wallet entry for — only USDT and USDC on Aptos are supported.`
+      );
+    }
+    if (!wallet.aptos) {
+      throw new IntentsValidationError(
+        `No derived Aptos address — open the Aptos chain in the dashboard so the wallet derives one, then retry.`
+      );
+    }
+    assertValidAptosAddress(wallet.aptos);
+    return wallet.aptos;
   }
 
   // Other native chains — destination-only in v1.x. The wallet doesn't
@@ -486,6 +528,19 @@ export function assertValidStellarAddress(addr: string): void {
   }
 }
 
+// Aptos account address (2026-10-06): 0x + 64 lowercase hex chars, the padded
+// form the wallet derives (`apt-wallet.ts`). Never a short form: padding one
+// out names a different account.
+const APTOS_ADDRESS = /^0x[0-9a-f]{64}$/;
+
+export function assertValidAptosAddress(addr: string): void {
+  if (!APTOS_ADDRESS.test(addr)) {
+    throw new IntentsValidationError(
+      `"${addr}" is not a valid Aptos address (expected 0x + 64 lowercase hex chars).`
+    );
+  }
+}
+
 // Sui address: 0x + 64 lowercase hex chars (32 bytes).
 const SUI_ADDRESS = /^0x[0-9a-f]{64}$/;
 
@@ -597,6 +652,14 @@ const WALLETS_BY_CHAIN_KEY_TO_BUNDLE_FIELD: Partial<
   // Its own field, not `tron`: TRX and USDT-TRON are separate wallet
   // entries, and each asset is delivered where the dashboard shows it.
   "usdt-tron": "usdtTron",
+  // The NEP-141 legs are held by the NEAR account itself (one derivation,
+  // no alternative paths), so they share `near` (2026-10-06).
+  "usdt-near": "near",
+  "usdc-near": "near",
+  // The Aptos legs' account. Native APT has no registry entry, so these two
+  // are the only keys that fill `aptos`.
+  "usdt-aptos": "aptos",
+  "usdc-aptos": "aptos",
   // Intentional `null`s — wallet chains the NEAR Intents resolver
   // never targets. Listed explicitly so a future reader sees the
   // omissions are deliberate, not a missing-row oversight.
@@ -637,7 +700,11 @@ export function deriveWalletAddresses(
     seen.add(key);
     const bundleField = WALLETS_BY_CHAIN_KEY_TO_BUNDLE_FIELD[key];
     if (!bundleField) continue;
-    bundle[bundleField] = walletsByChain[key]?.address;
+    // Several keys can fill one field since 2026-10-06 (`near` and the NEP-141
+    // legs; the two Aptos legs). They hold the same address; a key whose
+    // wallet is missing must not blank a field another key already filled.
+    const address = walletsByChain[key]?.address;
+    if (address !== undefined || !(bundleField in bundle)) bundle[bundleField] = address;
   }
   return bundle;
 }

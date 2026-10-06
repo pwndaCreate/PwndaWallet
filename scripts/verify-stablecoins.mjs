@@ -15,6 +15,11 @@
 //   * Bridged USDC.e on Arbitrum (0xFF970A61...) and Optimism (0x7F5c764c...)
 //     BOTH still answer symbol() = "USDC". Only name() distinguishes them
 //     ("USD Coin (Arb1)"), which is why name is checked too.
+//
+// Since 2026-10-06 it also reads NEAR's NEP-141 contracts (`ft_metadata`) and
+// Aptos's fungible-asset objects (the `0x1::fungible_asset::Metadata`
+// resource) — before, a NEAR or Aptos row fell through to the EVM branch and
+// failed with "no rpc".
 
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
@@ -144,11 +149,68 @@ async function tronConst(contract, selector) {
   throw last;
 }
 
+// NEAR (2026-10-06): a NEP-141 contract states its own metadata through the
+// standard `ft_metadata` view (NEP-148) — symbol, name, decimals.
+const NEAR_RPC = ["https://near.drpc.org", "https://rpc.fastnear.com", "https://near.lava.build", "https://rpc.mainnet.near.org"];
+async function nearView(contract, method) {
+  let last;
+  for (const url of NEAR_RPC) {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "query",
+          params: { request_type: "call_function", finality: "final", account_id: contract, method_name: method, args_base64: "e30=" },
+        }),
+        signal: AbortSignal.timeout(15000),
+      });
+      const text = await r.text();
+      if (!text.trimStart().startsWith("{")) throw new Error(`non-JSON from ${url}: ${text.slice(0, 40).trim()}`);
+      const j = JSON.parse(text);
+      if (j.error) throw new Error(j.error.message ?? JSON.stringify(j.error).slice(0, 120));
+      if (j.result?.error) throw new Error(j.result.error);
+      return JSON.parse(Buffer.from(j.result.result).toString("utf8"));
+    } catch (e) { last = e; }
+  }
+  throw last;
+}
+
+// Aptos (2026-10-06): a fungible asset is an OBJECT whose address is the
+// registry's `contract`; its `0x1::fungible_asset::Metadata` resource is the
+// asset's own symbol, name and decimals. A wrong address has no such resource.
+const APTOS_API = "https://api.mainnet.aptoslabs.com/v1";
+async function aptosFaMetadata(addr) {
+  const r = await fetch(`${APTOS_API}/accounts/${addr}/resource/0x1::fungible_asset::Metadata`, {
+    signal: AbortSignal.timeout(15000),
+  });
+  if (!r.ok) throw new Error(`HTTP ${r.status} reading the Metadata resource at ${addr}`);
+  return (await r.json()).data;
+}
+
 const rows = [];
 let bad = 0;
 for (const r of readRegistry()) {
   try {
     // Non-EVM legs answer a different question in a different protocol.
+    if (r.parent === "near") {
+      const meta = await nearView(r.addr, "ft_metadata");
+      const symOk = String(meta.symbol).toUpperCase() === r.want;
+      const decOk = meta.decimals === r.decimals;
+      if (!symOk || !decOk) bad++;
+      rows.push({ ...r, sym: meta.symbol, dec: meta.decimals, name: meta.name, symOk, decOk });
+      continue;
+    }
+    if (r.parent === "aptos") {
+      const meta = await aptosFaMetadata(r.addr);
+      const symOk = String(meta.symbol).toUpperCase() === r.want;
+      const decOk = Number(meta.decimals) === r.decimals;
+      if (!symOk || !decOk) bad++;
+      rows.push({ ...r, sym: meta.symbol, dec: Number(meta.decimals), name: meta.name, symOk, decOk });
+      continue;
+    }
     if (r.parent === "solana") {
       const sup = await solRpc("getTokenSupply", [r.addr]);
       const info = await solRpc("getAccountInfo", [r.addr, { encoding: "jsonParsed" }]);

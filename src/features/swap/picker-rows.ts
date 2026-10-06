@@ -26,6 +26,7 @@
  * to avoid choosing one — every selection resolves to exactly one leg key.
  */
 import { ASSET_CAPABILITIES } from "./asset-capabilities";
+import { stablecoinLegLabel } from "../../wallets/stablecoins";
 
 /**
  * Symbols that GROUP under another symbol in the picker.
@@ -41,6 +42,12 @@ import { ASSET_CAPABILITIES } from "./asset-capabilities";
  * networks without it, and concludes the wallet cannot do it. So it groups —
  * and the per-network row below still SAYS `USD₮0`, because grouping is for
  * findability and must not hide which token is about to be swapped.
+ *
+ * Since 2026-10-06 (operator request 2026-10-01) it says it as a small NOTE
+ * beside the network ("Arbitrum" + "USD₮0"), the way the wallet's rows do,
+ * rather than in the network's name ("Arbitrum · USDT0"). On Optimism the
+ * note is the whole difference between two USDT rows: the bridged USDT and
+ * USD₮0 are different tokens there.
  */
 const GROUPS_UNDER: Readonly<Record<string, string>> = {
   USDT0: "USDT",
@@ -64,8 +71,26 @@ export interface PickerRow {
    * expands and the user picks among {@link networks}.
    */
   legs: string[];
-  /** Per-leg display data, index-aligned with {@link legs}. */
-  networks: Array<{ key: string; network: string }>;
+  /**
+   * Per-leg display data, index-aligned with {@link legs}. `note` is the
+   * token's own name when it files under another symbol ("USD₮0"), drawn
+   * small beside the network; absent otherwise.
+   */
+  networks: Array<{ key: string; network: string; note?: string }>;
+}
+
+/**
+ * The note a leg carries in the picker: the wallet's own (`stablecoinLegLabel`,
+ * "USD₮0" with the ₮), else the registry ticker when the leg files under a
+ * symbol it does not trade as.
+ */
+function noteFor(key: string): string | undefined {
+  const cap = ASSET_CAPABILITIES[key.toUpperCase()];
+  if (!cap) return undefined;
+  const trueSymbol = cap.ticker.toUpperCase();
+  if (trueSymbol === groupSymbolFor(trueSymbol)) return undefined;
+  const wallet = cap.walletsByChainKey ? stablecoinLegLabel(cap.walletsByChainKey) : undefined;
+  return wallet?.note ?? cap.ticker;
 }
 
 /**
@@ -87,11 +112,10 @@ export function pickerRows(roster: readonly string[]): PickerRow[] {
     const trueSymbol = (cap?.ticker ?? key).toUpperCase();
     const symbol = groupSymbolFor(trueSymbol);
     // When a leg files under a different symbol than it trades as, the
-    // network row has to say both, or the choice hides which token it is.
-    const network =
-      trueSymbol === symbol
-        ? (cap?.network ?? "")
-        : `${cap?.network ?? ""} · ${cap?.ticker ?? trueSymbol}`;
+    // network row has to say both, or the choice hides which token it is —
+    // the network as the row's name, the token's own name as its note.
+    const network = cap?.network ?? "";
+    const note = noteFor(key);
 
     if (!bySymbol.has(symbol)) {
       bySymbol.set(symbol, { symbol, legs: [], networks: [] });
@@ -99,7 +123,7 @@ export function pickerRows(roster: readonly string[]): PickerRow[] {
     }
     const row = bySymbol.get(symbol)!;
     row.legs.push(key);
-    row.networks.push({ key, network });
+    row.networks.push(note ? { key, network, note } : { key, network });
   }
 
   return order.map((s) => bySymbol.get(s)!);
@@ -115,7 +139,9 @@ export function isGrouped(row: PickerRow): boolean {
  *
  * Empty string when the key is not a leg (an ordinary coin like BTC, whose
  * network name would just repeat the symbol). Callers render it as a chip
- * only when non-empty.
+ * only when non-empty — a chip is already the small print, so a leg's note
+ * rides in it: "Arbitrum · USD₮0" (the wallet's spelling since 2026-10-06; it
+ * was the registry's "USDT0").
  */
 export function networkLabelFor(key: string): string {
   const cap = ASSET_CAPABILITIES[key.toUpperCase()];
@@ -123,10 +149,8 @@ export function networkLabelFor(key: string): string {
   // An asset whose key IS its symbol is a native coin; "BTC on Bitcoin" is
   // noise. Only the per-leg keys earn a chip.
   if (cap.ticker.toUpperCase() === key.toUpperCase()) return "";
-  const trueSymbol = cap.ticker.toUpperCase();
-  return trueSymbol === groupSymbolFor(trueSymbol)
-    ? cap.network
-    : `${cap.network} · ${cap.ticker}`;
+  const note = noteFor(key);
+  return note ? `${cap.network} · ${note}` : cap.network;
 }
 
 /** The symbol a key trades as — `USDC-ARB` → `USDC`, `BTC` → `BTC`. */
@@ -135,4 +159,19 @@ export function symbolFor(key: string): string {
     ASSET_CAPABILITIES[key.toUpperCase()]?.ticker ?? key
   ).toUpperCase();
   return groupSymbolFor(trueSymbol);
+}
+
+/**
+ * A key as a sentence names it, where there is no room for a chip:
+ * `USDT0-ARB` → "USDT (Arbitrum · USD₮0)", `USDC-ARB` → "USDC (Arbitrum)",
+ * `BTC` → "BTC" — the wallet's own spelling of a leg (its `displayName`).
+ *
+ * 2026-10-06 (operator request 2026-10-01): the minimum hint and the confirm
+ * screen printed the registry key, so a USD₮0 leg still read "USDT0-ARB"
+ * after the picker stopped calling it that, and Optimism's two USDT legs
+ * differed only by a "0" in "USDT-OP" / "USDT0-OP".
+ */
+export function legDisplayName(key: string): string {
+  const network = networkLabelFor(key);
+  return network ? `${symbolFor(key)} (${network})` : symbolFor(key);
 }

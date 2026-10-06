@@ -21,6 +21,7 @@ import {
   addressForAssetId,
   assertValidBtcAddress,
   assertValidEvmAddress,
+  deriveWalletAddresses,
   type WalletAddresses,
 } from "./asset-address-resolver";
 
@@ -157,6 +158,58 @@ describe("addressForAssetId — extended chain coverage (2026-05-07)", () => {
     expect(() => addressForAssetId("BTC.BTC", HARDHAT_WALLET)).toThrow(
       /not in any recognized NEAR Intents namespace/
     );
+  });
+});
+
+/**
+ * USDT/USDC on NEAR and on Aptos (2026-10-06). Each token is held BY its
+ * chain's account, so a swap delivers it there and refunds it there; any
+ * other token on those chains is refused rather than delivered where no
+ * balance row shows it. Before this, all four ids answered "Unrecognized".
+ */
+describe("addressForAssetId — the NEAR and Aptos stablecoin legs (2026-10-06)", () => {
+  const NEAR_ACCOUNT = "5510e2b44cae6eb807e3e0e45d579dda058c274abcba15e5cb84636f5d1ee412";
+  const APTOS_ACCOUNT = "0xeb663b681209e7087d681c5d3eed12aaa8e1915e7c87794542c3f96e94b3d3bf";
+  const wallet: WalletAddresses = { ...HARDHAT_WALLET, near: NEAR_ACCOUNT, aptos: APTOS_ACCOUNT };
+
+  it("delivers USDT and USDC on NEAR to the NEAR account", () => {
+    expect(addressForAssetId("nep141:usdt.tether-token.near", wallet)).toBe(NEAR_ACCOUNT);
+    expect(
+      addressForAssetId("nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1", wallet),
+    ).toBe(NEAR_ACCOUNT);
+  });
+
+  it("delivers USDT and USDC on Aptos to the Aptos account", () => {
+    expect(addressForAssetId("nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near", wallet)).toBe(APTOS_ACCOUNT);
+    expect(addressForAssetId("nep141:aptos-34ee497f210c5a511e8d5b53bc56d75b63612bb5.omft.near", wallet)).toBe(APTOS_ACCOUNT);
+  });
+
+  it("refuses other tokens on those chains, and a chain account not derived yet", () => {
+    expect(() => addressForAssetId("nep141:token.sweat", wallet)).toThrow(/Unrecognized/);
+    expect(() => addressForAssetId("nep141:aptos.omft.near", wallet)).toThrow(/only USDT and USDC on Aptos/);
+    expect(() =>
+      addressForAssetId("nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near", HARDHAT_WALLET),
+    ).toThrow(/No derived Aptos address/);
+    expect(() =>
+      addressForAssetId("nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near", { aptos: "0x1" }),
+    ).toThrow(/not a valid Aptos address/);
+  });
+
+  it("the bundle fills `aptos` from the Aptos legs, and a missing leg never blanks a filled field", () => {
+    const leg = (address: string) => ({ address });
+    expect(
+      deriveWalletAddresses({
+        near: leg(NEAR_ACCOUNT),
+        "usdt-near": leg(NEAR_ACCOUNT),
+        "usdt-aptos": leg(APTOS_ACCOUNT),
+        "usdc-aptos": leg(APTOS_ACCOUNT),
+      }),
+    ).toMatchObject({ near: NEAR_ACCOUNT, aptos: APTOS_ACCOUNT });
+    // `usdc-near` absent: `near` still holds the account the others filled.
+    expect(deriveWalletAddresses({ near: leg(NEAR_ACCOUNT), "usdt-aptos": leg(APTOS_ACCOUNT) })).toMatchObject({
+      near: NEAR_ACCOUNT,
+      aptos: APTOS_ACCOUNT,
+    });
   });
 });
 

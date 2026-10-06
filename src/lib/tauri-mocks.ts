@@ -1418,7 +1418,88 @@ const MOCK_TOKEN_UNITS: Record<string, bigint> = {
   // USDT0
   "0xfd086bc7cd5c481dcc9c85ebe478a1c0b69fcbb9": 512_000_000n,            // ARB    512.00
   "0xc2132d05d31c914a87c6611c10748aeb04b58e8f": 96_750_000n,             // POL     96.75
+  // Optimism's USD₮0 (2026-10-06): held, while Optimism's bridged USDT
+  // above is 0, so the two Optimism USDT rows read differently.
+  "0x01bff41798a0bcf287b996046ca68b395dbc1071": 33_000_000n,             // OP      33.00
 };
+
+/**
+ * NEP-141 and Aptos fungible-asset balances for the funded scenarios
+ * (2026-10-06, the USDT/USDC legs on NEAR and Aptos), in each token's 6
+ * decimals. USDC stays at 0 on both chains so an empty leg is on screen too.
+ * Only these token reads are answered; everything else on NEAR and Aptos
+ * still passes through to the real network, as before.
+ */
+const MOCK_NEP141_UNITS: Record<string, bigint> = {
+  "usdt.tether-token.near": 120_500_000n, // USDT 120.50
+  "17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1": 0n, // USDC 0
+};
+const MOCK_APTOS_FA_UNITS: Record<string, bigint> = {
+  "0x357b0b74bc833e95a115ad22604854d6b0fca151cecd94111770e5d6ffc9dc2b": 48_250_000n, // USDT 48.25
+  "0xbae207659db88bea0cbead6da0ed00aac12edcdda169e591cd41c94180b46f3b": 0n, // USDC 0
+};
+/** The test seed's NEAR account and Aptos address: registered / holding a store. */
+const SANDBOX_NEAR_ACCOUNT = "5510e2b44cae6eb807e3e0e45d579dda058c274abcba15e5cb84636f5d1ee412";
+const SANDBOX_APTOS_ADDRESS = "0xeb663b681209e7087d681c5d3eed12aaa8e1915e7c87794542c3f96e94b3d3bf";
+
+/**
+ * A NEP-141 view call (`query` / `call_function`) on one of the two token
+ * contracts, funded only; `null` for anything else (passed through). The
+ * test seed's account is registered with both; any other account is not, so
+ * the Send modal's registration notice can be seen by typing any recipient.
+ */
+function nearTokenViewMock(params: any, funded: boolean): unknown | null {
+  const contract = String(params?.account_id ?? "");
+  if (!funded || !Object.prototype.hasOwnProperty.call(MOCK_NEP141_UNITS, contract)) return null;
+  let args: any = {};
+  try {
+    args = JSON.parse(atob(String(params?.args_base64 ?? "")));
+  } catch {
+    args = {};
+  }
+  let value: unknown;
+  switch (String(params?.method_name ?? "")) {
+    case "ft_balance_of":
+      value = args?.account_id === SANDBOX_NEAR_ACCOUNT ? MOCK_NEP141_UNITS[contract].toString() : "0";
+      break;
+    case "storage_balance_bounds":
+      value = { min: "1250000000000000000000", max: "1250000000000000000000" };
+      break;
+    case "storage_balance_of":
+      value = args?.account_id === SANDBOX_NEAR_ACCOUNT
+        ? { total: "1250000000000000000000", available: "0" }
+        : null;
+      break;
+    default:
+      return null;
+  }
+  return {
+    result: Array.from(new TextEncoder().encode(JSON.stringify(value))),
+    logs: [],
+    block_height: 218_000_000,
+    block_hash: "11111111111111111111111111111111",
+  };
+}
+
+/**
+ * An Aptos `/view` of `primary_fungible_store::balance` or
+ * `primary_store_exists` for one of the two token metadata objects, funded
+ * only; `null` for anything else (passed through, APT's own balance included).
+ */
+function aptosFaViewMock(body: any, funded: boolean): unknown[] | null {
+  const fn = String(body?.function ?? "");
+  const args = Array.isArray(body?.arguments) ? body.arguments : [];
+  const owner = String(args[0] ?? "").toLowerCase();
+  const metadata = String(args[1] ?? "").toLowerCase();
+  if (!funded || !Object.prototype.hasOwnProperty.call(MOCK_APTOS_FA_UNITS, metadata)) return null;
+  if (fn === "0x1::primary_fungible_store::balance") {
+    return [owner === SANDBOX_APTOS_ADDRESS ? MOCK_APTOS_FA_UNITS[metadata].toString() : "0"];
+  }
+  if (fn === "0x1::primary_fungible_store::primary_store_exists") {
+    return [owner === SANDBOX_APTOS_ADDRESS];
+  }
+  return null;
+}
 
 const EVM_WEI_BY_CHAINID: Record<number, bigint> = {
   1: 1_250_000_000_000_000_000n, // 1.25 ETH
@@ -1824,6 +1905,15 @@ function jsonRpcOne(url: string, req: any, funded: boolean, degraded: boolean): 
   if (method === "fee") return ok({ drops: { base_fee: "10", open_ledger_fee: "10", median_fee: "5000" }, status: "success" });
   if (method === "submit") return ok({ engine_result: "tesSUCCESS", engine_result_code: 0, tx_json: { hash: "ABCDEF" }, status: "success" });
 
+  // ---- NEAR: the USDT/USDC contracts' view calls (2026-10-06) ----
+  // `nearTokenViewMock` answers ft_balance_of / storage_balance_of /
+  // storage_balance_bounds on the two token contracts in the funded
+  // scenarios; every other NEAR call returns null here and passes through.
+  if (method === "query" && req?.params?.request_type === "call_function") {
+    const r = nearTokenViewMock(req.params, funded);
+    if (r !== null) return ok(r);
+  }
+
   // Per-contract ERC-20 balances for the funded scenarios, in the token's OWN
   // decimals (verified per contract in `wallets/stablecoins.ts`: BSC is 18,
   // everything else 6). Spread across networks on purpose so the stacked row
@@ -2001,6 +2091,14 @@ function dispatchUrl(
   if (body && typeof body === "object" && typeof body.query === "string") {
     const g = graphQlOne(url, body, funded, degraded);
     if (g !== null) return g;
+  }
+
+  // ---- Aptos: the USDT/USDC fungible-asset views (2026-10-06) ----
+  // Funded scenarios only; any other Aptos call passes through (see
+  // `aptosFaViewMock`).
+  if (url.includes("aptoslabs.com/v1/view") && body && typeof body === "object" && typeof body.function === "string") {
+    const v = aptosFaViewMock(body, funded);
+    if (v !== null) return { status: 200, json: v };
   }
 
   // ---- BasicSwap public market snapshot (markets.basicswapdex.com) ----
@@ -2680,6 +2778,14 @@ function intentsTokenCatalog(): Array<{
     // fixture gap the note above warns about, met while re-checking the
     // LTC → TRX report. The live catalog carries it.
     { assetId: "nep141:ltc.omft.near", decimals: 8, blockchain: "ltc", symbol: "LTC", price: priceFor("LTC") },
+    // The stablecoin legs added 2026-10-06: Optimism's USD₮0, and USDT/USDC
+    // on NEAR and on Aptos. Ids as the live 1Click list gave them that day,
+    // so MIN and quotes for those pairs have both assets in the sandbox too.
+    { assetId: "nep245:v2_1.omni.hot.tg:10_2R1RXDBxCyJTeMEsdXydh7xsHmz", decimals: 6, blockchain: "op", symbol: "USDT0", price: priceFor("USDT") },
+    { assetId: "nep141:usdt.tether-token.near", decimals: 6, blockchain: "near", symbol: "USDT", price: priceFor("USDT") },
+    { assetId: "nep141:17208628f84f5d6ad33f0da3bbbeb27ffcb398eac501a31bd6ad2011e36133a1", decimals: 6, blockchain: "near", symbol: "USDC", price: priceFor("USDC") },
+    { assetId: "nep141:aptos-88cb7619440a914fe6400149a12b443c3ac21d59.omft.near", decimals: 6, blockchain: "aptos", symbol: "USDT", price: priceFor("USDT") },
+    { assetId: "nep141:aptos-34ee497f210c5a511e8d5b53bc56d75b63612bb5.omft.near", decimals: 6, blockchain: "aptos", symbol: "USDC", price: priceFor("USDC") },
   ];
 }
 

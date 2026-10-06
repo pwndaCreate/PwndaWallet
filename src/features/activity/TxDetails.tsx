@@ -30,6 +30,7 @@ import { getAdapter } from "../../wallets";
 import type { ChainTx } from "../../wallets";
 import { explorerTxUrl } from "../../wallets/explorers";
 import { txDisplayTicker, txFeeTicker, txUsdPrice } from "../../wallets/tx-display";
+import { coinMarkFor } from "../../wallets/stablecoins";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
 import { fmtRelative } from "../../utils/format";
 import { openExternal } from "../../utils/openExternal";
@@ -579,7 +580,8 @@ export function TxDetailsView({ tx, model: m, onExplorer, speedUp }: TxDetailsVi
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 14, minWidth: 0 }}>
       <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
-        <CoinIcon sym={m.ticker} size={42} accent={m.color} />
+        {/* A USD₮0 row reads "USDT" and keeps the USD₮0 mark (2026-10-06). */}
+        <CoinIcon sym={coinMarkFor(tx.chain, m.ticker)} size={42} accent={m.color} />
         <div style={{ minWidth: 0 }}>
           <div style={{ ...mono, fontSize: 10, color: toneColor, letterSpacing: 1.5, textTransform: "uppercase" }}>
             {m.directionLabel}

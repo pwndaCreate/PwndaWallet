@@ -32,14 +32,17 @@ describe("pickerRows", () => {
     expect(rows[0].legs).toEqual(["BTC"]);
   });
 
-  it("collapses USDC's nine legs into one expandable row", () => {
+  it("collapses USDC's eleven legs into one expandable row", () => {
     const rows = pickerRows(getDropdownTickers({ sourceOnly: true, router: "intents" }));
     const usdc = rows.find((r) => r.symbol === "USDC")!;
     expect(usdc, "USDC row missing").toBeDefined();
     expect(isGrouped(usdc)).toBe(true);
-    // Nine since 2026-09-29: Monad joined the eight EVM/Solana legs.
-    expect(usdc.legs.length).toBe(9);
+    // Nine since 2026-09-29 (Monad joined the eight EVM/Solana legs); eleven
+    // since 2026-10-06, with NEAR and Aptos.
+    expect(usdc.legs.length).toBe(11);
     expect(usdc.legs).toContain("USDC-MONAD");
+    expect(usdc.legs).toContain("USDC-NEAR");
+    expect(usdc.legs).toContain("USDC-APTOS");
     // Every leg resolves to a real registry entry — a row standing for a key
     // nothing can route is the LTC failure wearing a different hat.
     for (const key of usdc.legs) {
@@ -87,25 +90,51 @@ describe("USDT0 — grouped for findability, never disguised", () => {
     expect(usdt.legs).toContain("USDT-TRON");
     // Plus Monad's USD₮0 since 2026-09-29.
     expect(usdt.legs).toContain("USDT0-MONAD");
-    expect(usdt.legs.length).toBe(9);
+    // Plus Optimism's USD₮0, and USDT on NEAR and Aptos, since 2026-10-06.
+    expect(usdt.legs).toContain("USDT0-OP");
+    expect(usdt.legs).toContain("USDT-NEAR");
+    expect(usdt.legs).toContain("USDT-APTOS");
+    expect(usdt.legs.length).toBe(12);
   });
 
-  it("still SAYS USDT0 on the network row", () => {
+  // Operator request 2026-10-01: "the row reads USDT, with USD₮0 as a small
+  // note". Until 2026-10-06 the network row's NAME was "Arbitrum · USDT0".
+  it("still SAYS USD₮0 on the network row — as its note, beside the network", () => {
     // Grouping is for findability. If it also hid which token was being
     // swapped it would be worse than the flat list it replaced: USD₮0 is a
     // different contract and a different bridge standard.
     const rows = pickerRows(getDropdownTickers({ sourceOnly: true, router: "intents" }));
     const usdt = rows.find((r) => r.symbol === "USDT")!;
     const arb = usdt.networks.find((n) => n.key === "USDT0-ARB")!;
-    expect(arb.network).toContain("Arbitrum");
-    expect(arb.network).toContain("USDT0");
+    expect(arb).toEqual({ key: "USDT0-ARB", network: "Arbitrum", note: "USD₮0" });
+    for (const key of ["USDT0-POL", "USDT0-MONAD", "USDT0-OP"]) {
+      expect(usdt.networks.find((n) => n.key === key)?.note, key).toBe("USD₮0");
+    }
+    // A plain USDT leg carries no note.
+    expect(usdt.networks.find((n) => n.key === "USDT-ETH")).toEqual({ key: "USDT-ETH", network: "Ethereum" });
+  });
+
+  it("tells Optimism's two USDT rows apart by the note alone", () => {
+    // Optimism has the old bridged USDT AND a separate USD₮0 contract; both
+    // are offered, under the same network name, so the note is what differs.
+    const rows = pickerRows(getDropdownTickers({ router: "intents" }));
+    const usdt = rows.find((r) => r.symbol === "USDT")!;
+    const op = usdt.networks.filter((n) => n.network === "Optimism");
+    expect(op.map((n) => n.key).sort()).toEqual(["USDT-OP", "USDT0-OP"]);
+    expect(op.find((n) => n.key === "USDT-OP")?.note).toBeUndefined();
+    expect(op.find((n) => n.key === "USDT0-OP")?.note).toBe("USD₮0");
+    expect(networkLabelFor("USDT-OP")).toBe("Optimism");
+    expect(networkLabelFor("USDT0-OP")).toBe("Optimism · USD₮0");
   });
 
   it("labels the closed button with both the network and the token", () => {
-    expect(networkLabelFor("USDT0-ARB")).toContain("Arbitrum");
-    expect(networkLabelFor("USDT0-ARB")).toContain("USDT0");
+    // The chip is already the small print, so the note rides in it — spelled
+    // as the wallet spells it (USD₮0), not as the registry key (USDT0).
+    expect(networkLabelFor("USDT0-ARB")).toBe("Arbitrum · USD₮0");
     // A plain leg needs only its network.
     expect(networkLabelFor("USDC-BASE")).toBe("Base");
+    expect(networkLabelFor("USDT-NEAR")).toBe("NEAR");
+    expect(networkLabelFor("USDC-APTOS")).toBe("Aptos");
   });
 
   it("gives a native coin no network chip", () => {
@@ -120,6 +149,9 @@ describe("symbolFor", () => {
     expect(symbolFor("USDC-BASE")).toBe("USDC");
     expect(symbolFor("USDT-ETH")).toBe("USDT");
     expect(symbolFor("USDT0-ARB")).toBe("USDT");
+    expect(symbolFor("USDT0-OP")).toBe("USDT");
+    expect(symbolFor("USDT-NEAR")).toBe("USDT");
+    expect(symbolFor("USDC-APTOS")).toBe("USDC");
     expect(symbolFor("BTC")).toBe("BTC");
   });
 });
