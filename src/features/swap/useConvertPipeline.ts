@@ -38,7 +38,12 @@ import type {
   SidecarSwapState,
   SidecarTrackedSwap,
 } from "../swap-sidecar";
-import { feeBearingPurchase, stageForBidState, tickerForCoin } from "../swap-sidecar";
+import {
+  feeBearingPurchase,
+  LICENCE_FEE_FRACTION,
+  stageForBidState,
+  tickerForCoin,
+} from "../swap-sidecar";
 import {
   followConversionRebid,
   recordConversionStarted,
@@ -97,10 +102,15 @@ export interface ConvertPipelineState {
    * wallet's LTC address, the one on hop 1's confirm screen; `"node-wallet"`,
    * the swap node's own LTC wallet. Since 2026-10-06 hop 1 is a purchase the
    * licence fee is charged on (XMR -> LTC), so its LTC stays in the node's
-   * wallet for the fee, and the conversion ends there ({@link afterHop1}).
-   * Hop 2 spends from this wallet's address.
+   * wallet for the fee. Where that leads is {@link hop2Next}.
    */
   hop2PaidTo: "address" | "node-wallet" | null;
+  /**
+   * What a settled hop 1 leads to ({@link afterHop1}): `"hop2"` seeds the NEAR
+   * Intents form, `"finish"` ends the conversion at LTC. Null before hop 1
+   * settles.
+   */
+  hop2Next: "hop2" | "finish" | null;
 
   /**
    * True when hop 1 ended in a way that is not "settled": refunded,
@@ -113,7 +123,7 @@ export interface ConvertPipelineState {
   /** Open the P2P review for XMR -> LTC. The caller supplies the opener. */
   beginHop1: () => void;
   /** Seed the aggregator form with LTC -> target and let the user confirm.
-   *  Does nothing when hop 1's LTC stayed in the swap node ({@link afterHop1}). */
+   *  Does nothing when {@link hop2Next} is not `"hop2"`. */
   beginHop2: () => void;
   /** End a conversion at LTC whose hop 1 paid the swap node's wallet: logs
    *  where it ended and returns to idle (2026-10-06). */
@@ -134,6 +144,12 @@ export interface ConvertPipelineArgs {
   onSeedHop1: (amount: string) => void;
   /** Same, for the NEAR Intents leg: LTC -> target, with hop 1's output. */
   onSeedHop2: (amount: string, target: string) => void;
+  /**
+   * The swap node holds this wallet's own LTC account (verified C8 sharing,
+   * `useSwapAutoSetup().shared` includes `"LTC"`). LTC the node kept is then in
+   * this wallet's account, and hop 2 can spend it ({@link afterHop1}).
+   */
+  routeHopShared?: boolean;
 }
 
 function readStored(key: string): string | null {
@@ -316,14 +332,47 @@ export function hop1PaidTo(
 }
 
 /**
- * What a settled hop 1 leads to (2026-10-06). Hop 2 spends LTC from this
- * wallet's own address; LTC the swap node kept is not there (and the fee is
- * taken from it after the swap). So for that case the conversion ends at LTC
- * and says where it is, rather than seed a NEAR Intents swap from an address
- * that does not hold the coin.
+ * What a settled hop 1 leads to. Hop 2 spends LTC from this wallet's own
+ * account (`sendFromAccount` gathers the whole BIP-84 account).
+ *
+ * - Paid to this wallet's address: hop 2.
+ * - Kept by the swap node, and the node holds this wallet's own LTC account
+ *   (`shared`, the default lean setup): the LTC is already in this wallet's
+ *   account, so hop 2, as before 2026-10-06. The licence fee is withdrawn from
+ *   the same account by the backend after the swap; {@link hop2SeedAmount}
+ *   leaves room for it, so the user never handles it.
+ * - Kept by a node with its own LTC wallet: the coin is not in this wallet, so
+ *   the conversion ends at LTC and says where it is, rather than seed a NEAR
+ *   Intents swap from an account that does not hold it.
+ *
+ * 2026-10-06, corrected the same day: the first version ended every
+ * node-kept hop 1 at LTC ("► DONE"), which on a shared account stopped EARN
+ * one step short for no reason.
  */
-export function afterHop1(paidTo: "address" | "node-wallet" | null): "hop2" | "finish" {
-  return paidTo === "node-wallet" ? "finish" : "hop2";
+export function afterHop1(
+  paidTo: "address" | "node-wallet" | null,
+  shared = false,
+): "hop2" | "finish" {
+  return paidTo === "node-wallet" && !shared ? "finish" : "hop2";
+}
+
+/**
+ * The LTC amount hop 2 is seeded with. Hop 1's receive amount, less the
+ * licence fee when that fee is still to come out of the same LTC (kept by the
+ * node: the purchase was fee-bearing). Floors to 8 decimals so the seed never
+ * exceeds what will be there; hop 2's own form checks the balance, and the
+ * user confirms it. Unparseable input passes through unchanged.
+ */
+export function hop2SeedAmount(
+  viaAmount: string,
+  paidTo: "address" | "node-wallet" | null,
+): string {
+  if (paidTo !== "node-wallet") return viaAmount;
+  const n = Number(viaAmount);
+  if (!Number.isFinite(n) || n <= 0) return viaAmount;
+  const atoms = Math.floor(Math.round(n * 1e8) * (1 - LICENCE_FEE_FRACTION));
+  const whole = Math.floor(atoms / 1e8);
+  return `${whole}.${String(atoms % 1e8).padStart(8, "0")}`;
 }
 
 /**
@@ -423,6 +472,7 @@ export function useConvertPipeline({
   sidecar,
   onSeedHop1,
   onSeedHop2,
+  routeHopShared = false,
 }: ConvertPipelineArgs): ConvertPipelineState {
   const [targetCoin, setTargetCoinRaw] = useState<string>(
     () => readStored(TARGET_STORAGE_KEY) ?? "BTC",
@@ -518,16 +568,21 @@ export function useConvertPipeline({
     onSeedHop1("");
   }, [onSeedHop1]);
 
+  const hop2Next = useMemo(
+    () => (stage === "hop2-ready" ? afterHop1(hop2PaidTo, routeHopShared) : null),
+    [stage, hop2PaidTo, routeHopShared],
+  );
+
   const beginHop2 = useCallback(() => {
-    // Never from this wallet's address for LTC the swap node kept (2026-10-06).
-    if (!hop2InputAmount || afterHop1(hop2PaidTo) !== "hop2") return;
+    // Never for LTC a node with its own wallet kept ({@link afterHop1}).
+    if (!hop2InputAmount || afterHop1(hop2PaidTo, routeHopShared) !== "hop2") return;
     setStage("hop2-running");
     // The pipeline's work ends when hop 2 is handed to the swap form: the
     // NEAR leg then has its own confirm + Activity entry, and claiming an
     // outcome here would be asserting something this hook cannot observe.
     if (hop1BidId) updateConversion(hop1BidId, { status: "done" });
-    onSeedHop2(hop2InputAmount, targetCoin);
-  }, [hop2InputAmount, hop2PaidTo, onSeedHop2, targetCoin, hop1BidId]);
+    onSeedHop2(hop2SeedAmount(hop2InputAmount, hop2PaidTo), targetCoin);
+  }, [hop2InputAmount, hop2PaidTo, routeHopShared, onSeedHop2, targetCoin, hop1BidId]);
 
   const reset = useCallback(() => {
     setStage("idle");
@@ -589,6 +644,7 @@ export function useConvertPipeline({
       hop1,
       hop2InputAmount,
       hop2PaidTo,
+      hop2Next,
       hop1Unwound,
       beginHop1,
       beginHop2,
@@ -605,6 +661,7 @@ export function useConvertPipeline({
       hop1,
       hop2InputAmount,
       hop2PaidTo,
+      hop2Next,
       hop1Unwound,
       beginHop1,
       beginHop2,

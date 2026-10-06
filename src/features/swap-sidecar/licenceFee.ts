@@ -77,6 +77,14 @@ export function feeLegFor(
 export const FEE_SCHEDULE_TICKERS = ["LTC", "BCH", "BTC"] as const;
 
 /**
+ * The licence fee's rate as a fraction: `schedule::RATE_BPS` (50 bps) / 10 000.
+ * Only for leaving room for a fee not yet taken (EARN's hop 2); the charged
+ * amount is always the backend's `sidecar_fees_quote`. `convertAdopt.test.ts`
+ * reads the Rust constant to keep the two equal.
+ */
+export const LICENCE_FEE_FRACTION = 0.005;
+
+/**
  * Is a taker's purchase of `bought`, paid for with `sold`, charged the licence
  * fee in the coin bought (operator decision, 2026-10-06)? The schedule's own
  * test, in its order: exactly one leg scriptless and the coin bought is the

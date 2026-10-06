@@ -35,13 +35,14 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
 import type { BasicSwapOffer } from "../../api/basicswap";
-import { toTakerOffers, type SidecarSwapHandle } from "../swap-sidecar";
+import { LICENCE_FEE_FRACTION, toTakerOffers, type SidecarSwapHandle } from "../swap-sidecar";
 import {
   CONVERT_ROUTE_HOP,
   CONVERT_SOURCE,
   afterHop1,
   hop1ConversionRecord,
   hop1PaidTo,
+  hop2SeedAmount,
   isConvertHop1Leg,
   shouldAdoptAsHop1,
   type ConvertPipelineState,
@@ -280,6 +281,7 @@ function pipeline(stage: ConvertStage): ConvertPipelineState {
     hop1: null,
     hop2InputAmount: null,
     hop2PaidTo: null,
+    hop2Next: null,
     hop1Unwound: false,
     beginHop1: noop,
     beginHop2: noop,
@@ -357,12 +359,12 @@ describe("hop 2's line says where hop 1 paid", () => {
     vi.unstubAllGlobals();
   });
 
-  const render = (paidTo: ConvertPipelineState["hop2PaidTo"]) => {
+  const render = (paidTo: ConvertPipelineState["hop2PaidTo"], shared = false) => {
     vi.stubGlobal("window", { localStorage: memoryStorage() });
     return renderToStaticMarkup(
       createElement(EarnConvertBody, {
         variant: "landscape",
-        pipeline: { ...pipeline("hop2-ready"), hop2InputAmount: "0.09990000", hop2PaidTo: paidTo },
+        pipeline: { ...pipeline("hop2-ready"), hop2InputAmount: "0.09990000", hop2PaidTo: paidTo, hop2Next: afterHop1(paidTo, shared) },
         sourceBalance: 0.5,
         pricesByTicker: { XMR: 162.3, LTC: 117, BTC: 62_000 },
         mining: { active: false },
@@ -378,6 +380,14 @@ describe("hop 2's line says where hop 1 paid", () => {
     expect(text).toContain("Sweep back (in Settings) moves it to your wallet");
     expect(text).toContain("► DONE");
     expect(text).not.toContain("CONVERT THE SECOND HOP");
+  });
+
+  it("a shared LTC account: the node's LTC is this wallet's, so hop 2 follows", () => {
+    const text = render("node-wallet", true);
+    expect(text).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your wallet.`);
+    expect(text).toContain("CONVERT THE SECOND HOP");
+    expect(text).not.toContain("► DONE");
+    expect(text).not.toContain("Sweep back");
   });
 
   it("this wallet, when the bid paid its address", () => {
@@ -403,10 +413,40 @@ describe("hop 2's line says where hop 1 paid", () => {
     expect(afterHop1("address")).toBe("hop2");
   });
 
+  // 2026-10-06 correction: the first cut ended EVERY node-kept hop 1 at LTC
+  // ("► DONE"). On a shared LTC account (the default lean setup) the node's
+  // LTC is this wallet's own, so EARN must go on to hop 2 as before, with the
+  // licence fee left in the account for the backend to withdraw.
+  it("a shared LTC account goes on to hop 2, seeded net of the licence fee", () => {
+    expect(afterHop1("node-wallet", true)).toBe("hop2");
+    expect(afterHop1("node-wallet", false)).toBe("finish");
+    expect(afterHop1("address", true)).toBe("hop2");
+    expect(afterHop1(null, true)).toBe("hop2");
+    // 0.5% left for the fee, floored to 8 dp; an address payout is untouched.
+    expect(hop2SeedAmount("1.00000000", "node-wallet")).toBe("0.99500000");
+    expect(hop2SeedAmount("0.12345678", "node-wallet")).toBe("0.12283949");
+    expect(hop2SeedAmount("0.12345678", "address")).toBe("0.12345678");
+    expect(hop2SeedAmount("not-a-number", "node-wallet")).toBe("not-a-number");
+    // The fraction is the schedule's own rate, not a second opinion.
+    const schedule = readFileSync(
+      resolve(__dirname, "../../../src-tauri/src/sidecar_fees/schedule.rs"),
+      "utf8",
+    );
+    const bps = Number(/pub const RATE_BPS: u64 = (\d+);/.exec(schedule)?.[1]);
+    expect(LICENCE_FEE_FRACTION).toBe(bps / 10_000);
+  });
+
+  it("App passes the verified-shared LTC flag to the pipeline", () => {
+    const app = readFileSync(resolve(__dirname, "../../App.tsx"), "utf8");
+    const call = app.slice(app.indexOf("useConvertPipeline({"), app.indexOf("useConvertPipeline({") + 600);
+    expect(call).toContain('routeHopShared: swapAutoSetup.shared.includes("LTC")');
+  });
+
   it("nothing loops: no hop 2 from LTC the node kept, and DONE ends the run", () => {
     const hook = read("useConvertPipeline.ts");
     const begin = hook.slice(hook.indexOf("const beginHop2 = useCallback"), hook.indexOf("const reset = useCallback"));
-    expect(begin).toMatch(/if \(!hop2InputAmount \|\| afterHop1\(hop2PaidTo\) !== "hop2"\) return;[\s\S]*setStage\("hop2-running"\)/);
+    expect(begin).toMatch(/if \(!hop2InputAmount \|\| afterHop1\(hop2PaidTo, routeHopShared\) !== "hop2"\) return;[\s\S]*setStage\("hop2-running"\)/);
+    expect(begin).toContain("onSeedHop2(hop2SeedAmount(hop2InputAmount, hop2PaidTo), targetCoin);");
     const finish = hook.slice(hook.indexOf("const finishAtRouteHop = useCallback"), hook.indexOf("const adoptHop1"));
     expect(finish).toMatch(/updateConversion\(hop1BidId, \{[\s\S]*status: "done"[\s\S]*\}\);[\s\S]*reset\(\);/);
     // `reset` clears the stored hop 1, so the settle effect has nothing to read again.

@@ -57,7 +57,7 @@ export { activeSwapToTracked } from "./activeSwaps";
 // Where a bid's bought coin is paid (2026-10-06): the swap's details and
 // EARN say where a purchase the licence fee is charged on was paid, in the
 // confirm screen's own words.
-export { feeBearingPurchase } from "./licenceFee";
+export { feeBearingPurchase, LICENCE_FEE_FRACTION } from "./licenceFee";
 export { FEE_KEPT_TAIL } from "./payoutDestination";
 // Coin naming: the node names coins ("Monero"); history rows hold tickers.
 // And which tickers are the scriptless leg ("Chain B" of an adaptor swap).

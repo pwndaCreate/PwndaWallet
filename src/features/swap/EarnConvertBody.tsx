@@ -26,7 +26,6 @@ import {
   CONVERT_ROUTE_HOP,
   CONVERT_SOURCE,
   CONVERT_QUICK_TARGETS,
-  afterHop1,
   projectConversion,
 } from "./useConvertPipeline";
 import {
@@ -134,12 +133,14 @@ export function EarnConvertBody({
     : (CONVERT_QUICK_TARGETS as readonly string[]);
   const hiddenCount = Math.max(0, allTargets.length - CONVERT_QUICK_TARGETS.length);
 
-  const { targetCoin, stage, hop1, hop2InputAmount, hop2PaidTo, hop1Unwound } = pipeline;
+  const { targetCoin, stage, hop1, hop2InputAmount, hop2Next, hop1Unwound } = pipeline;
 
-  /** Hop 1's LTC stayed in the swap node (2026-10-06): the conversion ends at
-   *  LTC instead of seeding a second hop from an address that does not hold
-   *  it. `afterHop1` is the same rule `beginHop2` refuses by. */
-  const keptByNode = stage === "hop2-ready" && afterHop1(hop2PaidTo) === "finish";
+  /** Hop 1's LTC stayed in a swap node with its own LTC wallet (2026-10-06):
+   *  the conversion ends at LTC instead of seeding a second hop from an
+   *  account that does not hold it. On a shared LTC account (the default) the
+   *  LTC is already this wallet's and hop 2 runs as before. `hop2Next` is the
+   *  pipeline's `afterHop1`, the same rule `beginHop2` refuses by. */
+  const keptByNode = hop2Next === "finish";
   /** Why it stayed: hop 1 is a purchase the licence fee is charged on. */
   const hop1FeeBearing = feeBearingPurchase(CONVERT_SOURCE, CONVERT_ROUTE_HOP);
 

@@ -2070,6 +2070,9 @@ function App() {
     sidecar: sidecarTracker ?? null,
     onSeedHop1: seedHop1,
     onSeedHop2: seedHop2,
+    // The node holds this wallet's own LTC account: LTC it kept from hop 1 is
+    // this wallet's, so EARN goes on to hop 2 (`afterHop1`).
+    routeHopShared: swapAutoSetup.shared.includes("LTC"),
   });
 
   /**
