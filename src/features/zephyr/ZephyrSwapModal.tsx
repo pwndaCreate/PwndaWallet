@@ -13,9 +13,14 @@ import {
   type ZphAssetBalance,
   type ZphTransferResponse,
 } from "../../wallets/zph-rpc";
-import { getZphSessionEpoch, relayZphTransaction } from "../../wallets/zph-wallet";
+import {
+  getZphFeeRate,
+  getZphSessionEpoch,
+  relayZphTransaction,
+  zphConversionFeeEstimate,
+} from "../../wallets/zph-wallet";
 import { isSendOutcomeUnknown } from "../../wallets/send-outcome";
-import { SEND_QUOTE_MAX_AGE_MS } from "../../wallets/send-quote";
+import type { DaemonFeeRate } from "../../wallets/cryptonote-fee";
 import type { TxResult } from "../../wallets/types";
 import { errorText } from "../../lib/errorText";
 import type { ZphLiveStats } from "../../wallets/zph-scanner-api";
@@ -35,9 +40,17 @@ import { ModalBackdrop } from "../../components/ModalBackdrop";
  * get_tx_metadata:true) so the user sees a binding fee + builds the
  * tx, then `Confirm Swap` calls `relayTransfer(metadata)` to broadcast.
  *
- * Quotes auto-refresh every QUOTE_REFRESH_MS while the user is reviewing
- * — pricing record updates per block (~120s), so a stale quote could be
- * silently re-priced on relay. We pre-empt that by re-quoting on a timer.
+ * Built ONCE, on Review (operator request, 2026-10-01). Until then the shown
+ * quote was rebuilt every 60 s ("pricing record updates per block, so a stale
+ * quote could be silently re-priced on relay" — it cannot be: a built
+ * conversion carries its own pricing record and either stays valid or is
+ * refused). Every build asks the node for the coins it spends with fresh
+ * decoys, and a node that sees several builds of one conversion can tell which
+ * coins are the wallet's. Now the edit step shows an ESTIMATE that builds
+ * nothing (the node's fee rate × a typical conversion, converted at the
+ * oracle rate — `zphConversionFeeEstimate`), Review builds once, Review again
+ * with the same inputs shows that same build, and Confirm relays it while its
+ * pricing record is valid (`ZPH_CONVERSION_MAX_AGE_MS`).
  *
  * The quote/confirm timing lives in `createSwapFlow` below (2026-09-29
  * send-safety audit, finding 2), free of React so it is unit-tested
@@ -66,29 +79,41 @@ export type SwapModalState =
   | { kind: "unknown"; txHash: string; message: string }
   | { kind: "error"; message: string };
 
-/** Auto-refresh cadence — kept under one block (~120s) so the user
- *  always sees a quote that's no more than ~60s away from a freshly
- *  re-priced tx. */
-const QUOTE_REFRESH_MS = 60_000;
-
 /**
- * May a quote built at `quotedAt` still be relayed as built? Under 90 s, the
- * same window `useSend` applies to Send-modal quotes (`SEND_QUOTE_MAX_AGE_MS`).
+ * How long a built conversion may wait for Confirm: 5 minutes (operator
+ * request, 2026-10-01; was 90 s, the Send modal's `SEND_QUOTE_MAX_AGE_MS`).
+ *
+ * The protocol's window is longer. A conversion carries the pricing record it
+ * was built with, which must be one of the last 10 blocks both when the pool
+ * takes it and when a block includes it (`tx_pr_height_valid`,
+ * PRICING_RECORD_VALID_BLOCKS = 10; cryptonote_tx_utils.cpp:1404-1412,
+ * tx_pool.cpp:246 and blockchain.cpp:4738 at v2.3.0) — about 18 minutes from
+ * the build at 2-minute blocks. Five minutes (about 2.5 blocks) leaves the
+ * relayed transaction roughly 6 blocks to be mined. Past it, Confirm sends
+ * nothing and asks for a new review rather than rebuilding on its own: every
+ * build of the same conversion is one more set of decoys around the same coins.
  */
+export const ZPH_CONVERSION_MAX_AGE_MS = 5 * 60_000;
+
+/** May a conversion built at `quotedAt` still be relayed as built? */
 export function swapQuoteIsFresh(quotedAt: number, now: number): boolean {
   const age = now - quotedAt;
-  return age >= 0 && age < SEND_QUOTE_MAX_AGE_MS;
+  return age >= 0 && age < ZPH_CONVERSION_MAX_AGE_MS;
 }
 
 export interface SwapFlow {
   /** Leave any quote for the edit form; a build still running is dropped. */
   edit(): void;
   /**
-   * Price the modal's current inputs. `silent` is the background refresh of a
-   * SHOWN quote: it keeps that quote when it fails.
+   * Review: build the modal's current inputs, once. When the last build was
+   * for exactly these inputs (`inputsKey`) and can still be relayed, it is
+   * shown again and nothing is built. Never called on a timer (2026-10-01).
    */
-  quote(silent?: boolean): Promise<void>;
-  /** Relay the shown quote, or re-price it first when it is too old. */
+  quote(): Promise<void>;
+  /**
+   * Relay the shown quote. Too old to relay: nothing is built or sent, and
+   * the user is told to review again.
+   */
   confirm(): Promise<void>;
   /** The modal is closing: every result still in flight is dropped. */
   dispose(): void;
@@ -112,14 +137,21 @@ export interface SwapFlow {
  * So, as in `quoteController.ts`: a generation counter, bumped whenever the
  * modal leaves a quote (Edit, Back, Confirm, close) or starts pricing a new
  * one. A build that finishes under an older generation describes a quote the
- * modal no longer shows, and is dropped. Confirm relays nothing older than
- * 90 s (`swapQuoteIsFresh`) — it re-prices instead, and the user confirms the
- * new quote — and one relay runs at a time.
+ * modal no longer shows, and is dropped. One relay runs at a time.
+ *
+ * Since 2026-10-01 (operator request) nothing builds in the background, and
+ * Confirm never builds: a quote past `ZPH_CONVERSION_MAX_AGE_MS` is not
+ * relayed and not rebuilt — the user is asked to review again. (Until then
+ * the modal re-quoted every 60 s, and Confirm re-priced a quote 90 s old.) A
+ * review of inputs identical to the last build's (`inputsKey`) shows that
+ * build again instead of building the same conversion twice.
  */
 export function createSwapFlow(deps: {
   build: () => Promise<SwapQuote>;
   relay: (quote: SwapQuote) => Promise<TxResult>;
   onChange: (state: SwapModalState) => void;
+  /** The inputs a build would be for, as one string: equal keys, same conversion. */
+  inputsKey?: () => string;
   now?: () => number;
 }): SwapFlow {
   const now = deps.now ?? (() => Date.now());
@@ -127,31 +159,38 @@ export function createSwapFlow(deps: {
   let generation = 0;
   let relaying = false;
   let disposed = false;
+  // The last build and the inputs it is for, until it is relayed.
+  let lastBuild: { key: string; quote: SwapQuote } | null = null;
 
   const set = (next: SwapModalState) => {
     current = next;
     if (!disposed) deps.onChange(next);
   };
 
-  async function quote(silent = false): Promise<void> {
+  async function quote(): Promise<void> {
     if (disposed || relaying) return;
-    // A background refresh only ever replaces a quote that is on screen.
-    if (silent && !(current.kind === "quote" && !current.loading)) return;
+    // Only from the form, an error, or a shown quote: never after a relay ran
+    // (success, or an outcome that may have gone out).
+    if (current.kind !== "edit" && current.kind !== "error" && current.kind !== "quote") return;
+    // A build is running already: one press, one build.
+    if (current.kind === "quote" && current.loading) return;
+    const key = deps.inputsKey?.();
+    if (lastBuild && key !== undefined && lastBuild.key === key && swapQuoteIsFresh(lastBuild.quote.quotedAt, now())) {
+      generation++;
+      set({ kind: "quote", loading: false, quote: lastBuild.quote });
+      return;
+    }
     const mine = ++generation;
-    if (!silent) set({ kind: "quote", loading: true });
+    set({ kind: "quote", loading: true });
     let built: SwapQuote;
     try {
       built = await deps.build();
     } catch (e) {
       if (disposed || mine !== generation) return;
-      if (silent) {
-        // The shown quote stays; Confirm re-prices it once it is 90 s old.
-        console.warn("[ZephyrSwapModal] auto-requote failed:", errorText(e));
-        return;
-      }
       set({ kind: "error", message: errorText(e, "Quote failed") });
       return;
     }
+    if (key !== undefined) lastBuild = { key, quote: built };
     if (disposed || mine !== generation) return;
     set({ kind: "quote", loading: false, quote: built });
   }
@@ -169,11 +208,22 @@ export function createSwapFlow(deps: {
       if (current.kind !== "quote" || current.loading) return;
       const q = current.quote;
       if (!swapQuoteIsFresh(q.quotedAt, now())) {
-        await quote(false);
+        // Its pricing record may no longer be accepted. Nothing is built here:
+        // the user reviews again, which builds once more.
+        generation++;
+        lastBuild = null;
+        set({
+          kind: "error",
+          message:
+            `This conversion was built more than ${Math.round(ZPH_CONVERSION_MAX_AGE_MS / 60_000)} minutes ago, ` +
+            "so the price record it uses may no longer be accepted. Nothing was sent. Go back and review it " +
+            "again to build it with the current price.",
+        });
         return;
       }
-      generation++; // any re-quote still building is for a quote being left
+      generation++; // any build still running is for a quote being left
       relaying = true;
+      lastBuild = null; // handed to the relay: never offered again
       set({ kind: "submitting" });
       try {
         const r = await deps.relay(q);
@@ -202,8 +252,31 @@ export function createSwapFlow(deps: {
  * `zph-wallet.test.ts`. A conversion over many small outputs can need more;
  * its quote then fails with the wallet's own "not enough unlocked money"
  * (a build, so nothing is sent) and the user lowers the amount.
+ *
+ * Corrected 2026-10-01: 0.0000254 is the test mock's made-up fee, not a
+ * quote. On chain (read-only sample, 2026-10-06) a two-input conversion
+ * weighs about 2,975, so it costs about 0.00062 ZEPH at the low rate and
+ * 0.0024 at the normal rate the wallet pays while the network is busy — more
+ * than this reserve. MAX now also keeps back the estimate at the busy rate
+ * when there is one ({@link conversionFeeReserve}).
  */
 export const ZPH_CONVERSION_FEE_RESERVE_ATOMIC = 1_000_000_000n;
+
+/**
+ * What MAX keeps back for the fee, in the source asset's atomic units: the
+ * largest of the fixed reserve, the exact fee the last review of this source
+ * asset showed, and the estimated fee at the BUSY rate (2026-10-01).
+ */
+export function conversionFeeReserve(parts: {
+  quoted?: bigint | null;
+  estimatedBusy?: bigint | null;
+}): bigint {
+  let reserve = ZPH_CONVERSION_FEE_RESERVE_ATOMIC;
+  for (const v of [parts.quoted, parts.estimatedBusy]) {
+    if (v != null && v > reserve) reserve = v;
+  }
+  return reserve;
+}
 
 /**
  * The amount MAX fills in (2026-09-29 send-safety audit, finding 9): unlocked
@@ -576,6 +649,18 @@ export function ZephyrSwapModal({
         return r;
       },
       onChange: setState,
+      // Same recipient, amount (as the build will clamp it), pair and wallet
+      // session: the same conversion, so a second Review shows the first build.
+      inputsKey: () => {
+        const i = inputsRef.current;
+        return [
+          i.walletAddress,
+          clampZphDisplayDecimals(i.amount, 4),
+          i.sourceAsset,
+          i.destAsset,
+          String(getZphSessionEpoch()),
+        ].join("|");
+      },
     });
     flowRef.current = flow;
     return () => {
@@ -584,13 +669,34 @@ export function ZephyrSwapModal({
     };
   }, []);
 
-  // 1-second ticker drives the auto-refresh countdown between requotes.
-  const [tickNow, setTickNow] = useState(Date.now());
+  // The node's fee rate, for the ESTIMATE shown until the review (operator
+  // request, 2026-10-01). Reading it builds nothing and names nothing about
+  // the wallet, so it may refresh while the modal is open; the conversion
+  // itself is built only by Review.
+  const [feeRate, setFeeRate] = useState<DaemonFeeRate | null>(null);
+  const [feeRateFailed, setFeeRateFailed] = useState(false);
   useEffect(() => {
-    if (state.kind !== "quote" || state.loading) return;
-    const id = window.setInterval(() => setTickNow(Date.now()), 1000);
-    return () => window.clearInterval(id);
-  }, [state.kind, state.kind === "quote" && !state.loading]);
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await getZphFeeRate();
+        if (cancelled) return;
+        setFeeRate(r);
+        setFeeRateFailed(false);
+      } catch (e) {
+        if (cancelled) return;
+        setFeeRate(null);
+        setFeeRateFailed(true);
+        console.warn("[ZephyrSwapModal] the node's fee rate is unavailable:", errorText(e));
+      }
+    };
+    void load();
+    const id = window.setInterval(() => void load(), 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, []);
 
   const validDests = useMemo(
     () => validDestinationsFor(sourceAsset),
@@ -634,29 +740,19 @@ export function ZephyrSwapModal({
   const srcColor = ASSET_COLOR[sourceAsset];
   const dstColor = ASSET_COLOR[destAsset];
 
+  // The conversion's fee ESTIMATED without building it, in the source asset
+  // (null: the rate, or a non-ZEPH source's oracle rate, is unknown).
+  const feeEstimate = feeRate ? zphConversionFeeEstimate(feeRate, sourceAsset, liveStats) : null;
+
   // ---- Actions ----
 
-  const handleQuote = (silent = false) => {
+  // Review: the ONE build of this conversion. Nothing re-quotes on a timer any
+  // more (operator request, 2026-10-01): the shown quote used to be rebuilt
+  // every 60 s, each time asking the node for the same coins with new decoys.
+  const handleReview = () => {
     if (!canQuote) return;
-    void flowRef.current?.quote(silent);
+    void flowRef.current?.quote();
   };
-
-  // Auto-requote while quote is loaded. The flow drops a result that arrives
-  // after the modal left this quote (Edit, Confirm, close).
-  useEffect(() => {
-    if (state.kind !== "quote" || state.loading) return;
-    const id = window.setInterval(() => {
-      void flowRef.current?.quote(true);
-    }, QUOTE_REFRESH_MS);
-    return () => window.clearInterval(id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    state.kind,
-    state.kind === "quote" && !state.loading ? state.quote.quotedAt : 0,
-    sourceAsset,
-    destAsset,
-    amount,
-  ]);
 
   const handleConfirm = () => {
     void flowRef.current?.confirm();
@@ -665,13 +761,15 @@ export function ZephyrSwapModal({
   const reset = () => flowRef.current?.edit();
 
   // MAX keeps the network fee back (2026-09-29, finding 9): the fee is paid in
-  // the SOURCE asset, so the whole unlocked balance could never convert.
+  // the SOURCE asset, so the whole unlocked balance could never convert. Since
+  // 2026-10-01 the reserve covers the estimate at the busy rate too
+  // (`conversionFeeReserve`).
   const maxAmount = maxConvertibleAmount(
     srcBal.unlocked,
-    (() => {
-      const quoted = lastFeeRef.current[sourceAsset] ?? 0n;
-      return quoted > ZPH_CONVERSION_FEE_RESERVE_ATOMIC ? quoted : ZPH_CONVERSION_FEE_RESERVE_ATOMIC;
-    })()
+    conversionFeeReserve({
+      quoted: lastFeeRef.current[sourceAsset] ?? null,
+      estimatedBusy: feeEstimate?.busy ?? null,
+    })
   );
 
   const handleSetMax = () => {
@@ -837,15 +935,10 @@ export function ZephyrSwapModal({
     const quoteLoaded = state.kind === "quote" && !state.loading;
     const quoteLoading = state.kind === "quote" && state.loading;
     const quote = quoteLoaded ? state.quote.response : null;
-    const quoteAge = quoteLoaded ? tickNow - state.quote.quotedAt : 0;
-    const refreshSec = Math.max(
-      0,
-      Math.round((QUOTE_REFRESH_MS - quoteAge) / 1000)
-    );
-    // Past 90 s Confirm re-prices before it relays (`swapQuoteIsFresh`); say so
-    // instead of a countdown stuck at 0 after a failed refresh.
-    const quoteExpired =
-      quoteLoaded && !swapQuoteIsFresh(state.quote.quotedAt, tickNow);
+    // When it was built, and how long Confirm may relay it (no ticker: nothing
+    // refreshes it any more, and Confirm itself checks the age).
+    const builtAt = quoteLoaded ? new Date(state.quote.quotedAt).toLocaleTimeString() : "";
+    const relayMinutes = Math.round(ZPH_CONVERSION_MAX_AGE_MS / 60_000);
 
     // Estimated destination amount (post-fee, oracle spot rate).
     let estimatedDest: number | null = null;
@@ -859,6 +952,14 @@ export function ZephyrSwapModal({
         liveStats
       );
     }
+
+    // Before the review: the same receive estimate from the typed amount and
+    // the ESTIMATED fee — nothing built (2026-10-01).
+    const estimatedFeeDecimal = feeEstimate ? Number(atomicToZph(feeEstimate.usual)) : 0;
+    const previewDest =
+      !quote && amountNumeric > 0 && liveStats
+        ? estimateDestAmount(sourceAsset, destAsset, Math.max(0, amountNumeric - estimatedFeeDecimal), liveStats)
+        : null;
 
     const labelStyle: React.CSSProperties = {
       display: "block",
@@ -1094,7 +1195,78 @@ export function ZephyrSwapModal({
           </p>
         </div>
 
-        {/* QUOTE PANEL */}
+        {/* ESTIMATE PANEL (2026-10-01): until the review, what this
+            conversion should cost and return, with nothing built. */}
+        {!quoteLoading && !quote && isDirectPair(sourceAsset, destAsset) && (
+          <div
+            data-conversion-estimate
+            style={{
+              border: "1px dashed rgba(255,255,255,0.12)",
+              borderRadius: 2,
+              padding: "10px 14px",
+              marginTop: 14,
+              fontFamily: "var(--mono)",
+            }}
+          >
+            <div
+              style={{
+                fontSize: 10,
+                letterSpacing: 1.5,
+                color: "var(--text-dim)",
+                marginBottom: 8,
+              }}
+            >
+              ESTIMATE
+            </div>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "auto 1fr",
+                gap: "6px 14px",
+                fontSize: 12,
+              }}
+            >
+              <span style={{ color: "var(--text-dim)" }}>Network fee</span>
+              <span style={{ textAlign: "right" }} data-fee-estimate={feeEstimate ? undefined : "none"}>
+                {feeEstimate
+                  ? `≈ ${atomicToZph(feeEstimate.usual)} ${ZPH_UI_TICKER[sourceAsset]} estimated`
+                  : feeRate == null && !feeRateFailed
+                    ? "reading the network's rate…"
+                    : "shown at confirmation"}
+              </span>
+              {previewDest != null && (
+                <>
+                  <span style={{ color: "var(--text-dim)" }}>You receive</span>
+                  <span style={{ textAlign: "right", color: dstColor }}>
+                    ≈ {fmtAmount(previewDest)} {ZPH_UI_TICKER[destAsset]}
+                  </span>
+                </>
+              )}
+            </div>
+            <p
+              style={{
+                marginTop: 8,
+                marginBottom: 0,
+                fontSize: 9,
+                color: "var(--text-dim)",
+                letterSpacing: 0.3,
+                lineHeight: 1.5,
+              }}
+            >
+              {feeEstimate
+                ? `A typical conversion (two inputs) at the network's current fee rate${
+                    feeEstimate.busy != null
+                      ? `; about ${atomicToZph(feeEstimate.busy)} ${ZPH_UI_TICKER[sourceAsset]} when the network is busy`
+                      : ""
+                  }. `
+                : "The network's fee rate could not be read, so there is no fee estimate. "}
+              Review builds this conversion once and shows its exact fee before anything is
+              broadcast.
+            </p>
+          </div>
+        )}
+
+        {/* QUOTE PANEL: the one build Review made, exactly as Confirm relays it. */}
         {(quoteLoading || quote) && (
           <div
             style={{
@@ -1116,12 +1288,10 @@ export function ZephyrSwapModal({
                 justifyContent: "space-between",
               }}
             >
-              <span>QUOTE</span>
+              <span>REVIEW</span>
               {quoteLoaded && (
                 <span style={{ fontSize: 9 }}>
-                  {quoteExpired
-                    ? "expired: Confirm re-quotes first"
-                    : `↻ refreshing in ${refreshSec}s`}
+                  built {builtAt} · confirm within {relayMinutes} min
                 </span>
               )}
               {quoteLoading && <span style={{ fontSize: 9 }}>building…</span>}
@@ -1137,7 +1307,7 @@ export function ZephyrSwapModal({
                   color: "var(--text-dim)",
                 }}
               >
-                Fetching oracle rate from wallet-rpc…
+                Building this conversion once to show its exact fee…
               </div>
             )}
 
@@ -1199,6 +1369,7 @@ export function ZephyrSwapModal({
                   lineHeight: 1.5,
                 }}
               >
+                Exact fee of the transaction Confirm broadcasts, built once.
                 Receive amount is an oracle-spot estimate. The protocol
                 applies the worst of (spot, 24h MA) at mine time, so the
                 actual delivered amount may be slightly less.
@@ -1227,7 +1398,7 @@ export function ZephyrSwapModal({
               Cancel
             </button>
             <button className="btn-primary" disabled>
-              ⏳ Quoting…
+              ⏳ Building…
             </button>
           </div>
         ) : (
@@ -1238,13 +1409,13 @@ export function ZephyrSwapModal({
             <button
               className="btn-primary"
               disabled={!canQuote}
-              onClick={() => handleQuote(false)}
+              onClick={handleReview}
               title={
                 amountNumeric <= 0
                   ? "Enter an amount greater than 0"
                   : insufficientBalance
                     ? "Amount exceeds your unlocked balance"
-                    : "Get a binding fee quote"
+                    : "Builds this conversion once to show its exact fee. Nothing is sent until you confirm."
               }
               style={
                 canQuote
@@ -1256,7 +1427,7 @@ export function ZephyrSwapModal({
                   : undefined
               }
             >
-              ► Get Quote
+              ► Review {purpose.verb}
             </button>
           </div>
         )}

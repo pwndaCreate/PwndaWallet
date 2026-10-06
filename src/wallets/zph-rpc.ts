@@ -23,7 +23,14 @@ import { decimalToAtomic } from "./decimal-amount";
 import { invoke } from "../lib/tauri";
 // Monero-family helpers shared with `xmr-rpc.ts`: zephyr-wallet-rpc v2.3.0 is
 // a Monero fork behind the same Rust proxy (`wallet_rpc_common.rs`).
-import { atomicForRpc, isTxNotFound, ownTxState, type OwnTxState } from "./xmr-rpc";
+import {
+  DAEMON_FEE_RATE_TIMEOUT_MS,
+  atomicForRpc,
+  isTxNotFound,
+  ownTxState,
+  type OwnTxState,
+} from "./xmr-rpc";
+import { daemonFeeRateFrom, type DaemonFeeRate } from "./cryptonote-fee";
 
 export const ZPH_WALLET_FILENAME = "pwnda-zph-active";
 
@@ -488,8 +495,20 @@ export const ZPH_TRANSFER_PRIORITY = 0;
  * fully built and signed; the metadata blob is just held back from
  * broadcast until the user confirms.
  *
- * Quote staleness window: pricing record updates per block (~120s).
- * Treat quotes older than ~90s as stale and re-quote.
+ * Built only when the user asks to review a send or conversion, never to
+ * preview a fee (operator request, 2026-10-01): each build asks the node for
+ * the coins it spends with fresh decoys, and several builds of one spend can
+ * show the node which coins are ours. Previews are estimates
+ * (`cryptonote-fee.ts`).
+ *
+ * Staleness (corrected 2026-10-01; this said "treat quotes older than ~90s as
+ * stale and re-quote" for every build). Only a CONVERSION expires: its
+ * pricing record must be one of the last 10 blocks when it enters the pool and
+ * when it is mined (`tx_pr_height_valid`, PRICING_RECORD_VALID_BLOCKS = 10,
+ * cryptonote_tx_utils.cpp:1404-1412 at v2.3.0; checked only when source and
+ * destination differ, tx_pool.cpp:235-249). A same-asset send carries no
+ * pricing record (`pricing_record_height` must be 0, tx_pool.cpp:301-305) and
+ * can be relayed whenever it is confirmed.
  */
 export async function buildAssetTransfer(args: {
   destination: string;
@@ -523,7 +542,8 @@ export async function buildAssetTransfer(args: {
 /**
  * The same build, under the name the quote callers use (`zphAdapter.quoteSend`,
  * `ZephyrSwapModal`): a quote IS the built transaction that `relayTransfer`
- * later broadcasts unchanged.
+ * later broadcasts unchanged. Since 2026-10-01 both call it once, when the
+ * user asks to review, never on an edit or a timer.
  */
 export async function quoteAssetTransfer(args: {
   destination: string;
@@ -644,18 +664,23 @@ export interface GetTransfersOpts {
 }
 
 /**
- * `get_fee_estimate` raw response — same shape as Monero's. `fees` is per
- * priority (slow/normal/fast/fastest) atomic-units per byte for a typical
- * transaction; older builds only return `fee`.
+ * The Zephyr node's current fee rate (`get_fee_estimate`), for the Send and
+ * conversion modals' estimate (operator request, 2026-10-01; see
+ * `cryptonote-fee.ts`).
+ *
+ * Replaces `getZphFeeEstimate`, which asked the WALLET-rpc for this daemon
+ * method: zephyr-wallet-rpc has no such method (`-32601 Method not found`,
+ * absent from wallet_rpc_server.h:70-162 at v2.3.0) and nothing called it
+ * after 2026-09-15. The daemon is asked by Rust (`zph_fee_estimate` →
+ * `wallet_rpc_common::daemon_fee_estimate`), at `daemonUrl`, the node this
+ * wallet session already uses. Throws when the node gave no usable rate.
  */
-export interface ZphFeeEstimate {
-  fee: number;
-  quantization_mask?: number;
-  fees?: number[];
-}
-
-export async function getZphFeeEstimate(graceBlocks: number = 10): Promise<ZphFeeEstimate> {
-  return rpc<ZphFeeEstimate>("get_fee_estimate", { grace_blocks: graceBlocks });
+export async function getZphDaemonFeeRate(daemonUrl: string): Promise<DaemonFeeRate> {
+  const raw = await invoke<unknown>("zph_fee_estimate", {
+    url: daemonUrl,
+    timeoutMs: DAEMON_FEE_RATE_TIMEOUT_MS,
+  });
+  return daemonFeeRateFrom(raw);
 }
 
 export async function getTransfers(

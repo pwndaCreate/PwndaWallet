@@ -15,6 +15,7 @@ import { decimalToAtomic } from "./decimal-amount";
 import { invoke } from "../lib/tauri";
 import { errorText } from "../lib/errorText";
 import { SendOutcomeUnknownError } from "./send-outcome";
+import { daemonFeeRateFrom, type DaemonFeeRate } from "./cryptonote-fee";
 import type { TxResult } from "./types";
 
 /**
@@ -425,6 +426,12 @@ export interface XmrBuiltTransfer {
  * broadcasts or marks outputs spent (`fill_response` in wallet_rpc_server.cpp),
  * so a build that fails or times out sent nothing and is safe to retry. The
  * txid is known before {@link relayTransfer} can put anything on the network.
+ *
+ * It is also the Send modal's Review step since 2026-10-01
+ * (`xmrAdapter.quoteSend`): built ONCE when the user asks to review, its fee
+ * shown, then relayed unchanged. It is never built just to preview a fee:
+ * each build asks the node for the real output with fresh decoys, and several
+ * builds of one spend can show the node which output is ours.
  */
 export async function buildTransfer(
   destination: string,
@@ -720,7 +727,30 @@ export async function getTransfers(opts: GetTransfersOpts = {}): Promise<XmrTran
 // `getXmrFeeEstimate` was removed 2026-09-29: `get_fee_estimate` is a DAEMON
 // method monero-wallet-rpc does not have, so it answered `-32601 Method not
 // found` on every call (see `xmrAdapter.getFeeEstimate`). Nothing called it
-// successfully, ever.
+// successfully, ever. Since 2026-10-01 the method is asked of the DAEMON, by
+// Rust: `getXmrDaemonFeeRate` below.
+
+/** How long the fee-rate read may take. The estimate is advisory: past this it
+ *  is "shown at confirmation" rather than holding the Send modal up. */
+export const DAEMON_FEE_RATE_TIMEOUT_MS = 8_000;
+
+/**
+ * The node's current fee rate (`get_fee_estimate`), for the Send modal's
+ * estimate (operator request, 2026-10-01; see `cryptonote-fee.ts`).
+ *
+ * Read by Rust (`xmr_fee_estimate` → `wallet_rpc_common::daemon_fee_estimate`)
+ * from `daemonUrl`, the node this wallet session already uses: the method is
+ * the daemon's, and a webview `fetch` fails CORS on most public nodes. The
+ * request names nothing about the wallet. Throws when the node gave no usable
+ * rate; the caller then shows no number.
+ */
+export async function getXmrDaemonFeeRate(daemonUrl: string): Promise<DaemonFeeRate> {
+  const raw = await invoke<unknown>("xmr_fee_estimate", {
+    url: daemonUrl,
+    timeoutMs: DAEMON_FEE_RATE_TIMEOUT_MS,
+  });
+  return daemonFeeRateFrom(raw);
+}
 
 /** Fetch a single transaction by its txid. */
 export async function getTransferByTxid(txid: string): Promise<XmrTransfer | null> {

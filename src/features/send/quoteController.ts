@@ -11,15 +11,34 @@
  * "12", would both be wrong in ways a screenshot does not show. The timing rules
  * live here, free of React, so they are unit-tested with fake timers
  * (`quoteController.test.ts`); `useSendQuote` only wires this to state.
+ *
+ * # Two modes (operator request, 2026-10-01)
+ *
+ * That debounce and that 60 s refresh were themselves the problem for Monero
+ * and Zephyr: each build asks the node for the coins it spends together with a
+ * fresh set of decoys, and a node that sees several builds of one spend sees
+ * the real coin in every one while the decoys change. So a controller is
+ * "auto" (above: Xelis, whose quote is `estimate_fees` and builds nothing) or
+ * "on-request": nothing is built until `request()` — the Send modal's Review —
+ * and then once; an identical request reuses that build, and nothing refreshes
+ * it. The adapter flag that picks the mode is `quoteBuildsSpend`.
  */
 import type { SendQuote, SendQuoteErrorKind } from "../../wallets/types";
 import { errorText } from "../../lib/errorText";
 import { isDefinitiveQuoteError, quoteErrorKind } from "../../wallets/send-quote";
 
-/** Wait this long after the last edit before asking the wallet. */
+/** Wait this long after the last edit before asking the wallet ("auto" only). */
 export const QUOTE_DEBOUNCE_MS = 600;
-/** Re-price this often while the modal is open and the inputs are unchanged. */
+/** Re-price this often while the modal is open and the inputs are unchanged ("auto" only). */
 export const QUOTE_REFRESH_MS = 60_000;
+
+/**
+ * When a controller asks the wallet:
+ *  - `"auto"`: 600 ms after the last edit, then every 60 s while the inputs stand.
+ *  - `"on-request"`: only when `request()` (or `retry()`) is called, once per
+ *    set of inputs, never on a timer.
+ */
+export type QuoteMode = "auto" | "on-request";
 
 export interface QuoteInputs {
   to: string;
@@ -95,10 +114,29 @@ export interface QuoteTimers {
 }
 
 export interface QuoteController {
-  /** New inputs (or null: nothing quotable). Unchanged inputs are a no-op. */
+  /**
+   * New inputs (or null: nothing quotable). Unchanged inputs are a no-op.
+   * "auto" prices them after the debounce; "on-request" never builds here.
+   */
   setInputs(next: QuoteInputs | null): void;
-  /** Re-price now, discarding any answer still in flight. */
+  /**
+   * Re-price now, discarding any answer still in flight. "on-request": the
+   * same as `request()` — an explicit retry after a failure builds again.
+   */
   retry(): void;
+  /**
+   * "on-request": build the current inputs' transaction, ONCE. If the last
+   * build was for exactly these inputs it is shown again and nothing is
+   * built; a build already running for them is not doubled; a build running
+   * for other inputs is waited for. "auto": the same as `retry()`.
+   */
+  request(): void;
+  /**
+   * Forget every build ("on-request": the shown one has been handed to a send;
+   * if that send fails, the next review builds afresh instead of offering a
+   * transaction that may no longer be relayable).
+   */
+  discard(): void;
   /** Stop every timer and emission. */
   dispose(): void;
   snapshot(): QuoteSnapshot;
@@ -107,10 +145,13 @@ export interface QuoteController {
 export function createQuoteController(opts: {
   quote: (inputs: QuoteInputs) => Promise<SendQuote>;
   onChange: (snapshot: QuoteSnapshot) => void;
+  /** Default "auto", the behaviour before 2026-10-01. */
+  mode?: QuoteMode;
   debounceMs?: number;
   refreshMs?: number;
   timers?: QuoteTimers;
 }): QuoteController {
+  const mode: QuoteMode = opts.mode ?? "auto";
   const debounceMs = opts.debounceMs ?? QUOTE_DEBOUNCE_MS;
   const refreshMs = opts.refreshMs ?? QUOTE_REFRESH_MS;
   const timers: QuoteTimers = opts.timers ?? {
@@ -124,8 +165,14 @@ export function createQuoteController(opts: {
   // carrying an older generation describes inputs the modal no longer shows.
   let generation = 0;
   let inFlight = false;
+  let inFlightInputs: QuoteInputs | null = null;
   let rerun = false;
   let disposed = false;
+  // "on-request" only: the last successful build and the inputs it is for, so
+  // reviewing the same send again shows it instead of building it again.
+  let lastBuild: { inputs: QuoteInputs; quote: SendQuote } | null = null;
+  // Bumped by `discard()`: a build that finishes after it is not remembered.
+  let forgetCount = 0;
 
   const emit = (next: QuoteSnapshot) => {
     snap = next;
@@ -150,23 +197,34 @@ export function createQuoteController(opts: {
     // One wallet call at a time: a build requested while another is running
     // waits for it and then runs with whatever the inputs are by then.
     if (inFlight) {
+      // A second request for the build already running is not a second build.
+      if (mode === "on-request" && sameInputs(inFlightInputs, snap.inputs)) return;
       rerun = true;
+      if (mode === "on-request" && !snap.pending) emit({ ...snap, pending: true });
+      return;
+    }
+    if (mode === "on-request" && lastBuild && sameInputs(lastBuild.inputs, snap.inputs)) {
+      emit({ inputs: snap.inputs, quote: lastBuild.quote, failure: null, pending: false });
       return;
     }
     inFlight = true;
     rerun = false;
     const inputs = snap.inputs;
+    inFlightInputs = inputs;
     const gen = generation;
+    const forgets = forgetCount;
     if (!snap.pending) emit({ ...snap, pending: true });
 
     let settled: QuoteSnapshot;
     try {
       const q = await opts.quote(inputs);
       settled = { inputs, quote: q, failure: null, pending: false };
+      if (mode === "on-request" && forgets === forgetCount) lastBuild = { inputs, quote: q };
     } catch (e) {
       settled = { inputs, quote: null, failure: describeQuoteFailure(e), pending: false };
     } finally {
       inFlight = false;
+      inFlightInputs = null;
     }
 
     if (disposed) return;
@@ -176,11 +234,19 @@ export function createQuoteController(opts: {
       return;
     }
     // Inputs changed while this build ran: its answer is for the old inputs,
-    // and the debounce timer `setInputs` armed will price the new ones.
+    // and the debounce timer `setInputs` armed will price the new ones ("auto";
+    // "on-request" keeps it in `lastBuild` for a review of those inputs).
     if (gen !== generation) return;
     emit(settled);
-    schedule(refreshMs);
+    if (mode === "auto") schedule(refreshMs);
   }
+
+  const request = () => {
+    if (disposed || !snap.inputs) return;
+    // Already showing this send's build: confirming it needs nothing new.
+    if (snap.quote) return;
+    void run();
+  };
 
   return {
     setInputs(next) {
@@ -191,14 +257,44 @@ export function createQuoteController(opts: {
         emit(EMPTY_QUOTE);
         return;
       }
+      if (mode === "on-request") {
+        // A review queued for the previous inputs is not one for these.
+        rerun = false;
+        emit({ inputs: next, quote: null, failure: null, pending: false });
+        return;
+      }
       emit({ inputs: next, quote: null, failure: null, pending: true });
       schedule(debounceMs);
     },
     retry() {
       if (disposed || !snap.inputs) return;
+      if (mode === "on-request") {
+        request();
+        return;
+      }
       generation++;
       clear();
       void run();
+    },
+    request() {
+      if (mode === "auto") {
+        if (disposed || !snap.inputs) return;
+        generation++;
+        clear();
+        void run();
+        return;
+      }
+      request();
+    },
+    discard() {
+      if (disposed) return;
+      lastBuild = null;
+      forgetCount++;
+      generation++;
+      clear();
+      if (snap.quote || snap.failure || snap.pending) {
+        emit({ inputs: snap.inputs, quote: null, failure: null, pending: false });
+      }
     },
     dispose() {
       disposed = true;

@@ -14,8 +14,12 @@
  *     (cryptonote_config.h:226-228).
  *   - A same-asset send pays its network fee in the SENT asset, not ZEPH
  *     (rctSigs.cpp:1861-1862, wallet2.cpp:9593/9673-9674, tx_pool.cpp:367).
- *     Fees are priced per send with a dry-run `transfer` (`quoteSend`);
- *     wallet-rpc has no `get_fee_estimate`.
+ *     While the user edits, the fee is an ESTIMATE that builds nothing: the
+ *     node's `get_fee_estimate` rate (read by Rust; the wallet-rpc has no such
+ *     method) times a typical send's weight. The exact fee comes from ONE
+ *     dry-run `transfer` (`quoteSend`), made when the user reviews the send,
+ *     and Confirm relays that build (operator request, 2026-10-01; until then
+ *     the dry run was rebuilt on every edit and every 60 s).
  *   - Separate sidecar on loopback port 18083, separate wallet-dir,
  *     separate node pool (`zph-nodes.ts`).
  *
@@ -36,9 +40,18 @@ import type {
   SendableBalance,
   TxParties,
 } from "./types";
-import { SEND_QUOTE_MAX_AGE_MS, SendQuoteError } from "./send-quote";
+import { SendQuoteError } from "./send-quote";
 import { isSendOutcomeUnknown } from "./send-outcome";
 import { settleRelayFailure } from "./xmr-rpc";
+import {
+  TYPICAL_SEND_DESCRIPTION,
+  ZEPHYR_TYPICAL_CONVERSION_WEIGHT,
+  ZEPHYR_TYPICAL_SEND_WEIGHT,
+  typicalFee,
+  type DaemonFeeRate,
+  type TypicalFee,
+} from "./cryptonote-fee";
+import type { ZphLiveStats } from "./zph-scanner-api";
 import { readWalletRpcTransferParties } from "./parties-b-walletrpc";
 import { errorText } from "../lib/errorText";
 import {
@@ -84,6 +97,7 @@ import {
   checkZphDefenderExclusion,
   addZphDefenderExclusion,
   relayTransfer,
+  getZphDaemonFeeRate,
   parseZphAssetSelector,
   ZPH_UI_TICKER,
   type ZphTransfer,
@@ -330,7 +344,7 @@ export async function relayZphTransaction(built: ZphBuiltTransaction): Promise<T
   if (!session || built.epoch == null || session.epoch !== built.epoch) {
     throw new Error(
       "This transaction was built by a Zephyr wallet session that is no longer open. " +
-        "Nothing was sent; build it again."
+        "Nothing was sent; review it again."
     );
   }
   let r: { tx_hash?: string } | null;
@@ -381,6 +395,72 @@ async function buildZphSend(recipient: string, amount: string, asset: ZphAssetTy
     );
   }
   return r as typeof r & { tx_metadata: string };
+}
+
+/**
+ * The session node's fee rate (`get_fee_estimate`, read by Rust), for an
+ * estimate that builds nothing (operator request, 2026-10-01). Throws when no
+ * session is open or the node gave no usable rate.
+ */
+export async function getZphFeeRate(): Promise<DaemonFeeRate> {
+  if (!session) {
+    throw new Error("Zephyr session not initialized");
+  }
+  return getZphDaemonFeeRate(session.daemonUrl);
+}
+
+/** The oracle rates a non-ZEPH conversion fee is converted with (scanner `livestats`). */
+export type ZphFeeConversionRates = Pick<ZphLiveStats, "zsd_rate" | "zrs_rate" | "zys_price" | "zsd_price">;
+
+/**
+ * A CONVERSION's fee estimated without building it, in the SOURCE asset's
+ * atomic units (operator request, 2026-10-01; the conversion modal used to
+ * rebuild the conversion every 60 s to show its fee).
+ *
+ * wallet2 prices a conversion in ZEPH (weight × rate, rounded up) and, for a
+ * source other than ZEPH, converts that into the source asset at the pricing
+ * record's moving-average rates (`get_fee_in_asset_equivalent`,
+ * cryptonote_tx_utils.cpp:1388-1402 at v2.3.0): ZSD at `stable_ma`, ZRS at
+ * `reserve_ma`, ZYS at `stable_ma` and then `yield_price`. On chain, most
+ * conversions show exactly that: ZSD-source ones paid about 1/2.9 of the ZEPH
+ * rate per byte, ZRS-source ones about 1/1.23 (read-only sample, 2026-10-06;
+ * a few paid the ZEPH figure unconverted, from another client - inference).
+ *
+ * The estimate converts at the oracle rates the modal already shows (scanner
+ * `livestats`): `zsd_rate` (ZEPH per ZSD), `zrs_rate` (ZEPH per ZRS), and ZYS's
+ * price in ZSD (`zys_price / zsd_price`). Those are spot rates; the record's
+ * MA rates differ by a few percent and need a daemon call, which an estimate
+ * does not justify. A non-ZEPH source with no usable rate gives `null`: no
+ * number rather than a guess.
+ */
+export function zphConversionFeeEstimate(
+  rate: DaemonFeeRate,
+  source: ZphAssetType,
+  stats: ZphFeeConversionRates | null | undefined,
+): TypicalFee | null {
+  const zeph = typicalFee(rate, ZEPHYR_TYPICAL_CONVERSION_WEIGHT);
+  if (source === "ZPH") return zeph;
+  const usable = (n: number | undefined): n is number =>
+    typeof n === "number" && Number.isFinite(n) && n > 0;
+  let zephPerUnit: number | null = null;
+  if (source === "ZSD" && usable(stats?.zsd_rate)) {
+    zephPerUnit = stats!.zsd_rate!;
+  } else if (source === "ZRS" && usable(stats?.zrs_rate)) {
+    zephPerUnit = stats!.zrs_rate!;
+  } else if (
+    source === "ZYS" &&
+    usable(stats?.zsd_rate) &&
+    usable(stats?.zys_price) &&
+    usable(stats?.zsd_price)
+  ) {
+    zephPerUnit = stats!.zsd_rate! * (stats!.zys_price / stats!.zsd_price);
+  }
+  if (zephPerUnit == null) return null;
+  const convert = (atomicZeph: bigint) => BigInt(Math.ceil(Number(atomicZeph) / zephPerUnit!));
+  return {
+    usual: convert(zeph.usual),
+    busy: zeph.busy != null ? convert(zeph.busy) : null,
+  };
 }
 
 // =========================================================================
@@ -980,6 +1060,12 @@ export const zphAdapter: ChainAdapter = {
    * (wallet2.cpp:7187-7273): a quote spends, locks and lists nothing. The
    * returned `fee` is in the SENT asset's atomic units
    * (wallet_rpc_server.cpp:1051), so `feeTicker` is that asset's ticker.
+   *
+   * Since 2026-10-01 this is the Review step, built ONCE when the user asks
+   * ({@link quoteBuildsSpend}). It was called 600 ms after every edit and
+   * every 60 s while the Send modal was open, and every build asks the node
+   * for the coins it spends with a fresh set of decoys: several builds of one
+   * spend can show a node which coins are the wallet's.
    */
   async quoteSend({ to, amount, assetType }): Promise<SendQuote> {
     if (!session) {
@@ -1013,37 +1099,39 @@ export const zphAdapter: ChainAdapter = {
   },
 
   /**
-   * Broadcast the transaction `quoteSend` built (`relay_tx`, param `hex`).
+   * Confirm: broadcast the transaction the review built (`relay_tx`, param
+   * `hex`) — exactly that one, whose fee the modal showed.
    *
-   * `useSend` calls this only for a quote that matches the send and is under
-   * 90 s old. The adapter re-checks what only it can see: a ticket from an
-   * earlier wallet session, or one that aged out in between, is not relayed;
-   * the same send is built fresh instead. A ticket without its txid is not
-   * relayed either: a relay that fails ambiguously is settled by that txid.
+   * It NEVER builds again (operator request, 2026-10-01). Until then a ticket
+   * from an earlier wallet session, or one 90 s old, was replaced by a fresh
+   * build relayed on the spot: a second build of the same spend, with a fee
+   * nobody had been shown. Now such a ticket is refused with "Nothing was
+   * sent" (`relayZphTransaction` checks the session) and the user reviews
+   * again. Age is no reason to rebuild a same-asset send: it carries no
+   * pricing record (`pricing_record_height` must be 0 for a transfer,
+   * tx_pool.cpp:301-305 at v2.3.0) and does not expire; the 90 s rule came
+   * from conversions, whose record must be one of the last 10 blocks. A ticket
+   * without its txid is not relayed either: a relay that fails ambiguously is
+   * settled by that txid.
    */
   async sendQuoted(quote: SendQuote): Promise<TxResult> {
     if (!session) {
       throw new Error("Zephyr session not initialized. Please wait for sync.");
     }
     const t = quote.ticket as Partial<ZphQuoteTicket> | null | undefined;
-    const age = Date.now() - quote.quotedAt;
-    const relayable =
-      !!t &&
-      typeof t.txMetadata === "string" &&
-      t.txMetadata.length > 0 &&
-      typeof t.txHash === "string" &&
-      t.txHash.length > 0 &&
-      t.epoch === session.epoch &&
-      age >= 0 &&
-      age < SEND_QUOTE_MAX_AGE_MS;
-    if (!relayable) {
-      return zphAdapter.sendTransaction("", quote.to, quote.amount, quote.assetType);
+    if (
+      !t ||
+      typeof t.txMetadata !== "string" ||
+      t.txMetadata.length === 0 ||
+      typeof t.txHash !== "string" ||
+      t.txHash.length === 0 ||
+      typeof t.epoch !== "number"
+    ) {
+      throw new Error(
+        "This Zephyr send has no reviewed transaction to broadcast. Nothing was sent; review it again."
+      );
     }
-    return relayZphTransaction({
-      txMetadata: t.txMetadata as string,
-      txHash: t.txHash as string,
-      epoch: t.epoch ?? null,
-    });
+    return relayZphTransaction({ txMetadata: t.txMetadata, txHash: t.txHash, epoch: t.epoch });
   },
 
   /** Unlocked and total balance of the asset a send draws on (2026-09-15). */
@@ -1138,21 +1226,50 @@ export const zphAdapter: ChainAdapter = {
   networkComputesFee: true,
 
   /**
-   * No fee estimate exists without building the transaction.
+   * An ESTIMATE that builds nothing, in the asset being sent (operator
+   * request, 2026-10-01): the session node's fee rate (`get_fee_estimate`, read
+   * by Rust) times the weight of a typical send, 2,231 (two inputs, two
+   * outputs; `cryptonote-fee.ts`). `normal` is the low rate the wallet's
+   * priority 0 pays unless the network is busy, `fast` the normal rate it pays
+   * then. A same-asset send pays the same number of atomic units per byte in
+   * any asset: the pool converts a transfer's fee with no pricing record, i.e.
+   * not at all (`check_fee` → `get_fee_in_zeph_equivalent`, inference from
+   * blockchain.cpp:3946-3986 at v2.3.0), and ZEPHUSD / ZEPHYRS sends on chain
+   * paid 210,000 or 820,000 per byte like ZEPH ones (read-only sample,
+   * 2026-10-06). The exact fee comes from the one build `quoteSend` makes when
+   * the user reviews.
    *
-   * This called `get_fee_estimate`, a DAEMON method that zephyr-wallet-rpc does
-   * not have (absent from its method map, wallet_rpc_server.h:70-162 at
-   * v2.3.0), so every call failed with `RPC error -32601: Method not found`.
-   * A response without `fee`/`fees` would also have produced an estimate with
-   * no `normal` tier, which `SendModal` dereferences. Since 2026-09-15 the Send
-   * modal prices Zephyr sends with `quoteSend` and never calls this; any other
-   * caller gets a readable reason instead of a broken tier.
+   * History: this called the WALLET-rpc's `get_fee_estimate`, a daemon method
+   * it does not have (absent from wallet_rpc_server.h:70-162 at v2.3.0):
+   * `-32601 Method not found`. From 2026-09-15 it threw without a call and the
+   * Send modal priced every send by building it, on every edit and every 60 s.
+   *
+   * Throws when the session is not open or the node gave no usable rate; the
+   * Send modal then says the fee is shown at confirmation.
    */
-  async getFeeEstimate(): Promise<FeeEstimate> {
-    throw new Error(
-      "Zephyr fees are priced per send: enter a recipient and an amount to see the exact fee."
-    );
+  async getFeeEstimate(assetType?: string): Promise<FeeEstimate> {
+    if (!session) {
+      throw new Error("Zephyr session not initialized");
+    }
+    const asset = parseZphAssetSelector(assetType);
+    const rate = await getZphDaemonFeeRate(session.daemonUrl);
+    const fee = typicalFee(rate, ZEPHYR_TYPICAL_SEND_WEIGHT);
+    return {
+      normal: { value: atomicToZph(fee.usual) },
+      ...(fee.busy != null ? { fast: { value: atomicToZph(fee.busy) } } : {}),
+      unit: ZPH_UI_TICKER[asset],
+      typicalShape: TYPICAL_SEND_DESCRIPTION,
+      fetchedAt: Date.now(),
+      raw: {
+        perByte: rate.perByte.map(String),
+        quantizationMask: String(rate.quantizationMask),
+        weight: ZEPHYR_TYPICAL_SEND_WEIGHT,
+      },
+    };
   },
+
+  /** `quoteSend` builds the spend itself: review once, never preview (2026-10-01). */
+  quoteBuildsSpend: true,
 };
 
 /**

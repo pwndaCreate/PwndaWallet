@@ -597,6 +597,103 @@ pub async fn probe_node(url: String, timeout_ms: u64) -> NodeProbeResult {
 }
 
 // =========================================================================
+// The node's fee rate (`get_fee_estimate`), for the Send fee estimate
+// =========================================================================
+
+/// The node's current fee rate, as its `get_fee_estimate` reports it.
+///
+/// Operator request, 2026-10-01: the Monero and Zephyr Send and conversion
+/// modals show a fee ESTIMATED from this rate and a typical transaction weight
+/// (`src/wallets/cryptonote-fee.ts`) instead of building the transaction to
+/// price it. Every build asks the node for the coins it spends plus a fresh
+/// set of decoys, and repeated builds of one spend can show the node which
+/// coins are the wallet's. This request names no address, output or amount.
+///
+/// Read here because nothing else can: `get_fee_estimate` is a DAEMON method
+/// that monero-wallet-rpc and zephyr-wallet-rpc answer with -32601, and a
+/// webview `fetch` fails CORS on most public nodes (see [`probe_node`]).
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct DaemonFeeEstimate {
+    /// Atomic units per byte of weight, by priority: low, normal, elevated,
+    /// priority. A node too old to report `fees` gives one entry, its `fee`.
+    pub fees: Vec<u64>,
+    /// A fee is rounded UP to a multiple of this.
+    pub quantization_mask: u64,
+}
+
+/// A `get_fee_estimate` JSON-RPC reply as a [`DaemonFeeEstimate`], or why not.
+///
+/// Refuses anything that cannot price a fee (an error, a non-OK status, no
+/// rate, a zero rate or mask), so the modal says the fee is shown at
+/// confirmation rather than showing a number the node did not give.
+pub fn parse_fee_estimate(reply: &serde_json::Value) -> Result<DaemonFeeEstimate, String> {
+    if let Some(err) = reply.get("error").filter(|e| !e.is_null()) {
+        let msg = err.get("message").and_then(|m| m.as_str()).unwrap_or("no message");
+        return Err(format!("node error: {msg}"));
+    }
+    let result = reply.get("result").ok_or("no result in the node's reply")?;
+    if let Some(status) = result.get("status").and_then(|s| s.as_str()) {
+        if status != "OK" {
+            return Err(format!("node status: {status}"));
+        }
+    }
+    let mut fees: Vec<u64> = match result.get("fees").and_then(|f| f.as_array()) {
+        // A non-number becomes 0, which the check below refuses.
+        Some(list) => list.iter().map(|v| v.as_u64().unwrap_or(0)).collect(),
+        None => Vec::new(),
+    };
+    if fees.is_empty() {
+        if let Some(fee) = result.get("fee").and_then(|f| f.as_u64()) {
+            fees.push(fee);
+        }
+    }
+    if fees.is_empty() || fees.iter().any(|&f| f == 0) {
+        return Err("the node reported no usable fee rate".into());
+    }
+    // `KV_SERIALIZE_OPT(quantization_mask, (uint64_t)1)`: absent means 1.
+    let quantization_mask = match result.get("quantization_mask") {
+        None => 1,
+        Some(v) => v
+            .as_u64()
+            .filter(|&m| m > 0)
+            .ok_or("the node reported an unusable quantization mask")?,
+    };
+    Ok(DaemonFeeEstimate { fees, quantization_mask })
+}
+
+/// Ask the daemon at `url` for its fee rate: `get_fee_estimate` POSTed to
+/// `<url>/json_rpc`, the same `grace_blocks` (10) wallet2 asks with. No
+/// credentials: it is public daemon RPC, served by restricted nodes too.
+pub async fn daemon_fee_estimate(url: String, timeout_ms: u64) -> Result<DaemonFeeEstimate, String> {
+    let base = url.trim_end_matches('/').trim_end_matches("/json_rpc").to_string();
+    let endpoint = format!("{base}/json_rpc");
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": "0", "method": "get_fee_estimate",
+        "params": { "grace_blocks": 10 }
+    });
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|e| format!("client build: {e}"))?;
+    let resp = client.post(&endpoint).json(&body).send().await.map_err(|e| {
+        if e.is_timeout() {
+            "timeout".to_string()
+        } else if e.is_connect() {
+            "connect failed".to_string()
+        } else {
+            e.to_string()
+        }
+    })?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status().as_u16()));
+    }
+    let text = resp.text().await.map_err(|e| format!("read failed: {e}"))?;
+    let reply: serde_json::Value =
+        serde_json::from_str(&text).map_err(|_| "the node's reply was not JSON".to_string())?;
+    parse_fee_estimate(&reply)
+}
+
+// =========================================================================
 // Live-network tests — run with `cargo test -- --ignored --nocapture`
 // =========================================================================
 //
@@ -629,6 +726,117 @@ mod tests {
         assert_eq!(wallet_rpc_concurrency(3), 3);
         assert_eq!(wallet_rpc_concurrency(1), 2, "a single core still gets two");
         assert_eq!(wallet_rpc_concurrency(0), 2, "num_cpus reporting 0 must not pass 0");
+    }
+
+    // ── get_fee_estimate, for the Send fee estimate (operator request 2026-10-01)
+
+    /// A public Monero mainnet node's reply on 2026-10-06, verbatim.
+    #[test]
+    fn fee_estimate_reads_a_live_monero_reply() {
+        let reply = serde_json::json!({"id":"0","jsonrpc":"2.0","result":{"credits":0,"fee":20000,"fees":[20000,80000,320000,4000000],"quantization_mask":10000,"status":"OK","top_hash":"","untrusted":false}});
+        assert_eq!(
+            parse_fee_estimate(&reply).unwrap(),
+            DaemonFeeEstimate { fees: vec![20_000, 80_000, 320_000, 4_000_000], quantization_mask: 10_000 }
+        );
+    }
+
+    /// Zephyr's daemon is Monero's `core_rpc_server`: same reply, its own rates
+    /// (remote-node.zephyrprotocol.com, 2026-10-06).
+    #[test]
+    fn fee_estimate_reads_a_live_zephyr_reply() {
+        let reply = serde_json::json!({"id":"0","jsonrpc":"2.0","result":{"credits":0,"fee":210000,"fees":[210000,820000,3300000,41000000],"quantization_mask":10000,"status":"OK","top_hash":"","untrusted":false}});
+        assert_eq!(parse_fee_estimate(&reply).unwrap().fees[0], 210_000);
+    }
+
+    #[test]
+    fn fee_estimate_takes_fee_from_a_node_without_fees_and_mask_one_when_absent() {
+        let reply = serde_json::json!({"result":{"fee":20000,"status":"OK"}});
+        assert_eq!(
+            parse_fee_estimate(&reply).unwrap(),
+            DaemonFeeEstimate { fees: vec![20_000], quantization_mask: 1 }
+        );
+    }
+
+    /// Nothing that cannot price a fee gets through: the modal then says the fee
+    /// is shown at confirmation instead of showing a made-up number or 0.
+    #[test]
+    fn fee_estimate_refuses_what_cannot_price_a_fee() {
+        let refused = [
+            // What a wallet-rpc answers: the method is the DAEMON's.
+            serde_json::json!({"error":{"code":-32601,"message":"Method not found"},"id":"0","jsonrpc":"2.0"}),
+            serde_json::json!({"result":{"fees":[20000],"quantization_mask":10000,"status":"BUSY"}}),
+            serde_json::json!({"result":{"fees":[],"quantization_mask":10000,"status":"OK"}}),
+            serde_json::json!({"result":{"fees":[0,80000],"quantization_mask":10000,"status":"OK"}}),
+            serde_json::json!({"result":{"fees":["20000"],"quantization_mask":10000,"status":"OK"}}),
+            serde_json::json!({"result":{"fees":[20000],"quantization_mask":0,"status":"OK"}}),
+            serde_json::json!({"result":{"status":"OK"}}),
+            serde_json::json!({"id":"0"}),
+        ];
+        for reply in refused {
+            assert!(parse_fee_estimate(&reply).is_err(), "accepted {reply}");
+        }
+    }
+
+    /// What actually goes on the wire: `get_fee_estimate` POSTed to
+    /// `/json_rpc` with wallet2's grace_blocks, and nothing about the wallet.
+    #[tokio::test]
+    async fn fee_estimate_posts_get_fee_estimate_to_json_rpc() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = seen.clone();
+        tokio::spawn(async move {
+            let listener = tokio::net::TcpListener::from_std(listener).unwrap();
+            let Ok((mut sock, _)) = listener.accept().await else { return };
+            // Read the head, then exactly Content-Length bytes of body.
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                let text = String::from_utf8_lossy(&buf).to_string();
+                if let Some(end) = text.find("\r\n\r\n") {
+                    let len = text[..end]
+                        .lines()
+                        .find_map(|l| {
+                            let (k, v) = l.split_once(':')?;
+                            k.eq_ignore_ascii_case("content-length").then(|| v.trim().parse::<usize>().ok())?
+                        })
+                        .unwrap_or(0);
+                    if buf.len() >= end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            *sink.lock().unwrap() = String::from_utf8_lossy(&buf).to_string();
+            let body = r#"{"id":"0","jsonrpc":"2.0","result":{"fee":20000,"fees":[20000,80000,320000,4000000],"quantization_mask":10000,"status":"OK"}}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        });
+
+        // A trailing slash and a pasted `/json_rpc` both reach the same endpoint.
+        let got = daemon_fee_estimate(format!("http://127.0.0.1:{port}/json_rpc/"), 5_000)
+            .await
+            .expect("fee estimate");
+        assert_eq!(got.fees, vec![20_000, 80_000, 320_000, 4_000_000]);
+        assert_eq!(got.quantization_mask, 10_000);
+
+        let request = seen.lock().unwrap().clone();
+        assert!(request.starts_with("POST /json_rpc HTTP/1.1"), "{request}");
+        let body = &request[request.find("\r\n\r\n").expect("head") + 4..];
+        let json: serde_json::Value = serde_json::from_str(body).expect("JSON body");
+        assert_eq!(json["method"], "get_fee_estimate");
+        assert_eq!(json["params"], serde_json::json!({ "grace_blocks": 10 }));
     }
 
     /// `sidecar_naming` is the whole point of the zano generalization — pin the

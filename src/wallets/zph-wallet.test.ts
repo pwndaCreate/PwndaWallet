@@ -19,6 +19,13 @@
  * and then relayed, and a relay that does not report success is settled by
  * txid — found → success, provably not relayed → plain Error, otherwise
  * `SendOutcomeUnknownError(txid)`. "Try again" is only ever said about a build.
+ *
+ * Operator request, 2026-10-01: the preview fee is an estimate that builds
+ * nothing (`getFeeEstimate`: the node's rate, read by Rust as
+ * `zph_fee_estimate`, × a typical send), the build happens once on Review
+ * (`quoteSend`), and Confirm (`sendQuoted`) relays that build whatever its age
+ * and never builds again — it used to rebuild a 90 s old or other-session
+ * quote and relay the new build unseen.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -45,16 +52,19 @@ import { isSendOutcomeUnknown } from "./send-outcome";
 import type { ZphTransfer } from "./zph-rpc";
 import {
   classifyZphTransferError,
+  getZphFeeRate,
   getZphSessionEpoch,
   initZphSession,
   lockZphWallet,
   onZphSent,
   relayZphTransaction,
   zphAdapter,
+  zphConversionFeeEstimate,
   zphRecipientProblem,
   zphSyncRefusal,
   zphTransferToChainTx,
 } from "./zph-wallet";
+import { daemonFeeRateFrom } from "./cryptonote-fee";
 
 const invokeMock = vi.mocked(invoke);
 const SEED = Array.from({ length: 25 }, (_, i) => `word${i}`).join(" ");
@@ -69,6 +79,9 @@ let walletHeight = 1_900_000;
 let probeHeight = 1_900_000;
 /** Builds so far: each build's signed blob is distinct, like a real wallet's. */
 let builds = 0;
+/** What Rust's `zph_fee_estimate` answers: remote-node.zephyrprotocol.com on 2026-10-06. */
+const LIVE_FEE_RATE = { fees: [210_000, 820_000, 3_300_000, 41_000_000], quantization_mask: 10_000 };
+let feeRateReply: () => unknown = () => LIVE_FEE_RATE;
 
 function defaultRpc(): Record<string, RpcHandler> {
   return {
@@ -122,6 +135,8 @@ beforeAll(async () => {
         return probeHeight > 0
           ? { url: args.url, ok: true, latency_ms: 5, height: probeHeight, error: null }
           : { url: args.url, ok: false, latency_ms: null, height: null, error: "timeout" };
+      case "zph_fee_estimate":
+        return feeRateReply();
       case "zph_rpc_call": {
         const h = rpc[args.method];
         // Real rejections are STRINGS (Tauri `Err(String)`), so the mock's are too.
@@ -140,6 +155,7 @@ beforeEach(() => {
   rpc = defaultRpc();
   walletHeight = 1_900_000;
   probeHeight = 1_900_000;
+  feeRateReply = () => LIVE_FEE_RATE;
 });
 
 describe("zphTransferToChainTx", () => {
@@ -369,9 +385,31 @@ describe("sendTransaction", () => {
 });
 
 describe("getFeeEstimate / balances", () => {
-  it("never calls get_fee_estimate, which zephyr-wallet-rpc does not have", async () => {
-    await expect(zphAdapter.getFeeEstimate()).rejects.toThrow(/priced per send/);
-    expect(invokeMock).not.toHaveBeenCalled();
+  it("estimates from the session node's rate, in the asset being sent, and builds nothing (2026-10-01)", async () => {
+    const est = await zphAdapter.getFeeEstimate("ZSD");
+    // Was: throw "Zephyr fees are priced per send…", and the modal built the
+    // send instead — on every edit and every 60 s.
+    expect(est).toMatchObject({
+      normal: { value: "0.00046851" }, // 2,231 × 210,000, ZSD atomic units like ZEPH's
+      fast: { value: "0.00182942" }, // 2,231 × 820,000: the busy-network rate
+      unit: "ZEPHUSD",
+      typicalShape: "two inputs, two outputs",
+    });
+    expect((await zphAdapter.getFeeEstimate()).unit).toBe("ZEPH");
+    // The DAEMON the session uses, through Rust; never the wallet-rpc, which
+    // has no get_fee_estimate and would have to build to price anything.
+    expect(invokeMock).toHaveBeenCalledWith("zph_fee_estimate", {
+      url: "http://node.sandbox.test:17767",
+      timeoutMs: 8_000,
+    });
+    expect(invokeMock.mock.calls.map(([cmd]) => cmd)).toEqual(["zph_fee_estimate", "zph_fee_estimate"]);
+  });
+
+  it("gives no number when the node gives no usable rate — never 0", async () => {
+    feeRateReply = () => ({ fees: [0, 820_000], quantization_mask: 10_000 });
+    await expect(zphAdapter.getFeeEstimate()).rejects.toThrow(/no usable fee rate/);
+    await expect(zphAdapter.getFeeEstimate("BOGUS")).rejects.toThrow(/Unknown Zephyr asset/);
+    expect(rpcCalls()).toEqual([]);
   });
 
   it("reads balances by asset_type, not by array position", async () => {
@@ -422,27 +460,74 @@ describe("sendQuoted", () => {
     expect(heard).toHaveBeenCalledTimes(1);
   });
 
-  it("builds fresh (and relays the NEW build) instead of relaying a quote that aged out", async () => {
+  it("relays the reviewed build as built even minutes later, and builds nothing (2026-10-01)", async () => {
     const q = await zphAdapter.quoteSend!({ to: TO, amount: "2" });
     invokeMock.mockClear();
-    await zphAdapter.sendQuoted!({ ...q, quotedAt: Date.now() - 91_000 });
-    const calls = rpcCalls();
-    expect(calls.find((c) => c.method === "transfer")!.params.do_not_relay).toBe(true);
-    const relays = calls.filter((c) => c.method === "relay_tx");
-    expect(relays).toHaveLength(1);
-    expect(relays[0].params.hex).not.toBe(quotedBlob(q));
+    await zphAdapter.sendQuoted!({ ...q, quotedAt: Date.now() - 10 * 60_000 });
+    // Was: past 90 s it built the send again and relayed THAT, a fee nobody
+    // had seen and a second build of the same spend. A same-asset send has no
+    // pricing record and does not expire.
+    expect(rpcCalls()).toEqual([{ method: "relay_tx", params: { hex: quotedBlob(q) } }]);
   });
 
-  it("never relays a transaction built by an earlier wallet session", async () => {
+  it("refuses a build from an earlier wallet session; builds and relays nothing (2026-10-01)", async () => {
     const q = await zphAdapter.quoteSend!({ to: TO, amount: "2" });
     await initZphSession(SEED_2, "master-password"); // a new session (new epoch)
     invokeMock.mockClear();
-    await zphAdapter.sendQuoted!(q);
-    const calls = rpcCalls();
-    expect(calls.map((c) => c.method)).toContain("transfer");
-    expect(calls.filter((c) => c.method === "relay_tx").map((c) => c.params.hex)).not.toContain(
-      quotedBlob(q),
+    const err = await zphAdapter.sendQuoted!(q).catch((e) => e);
+    // Was: built a fresh send through the new session's wallet and relayed it.
+    expect(err.message).toMatch(/no longer open\. Nothing was sent; review it again/);
+    expect(isSendOutcomeUnknown(err)).toBe(false);
+    expect(rpcCalls().map((c) => c.method)).toEqual([]);
+    await initZphSession(SEED, "master-password");
+  });
+
+  it("refuses a quote with no build behind it", async () => {
+    const q = await zphAdapter.quoteSend!({ to: TO, amount: "2" });
+    invokeMock.mockClear();
+    const err = await zphAdapter.sendQuoted!({ ...q, ticket: { txMetadata: "", txHash: TX_HASH } }).catch((e) => e);
+    expect(err.message).toMatch(/no reviewed transaction to broadcast\. Nothing was sent/);
+    expect(rpcCalls()).toEqual([]);
+  });
+
+  it("is reviewed, not previewed: its quote builds the spend", () => {
+    expect(zphAdapter.quoteBuildsSpend).toBe(true);
+  });
+});
+
+describe("a conversion's fee estimate (2026-10-01)", () => {
+  const rate = daemonFeeRateFrom(LIVE_FEE_RATE);
+  // livestats as read on 2026-10-06 (zsd_rate / zrs_rate are ZEPH per unit).
+  const stats = { zsd_rate: 2.7596, zrs_rate: 1.225, zys_price: 1.9833, zsd_price: 1.0001 };
+
+  it("prices a typical conversion from ZEPH at the node's rate: 2,975 × 210,000", () => {
+    expect(zphConversionFeeEstimate(rate, "ZPH", null)).toEqual({
+      usual: 624_750_000n,
+      busy: 2_439_500_000n,
+    });
+  });
+
+  it("converts into the source asset at the oracle rate, as wallet2 converts at the record's", () => {
+    expect(zphConversionFeeEstimate(rate, "ZSD", stats)!.usual).toBe(BigInt(Math.ceil(624_750_000 / 2.7596)));
+    expect(zphConversionFeeEstimate(rate, "ZRS", stats)!.usual).toBe(BigInt(Math.ceil(624_750_000 / 1.225)));
+    expect(zphConversionFeeEstimate(rate, "ZYS", stats)!.usual).toBe(
+      BigInt(Math.ceil(624_750_000 / (2.7596 * (1.9833 / 1.0001)))),
     );
+  });
+
+  it("gives no number for a non-ZEPH source without an oracle rate", () => {
+    expect(zphConversionFeeEstimate(rate, "ZSD", null)).toBeNull();
+    expect(zphConversionFeeEstimate(rate, "ZRS", { ...stats, zrs_rate: 0 })).toBeNull();
+    expect(zphConversionFeeEstimate(rate, "ZYS", { ...stats, zys_price: Number.NaN })).toBeNull();
+  });
+
+  it("reads the rate from the session's node, through Rust", async () => {
+    await expect(getZphFeeRate()).resolves.toEqual(rate);
+    expect(invokeMock).toHaveBeenCalledWith("zph_fee_estimate", {
+      url: "http://node.sandbox.test:17767",
+      timeoutMs: 8_000,
+    });
+    expect(rpcCalls()).toEqual([]);
   });
 });
 

@@ -223,6 +223,14 @@ export interface FeeEstimate {
    * was shown as "ESTIMATED", indistinguishable from a live reading.
    */
   isFallback?: boolean;
+  /**
+   * For a TOTAL estimated without building the transaction (Monero, Zephyr —
+   * operator request 2026-10-01): the transaction it prices, in words ("two
+   * inputs, two outputs"). `normal` is then what the wallet usually pays and
+   * `fast`, when present, what it pays while the network is busy; the user
+   * picks neither, so the Send modal shows them as one estimate, not tiers.
+   */
+  typicalShape?: string;
   /** ms epoch when fetched. */
   fetchedAt: number;
   /** Free-form raw payload from the source — never required by callers. */
@@ -616,8 +624,12 @@ export interface ChainAdapter {
    * Current network fee estimate, structured. Adapters that only have one
    * tier just populate `normal`. Throws only when every redundant source
    * is unreachable; never returns a stale or guessed value.
+   *
+   * `assetType` is the per-send asset selector (`sendTransaction`'s), for an
+   * adapter whose fee is charged in the asset being sent (Zephyr, 2026-10-01);
+   * every other adapter ignores it.
    */
-  getFeeEstimate(): Promise<FeeEstimate>;
+  getFeeEstimate(assetType?: string): Promise<FeeEstimate>;
 
   /**
    * The coin that pays this adapter's fees, when it is NOT the coin being
@@ -659,8 +671,10 @@ export interface ChainAdapter {
    * Price THIS send by building it without broadcasting (see `send-quote.ts`).
    *
    * Implemented where the wallet sets the fee itself and can build a
-   * transaction without relaying it (Zephyr, 2026-09-15). When present,
-   * `SendModal` shows this quote's fee instead of `getFeeEstimate`'s tiers.
+   * transaction without relaying it (Zephyr, 2026-09-15; Monero 2026-10-01).
+   * When present, `SendModal` shows this quote's fee instead of
+   * `getFeeEstimate`'s tiers — on every edit for most adapters, but only when
+   * the user asks to review the send where {@link quoteBuildsSpend} is set.
    * Throws `SendQuoteError`; only `insufficient-funds` and `invalid-address`
    * may block the Send button.
    */
@@ -668,9 +682,28 @@ export interface ChainAdapter {
 
   /**
    * Broadcast the transaction a `quoteSend` built. `useSend` calls this only
-   * when the quote still matches the send and is recent (`quoteMatchesSend`).
+   * when the quote still matches the send and is recent (`quoteMatchesSend`);
+   * with {@link quoteBuildsSpend}, for a matching quote of any age, and it
+   * never builds again.
    */
   sendQuoted?(quote: SendQuote): Promise<TxResult>;
+
+  /**
+   * True when `quoteSend` builds the real, spendable transaction, asking the
+   * node for the coins it spends with fresh decoys (Monero, Zephyr — operator
+   * request 2026-10-01).
+   *
+   * Built once, that hides which coins are the wallet's. Built again for the
+   * same spend, it does not: the real coin is in every request and the decoys
+   * change, so a node comparing them can find it. Zephyr's Send modal used to
+   * rebuild on every edit and every 60 s. For such an adapter:
+   *   - the Send modal shows `getFeeEstimate` (an estimate that builds
+   *     nothing) while the user edits, and calls `quoteSend` only when the
+   *     user asks to review the send (`quoteController`'s "on-request" mode);
+   *   - Confirm relays exactly that build (`sendQuoted`), and `useSend` never
+   *     falls back to building and relaying a send nobody reviewed.
+   */
+  quoteBuildsSpend?: boolean;
 
   /** Spendable (unlocked) and total balance of the asset a send would draw on. */
   getSendableBalance?(assetType?: string): Promise<SendableBalance>;

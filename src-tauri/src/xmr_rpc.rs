@@ -1527,6 +1527,18 @@ pub async fn xmr_probe_node(url: String, timeout_ms: u64) -> Result<XmrProbeResu
     })
 }
 
+/// The Monero node's fee rate (`get_fee_estimate`), for the Send modal's
+/// estimate (operator request 2026-10-01). See
+/// [`crate::wallet_rpc_common::daemon_fee_estimate`]; `url` is the daemon the
+/// wallet session uses.
+#[tauri::command]
+pub async fn xmr_fee_estimate(
+    url: String,
+    timeout_ms: u64,
+) -> Result<crate::wallet_rpc_common::DaemonFeeEstimate, String> {
+    crate::wallet_rpc_common::daemon_fee_estimate(url, timeout_ms).await
+}
+
 // =========================================================================
 // Auto-download + Windows Defender exclusion for monero-wallet-rpc.exe
 // =========================================================================

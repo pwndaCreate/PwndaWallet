@@ -206,3 +206,158 @@ describe("createQuoteController", () => {
     expect(h.snaps.length).toBe(emitted);
   });
 });
+
+/**
+ * "on-request" mode (operator request, 2026-10-01): Monero and Zephyr, whose
+ * quote is a build of the spend itself. The auto rules above built a Zephyr
+ * send 600 ms after every edit and again every 60 s; each build asks the node
+ * for the coins with fresh decoys, so the node could tell which coins were the
+ * wallet's. Here nothing builds unless asked, and once.
+ */
+describe("createQuoteController — on-request (reviewed sends)", () => {
+  function reviewHarness(impl: (i: QuoteInputs) => Promise<SendQuote>) {
+    const snaps: QuoteSnapshot[] = [];
+    const quote = vi.fn(impl);
+    const ctrl = createQuoteController({ quote, onChange: (s) => snaps.push(s), mode: "on-request" });
+    const last = () => snaps[snaps.length - 1] ?? EMPTY_QUOTE;
+    return { ctrl, quote, snaps, last };
+  }
+
+  it("builds nothing while the user edits, however long the modal stays open", async () => {
+    const h = reviewHarness(async (i) => mkQuote(i.amount));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    h.ctrl.setInputs({ to: TO, amount: "12" });
+    await vi.advanceTimersByTimeAsync(5_000);
+    h.ctrl.setInputs({ to: TO, amount: "12", assetType: "ZSD" });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    // Was: one build per pause in typing, then one every 60 s.
+    expect(h.quote).not.toHaveBeenCalled();
+    expect(h.last()).toMatchObject({ quote: null, pending: false, inputs: { amount: "12" } });
+  });
+
+  it("Review builds once, and nothing refreshes that build", async () => {
+    const h = reviewHarness(async (i) => mkQuote(i.amount));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    expect(h.last().pending).toBe(true);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.last()).toMatchObject({ pending: false, quote: { amount: "1" } });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(h.quote).toHaveBeenCalledTimes(1);
+  });
+
+  it("one press while building, or Review of a send already shown, is no second build", async () => {
+    const h = reviewHarness((i) => new Promise<SendQuote>((r) => setTimeout(() => r(mkQuote(i.amount)), 3_000)));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    h.ctrl.request(); // a double click
+    await vi.advanceTimersByTimeAsync(3_000);
+    h.ctrl.request(); // pressed again with the build on screen
+    h.ctrl.retry();
+    await vi.advanceTimersByTimeAsync(3_000);
+    expect(h.quote).toHaveBeenCalledTimes(1);
+  });
+
+  it("the same send reviewed again after an edit is shown from the first build", async () => {
+    const h = reviewHarness(async (i) => mkQuote(i.amount));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    const first = h.last().quote;
+    h.ctrl.setInputs({ to: TO, amount: "2" }); // the build leaves the screen…
+    expect(h.last()).toMatchObject({ quote: null, inputs: { amount: "2" } });
+    h.ctrl.setInputs({ to: TO, amount: "1" }); // …and is not shown again by itself
+    expect(h.last().quote).toBeNull();
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.last().quote).toBe(first);
+    expect(h.quote).toHaveBeenCalledTimes(1);
+  });
+
+  it("a changed send is built once more, on its own Review", async () => {
+    const h = reviewHarness(async (i) => mkQuote(i.amount));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    h.ctrl.setInputs({ to: TO, amount: "2" });
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(h.quote).toHaveBeenCalledTimes(1);
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.quote).toHaveBeenCalledTimes(2);
+    expect(h.last()).toMatchObject({ quote: { amount: "2" } });
+  });
+
+  it("Review of new inputs during a build waits for it, then builds them once", async () => {
+    const h = reviewHarness((i) => new Promise<SendQuote>((r) => setTimeout(() => r(mkQuote(i.amount)), 5_000)));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request(); // build 1 starts
+    await vi.advanceTimersByTimeAsync(1_000);
+    h.ctrl.setInputs({ to: TO, amount: "2" });
+    h.ctrl.request(); // queued, not run beside build 1
+    expect(h.last()).toMatchObject({ inputs: { amount: "2" }, pending: true });
+    expect(h.quote).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(4_000); // build 1 settles; "2" starts
+    expect(h.quote).toHaveBeenCalledTimes(2);
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(h.last()).toMatchObject({ inputs: { amount: "2" }, pending: false, quote: { amount: "2" } });
+  });
+
+  it("an edit after Review cancels the queued build for the old inputs", async () => {
+    const h = reviewHarness((i) => new Promise<SendQuote>((r) => setTimeout(() => r(mkQuote(i.amount)), 5_000)));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(1_000);
+    h.ctrl.setInputs({ to: TO, amount: "2" });
+    h.ctrl.request(); // queued behind build 1
+    h.ctrl.setInputs({ to: TO, amount: "3" }); // …then the user changed it again
+    await vi.advanceTimersByTimeAsync(20_000);
+    expect(h.quote).toHaveBeenCalledTimes(1);
+    expect(h.last()).toMatchObject({ inputs: { amount: "3" }, quote: null, pending: false });
+  });
+
+  it("a failed review is shown and built again only when the user retries", async () => {
+    let fail = true;
+    const h = reviewHarness(async (i) => {
+      if (fail) throw new SendQuoteError("not-ready", "The node timed out.");
+      return mkQuote(i.amount);
+    });
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.last()).toMatchObject({ quote: null, failure: { kind: "not-ready", definitive: false } });
+    await vi.advanceTimersByTimeAsync(10 * 60_000);
+    expect(h.quote).toHaveBeenCalledTimes(1);
+    fail = false;
+    h.ctrl.retry();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.quote).toHaveBeenCalledTimes(2);
+    expect(h.last()).toMatchObject({ failure: null, quote: { amount: "1" } });
+  });
+
+  it("discard forgets the build handed to a send: the next Review builds afresh", async () => {
+    const h = reviewHarness(async (i) => mkQuote(i.amount));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    h.ctrl.discard();
+    expect(h.last()).toMatchObject({ quote: null, inputs: { amount: "1" } });
+    h.ctrl.request();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.quote).toHaveBeenCalledTimes(2);
+  });
+
+  it("a build that lands after discard is neither shown nor remembered", async () => {
+    let resolve!: (q: SendQuote) => void;
+    const h = reviewHarness(() => new Promise<SendQuote>((r) => (resolve = r)));
+    h.ctrl.setInputs({ to: TO, amount: "1" });
+    h.ctrl.request();
+    h.ctrl.discard();
+    resolve(mkQuote("1"));
+    await vi.advanceTimersByTimeAsync(0);
+    expect(h.last().quote).toBeNull();
+    h.ctrl.request();
+    expect(h.quote).toHaveBeenCalledTimes(2);
+  });
+});

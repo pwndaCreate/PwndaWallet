@@ -131,7 +131,18 @@ export function SendModal({
   // Zephyr's estimate called a daemon method its wallet-rpc does not have, so
   // the box showed an error forever and no fee was ever priced. Every other
   // chain keeps the tier UI exactly as it was.
+  //
+  // ── Reviewed sends: Monero and Zephyr (operator request, 2026-10-01) ─────
+  //
+  // That price was a build on every edit and every 60 s, and each build asks
+  // the node for the coins it spends with fresh decoys: a node seeing several
+  // builds of one spend can tell which coins are the wallet's. Where the quote
+  // builds the spend (`quoteBuildsSpend`) the box shows an ESTIMATE that
+  // builds nothing (`getFeeEstimate`: the node's rate × a typical send), the
+  // button reads Review, and only that press builds — once. The exact fee of
+  // that build is then shown, and Confirm relays exactly it.
   const quoteDriven = typeof adapter.quoteSend === "function";
+  const reviewed = quoteDriven && adapter.quoteBuildsSpend === true;
   const priced = useSendQuote({
     adapter,
     to: sendTo,
@@ -239,11 +250,17 @@ export function SendModal({
   // Fetch fee estimate on mount and refresh every 30 s while open. Adapters
   // throw `not initialized` for sidecar chains until the wallet is open;
   // we surface that as a one-line note rather than a hard error.
+  //
+  // Reviewed adapters (Monero, Zephyr) fetch it too, for the estimate shown
+  // until the review: it reads the node's fee rate and builds nothing, so
+  // refreshing it is harmless. `assetType` because Zephyr's fee is charged in
+  // the asset being sent.
+  const fetchesEstimate = !quoteDriven || reviewed;
   const loadFee = useCallback(async () => {
-    if (quoteDriven) return;
+    if (!fetchesEstimate) return;
     setFeeLoading(true);
     try {
-      const r = await adapter.getFeeEstimate();
+      const r = await adapter.getFeeEstimate(assetType);
       setFee(r);
       setFeeError(null);
     } catch (e) {
@@ -263,10 +280,10 @@ export function SendModal({
     } finally {
       setFeeLoading(false);
     }
-  }, [adapter, quoteDriven]);
+  }, [adapter, fetchesEstimate, assetType]);
 
   useEffect(() => {
-    if (quoteDriven) return;
+    if (!fetchesEstimate) return;
     let cancelled = false;
     void (async () => {
       await loadFee();
@@ -279,7 +296,7 @@ export function SendModal({
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [loadFee, quoteDriven]);
+  }, [loadFee, fetchesEstimate]);
 
   // Truthy when we have a usable fee value for the currently-selected
   // tier. Send is blocked when this is false (per UXS-20260516-112
@@ -340,16 +357,23 @@ export function SendModal({
   const showsTotals = tiers.some((t) => feeTotalFor(fee, t.value, usdPrice) != null);
 
   // USD price of the coin a quoted fee is charged in: ZEPH at `usdPrice`, a
-  // Zephyr ecosystem asset at its oracle price, anything else unpriced.
-  const quotedFeeTicker = priced.quote?.feeTicker ?? null;
-  const quotedFeeUsdPrice =
-    quotedFeeTicker == null
+  // Zephyr ecosystem asset at its oracle price, anything else unpriced. The
+  // same rule prices a reviewed adapter's estimate, whose unit is that coin.
+  const feeUsdPriceFor = (ticker: string | null | undefined): number | undefined =>
+    ticker == null
       ? undefined
-      : quotedFeeTicker === adapter.ticker
+      : ticker === adapter.ticker
         ? usdPrice
-        : quotedFeeTicker === sendTicker
+        : ticker === sendTicker
           ? assetUsdPrice
           : undefined;
+  const quotedFeeUsdPrice = feeUsdPriceFor(priced.quote?.feeTicker ?? null);
+
+  // The primary button of a reviewed send: Review builds the transaction
+  // once; with its build on screen it becomes Confirm, which relays exactly
+  // that build. Without inputs worth building (`priced.inputs`), Review waits.
+  const reviewedQuote = reviewed ? priced.quote : null;
+  const reviewBlocked = reviewed && !reviewedQuote && (priced.pending || !priced.inputs);
 
   return (
     // The shared backdrop (2026-10-01): rendered into document.body, so the
@@ -515,7 +539,16 @@ export function SendModal({
 
         <div className="form-group">
           <label>Network fee</label>
-          {quoteDriven ? (
+          {reviewed ? (
+            <ReviewedFee
+              priced={priced}
+              estimate={fee}
+              estimateFailed={feeError != null}
+              networkTicker={adapter.ticker}
+              sendTicker={sendTicker}
+              feeUsdPriceFor={feeUsdPriceFor}
+            />
+          ) : quoteDriven ? (
             <QuotedFee
               priced={priced}
               networkTicker={adapter.ticker}
@@ -744,12 +777,20 @@ export function SendModal({
             // arrow on purpose: `onClick={onSend}` would hand the MouseEvent to
             // `handleSend` as its fee-rate argument. Quote-driven adapters pass
             // the priced quote instead (2026-09-15); `useSend` relays it only if
-            // it is still exactly this send.
+            // it is still exactly this send. A reviewed send (2026-10-01): the
+            // first press builds the transaction once (Review); with that build
+            // on screen the press is Confirm and hands it to `useSend`, which
+            // relays exactly it.
             onClick={() =>
-              quoteDriven
-                ? onSend(undefined, priced.quote ?? undefined)
-                : onSend(feeRateForSend(fee, selectedTierFee ?? undefined))
+              reviewed
+                ? reviewedQuote
+                  ? onSend(undefined, reviewedQuote)
+                  : priced.request()
+                : quoteDriven
+                  ? onSend(undefined, priced.quote ?? undefined)
+                  : onSend(feeRateForSend(fee, selectedTierFee ?? undefined))
             }
+            data-send-step={reviewed ? (reviewedQuote ? "confirm" : "review") : undefined}
             // UXS-20260516-112 AC #3: block Send until we actually
             // have a fee number to charge against. Title attribute
             // gives keyboard / screen-reader users an explanation
@@ -766,6 +807,7 @@ export function SendModal({
               !feeReady ||
               gasShort ||
               quoteBlocks ||
+              reviewBlocked ||
               !!tagError ||
               !!memoError
             }
@@ -782,10 +824,26 @@ export function SendModal({
                     : `This address has no ${gas?.ticker ?? "gas"} on ${gas?.chainName ?? "this network"} to pay the fee with.`
                   : !feeReady
                     ? "Network fee isn't available yet — Send is disabled until the fee fetch succeeds."
-                    : undefined
+                    : reviewed
+                      ? reviewedQuote
+                        ? "Broadcasts exactly the transaction whose fee is shown above."
+                        : priced.pending
+                          ? "Building the transaction to show its exact fee…"
+                          : !priced.inputs
+                            ? "Enter a recipient and an amount to review."
+                            : "Builds this transaction once to show its exact fee. Nothing is sent until you confirm."
+                      : undefined
             }
           >
-            {sending ? "Sending…" : "► Send"}
+            {sending
+              ? "Sending…"
+              : reviewed
+                ? reviewedQuote
+                  ? "► Confirm send"
+                  : priced.pending
+                    ? "Building…"
+                    : "► Review"
+                : "► Send"}
           </button>
         </div>
       </div>
@@ -890,6 +948,127 @@ function QuotedFee({
         Exact fee of this transaction. Sent within 90 s it is broadcast as priced; after that it
         is rebuilt and the fee can differ slightly.{pending ? " Refreshing…" : ""}
       </div>
+    </div>
+  );
+}
+
+/**
+ * The fee box for a reviewed send (Monero, Zephyr — operator request
+ * 2026-10-01). Until the review: an ESTIMATE that builds nothing (the node's
+ * fee rate × a typical send, `getFeeEstimate`), or "Fee shown at
+ * confirmation." when the rate could not be read — never a guessed number,
+ * never 0. After Review: the exact fee of the ONE transaction that was built,
+ * which Confirm broadcasts as is.
+ */
+function ReviewedFee({
+  priced,
+  estimate,
+  estimateFailed,
+  networkTicker,
+  sendTicker,
+  feeUsdPriceFor,
+}: {
+  priced: ReturnType<typeof useSendQuote>;
+  estimate: FeeEstimate | null;
+  /** The last read of the rate failed (`getFeeEstimate` threw). */
+  estimateFailed: boolean;
+  /** The adapter's own coin (XMR, ZEPH). */
+  networkTicker: string;
+  sendTicker: string;
+  feeUsdPriceFor: (ticker: string | null | undefined) => number | undefined;
+}) {
+  const { quote, failure, pending, retry } = priced;
+  const base = { fontFamily: "var(--mono)", fontSize: 10, lineHeight: 1.5 } as const;
+  const dim = { fontSize: 9, color: "var(--text-dim)", marginTop: 2 } as const;
+  // A fee charged in the asset being sent, not in the adapter's own coin.
+  const paidIn = (ticker: string | null | undefined) =>
+    ticker && ticker !== networkTicker && ticker === sendTicker
+      ? `Paid in ${sendTicker}, the asset being sent, not in ${networkTicker}. `
+      : "";
+
+  if (quote) {
+    const usd = formatUsd(Number(quote.fee), feeUsdPriceFor(quote.feeTicker));
+    return (
+      <div data-send-quote="ready" style={base}>
+        <div style={{ fontSize: 12 }} data-fee-total>
+          {quote.fee}{" "}
+          <span style={{ fontSize: 9, opacity: 0.75 }}>
+            {quote.feeTicker ?? "(charged by the network)"}
+          </span>
+          {usd && <span style={{ fontSize: 9, opacity: 0.75 }}> · {usd}</span>}
+        </div>
+        <div style={dim}>
+          {paidIn(quote.feeTicker)}
+          Exact fee of the transaction Confirm broadcasts, built once for this recipient and amount.
+          Change either and it is built again only when you review again.
+        </div>
+      </div>
+    );
+  }
+
+  const usual = estimate?.normal?.value;
+  const busy = estimate?.fast?.value;
+  const usd = usual != null ? formatUsd(Number(usual), feeUsdPriceFor(estimate?.unit)) : null;
+  return (
+    <div data-send-quote={failure ? "error" : pending ? "pending" : "estimate"} style={base}>
+      {usual != null && estimate ? (
+        <>
+          <div style={{ fontSize: 12 }} data-fee-estimate>
+            ≈ {usual} <span style={{ fontSize: 9, opacity: 0.75 }}>{estimate.unit} estimated</span>
+            {usd && <span style={{ fontSize: 9, opacity: 0.75 }}> · {usd}</span>}
+          </div>
+          <div style={dim}>
+            {paidIn(estimate.unit)}A typical send
+            {estimate.typicalShape ? ` (${estimate.typicalShape})` : ""} at the network's current fee
+            rate{busy != null ? `; about ${busy} ${estimate.unit} when the network is busy` : ""}. One that
+            combines more of your coins costs more. Review builds this send once and shows its exact fee
+            before anything is broadcast.
+          </div>
+        </>
+      ) : estimateFailed ? (
+        <div data-fee-estimate="none" style={{ color: "var(--text-dim)" }}>
+          Fee shown at confirmation.
+          <div style={dim}>
+            The network's current fee rate could not be read, so there is no estimate. Review builds this
+            send once and shows its exact fee before anything is broadcast.
+          </div>
+        </div>
+      ) : (
+        // Not read yet (the first paint, before the fetch starts, included).
+        <div data-fee-estimate="reading" style={{ color: "var(--text-dim)" }}>
+          Reading the network's current fee rate…
+        </div>
+      )}
+      {pending && (
+        <div style={{ marginTop: 6, color: "var(--text-dim)" }}>
+          Building the transaction to show its exact fee…
+        </div>
+      )}
+      {failure && (
+        <div
+          data-send-quote-kind={failure.kind}
+          style={{
+            marginTop: 6,
+            color: "var(--warn)",
+            display: "flex",
+            alignItems: "baseline",
+            gap: 8,
+            flexWrap: "wrap",
+          }}
+        >
+          <span style={{ flex: "1 1 auto" }}>
+            {failure.message}{" "}
+            {failure.definitive
+              ? "Change the send, then review it again."
+              : "Nothing was sent; you can review it again."}
+          </span>
+          {!failure.definitive && (
+            <button type="button" onClick={retry} disabled={pending} style={quoteRetryStyle}>
+              {pending ? "Retrying…" : "Retry"}
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }

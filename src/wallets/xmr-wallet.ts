@@ -29,10 +29,17 @@ import type {
   ChainTx,
   TxHistoryPage,
   FeeEstimate,
+  SendQuote,
   SendableBalance,
   TxParties,
 } from "./types";
 import { errorText } from "../lib/errorText";
+import { SendQuoteError } from "./send-quote";
+import {
+  MONERO_TYPICAL_SEND_WEIGHT,
+  TYPICAL_SEND_DESCRIPTION,
+  typicalFee,
+} from "./cryptonote-fee";
 import { readWalletRpcTransferParties } from "./parties-b-walletrpc";
 import {
   generateXmrSeed,
@@ -74,6 +81,7 @@ import {
   getSyncStatus,
   setDaemon,
   buildTransfer,
+  getXmrDaemonFeeRate,
   relayTransfer,
   lookupOwnTransfer,
   settleRelayFailure,
@@ -898,29 +906,67 @@ export function classifyXmrBuildError(e: unknown): Error {
   return new Error(`${raw} (Nothing was sent.)`);
 }
 
-/** A built, signed, unrelayed Monero transaction. */
+/**
+ * A failed build as a `SendQuoteError` (2026-10-01): {@link classifyXmrBuildError}'s
+ * text, plus the kind the Send modal's Review step acts on — only
+ * `insufficient-funds` and `invalid-address` keep Confirm disabled
+ * (`isDefinitiveQuoteError`). A `SendQuoteError` is an `Error`, so a one-step
+ * send (`sendTransaction`) shows the same message.
+ */
+export function classifyXmrQuoteError(e: unknown): SendQuoteError {
+  if (e instanceof SendQuoteError) return e;
+  const readable = classifyXmrBuildError(e).message;
+  const raw = errorText(e, "").trim();
+  const m = /^RPC error (-?\d+):\s*([\s\S]*)$/.exec(raw);
+  const code = m ? Number(m[1]) : null;
+  const msg = m ? m[2] : raw;
+  if (
+    code === -37 ||
+    code === -17 ||
+    /not enough (unlocked )?money/i.test(msg) ||
+    (code === -16 && /^Transaction not possible/i.test(msg))
+  ) {
+    return new SendQuoteError("insufficient-funds", readable);
+  }
+  if (code === -2 || /WALLET_RPC_ERROR_CODE_WRONG_ADDRESS/.test(msg)) {
+    return new SendQuoteError("invalid-address", readable);
+  }
+  if (
+    code === -38 ||
+    code === -3 ||
+    /TCP connect|actively refused|Connection refused|RPC returned 401|No wallet file|timed out/i.test(raw)
+  ) {
+    return new SendQuoteError("not-ready", readable);
+  }
+  return new SendQuoteError("other", readable);
+}
+
+/** A built, signed, unrelayed Monero transaction. Also a reviewed quote's ticket. */
 interface XmrBuiltSend {
   txMetadata: string;
   txHash: string;
   /** The session that built it. */
   epoch: number;
+  /** Its fee, piconero. */
+  fee: number;
 }
 
-/** Build `amount` to `recipient` without broadcasting it. Throws readable errors. */
+/** Build `amount` to `recipient` without broadcasting it. Throws readable `SendQuoteError`s. */
 async function buildXmrSend(recipient: string, amount: string, epoch: number): Promise<XmrBuiltSend> {
   let r;
   try {
     r = await buildTransfer(recipient, amount);
   } catch (e) {
-    throw classifyXmrBuildError(e);
+    throw classifyXmrQuoteError(e);
   }
   if (!r || typeof r.tx_metadata !== "string" || r.tx_metadata.length === 0 || !r.tx_hash) {
-    throw new Error(
+    throw new SendQuoteError(
+      "other",
       "The Monero wallet built this send but returned no transaction to broadcast (no tx_metadata). " +
         "Nothing was sent."
     );
   }
-  return { txMetadata: r.tx_metadata, txHash: r.tx_hash, epoch };
+  return { txMetadata: r.tx_metadata, txHash: r.tx_hash, epoch, fee: r.fee };
 }
 
 /**
@@ -929,7 +975,9 @@ async function buildXmrSend(recipient: string, amount: string, epoch: number): P
  * found → the result; provably not relayed → a plain Error; anything else →
  * `SendOutcomeUnknownError(txid)`. Never "try again".
  */
-async function relayXmrSend(built: XmrBuiltSend): Promise<TxResult> {
+async function relayXmrSend(
+  built: Pick<XmrBuiltSend, "txMetadata" | "txHash" | "epoch">
+): Promise<TxResult> {
   if (!session || session.epoch !== built.epoch) {
     throw new Error(
       "The Monero wallet changed before this transaction was broadcast. Nothing was sent."
@@ -1140,31 +1188,114 @@ export const xmrAdapter: ChainAdapter = {
   networkComputesFee: true,
 
   /**
-   * No estimate exists without building the transaction.
+   * An ESTIMATE that builds nothing (operator request, 2026-10-01): the
+   * session node's fee rate (`get_fee_estimate`, read by Rust from the daemon
+   * this wallet already uses) times the weight of a typical send, 2,215 (two
+   * inputs, two outputs; `cryptonote-fee.ts` has the source and the measured
+   * range). `normal` is the low rate, which the wallet's priority 0 pays unless
+   * the network is busy; `fast` is the normal rate it pays then. The exact fee
+   * comes from the one build made when the user reviews the send
+   * ({@link xmrAdapter.quoteSend}).
    *
-   * This called `get_fee_estimate`, a DAEMON method monero-wallet-rpc does not
-   * have: `-32601 Method not found` on every call, on a healthy wallet, for
-   * every Send modal open and every 30 s refresh — each one a request queued on
-   * the single-threaded wallet-rpc. Since 2026-09-29 it throws a readable reason
-   * without calling anything; `networkComputesFee` keeps the missing value from
-   * blocking Send, as before.
+   * History. Until 2026-09-29 this called `get_fee_estimate` on the WALLET-rpc,
+   * which does not have it: `-32601 Method not found` on every call. From then
+   * until 2026-10-01 it threw "Not estimated in advance for Monero." without a
+   * call, and Monero showed no fee before sending at all, because the only
+   * exact price is a build: each build asks the node for the real output with
+   * a fresh set of decoys (`wallet2::get_outs`), and a node that sees several
+   * builds of one spend can find the real input (inference from the source;
+   * the ring database that would reuse a ring is filled only in
+   * `process_outgoing`, after a send). That is still why the preview is an
+   * estimate and the Review build happens once.
    *
-   * Not replaced by a `quoteSend` dry run the way Zephyr's is (finding 8): each
-   * dry-run `transfer` asks the node for the real output alongside a fresh set
-   * of decoys (`wallet2::get_outs`: "start with real one", then the request is
-   * sorted "to ensure the daemon doesn't know which output is ours"), and a
-   * quote is rebuilt on every edit and every 60 s. A remote node that sees two
-   * such requests for the same spend can intersect them and find the real
-   * input (inference from the source; the ring database that would reuse a
-   * ring is filled only in `process_outgoing`, after a send). The fee is set
-   * by the wallet at build time either way.
+   * Throws when the session is not open or the node gave no usable rate; the
+   * Send modal then says the fee is shown at confirmation, never a number the
+   * node did not give, never 0.
    */
   async getFeeEstimate(): Promise<FeeEstimate> {
     if (!session) {
       throw new Error("Monero session not initialized");
     }
-    throw new Error("Not estimated in advance for Monero.");
+    const rate = await getXmrDaemonFeeRate(session.daemonUrl);
+    const fee = typicalFee(rate, MONERO_TYPICAL_SEND_WEIGHT);
+    return {
+      normal: { value: piconeroToXmr(fee.usual) },
+      ...(fee.busy != null ? { fast: { value: piconeroToXmr(fee.busy) } } : {}),
+      unit: "XMR",
+      typicalShape: TYPICAL_SEND_DESCRIPTION,
+      fetchedAt: Date.now(),
+      raw: {
+        perByte: rate.perByte.map(String),
+        quantizationMask: String(rate.quantizationMask),
+        weight: MONERO_TYPICAL_SEND_WEIGHT,
+      },
+    };
   },
+
+  /**
+   * The Send modal's Review step (operator request, 2026-10-01): build THIS
+   * send once, without relaying it, so its exact fee is shown before Confirm.
+   *
+   * Never called while the user edits or on a timer ({@link quoteBuildsSpend}):
+   * a build asks the node for the coins it spends with fresh decoys. The quote's
+   * ticket is the built transaction; `sendQuoted` relays exactly it.
+   */
+  async quoteSend({ to, amount }): Promise<SendQuote> {
+    if (!session) {
+      throw new SendQuoteError("not-ready", "The Monero wallet is not open yet.");
+    }
+    const epoch = session.epoch;
+    // A wallet short of the tip can answer "not enough money" for funds it has
+    // not scanned yet, so a review waits for sync exactly as a send does.
+    const refusal = xmrSyncRefusal(await getXmrSyncProgress());
+    if (refusal) throw new SendQuoteError("not-ready", refusal);
+    const recipient = to.trim();
+    const priced = amount.trim();
+    const badRecipient = await checkXmrRecipient(recipient);
+    if (badRecipient) throw new SendQuoteError("invalid-address", badRecipient.message);
+    const built = await buildXmrSend(recipient, priced, epoch);
+    if (!Number.isSafeInteger(built.fee) || built.fee < 0) {
+      throw new SendQuoteError(
+        "other",
+        "The Monero wallet returned no usable fee for this send. Nothing was sent."
+      );
+    }
+    return {
+      to: recipient,
+      amount: priced,
+      fee: piconeroToXmr(built.fee),
+      feeTicker: "XMR",
+      quotedAt: Date.now(),
+      ticket: built,
+    };
+  },
+
+  /**
+   * Confirm: broadcast exactly the transaction the review built (`relay_tx`),
+   * whatever its age — a Monero transaction does not expire. It NEVER builds
+   * again: a ticket that cannot be relayed (malformed, or built by an earlier
+   * wallet session — `relayXmrSend` checks) is refused with "Nothing was sent",
+   * and the user reviews again.
+   */
+  async sendQuoted(quote: SendQuote): Promise<TxResult> {
+    const t = quote.ticket as Partial<XmrBuiltSend> | null | undefined;
+    if (
+      !t ||
+      typeof t.txMetadata !== "string" ||
+      t.txMetadata.length === 0 ||
+      typeof t.txHash !== "string" ||
+      t.txHash.length === 0 ||
+      typeof t.epoch !== "number"
+    ) {
+      throw new Error(
+        "This Monero send has no reviewed transaction to broadcast. Nothing was sent; review it again."
+      );
+    }
+    return relayXmrSend({ txMetadata: t.txMetadata, txHash: t.txHash, epoch: t.epoch });
+  },
+
+  /** `quoteSend` builds the spend itself: review once, never preview (2026-10-01). */
+  quoteBuildsSpend: true,
 };
 
 /**

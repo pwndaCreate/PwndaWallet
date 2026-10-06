@@ -18,6 +18,14 @@
  *     (finding 7);
  *   - priority 0, exact amounts above 2^53, failed rows in history, and an
  *     incoming mempool transfer shown as a receipt (findings 10, 11, 12).
+ *
+ * Operator request, 2026-10-01: a fee before sending, without letting the node
+ * see the same spend built over and over.
+ *   - `getFeeEstimate` is the node's `get_fee_estimate` rate (read by Rust,
+ *     `xmr_fee_estimate`) × a typical send's weight, and calls the wallet-rpc
+ *     for nothing — so it builds nothing;
+ *   - `quoteSend` (Review) builds once without relaying; `sendQuoted`
+ *     (Confirm) relays exactly that build and never builds again.
  */
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -57,6 +65,9 @@ type RpcHandler = (params: any) => unknown;
 let rpc: Record<string, RpcHandler>;
 let probeHeight = 3_000_000;
 let walletHeight = 3_000_000;
+/** What Rust's `xmr_fee_estimate` answers: a public node's reply on 2026-10-06. */
+const LIVE_FEE_RATE = { fees: [20_000, 80_000, 320_000, 4_000_000], quantization_mask: 10_000 };
+let feeRateReply: () => unknown = () => LIVE_FEE_RATE;
 
 function defaultRpc(): Record<string, RpcHandler> {
   return {
@@ -111,6 +122,8 @@ beforeAll(async () => {
         return probeHeight > 0
           ? { url: args.url, ok: true, latency_ms: 5, height: probeHeight, error: null }
           : { url: args.url, ok: false, latency_ms: null, height: null, error: "timeout" };
+      case "xmr_fee_estimate":
+        return feeRateReply();
       case "xmr_rpc_call": {
         const h = rpc[args.method];
         // Real rejections are STRINGS (Tauri `Err(String)`), so the mock's are too.
@@ -129,6 +142,7 @@ beforeEach(() => {
   rpc = defaultRpc();
   probeHeight = 3_000_000;
   walletHeight = 3_000_000;
+  feeRateReply = () => LIVE_FEE_RATE;
 });
 
 describe("Monero send: build, then relay (2026-09-29 send-safety audit)", () => {
@@ -299,8 +313,100 @@ describe("Monero history, balance and fee (2026-09-29 send-safety audit)", () =>
     await expect(xmrAdapter.getSendableBalance!()).resolves.toEqual({ unlocked: "3.25", total: "5" });
   });
 
-  it("never calls get_fee_estimate, which monero-wallet-rpc does not have", async () => {
-    await expect(xmrAdapter.getFeeEstimate()).rejects.toThrow(/Not estimated in advance/);
+  it("never asks the wallet-rpc for get_fee_estimate, a method it does not have", async () => {
+    await xmrAdapter.getFeeEstimate();
+    expect(methods()).not.toContain("get_fee_estimate");
+  });
+});
+
+describe("Monero fee before sending (operator request, 2026-10-01)", () => {
+  const commands = () => invokeMock.mock.calls.map(([cmd]) => cmd);
+
+  it("estimates from the session node's fee rate and builds nothing", async () => {
+    const est = await xmrAdapter.getFeeEstimate();
+    // Was: throw "Not estimated in advance for Monero." — no fee shown before sending.
+    expect(est).toMatchObject({
+      normal: { value: "0.0000443" }, // 2,215 × 20,000 piconero: the low rate the wallet usually pays
+      fast: { value: "0.0001772" }, // 2,215 × 80,000: what it pays while the network is busy
+      unit: "XMR",
+      typicalShape: "two inputs, two outputs",
+    });
+    // Asked of the DAEMON the session uses, through Rust; the wallet-rpc is not
+    // called at all, so no transaction is built.
+    expect(invokeMock).toHaveBeenCalledWith("xmr_fee_estimate", {
+      url: "http://node.sandbox.test:18081",
+      timeoutMs: 8_000,
+    });
+    expect(commands()).toEqual(["xmr_fee_estimate"]);
+  });
+
+  it("gives no number when the node gives no usable rate — never 0", async () => {
+    feeRateReply = () => ({ fees: [], quantization_mask: 10_000 });
+    await expect(xmrAdapter.getFeeEstimate()).rejects.toThrow(/no usable fee rate/);
+    feeRateReply = () => {
+      throw "timeout";
+    };
+    await expect(xmrAdapter.getFeeEstimate()).rejects.toBeDefined();
+    expect(commands()).not.toContain("xmr_rpc_call");
+  });
+
+  it("Review builds once without relaying, with the exact fee of that build", async () => {
+    const q = await xmrAdapter.quoteSend!({ to: ` ${TO} `, amount: " 1.5 " });
+    expect(q).toMatchObject({ to: TO, amount: "1.5", fee: "0.00003072", feeTicker: "XMR" });
+    expect(methods().filter((m) => m === "transfer")).toHaveLength(1);
+    expect(methods()).not.toContain("relay_tx");
+    expect(rpcCalls().find((c) => c.method === "transfer")!.params).toMatchObject({
+      do_not_relay: true,
+      get_tx_metadata: true,
+      priority: 0,
+    });
+  });
+
+  it("Confirm relays exactly the reviewed build, minutes later, and builds nothing", async () => {
+    const q = await xmrAdapter.quoteSend!({ to: TO, amount: "1.5" });
+    invokeMock.mockClear();
+    const r = await xmrAdapter.sendQuoted!({ ...q, quotedAt: q.quotedAt - 10 * 60_000 });
+    expect(r).toEqual({ hash: TX_HASH });
+    expect(rpcCalls()).toEqual([{ method: "relay_tx", params: { hex: METADATA } }]);
+  });
+
+  it("Confirm never builds a send that was not reviewed: a ticketless quote is refused", async () => {
+    const q = await xmrAdapter.quoteSend!({ to: TO, amount: "1.5" });
+    invokeMock.mockClear();
+    const err = await xmrAdapter.sendQuoted!({ ...q, ticket: null }).catch((e) => e);
+    expect(err.message).toMatch(/Nothing was sent; review it again/);
+    expect(isSendOutcomeUnknown(err)).toBe(false);
     expect(methods()).toEqual([]);
+  });
+
+  it("a review failure is classified: unlocked funds short blocks Confirm; a node timeout does not", async () => {
+    rpc.transfer = () => {
+      throw "RPC error -37: not enough unlocked money";
+    };
+    const short = await xmrAdapter.quoteSend!({ to: TO, amount: "99" }).catch((e) => e);
+    expect(short).toMatchObject({ kind: "insufficient-funds" });
+    expect(short.message).toMatch(/Nothing was sent/);
+    rpc.transfer = () => {
+      throw "RPC timed out after 30s";
+    };
+    await expect(xmrAdapter.quoteSend!({ to: TO, amount: "1" })).rejects.toMatchObject({
+      kind: "not-ready",
+    });
+    expect(methods()).not.toContain("relay_tx");
+  });
+
+  it("a review waits for sync and refuses an invalid recipient without building", async () => {
+    walletHeight = 1_000;
+    await expect(xmrAdapter.quoteSend!({ to: TO, amount: "1" })).rejects.toMatchObject({ kind: "not-ready" });
+    walletHeight = 3_000_000;
+    rpc.validate_address = () => ({ valid: false, integrated: false, subaddress: false, nettype: "mainnet" });
+    await expect(xmrAdapter.quoteSend!({ to: TO, amount: "1" })).rejects.toMatchObject({
+      kind: "invalid-address",
+    });
+    expect(methods()).not.toContain("transfer");
+  });
+
+  it("is reviewed, not previewed: its quote builds the spend", () => {
+    expect(xmrAdapter.quoteBuildsSpend).toBe(true);
   });
 });

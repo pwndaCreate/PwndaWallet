@@ -117,6 +117,12 @@
  *        Sui send runs to "sent". `degraded`: every Sui call 503s.
  *      - XMR/ZPH wallet RPC (xmr_rpc_call/zph_rpc_call: get_balance /
  *        get_address / get_transfers) when wallet_populated / degraded.
+ *        Since 2026-10-01 also the Send modal's Review → Confirm for both
+ *        (a dry-run `transfer` with a realistic fee, then `relay_tx`), and the
+ *        node fee rate behind the build-free estimate (`xmr_fee_estimate` /
+ *        `zph_fee_estimate`; `degraded` fails it on purpose). An XMR/ZPH send
+ *        still needs a session: set the chain up from its import panel first
+ *        (the bypass derives no XMR/ZPH seed).
  *      - Xelis sidecar LIFECYCLE (xelis_binary_status, _rpc_is_running,
  *        _ensure_wallet, _start_rpc, _stop_rpc, _probe_node,
  *        _download_wallet_rpc), 2026-09-15.
@@ -2101,6 +2107,11 @@ function dispatchUrl(
         zsd_price: 1,
         zrs_price: 0.4183,
         zys_price: 1.931,
+        // ZEPH per ZSD / per ZRS, from the prices above (2026-10-01). The live
+        // API has both; the conversion modal's fee estimate converts a ZEPH fee
+        // into a ZEPHUSD / ZEPHRSV / ZEPHYRS one with them.
+        zsd_rate: 2.9334,
+        zrs_rate: 1.2271,
         zsd_in_yield_reserve: 303_097.75,
         zsd_in_yield_reserve_percent: 0.78,
         zys_current_variable_apy: 8.2618,
@@ -2894,6 +2905,43 @@ const ZPH_SANDBOX_BALANCES: Record<string, { balance: number; unlocked_balance: 
  *  paid in the source asset: rctSigs.cpp:1861-1862 at v2.3.0). */
 const ZPH_SANDBOX_FEE = 25_400_000;
 
+// ---------------------------------------------------------------------------
+// Fee estimate without a build (operator request, 2026-10-01).
+//
+// `xmr_fee_estimate` / `zph_fee_estimate` answer as Rust's
+// `wallet_rpc_common::daemon_fee_estimate` does: the node's `get_fee_estimate`
+// rates, `{ fees, quantization_mask }`. The values are what public mainnet
+// nodes answered on 2026-10-06 (read-only). `degraded`: the node does not
+// answer, so the Send and conversion modals say the fee is shown at
+// confirmation instead of a number.
+//
+// The builds below charge what a one-input build costs at those rates
+// (median weights measured on chain the same day), so the exact fee a review
+// shows sits a little under the estimate (two inputs), as on mainnet.
+// ---------------------------------------------------------------------------
+const XMR_SANDBOX_FEE_RATES = [20_000, 80_000, 320_000, 4_000_000];
+const ZPH_SANDBOX_FEE_RATES = [210_000, 820_000, 3_300_000, 41_000_000];
+
+function feeEstimateMock(fees: number[]): unknown {
+  if (scenario() === "degraded") throw "timeout";
+  return { fees, quantization_mask: 10_000 };
+}
+
+/** A one-input Monero send: 1,536 × 20,000. */
+const XMR_SANDBOX_BUILD_FEE = 30_720_000;
+
+/**
+ * A one-input Zephyr build at the low rate: a send 1,542 × 210,000, a
+ * conversion 2,292 × 210,000 — converted into a non-ZEPH source asset at the
+ * mocked livestats rates, as wallet2 converts at the pricing record's.
+ */
+function zphSandboxBuildFee(src: string, dst: string): number {
+  if (src === dst) return 323_820_000;
+  const zeph = 481_320_000;
+  const zephPerUnit: Record<string, number> = { ZPH: 1, ZSD: 2.9334, ZRS: 1.2271, ZYS: 2.9334 * 1.931 };
+  return Math.round(zeph / (zephPerUnit[src] ?? 1));
+}
+
 /** Deterministic 64-hex id, so a quote and the relay of its metadata agree. */
 function zphMockHash(seed: string): string {
   let h = 0x811c9dc5;
@@ -2961,8 +3009,11 @@ function zphWalletRpcDispatch(method: string, params: any, funded: boolean): unk
         throw "RPC error -4: Mint/redeem TX amounts permit at most 4 decimal places";
       }
       const bal = funded ? ZPH_SANDBOX_BALANCES[src] : undefined;
-      if (amount + ZPH_SANDBOX_FEE > (bal?.balance ?? 0)) throw "RPC error -17: not enough money";
-      if (amount + ZPH_SANDBOX_FEE > (bal?.unlocked_balance ?? 0)) {
+      // A realistic fee since 2026-10-01 (was the flat 25,400,000), so the
+      // exact fee a review shows can be set beside the estimate.
+      const fee = zphSandboxBuildFee(src, dst);
+      if (amount + fee > (bal?.balance ?? 0)) throw "RPC error -17: not enough money";
+      if (amount + fee > (bal?.unlocked_balance ?? 0)) {
         throw "RPC error -37: not enough unlocked money";
       }
       const txHash = zphMockHash(`${address}|${amount}|${src}|${dst}|${Date.now()}`);
@@ -2970,8 +3021,8 @@ function zphWalletRpcDispatch(method: string, params: any, funded: boolean): unk
         tx_hash: txHash,
         tx_key: zphMockHash(`key|${txHash}`),
         amount,
-        fee: ZPH_SANDBOX_FEE,
-        weight: 1541,
+        fee,
+        weight: src === dst ? 1542 : 2292,
       };
       // A dry run (`do_not_relay`) returns the signed blob for relay_tx; the
       // sandbox encodes the hash in it so the relay reports the same id.
@@ -3062,7 +3113,34 @@ function xmrRpcDispatch(args: any, kind: "xmr" | "zph"): unknown {
     case "validate_address":
       return { valid: true, integrated: false, subaddress: false, nettype: "mainnet" };
     case "create_address":
-      return { address: "8sandboxsubaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", address_index: 1 };
+      return { address: "8sandboxsubaddressxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", address_index: 1 };
+    // Monero's Review → Confirm (2026-10-01): a dry-run `transfer` returns the
+    // signed blob and its exact fee; `relay_tx` reports the id encoded in it.
+    // Before this the XMR `transfer` answered `{}`, so a sandbox send stopped
+    // at "returned no transaction to broadcast". (Zephyr's are answered by
+    // `zphWalletRpcDispatch` above.)
+    case "transfer": {
+      const dest = args?.params?.destinations?.[0] ?? {};
+      const address = String(dest.address ?? "");
+      const amount = Number(dest.amount ?? 0);
+      if (!/^[48][1-9A-HJ-NP-Za-km-z]{94}$/.test(address)) {
+        throw `RPC error -2: WALLET_RPC_ERROR_CODE_WRONG_ADDRESS: ${address}`;
+      }
+      if (!(amount > 0)) throw "RPC error -46: destination amount is zero";
+      if (amount + XMR_SANDBOX_BUILD_FEE > (funded ? atomic : 0)) {
+        throw "RPC error -37: not enough unlocked money";
+      }
+      const txHash = zphMockHash(`xmr|${address}|${amount}|${Date.now()}`);
+      const built = { tx_hash: txHash, tx_key: zphMockHash(`key|${txHash}`), amount, fee: XMR_SANDBOX_BUILD_FEE, weight: 1536 };
+      return args?.params?.do_not_relay && args?.params?.get_tx_metadata
+        ? { ...built, tx_metadata: txHash + "0".repeat(256) }
+        : built;
+    }
+    case "relay_tx": {
+      const hex = String(args?.params?.hex ?? "");
+      if (hex.length < 64 || !/^[0-9a-f]+$/i.test(hex)) throw "RPC error -26: Failed to parse hex.";
+      return { tx_hash: hex.slice(0, 64) };
+    }
     default:
       return {};
   }
@@ -5250,6 +5328,10 @@ const MOCKS: Record<string, (args: any) => unknown> = {
   zph_stop_rpc: () => null,
   xmr_probe_node: () => ({ ok: true, height: 3_000_000, target_height: 3_000_000 }),
   zph_probe_node: () => ({ ok: true, height: 1_900_000, target_height: 1_900_000 }),
+  // The node's fee rate for the Send / conversion estimate (2026-10-01): see
+  // `feeEstimateMock` above.
+  xmr_fee_estimate: () => feeEstimateMock(XMR_SANDBOX_FEE_RATES),
+  zph_fee_estimate: () => feeEstimateMock(ZPH_SANDBOX_FEE_RATES),
   xmr_rpc_call: (args: any) => xmrRpcDispatch(args, "xmr"),
   zph_rpc_call: (args: any) => xmrRpcDispatch(args, "zph"),
 

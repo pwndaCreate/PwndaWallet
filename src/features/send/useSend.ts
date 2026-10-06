@@ -16,7 +16,7 @@ import {
   setSendDestinationTag,
   useSendAssetType,
 } from "./sendAssetStore";
-import { quoteMatchesSend } from "../../wallets/send-quote";
+import { routeQuotedSend } from "../../wallets/send-quote";
 import type {
   ChainAdapter,
   ChainType,
@@ -222,15 +222,21 @@ export function useSend(args: {
       // is exactly this send — same recipient, amount and asset — and recent
       // (`quoteMatchesSend`, 90 s). Otherwise the adapter builds the send fresh,
       // exactly as before quotes existed. Never relayed for other inputs.
-      const quote =
-        adapter.sendQuoted &&
-        quoteMatchesSend(
-          quoteArg,
-          { to: sendTo, amount: sendAmount, assetType: sendAssetType },
-          Date.now()
-        )
-          ? quoteArg
-          : null;
+      //
+      // Monero and Zephyr since 2026-10-01 (`quoteBuildsSpend`): the quote is
+      // the reviewed spend, relayed whatever its age, and a send without a
+      // matching review is refused here — never built and broadcast in one go
+      // (`routeQuotedSend`). The old fallback relayed a fresh build whose fee
+      // nobody had seen, and built the same spend a second time.
+      const route = routeQuotedSend(
+        adapter,
+        quoteArg,
+        { to: sendTo, amount: sendAmount, assetType: sendAssetType },
+        Date.now()
+      );
+      if (!sendOverride && !useAccountSend && route.kind === "refuse") {
+        throw new Error(route.message);
+      }
 
       // XRP's destination tag (2026-09-29), from the field the modal shows —
       // read once, here, and refused rather than dropped when malformed.
@@ -269,8 +275,8 @@ export function useSend(args: {
               wallet.address,
               { feeRate }
             )
-          : quote
-            ? await adapter.sendQuoted!(quote)
+          : route.kind === "relay"
+            ? await adapter.sendQuoted!(route.quote)
             : await adapter.sendTransaction(
                 keyMaterial,
                 sendTo,

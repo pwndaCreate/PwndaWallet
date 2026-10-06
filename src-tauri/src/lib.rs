@@ -343,6 +343,9 @@ pub fn run() {
             xmr_rpc::xmr_add_defender_exclusion,
             #[cfg(feature = "full")]
             xmr_rpc::xmr_probe_node,
+            // The node's fee rate for the Send estimate (2026-10-01).
+            #[cfg(feature = "full")]
+            xmr_rpc::xmr_fee_estimate,
             #[cfg(feature = "full")]
             zph_rpc::zph_start_rpc,
             #[cfg(feature = "full")]
@@ -359,6 +362,8 @@ pub fn run() {
             zph_rpc::zph_check_wallet_rpc,
             #[cfg(feature = "full")]
             zph_rpc::zph_probe_node,
+            #[cfg(feature = "full")]
+            zph_rpc::zph_fee_estimate,
             #[cfg(feature = "full")]
             zph_rpc::zph_download_wallet_rpc,
             #[cfg(feature = "full")]

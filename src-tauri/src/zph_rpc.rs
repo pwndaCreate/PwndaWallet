@@ -1320,6 +1320,18 @@ pub async fn zph_probe_node(url: String, timeout_ms: u64) -> Result<NodeProbeRes
     Ok(probe_node(url, timeout_ms).await)
 }
 
+/// The Zephyr node's fee rate (`get_fee_estimate`), for the Send and
+/// conversion modals' estimate (operator request 2026-10-01). See
+/// [`crate::wallet_rpc_common::daemon_fee_estimate`]; `url` is the daemon the
+/// wallet session uses.
+#[tauri::command]
+pub async fn zph_fee_estimate(
+    url: String,
+    timeout_ms: u64,
+) -> Result<crate::wallet_rpc_common::DaemonFeeEstimate, String> {
+    crate::wallet_rpc_common::daemon_fee_estimate(url, timeout_ms).await
+}
+
 // =========================================================================
 // Binary check (auto-download TBD — see plan)
 // =========================================================================
