@@ -1521,6 +1521,42 @@ mod tests {
         );
     }
 
+    /// The swap path's copy of the fee rule (`swap_bid::fee_bearing_purchase`,
+    /// which may not import this module) agrees with `decide` on every pair
+    /// (moved here 2026-10-06 to keep invariant 3).
+    #[test]
+    fn the_payout_rule_matches_the_schedule() {
+        // The copies themselves: every fee coin with an address, and the
+        // scriptless set, exactly as the schedule has them.
+        let mut fee_coins: Vec<&str> = crate::sidecar_fees::schedule::FEE_COINS.iter().map(|c| c.ticker).collect();
+        fee_coins.sort();
+        let mut copy: Vec<&str> = crate::swap_bid::PAYOUT_FEE_COINS.to_vec();
+        copy.sort();
+        assert_eq!(copy, fee_coins, "swap_bid::PAYOUT_FEE_COINS drifted from the fee schedule");
+        assert_eq!(crate::swap_bid::PAYOUT_SCRIPTLESS_TICKERS, crate::sidecar_fees::schedule::SCRIPTLESS_TICKERS);
+        use crate::sidecar_fees::engine::{decide, Decision, SettledBid, SWAP_COMPLETED};
+        for (sold, bought) in crate::swap_bid::tests::FEE_BEARING_PURCHASES.iter().chain(crate::swap_bid::tests::FREE_PURCHASES) {
+            let charged_in_bought = matches!(
+                decide(&SettledBid {
+                    bid_id: String::new(),
+                    state: SWAP_COMPLETED,
+                    ticker_from: bought.to_string(),
+                    ticker_to: sold.to_string(),
+                    amt_from: "1.0".into(),
+                    amt_to: "1.0".into(),
+                }),
+                Decision::Charge { ref ticker, .. } if ticker.as_str() == *bought
+            );
+            assert_eq!(crate::swap_bid::fee_bearing_purchase(sold, bought), charged_in_bought, "{sold} -> {bought}");
+        }
+        for (sold, bought) in crate::swap_bid::tests::FEE_BEARING_PURCHASES {
+            assert!(crate::swap_bid::fee_bearing_purchase(sold, bought), "{sold} -> {bought}");
+        }
+        for (sold, bought) in crate::swap_bid::tests::FREE_PURCHASES {
+            assert!(!crate::swap_bid::fee_bearing_purchase(sold, bought), "{sold} -> {bought}");
+        }
+    }
+
     #[test]
     fn parse_bid_reads_the_fields_the_engine_needs() {
         let v = serde_json::json!({

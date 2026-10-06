@@ -50,7 +50,6 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
-use crate::sidecar_fees::schedule as fee_schedule;
 use crate::swap_sidecar::{
     api_context, basic_auth_header, build_api_url, config_coin_active, datadir,
     decode_api_response, read_optin, shares_zano_host_wallet, shares_zph_host_wallet,
@@ -434,7 +433,7 @@ pub fn build_bid_body(req: &BidRequest) -> Value {
 //
 // ── ...and never on a purchase the licence fee is charged on ──────────────
 //
-// Operator decision, 2026-10-06: the taker-side licence fee (`sidecar_fees`,
+// Operator decision, 2026-10-06: the taker-side licence fee (the fee module,
 // `SHIPPED_MODE = Live`) must keep working in both directions, and it is
 // collected after SWAP_COMPLETED from the swap node's own wallet of the
 // scripted coin. Every bid this door places is the taker's. When it BUYS a
@@ -448,7 +447,7 @@ pub fn build_bid_body(req: &BidRequest) -> Value {
 // fee; a test runs `decide` itself over the same pairs. The sell direction
 // (scripted sold, scriptless bought) still pays the user's address: its fee
 // is taken from the scripted coin the node sold from, which the swap form's
-// MAX holds back (`reserve_for_sale`, via `sidecar_fees_reserve`), and the
+// MAX holds back (`reserve_for_sale`, via the fee-reserve command), and the
 // payout never touches that wallet. Scripted <-> scripted pairs carry no fee
 // and follow the rules above. The check runs before the form and connection
 // checks: for these swaps the fee is THE reason, whatever the address.
@@ -552,15 +551,25 @@ pub fn reported_connection(wallets: &Value, ticker: &str) -> Option<String> {
 /// schedule has a fee address for it (`fee_address_for`): the two predicates
 /// `engine::decide` charges by, in its order, so this cannot drift from what
 /// the watcher will collect.
+///
+/// The two facts are copied here, not imported: no swap-path module may
+/// reference the fee module (its invariant 3, `the_swap_path_does_not_depend_
+/// on_the_fee`). The fee module's own test `the_payout_rule_matches_the_schedule`
+/// runs `decide` over every pair against this function, so a schedule change
+/// that is not mirrored here fails there.
 pub fn fee_bearing_purchase(sold: &str, bought: &str) -> bool {
-    match fee_schedule::fee_leg(sold, bought) {
-        Some(leg) => {
-            leg.scripted == fee_schedule::norm(bought)
-                && fee_schedule::fee_address_for(&leg.scripted).is_some()
-        }
-        None => false,
-    }
+    let (s, b) = (sold.trim().to_ascii_uppercase(), bought.trim().to_ascii_uppercase());
+    PAYOUT_SCRIPTLESS_TICKERS.contains(&s.as_str())
+        && !PAYOUT_SCRIPTLESS_TICKERS.contains(&b.as_str())
+        && PAYOUT_FEE_COINS.contains(&b.as_str())
 }
+
+/// The scriptless coins the licence fee's eligibility is keyed on (a copy;
+/// see [`fee_bearing_purchase`]).
+pub const PAYOUT_SCRIPTLESS_TICKERS: &[&str] = &["XMR", "ZEPH", "ZANO"];
+/// The scripted coins the fee schedule charges, each with a fee address (a
+/// copy; see [`fee_bearing_purchase`]).
+pub const PAYOUT_FEE_COINS: &[&str] = &["LTC", "BCH", "BTC"];
 
 /// What one payout decision looks at. A rule that needs more of the swap adds
 /// its input here.
@@ -1125,7 +1134,7 @@ pub async fn swap_sidecar_bid_txns(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use serde_json::json;
 
@@ -1607,7 +1616,7 @@ mod tests {
 
     /// (sold, bought), by ticker: a taker's purchase the fee is charged on, in
     /// the coin bought. `payoutDestination.test.ts` runs the same pairs.
-    const FEE_BEARING_PURCHASES: &[(&str, &str)] = &[
+    pub(crate) const FEE_BEARING_PURCHASES: &[(&str, &str)] = &[
         ("XMR", "LTC"),
         ("XMR", "BTC"),
         ("XMR", "BCH"),
@@ -1617,7 +1626,7 @@ mod tests {
     ];
 
     /// (sold, bought): no fee in the coin bought.
-    const FREE_PURCHASES: &[(&str, &str)] = &[
+    pub(crate) const FREE_PURCHASES: &[(&str, &str)] = &[
         // The sell direction: the fee is on the coin sold.
         ("LTC", "XMR"),
         ("BTC", "ZEPH"),
@@ -1634,33 +1643,6 @@ mod tests {
         ("ZANO", "XMR"),
     ];
 
-    /// The payout rule and the watcher's charge are one predicate: for every
-    /// pair, "fee-bearing purchase" is exactly "`decide` charges a completed
-    /// swap of it in the coin bought".
-    #[test]
-    fn the_fee_rule_is_the_schedules_own_predicate() {
-        use crate::sidecar_fees::engine::{decide, Decision, SettledBid, SWAP_COMPLETED};
-        for (sold, bought) in FEE_BEARING_PURCHASES.iter().chain(FREE_PURCHASES) {
-            let charged_in_bought = matches!(
-                decide(&SettledBid {
-                    bid_id: String::new(),
-                    state: SWAP_COMPLETED,
-                    ticker_from: bought.to_string(),
-                    ticker_to: sold.to_string(),
-                    amt_from: "1.0".into(),
-                    amt_to: "1.0".into(),
-                }),
-                Decision::Charge { ref ticker, .. } if ticker.as_str() == *bought
-            );
-            assert_eq!(fee_bearing_purchase(sold, bought), charged_in_bought, "{sold} -> {bought}");
-        }
-        for (sold, bought) in FEE_BEARING_PURCHASES {
-            assert!(fee_bearing_purchase(sold, bought), "{sold} -> {bought}");
-        }
-        for (sold, bought) in FREE_PURCHASES {
-            assert!(!fee_bearing_purchase(sold, bought), "{sold} -> {bought}");
-        }
-    }
 
     /// XMR -> LTC as taker: the LTC stays in the node's wallet, whatever the
     /// address form or the connection.
