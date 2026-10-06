@@ -50,6 +50,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::sidecar_fees::schedule as fee_schedule;
 use crate::swap_sidecar::{
     api_context, basic_auth_header, build_api_url, config_coin_active, datadir,
     decode_api_response, read_optin, shares_zano_host_wallet, shares_zph_host_wallet,
@@ -430,6 +431,27 @@ pub fn build_bid_body(req: &BidRequest) -> Value {
 // not `basicswap.json`, which a settings edit rewrites before a restart
 // applies it, `:16324-16329`). Not read, or not listed, counts as not
 // electrum.
+//
+// ── ...and never on a purchase the licence fee is charged on ──────────────
+//
+// Operator decision, 2026-10-06: the taker-side licence fee (`sidecar_fees`,
+// `SHIPPED_MODE = Live`) must keep working in both directions, and it is
+// collected after SWAP_COMPLETED from the swap node's own wallet of the
+// scripted coin. Every bid this door places is the taker's. When it BUYS a
+// scripted coin the schedule charges with a scriptless one (XMR, ZEPH or ZANO
+// for LTC, BCH or BTC), the coin bought is what the fee is paid from
+// (`engine::reserve_for_sale`: the receive direction "needs no reserve: the
+// inflow is ~200x the fee"), so it lands in the node's wallet: no
+// `destination_address`. `fee_bearing_purchase` decides it with the schedule's
+// own predicates, the ones `engine::decide` charges by (`fee_leg`, then
+// `fee_address_for`), so the two cannot disagree about which swaps carry a
+// fee; a test runs `decide` itself over the same pairs. The sell direction
+// (scripted sold, scriptless bought) still pays the user's address: its fee
+// is taken from the scripted coin the node sold from, which the swap form's
+// MAX holds back (`reserve_for_sale`, via `sidecar_fees_reserve`), and the
+// payout never touches that wallet. Scripted <-> scripted pairs carry no fee
+// and follow the rules above. The check runs before the form and connection
+// checks: for these swaps the fee is THE reason, whatever the address.
 
 /// `SwapTypes.XMR_SWAP` (deployed `basicswap_util.py:91`).
 const SWAP_TYPE_XMR: u64 = 5;
@@ -452,7 +474,18 @@ pub const PAYOUT_ADDRESS_SHAPES: &[(&str, &str)] = &[
 /// the engine names it in `/json/offers` (`ci.coin_name()`: "Litecoin",
 /// "Bitcoin Cash", …). `None` for a coin the table above has no rule for.
 pub fn receive_ticker(offer: &Value) -> Option<&'static str> {
-    let name = field_str(offer, "coin_from")?;
+    ticker_for_coin_name(field_str(offer, "coin_from")?)
+}
+
+/// The ticker of the coin a bid on `offer` SELLS: the offer's `coin_to`, what
+/// the offerer receives and so what the taker pays (2026-10-06).
+pub fn send_ticker(offer: &Value) -> Option<&'static str> {
+    ticker_for_coin_name(field_str(offer, "coin_to")?)
+}
+
+/// A coin as the engine names it, or by ticker, to the ticker the payout
+/// tables use. `None` for a coin they have no rule for.
+fn ticker_for_coin_name(name: &str) -> Option<&'static str> {
     let key: String = name
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
@@ -513,14 +546,31 @@ pub fn reported_connection(wallets: &Value, ticker: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// What one payout decision looks at. A rule that needs more of the swap (the
-/// fee rule, if it comes: a taker buying a scripted coin with a scriptless one
-/// while the licence fee is live) adds its input here.
+/// Is a taker's purchase of `bought`, paid for with `sold`, charged the
+/// licence fee in the coin bought (2026-10-06, the trace above)? Exactly one
+/// scriptless leg and the coin bought is the other one (`fee_leg`), and the
+/// schedule has a fee address for it (`fee_address_for`): the two predicates
+/// `engine::decide` charges by, in its order, so this cannot drift from what
+/// the watcher will collect.
+pub fn fee_bearing_purchase(sold: &str, bought: &str) -> bool {
+    match fee_schedule::fee_leg(sold, bought) {
+        Some(leg) => {
+            leg.scripted == fee_schedule::norm(bought)
+                && fee_schedule::fee_address_for(&leg.scripted).is_some()
+        }
+        None => false,
+    }
+}
+
+/// What one payout decision looks at. A rule that needs more of the swap adds
+/// its input here.
 pub struct PayoutCase<'a> {
     /// The ENGINE's copy of the offer.
     pub offer: &'a Value,
     /// The coin bought, when the wallet has a rule for it.
     pub ticker: Option<&'static str>,
+    /// The coin this node pays with (the offer's `coin_to`), when known.
+    pub sold: Option<&'static str>,
     /// The address as it would be sent, trimmed.
     pub address: &'a str,
     /// How the node reports it reaches the coin bought's chain, when read.
@@ -534,7 +584,8 @@ type PayoutCheck = fn(&PayoutCase<'_>) -> Option<String>;
 /// refusal decides. `payoutDestination.ts::PAYOUT_CHECKS` is the same list in
 /// the same order (`check_<name>` here, `name` there), pinned by its test: a
 /// new rule is one entry in each.
-const PAYOUT_CHECKS: &[PayoutCheck] = &[check_protocol, check_coin, check_form, check_connection];
+const PAYOUT_CHECKS: &[PayoutCheck] =
+    &[check_protocol, check_coin, check_fee, check_form, check_connection];
 
 fn check_protocol(c: &PayoutCase<'_>) -> Option<String> {
     if c.offer.get("swap_type").and_then(|v| v.as_u64()) == Some(SWAP_TYPE_XMR) {
@@ -555,6 +606,21 @@ fn check_coin(c: &PayoutCase<'_>) -> Option<String> {
         "the wallet has no payout rule for {}, so it should not have sent an address. \
          Nothing was sent.",
         field_str(c.offer, "coin_from").unwrap_or("this coin")
+    ))
+}
+
+fn check_fee(c: &PayoutCase<'_>) -> Option<String> {
+    let Some(bought) = c.ticker else {
+        return check_coin(c);
+    };
+    if !fee_bearing_purchase(c.sold.unwrap_or(""), bought) {
+        return None;
+    }
+    Some(format!(
+        "the licence fee on this swap is taken from the swap node's {} wallet once it \
+         completes, so the {} bought stays in that wallet and the wallet should not have \
+         sent an address. Nothing was sent.",
+        bought, bought
     ))
 }
 
@@ -627,6 +693,7 @@ pub fn payout_destination(
     let case = PayoutCase {
         offer,
         ticker: receive_ticker(offer),
+        sold: send_ticker(offer),
         address: addr.trim(),
         connection,
     };
@@ -1311,8 +1378,18 @@ mod tests {
     // wallet's own encoders for XMR/ZEPH/ZANO, and BIP173/BIP86's published
     // examples. `payoutDestination.test.ts` runs the same list.
 
+    /// An offer selling `coin`, paid for with a scripted coin: no scriptless
+    /// leg, so no licence fee (2026-10-06), and the form or the connection is
+    /// the only thing a test of it tests.
     fn offer_buying(coin: &str) -> Value {
-        json!({ "offer_id": "ab".repeat(28), "swap_type": 5, "coin_from": coin, "coin_to": "Monero" })
+        let peer = if coin == "Litecoin" { "Bitcoin" } else { "Litecoin" };
+        offer_trading(peer, coin)
+    }
+
+    /// An offer this node would take paying `sold` for `bought`, both as the
+    /// engine names coins.
+    fn offer_trading(sold: &str, bought: &str) -> Value {
+        json!({ "offer_id": "ab".repeat(28), "swap_type": 5, "coin_from": bought, "coin_to": sold })
     }
 
     /// The form tests run on the connection that lets every coin through, so
@@ -1524,6 +1601,127 @@ mod tests {
         assert_eq!(reported_connection(&wallets, "DOGE"), None);
         assert_eq!(reported_connection(&wallets, "BCH"), None);
         assert_eq!(reported_connection(&json!({ "error": "Wallet is locked" }), "LTC"), None);
+    }
+
+    // -- ...and never on a purchase the licence fee is charged on ---------
+
+    /// (sold, bought), by ticker: a taker's purchase the fee is charged on, in
+    /// the coin bought. `payoutDestination.test.ts` runs the same pairs.
+    const FEE_BEARING_PURCHASES: &[(&str, &str)] = &[
+        ("XMR", "LTC"),
+        ("XMR", "BTC"),
+        ("XMR", "BCH"),
+        ("ZEPH", "LTC"),
+        ("ZANO", "BTC"),
+        ("ZEPH", "BCH"),
+    ];
+
+    /// (sold, bought): no fee in the coin bought.
+    const FREE_PURCHASES: &[(&str, &str)] = &[
+        // The sell direction: the fee is on the coin sold.
+        ("LTC", "XMR"),
+        ("BTC", "ZEPH"),
+        ("BCH", "ZANO"),
+        // Scripted <-> scripted: free.
+        ("LTC", "BTC"),
+        ("BTC", "LTC"),
+        ("BCH", "LTC"),
+        // A coin with no schedule row.
+        ("XMR", "DOGE"),
+        ("XMR", "DASH"),
+        // Two scriptless legs: free.
+        ("XMR", "ZEPH"),
+        ("ZANO", "XMR"),
+    ];
+
+    /// The payout rule and the watcher's charge are one predicate: for every
+    /// pair, "fee-bearing purchase" is exactly "`decide` charges a completed
+    /// swap of it in the coin bought".
+    #[test]
+    fn the_fee_rule_is_the_schedules_own_predicate() {
+        use crate::sidecar_fees::engine::{decide, Decision, SettledBid, SWAP_COMPLETED};
+        for (sold, bought) in FEE_BEARING_PURCHASES.iter().chain(FREE_PURCHASES) {
+            let charged_in_bought = matches!(
+                decide(&SettledBid {
+                    bid_id: String::new(),
+                    state: SWAP_COMPLETED,
+                    ticker_from: bought.to_string(),
+                    ticker_to: sold.to_string(),
+                    amt_from: "1.0".into(),
+                    amt_to: "1.0".into(),
+                }),
+                Decision::Charge { ref ticker, .. } if ticker.as_str() == *bought
+            );
+            assert_eq!(fee_bearing_purchase(sold, bought), charged_in_bought, "{sold} -> {bought}");
+        }
+        for (sold, bought) in FEE_BEARING_PURCHASES {
+            assert!(fee_bearing_purchase(sold, bought), "{sold} -> {bought}");
+        }
+        for (sold, bought) in FREE_PURCHASES {
+            assert!(!fee_bearing_purchase(sold, bought), "{sold} -> {bought}");
+        }
+    }
+
+    /// XMR -> LTC as taker: the LTC stays in the node's wallet, whatever the
+    /// address form or the connection.
+    #[test]
+    fn a_taker_buying_a_fee_coin_with_a_scriptless_one_leaves_it_with_the_node() {
+        let ltc = "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh";
+        for sold in ["Monero", "Zephyr", "Zano"] {
+            for connection in [Some("electrum"), Some("rpc"), None] {
+                let err = payout_destination(&offer_trading(sold, "Litecoin"), ltc, connection)
+                    .expect_err(&format!("{sold} -> LTC must leave the LTC with the node"));
+                assert!(err.contains("licence fee"), "{err}");
+                assert!(err.contains("Nothing was sent"), "{err}");
+            }
+        }
+        let err = payout_destination(&offer_trading("Monero", "Bitcoin"), "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu", ELECTRUM)
+            .expect_err("XMR -> BTC is fee-bearing");
+        assert!(err.contains("licence fee"), "{err}");
+    }
+
+    /// LTC -> XMR as taker: the fee is taken from the LTC the node sold from,
+    /// so the XMR bought is paid to the user's address.
+    #[test]
+    fn the_sell_direction_pays_the_users_address() {
+        let xmr = PAYS_AS_WRITTEN.iter().find(|(c, _)| *c == "Monero").unwrap().1;
+        for connection in [Some("rpc"), None] {
+            assert_eq!(
+                payout_destination(&offer_trading("Litecoin", "Monero"), xmr, connection).as_deref(),
+                Ok(xmr)
+            );
+        }
+    }
+
+    /// LTC <-> BTC carries no fee: the user's address, on electrum.
+    #[test]
+    fn scripted_pairs_pay_the_users_address() {
+        let btc = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu";
+        let ltc = "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh";
+        assert_eq!(payout_destination(&offer_trading("Litecoin", "Bitcoin"), btc, ELECTRUM).as_deref(), Ok(btc));
+        assert_eq!(payout_destination(&offer_trading("Bitcoin", "Litecoin"), ltc, ELECTRUM).as_deref(), Ok(ltc));
+    }
+
+    /// DOGE has no fee row: buying it with XMR is not touched by the fee rule
+    /// (the connection rule still holds it, so the refusal is that one).
+    #[test]
+    fn a_coin_with_no_fee_row_is_not_affected() {
+        let doge = PAYS_AS_WRITTEN.iter().find(|(c, _)| *c == "Dogecoin").unwrap().1;
+        assert!(!fee_bearing_purchase("XMR", "DOGE"));
+        assert_eq!(
+            payout_destination(&offer_trading("Monero", "Dogecoin"), doge, ELECTRUM).as_deref(),
+            Ok(doge),
+            "with the connection that lets it through, only the fee rule could refuse it"
+        );
+        let err = payout_destination(&offer_trading("Monero", "Dogecoin"), doge, Some("rpc")).unwrap_err();
+        assert!(!err.contains("licence fee"), "{err}");
+    }
+
+    #[test]
+    fn the_coin_sold_is_the_offers_coin_to() {
+        assert_eq!(send_ticker(&offer_trading("Monero", "Litecoin")), Some("XMR"));
+        assert_eq!(send_ticker(&offer_trading("Zephyr", "Bitcoin")), Some("ZEPH"));
+        assert_eq!(send_ticker(&offer_trading("Particl", "Bitcoin")), None);
     }
 
     #[test]

@@ -17,7 +17,10 @@
  *  - and (2026-10-06) that it is sent only where the swap node can follow a
  *    payout to an outside address: on an electrum connection for BTC, LTC and
  *    BCH, never for DOGE and DASH, whatever the connection for XMR, ZEPH and
- *    ZANO, as the node itself reports it.
+ *    ZANO, as the node itself reports it;
+ *  - and (operator decision, later 2026-10-06) never on a taker's purchase the
+ *    licence fee is charged on (LTC, BCH or BTC bought with XMR, ZEPH or
+ *    ZANO): that coin stays with the node so the fee can be taken from it.
  *
  * Vectors: the world-public test seed ("abandon … about") for the bitcoin
  * family, invented CryptoNote keys (G and 2G) through the wallet's own
@@ -60,6 +63,7 @@ vi.mock("../../api/basicswap", async (importOriginal) => {
 import * as api from "../../api/basicswap";
 import type { BasicSwapOffer } from "../../api/basicswap";
 import {
+  FEE_KEPT_TAIL,
   nodeWalletPayoutNote,
   PAYOUT_ADDRESS_SHAPES,
   PAYOUT_CHECKS,
@@ -75,11 +79,14 @@ import {
   type SidecarQuote,
 } from "./useSidecarSwap";
 import { SidecarConfirmModal } from "./SidecarConfirmModal";
+import { FEE_SCHEDULE_TICKERS, feeBearingPurchase, SCRIPTLESS_FEE_TICKERS } from "./licenceFee";
+import { tickerForCoin } from "./types";
 import type { NormalizedQuote } from "../swap/useSwapQuote";
 
 const read = (rel: string) =>
   readFileSync(resolve(__dirname, rel), "utf8").replace(/\r\n/g, "\n");
 const RUST = read("../../../src-tauri/src/swap_bid.rs");
+const RUST_SCHEDULE = read("../../../src-tauri/src/sidecar_fees/schedule.rs");
 
 /** A `const NAME: &[(&str, &str)] = &[ … ];` table from swap_bid.rs. */
 function rustPairs(name: string): [string, string][] {
@@ -92,16 +99,22 @@ function rustPairs(name: string): [string, string][] {
 const OFFER = "00000000" + "0f".repeat(24);
 const BID = "00000000" + "b1".repeat(24);
 
+/** A scripted coin to pay for `coin` with: no scriptless leg, so no licence
+ *  fee (2026-10-06). */
+const scriptedPeer = (coin: string) => (tickerForCoin(coin) === "LTC" ? "Bitcoin" : "Litecoin");
+
 /**
- * An offer buying `receiveCoin`, on a node that reaches that coin's chain over
- * `receiveConnection`. The form tests run on electrum, which lets every coin
- * through (2026-10-06), so the address form is the only thing they test.
+ * An offer buying `receiveCoin` with `sendCoin`, on a node that reaches the
+ * bought coin's chain over `receiveConnection`. The form tests run on
+ * electrum and pay with a scripted coin, which let every coin through
+ * (2026-10-06), so the address form is the only thing they test.
  */
 const buying = (
   receiveCoin: string,
   swapType: number | null | undefined,
   receiveConnection: string | null = "electrum",
-): PayoutOffer => ({ receiveCoin, swapType, receiveConnection });
+  sendCoin: string = scriptedPeer(receiveCoin),
+): PayoutOffer => ({ receiveCoin, sendCoin, swapType, receiveConnection });
 
 describe("which address forms the engine pays as written", () => {
   it("the TS table is the Rust table, coin for coin and pattern for pattern", () => {
@@ -191,10 +204,11 @@ function sidecarQuote(
   receiveCoin = "Litecoin",
   swapType = 5,
   receiveConnection: string | null = "electrum",
+  sendCoin: string = scriptedPeer(receiveCoin),
 ): SidecarQuote {
   const offer = {
     offerId: OFFER,
-    sendCoin: "Monero",
+    sendCoin,
     receiveCoin,
     maxReceive: 1,
     maxSend: 0.1,
@@ -211,10 +225,13 @@ function sidecarQuote(
     makerAddress: "pInventedMakerAddrXXXXXXXXXXXXXXXXX",
     createdAt: NOW - 60,
     expireAt: NOW + 3600,
-    raw: { swap_type: swapType, coin_from: receiveCoin, coin_to: "Monero" } as unknown as BasicSwapOffer,
+    raw: { swap_type: swapType, coin_from: receiveCoin, coin_to: sendCoin } as unknown as BasicSwapOffer,
   };
   return {
-    legs: { sendTicker: "XMR", receiveTicker: "LTC" },
+    legs: {
+      sendTicker: tickerForCoin(sendCoin) ?? sendCoin,
+      receiveTicker: tickerForCoin(receiveCoin) ?? receiveCoin,
+    },
     offer,
     rankedOffers: [offer],
     validation: { ok: true } as unknown as SidecarQuote["validation"],
@@ -271,8 +288,8 @@ const renderModal = (payoutAddress: string, quote: SidecarQuote = sidecarQuote()
     createElement(SidecarConfirmModal, {
       open: true,
       quote: { basicswapQuote: quote } as unknown as NormalizedQuote,
-      fromAsset: "XMR",
-      toAsset: "LTC",
+      fromAsset: quote.legs.sendTicker,
+      toAsset: quote.legs.receiveTicker,
       payoutAddress,
       onSubmitted: () => {},
       onClose: () => {},
@@ -348,12 +365,12 @@ describe("only where the node can follow a payout to an outside address (2026-10
   });
 
   it("the checks run in Rust's order, so a new rule is one entry on each side", () => {
-    const at = RUST.indexOf("const PAYOUT_CHECKS: &[PayoutCheck] = &[");
+    const at = RUST.indexOf("const PAYOUT_CHECKS: &[PayoutCheck] =");
     expect(at, "PAYOUT_CHECKS not found in swap_bid.rs").toBeGreaterThan(-1);
     const list = RUST.slice(at, RUST.indexOf("];", at));
     const rust = [...list.matchAll(/check_(\w+)/g)].map((m) => m[1]);
     expect(rust).toEqual(PAYOUT_CHECKS.map((c) => c.name));
-    expect(rust).toEqual(["protocol", "coin", "form", "connection"]);
+    expect(rust).toEqual(["protocol", "coin", "fee", "form", "connection"]);
   });
 
   it("an electrum coin still sends the address", () => {
@@ -477,6 +494,127 @@ describe("only where the node can follow a payout to an outside address (2026-10
     expect(renderModal(LTC, sidecarQuote("Litecoin", 5, "electrum"))).not.toContain(
       "data-payout-node-wallet",
     );
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// A purchase the licence fee is charged on stays with the node (2026-10-06)
+// ═══════════════════════════════════════════════════════════════════════
+
+/**
+ * Operator decision: the taker-side licence fee is collected after the swap
+ * completes from the swap node's own wallet of the scripted coin, in both
+ * directions. Buying LTC, BCH or BTC with XMR, ZEPH or ZANO therefore leaves
+ * the coin bought in that wallet; selling one for XMR, ZEPH or ZANO pays the
+ * user's address (that fee comes from the coin the node sold from); scripted
+ * to scripted carries no fee. Rust (`swap_bid.rs`) runs the same pairs, and
+ * checks them against the fee watcher's own `decide`.
+ */
+describe("a purchase the licence fee is charged on stays with the node (2026-10-06)", () => {
+  const LTC = "ltc1qjmxnz78nmc8nq77wuxh25n2es7rzm5c2rkk4wh";
+  const BTC = "bc1qcr8te4kr609gcawutmrza0j4xv80jy8z306fyu";
+  const sent = (coin: string) => rustPairs("PAYS_AS_WRITTEN").find(([c]) => c === coin)![1];
+
+  it("the schedule's rows and scriptless coins are Rust's", () => {
+    const at = RUST_SCHEDULE.indexOf("pub const FEE_COINS: &[CoinFee] = &[");
+    expect(at, "FEE_COINS not found in schedule.rs").toBeGreaterThan(-1);
+    const rows = RUST_SCHEDULE.slice(at, RUST_SCHEDULE.indexOf("\n];", at));
+    expect([...rows.matchAll(/ticker: "([A-Z]+)"/g)].map((m) => m[1]).sort()).toEqual(
+      [...FEE_SCHEDULE_TICKERS].sort(),
+    );
+    const scriptless = RUST_SCHEDULE.match(/pub const SCRIPTLESS_TICKERS: &\[&str\] = &\[([^\]]*)\]/);
+    expect(scriptless, "SCRIPTLESS_TICKERS not found in schedule.rs").not.toBeNull();
+    expect([...scriptless![1].matchAll(/"([A-Z]+)"/g)].map((m) => m[1])).toEqual([
+      ...SCRIPTLESS_FEE_TICKERS,
+    ]);
+  });
+
+  it("decides every pair as Rust's tests, and so its fee watcher, do", () => {
+    const bearing = rustPairs("FEE_BEARING_PURCHASES");
+    const free = rustPairs("FREE_PURCHASES");
+    expect(bearing.length).toBeGreaterThanOrEqual(6);
+    expect(free.length).toBeGreaterThanOrEqual(10);
+    for (const [sold, bought] of bearing) {
+      expect(feeBearingPurchase(sold, bought), `${sold} -> ${bought}`).toBe(true);
+    }
+    for (const [sold, bought] of free) {
+      expect(feeBearingPurchase(sold, bought), `${sold} -> ${bought}`).toBe(false);
+    }
+    // The node's coin names decide as their tickers do.
+    expect(feeBearingPurchase("Monero", "Litecoin")).toBe(true);
+    expect(feeBearingPurchase("Litecoin", "Monero")).toBe(false);
+  });
+
+  it("XMR -> LTC as taker: the node's wallet, so the fee can be taken from it", () => {
+    for (const connection of ["electrum", "rpc", null]) {
+      expect(planPayout(buying("Litecoin", 5, connection, "Monero"), LTC), String(connection)).toEqual({
+        to: "node-wallet",
+        ticker: "LTC",
+        reason: "fee",
+        address: LTC,
+      });
+    }
+    const note = nodeWalletPayoutNote(planPayout(buying("Litecoin", 5, "electrum", "Monero"), LTC));
+    expect(note).toBe(`It lands in your swap node's LTC wallet ${FEE_KEPT_TAIL}`);
+    expect(note).toContain("so the swap fee can be taken from it");
+    expect(note).toContain("Sweep back (in Settings) moves it to your wallet");
+    // The fee is the reason whatever the address form.
+    expect(
+      planPayout(buying("Litecoin", 5, "electrum", "Monero"), "LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez"),
+    ).toMatchObject({ to: "node-wallet", reason: "fee" });
+    // ZEPH and ZANO are scriptless legs too.
+    expect(planPayout(buying("Bitcoin", 5, "electrum", "Zano"), BTC)).toMatchObject({ reason: "fee" });
+    expect(planPayout(buying("Litecoin", 5, "electrum", "Zephyr"), LTC)).toMatchObject({ reason: "fee" });
+  });
+
+  it("LTC -> XMR as taker pays the user's XMR address", () => {
+    const xmr = sent("Monero");
+    for (const connection of ["rpc", null]) {
+      expect(planPayout(buying("Monero", 5, connection, "Litecoin"), xmr)).toEqual({
+        to: "address",
+        ticker: "XMR",
+        address: xmr,
+      });
+    }
+  });
+
+  it("LTC <-> BTC pays the user's address", () => {
+    expect(planPayout(buying("Bitcoin", 5, "electrum", "Litecoin"), BTC)).toEqual({
+      to: "address",
+      ticker: "BTC",
+      address: BTC,
+    });
+    expect(planPayout(buying("Litecoin", 5, "electrum", "Bitcoin"), LTC)).toEqual({
+      to: "address",
+      ticker: "LTC",
+      address: LTC,
+    });
+  });
+
+  it("a coin with no fee row is not affected", () => {
+    const doge = sent("Dogecoin");
+    expect(feeBearingPurchase("XMR", "DOGE")).toBe(false);
+    // Only the connection could hold it: with one that lets it through, it is sent.
+    expect(planPayout(buying("Dogecoin", 5, "electrum", "Monero"), doge)).toMatchObject({ to: "address" });
+    expect(planPayout(buying("Dogecoin", 5, "rpc", "Monero"), doge)).toMatchObject({ reason: "connection" });
+  });
+
+  it("a bid XMR -> LTC carries no address", async () => {
+    vi.mocked(api.swapSidecarPlaceBid).mockReset().mockResolvedValue(BID);
+    const r = await submitSidecarBid({
+      quote: sidecarQuote("Litecoin", 5, "electrum", "Monero"),
+      addrTo: LTC,
+    });
+    expect(r).toMatchObject({ ok: true, payout: { to: "node-wallet", reason: "fee" } });
+    expect(vi.mocked(api.swapSidecarPlaceBid).mock.calls[0][0].addrTo).toBeUndefined();
+  });
+
+  it("the confirm screen says so before the click", () => {
+    const html = renderModal(LTC, sidecarQuote("Litecoin", 5, "electrum", "Monero"));
+    expect(html).toContain("data-payout-node-wallet");
+    expect(html).toContain("so the swap fee can be taken from it");
+    expect(html).toContain("Sweep back (in Settings)");
+    expect(html).not.toContain(LTC);
   });
 });
 

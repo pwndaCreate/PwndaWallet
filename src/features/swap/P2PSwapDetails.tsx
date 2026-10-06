@@ -41,6 +41,8 @@ import {
   type P2PTxRole,
 } from "./p2p-history";
 import {
+  FEE_KEPT_TAIL,
+  feeBearingPurchase,
   requestSidecarTracker,
   type BidSeverity,
   type SidecarTrackerOutcome,
@@ -153,6 +155,10 @@ export function P2PSwapDetails({
   const txs = p2pLegTransactions(row);
   const unfinished = row.status === "pending";
   const maker = row.bidRole === "maker";
+  // A taker's purchase the licence fee is charged on (2026-10-06): its coin
+  // stays with the node so the fee can be taken from it, as the confirm
+  // screen said. Read from the pair, which is what the bid decided it from.
+  const feeKept = !maker && feeBearingPurchase(row.fromAsset, row.toAsset);
 
   // The swap's transactions, once per opening (2026-10-01). Written into the
   // row by the sink; `SwapDetailsModal` re-reads the row on that write.
@@ -237,8 +243,9 @@ export function P2PSwapDetails({
       {row.payoutTo === "node-wallet" && (
         <div data-p2p-payout="node-wallet" style={{ ...NOTE, marginTop: 10 }}>
           <span style={SMALL_CAPS}>payout · </span>
-          your swap node's {row.toAsset} wallet, not this wallet's {row.toAsset} address. The
-          confirm screen said so, and why, before the bid.
+          {feeKept
+            ? `your swap node's ${row.toAsset} wallet, ${FEE_KEPT_TAIL}`
+            : `your swap node's ${row.toAsset} wallet, not this wallet's ${row.toAsset} address. The confirm screen said so, and why, before the bid.`}
         </div>
       )}
 

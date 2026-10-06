@@ -1213,6 +1213,7 @@ export function payoutPlanForQuote(
   return planPayout(
     {
       receiveCoin: quote.offer.receiveCoin,
+      sendCoin: quote.offer.sendCoin,
       swapType: quote.offer.raw?.swap_type,
       receiveConnection: quote.receiveConnection,
     },

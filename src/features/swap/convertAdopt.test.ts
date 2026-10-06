@@ -39,7 +39,9 @@ import { toTakerOffers, type SidecarSwapHandle } from "../swap-sidecar";
 import {
   CONVERT_ROUTE_HOP,
   CONVERT_SOURCE,
+  afterHop1,
   hop1ConversionRecord,
+  hop1PaidTo,
   isConvertHop1Leg,
   shouldAdoptAsHop1,
   type ConvertPipelineState,
@@ -281,6 +283,7 @@ function pipeline(stage: ConvertStage): ConvertPipelineState {
     hop1Unwound: false,
     beginHop1: noop,
     beginHop2: noop,
+    finishAtRouteHop: noop,
     reset: noop,
   };
 }
@@ -342,6 +345,12 @@ describe("the CONVERSIONS panel lists the log", () => {
  * "Hop 1 settled: … is in your wallet" was true in neither case before (the
  * node paid its own wallet whatever the screen said), and is false in the
  * second now, so the line says which.
+ *
+ * Later on 2026-10-06 (operator decision): hop 1 buys LTC with XMR, a
+ * purchase the licence fee is charged on, so its LTC stays in the swap
+ * node's wallet for the fee, whatever the address. EARN says so in the
+ * confirm screen's words and ends the conversion at LTC ("► DONE") instead
+ * of seeding hop 2 from this wallet's address, which does not hold it.
  */
 describe("hop 2's line says where hop 1 paid", () => {
   afterEach(() => {
@@ -362,20 +371,48 @@ describe("hop 2's line says where hop 1 paid", () => {
     ).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ");
   };
 
-  it("the swap node's wallet, when the bid left the payout to it", () => {
+  it("the swap node's wallet, so the fee can be taken from it, and the run ends there", () => {
     const text = render("node-wallet");
     expect(text).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your swap node`);
-    expect(text).toContain(`not at this wallet`);
+    expect(text).toContain("so the swap fee can be taken from it");
+    expect(text).toContain("Sweep back (in Settings) moves it to your wallet");
+    expect(text).toContain("► DONE");
+    expect(text).not.toContain("CONVERT THE SECOND HOP");
   });
 
   it("this wallet, when the bid paid its address", () => {
     expect(render("address")).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your wallet.`);
+    expect(render("address")).toContain("CONVERT THE SECOND HOP");
     expect(render(null)).toContain(`0.09990000 ${CONVERT_ROUTE_HOP} is in your wallet.`);
   });
 
   it("the pipeline keeps where hop 1 paid with its amount", () => {
     const hook = read("useConvertPipeline.ts");
     const settled = hook.slice(hook.indexOf('case "settled":'), hook.indexOf('case "follow":'));
-    expect(settled).toContain("setHop2PaidTo(hop1?.payoutTo ?? null);");
+    expect(settled).toContain("setHop2PaidTo(hop1PaidTo(hop1?.payoutTo));");
+  });
+
+  it("hop 1 is a purchase the fee is charged on, so its LTC is the node's", () => {
+    // A hop 1 this session placed says where its bid asked to be paid.
+    expect(hop1PaidTo("node-wallet")).toBe("node-wallet");
+    expect(hop1PaidTo("address")).toBe("address");
+    // One picked up after a restart: the payout rule for XMR -> LTC.
+    expect(hop1PaidTo(undefined)).toBe("node-wallet");
+    expect(hop1PaidTo(null)).toBe("node-wallet");
+    expect(afterHop1("node-wallet")).toBe("finish");
+    expect(afterHop1("address")).toBe("hop2");
+  });
+
+  it("nothing loops: no hop 2 from LTC the node kept, and DONE ends the run", () => {
+    const hook = read("useConvertPipeline.ts");
+    const begin = hook.slice(hook.indexOf("const beginHop2 = useCallback"), hook.indexOf("const reset = useCallback"));
+    expect(begin).toMatch(/if \(!hop2InputAmount \|\| afterHop1\(hop2PaidTo\) !== "hop2"\) return;[\s\S]*setStage\("hop2-running"\)/);
+    const finish = hook.slice(hook.indexOf("const finishAtRouteHop = useCallback"), hook.indexOf("const adoptHop1"));
+    expect(finish).toMatch(/updateConversion\(hop1BidId, \{[\s\S]*status: "done"[\s\S]*\}\);[\s\S]*reset\(\);/);
+    // `reset` clears the stored hop 1, so the settle effect has nothing to read again.
+    const reset = hook.slice(hook.indexOf("const reset = useCallback"), hook.indexOf("const finishAtRouteHop"));
+    expect(reset).toContain("writeStored(HOP1_STORAGE_KEY, null);");
+    const body = read("EarnConvertBody.tsx");
+    expect(body).toMatch(/if \(keptByNode\) pipeline\.finishAtRouteHop\(\);\s*else pipeline\.beginHop2\(\);/);
   });
 });

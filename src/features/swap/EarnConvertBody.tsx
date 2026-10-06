@@ -26,6 +26,7 @@ import {
   CONVERT_ROUTE_HOP,
   CONVERT_SOURCE,
   CONVERT_QUICK_TARGETS,
+  afterHop1,
   projectConversion,
 } from "./useConvertPipeline";
 import {
@@ -44,7 +45,12 @@ import {
   loadConversions,
   conversionAge,
 } from "./convert-history";
-import { MarketPreview, useSwapSidecarOptIn } from "../swap-sidecar";
+import {
+  FEE_KEPT_TAIL,
+  MarketPreview,
+  feeBearingPurchase,
+  useSwapSidecarOptIn,
+} from "../swap-sidecar";
 
 export interface EarnConvertBodyProps {
   variant: "landscape" | "portrait";
@@ -130,6 +136,13 @@ export function EarnConvertBody({
 
   const { targetCoin, stage, hop1, hop2InputAmount, hop2PaidTo, hop1Unwound } = pipeline;
 
+  /** Hop 1's LTC stayed in the swap node (2026-10-06): the conversion ends at
+   *  LTC instead of seeding a second hop from an address that does not hold
+   *  it. `afterHop1` is the same rule `beginHop2` refuses by. */
+  const keptByNode = stage === "hop2-ready" && afterHop1(hop2PaidTo) === "finish";
+  /** Why it stayed: hop 1 is a purchase the licence fee is charged on. */
+  const hop1FeeBearing = feeBearingPurchase(CONVERT_SOURCE, CONVERT_ROUTE_HOP);
+
   /** LTC as a destination means one hop, not two. */
   const singleHop = targetCoin.toUpperCase() === CONVERT_ROUTE_HOP;
 
@@ -204,7 +217,7 @@ export function EarnConvertBody({
 
   const ctaLabel = (() => {
     if (stage === "hop1-running") return "SWAP IN PROGRESS…";
-    if (stage === "hop2-ready") return "► CONVERT THE SECOND HOP";
+    if (stage === "hop2-ready") return keptByNode ? "► DONE" : "► CONVERT THE SECOND HOP";
     if (stage === "hop2-running") return "CONFIRM IN THE SWAP TAB";
     // Ordered before the balance check on purpose: without the node this
     // cannot run at any balance, so that is the more useful thing to say.
@@ -222,8 +235,10 @@ export function EarnConvertBody({
     ((sourceBalance == null || sourceBalance <= 0) && stage !== "hop2-ready");
 
   const onCta = () => {
-    if (stage === "hop2-ready") pipeline.beginHop2();
-    else pipeline.beginHop1();
+    if (stage === "hop2-ready") {
+      if (keptByNode) pipeline.finishAtRouteHop();
+      else pipeline.beginHop2();
+    } else pipeline.beginHop1();
   };
 
   /* ── Pieces ────────────────────────────────────────────────── */
@@ -338,11 +353,11 @@ export function EarnConvertBody({
               through a full node (`payoutDestination.ts`). The second hop
               spends from this wallet's own address, so that case is said
               plainly. */}
-          {hop2PaidTo === "node-wallet"
-            ? `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your swap node's ${CONVERT_ROUTE_HOP} wallet, not at this wallet's ${CONVERT_ROUTE_HOP} address.`
-            : `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your wallet.`}{" "}
-          The second hop is priced when you start it, and you confirm that
-          rate.
+          {keptByNode
+            ? hop1FeeBearing
+              ? `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your swap node's ${CONVERT_ROUTE_HOP} wallet, ${FEE_KEPT_TAIL} Convert it from the Swap tab once it is in your wallet.`
+              : `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your swap node's ${CONVERT_ROUTE_HOP} wallet, not at this wallet's ${CONVERT_ROUTE_HOP} address.`
+            : `Hop 1 settled: ${hop2InputAmount} ${CONVERT_ROUTE_HOP} is in your wallet. The second hop is priced when you start it, and you confirm that rate.`}
         </div>
       )}
 

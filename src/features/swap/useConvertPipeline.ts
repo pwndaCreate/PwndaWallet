@@ -38,7 +38,7 @@ import type {
   SidecarSwapState,
   SidecarTrackedSwap,
 } from "../swap-sidecar";
-import { stageForBidState, tickerForCoin } from "../swap-sidecar";
+import { feeBearingPurchase, stageForBidState, tickerForCoin } from "../swap-sidecar";
 import {
   followConversionRebid,
   recordConversionStarted,
@@ -93,12 +93,12 @@ export interface ConvertPipelineState {
   /** LTC amount hop 1 produced — the input to hop 2. */
   hop2InputAmount: string | null;
   /**
-   * Where hop 1 paid that LTC (2026-10-01): `"address"`, this wallet's LTC
-   * address, the one on hop 1's confirm screen; `"node-wallet"`, the swap
-   * node's own LTC wallet, when that address was in a form the swap engine
-   * does not pay as written (`swap-sidecar/payoutDestination.ts`). `null`
-   * when this session did not place hop 1 (it was picked up after a
-   * restart) and so cannot say. Hop 2 spends from this wallet's address.
+   * Where hop 1 paid that LTC ({@link hop1PaidTo}): `"address"`, this
+   * wallet's LTC address, the one on hop 1's confirm screen; `"node-wallet"`,
+   * the swap node's own LTC wallet. Since 2026-10-06 hop 1 is a purchase the
+   * licence fee is charged on (XMR -> LTC), so its LTC stays in the node's
+   * wallet for the fee, and the conversion ends there ({@link afterHop1}).
+   * Hop 2 spends from this wallet's address.
    */
   hop2PaidTo: "address" | "node-wallet" | null;
 
@@ -112,8 +112,12 @@ export interface ConvertPipelineState {
 
   /** Open the P2P review for XMR -> LTC. The caller supplies the opener. */
   beginHop1: () => void;
-  /** Seed the aggregator form with LTC -> target and let the user confirm. */
+  /** Seed the aggregator form with LTC -> target and let the user confirm.
+   *  Does nothing when hop 1's LTC stayed in the swap node ({@link afterHop1}). */
   beginHop2: () => void;
+  /** End a conversion at LTC whose hop 1 paid the swap node's wallet: logs
+   *  where it ended and returns to idle (2026-10-06). */
+  finishAtRouteHop: () => void;
   /** Drop pipeline state back to idle (after a settle, or a user dismiss). */
   reset: () => void;
 }
@@ -297,6 +301,32 @@ export function nextHop1Step(args: {
 }
 
 /**
+ * Where a settled hop 1 paid its LTC (2026-10-06). The bid's own plan when this
+ * session placed it (`SidecarSwapHandle.payoutTo`). Otherwise the payout rule
+ * for the pair: hop 1 buys LTC with XMR, a purchase the licence fee is charged
+ * on, so the bid sent no address and the LTC is in the swap node's LTC wallet
+ * ({@link feeBearingPurchase}, the predicate the bid itself used). Released
+ * builds before this one never sent an address at all.
+ */
+export function hop1PaidTo(
+  bidPayoutTo: "address" | "node-wallet" | null | undefined,
+): "address" | "node-wallet" | null {
+  if (bidPayoutTo) return bidPayoutTo;
+  return feeBearingPurchase(CONVERT_SOURCE, CONVERT_ROUTE_HOP) ? "node-wallet" : null;
+}
+
+/**
+ * What a settled hop 1 leads to (2026-10-06). Hop 2 spends LTC from this
+ * wallet's own address; LTC the swap node kept is not there (and the fee is
+ * taken from it after the swap). So for that case the conversion ends at LTC
+ * and says where it is, rather than seed a NEAR Intents swap from an address
+ * that does not hold the coin.
+ */
+export function afterHop1(paidTo: "address" | "node-wallet" | null): "hop2" | "finish" {
+  return paidTo === "node-wallet" ? "finish" : "hop2";
+}
+
+/**
  * Is this P2P swap the conversion's first hop: XMR sent, LTC received?
  *
  * Compares TICKERS, through `tickerForCoin`, on both sides. The handle the
@@ -447,7 +477,7 @@ export function useConvertPipeline({
         setHop2InputAmount(step.viaAmount);
         // Kept with the amount: the tracker drops a finished swap once the
         // node stops listing it, and with it the handle that says this.
-        setHop2PaidTo(hop1?.payoutTo ?? null);
+        setHop2PaidTo(hop1PaidTo(hop1?.payoutTo));
         setHop1Unwound(false);
         setStage("hop2-ready");
         updateConversion(hop1BidId, { viaAmount: step.viaAmount });
@@ -489,14 +519,15 @@ export function useConvertPipeline({
   }, [onSeedHop1]);
 
   const beginHop2 = useCallback(() => {
-    if (!hop2InputAmount) return;
+    // Never from this wallet's address for LTC the swap node kept (2026-10-06).
+    if (!hop2InputAmount || afterHop1(hop2PaidTo) !== "hop2") return;
     setStage("hop2-running");
     // The pipeline's work ends when hop 2 is handed to the swap form: the
     // NEAR leg then has its own confirm + Activity entry, and claiming an
     // outcome here would be asserting something this hook cannot observe.
     if (hop1BidId) updateConversion(hop1BidId, { status: "done" });
     onSeedHop2(hop2InputAmount, targetCoin);
-  }, [hop2InputAmount, onSeedHop2, targetCoin, hop1BidId]);
+  }, [hop2InputAmount, hop2PaidTo, onSeedHop2, targetCoin, hop1BidId]);
 
   const reset = useCallback(() => {
     setStage("idle");
@@ -506,6 +537,23 @@ export function useConvertPipeline({
     setHop1Unwound(false);
     writeStored(HOP1_STORAGE_KEY, null);
   }, []);
+
+  /**
+   * End the conversion at LTC (2026-10-06): hop 1 settled into the swap
+   * node's own LTC wallet, which the second hop cannot spend from here. The
+   * log records where it ended; `reset` clears the stored hop 1, so the
+   * settle effect has nothing to read again and nothing is retried.
+   */
+  const finishAtRouteHop = useCallback(() => {
+    if (hop1BidId) {
+      updateConversion(hop1BidId, {
+        status: "done",
+        toTicker: CONVERT_ROUTE_HOP,
+        toAmount: hop2InputAmount ?? "",
+      });
+    }
+    reset();
+  }, [hop1BidId, hop2InputAmount, reset]);
 
   /**
    * Adopt a freshly-submitted P2P swap as hop 1.
@@ -544,6 +592,7 @@ export function useConvertPipeline({
       hop1Unwound,
       beginHop1,
       beginHop2,
+      finishAtRouteHop,
       reset,
       // Not in the public interface above because only App.tsx's wiring calls
       // it; typed via the cast at the call site.
@@ -559,6 +608,7 @@ export function useConvertPipeline({
       hop1Unwound,
       beginHop1,
       beginHop2,
+      finishAtRouteHop,
       reset,
       adoptHop1,
     ],

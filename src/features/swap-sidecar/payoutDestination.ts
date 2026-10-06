@@ -45,6 +45,20 @@
  * them. The trace, with the engine's file:line, is in `swap_bid.rs` above
  * `PAYOUT_CONNECTION_REQUIRED`.
  *
+ * # Never on a purchase the licence fee is charged on (2026-10-06)
+ *
+ * Operator decision: the taker-side licence fee is collected after the swap
+ * completes from the swap node's own wallet of the scripted coin. A bid that
+ * BUYS a coin the fee schedule charges (LTC, BCH, BTC) with a scriptless one
+ * (XMR, ZEPH, ZANO) is paying for the very coin the fee is taken from, so
+ * that coin stays in the node's wallet and no address is sent, whatever its
+ * form or the connection ({@link feeBearingPurchase}; Rust's
+ * `fee_bearing_purchase` is built on the predicates the fee watcher charges
+ * by). The confirm screen, the swap's details and EARN say so, in one
+ * sentence ({@link FEE_KEPT_TAIL}). Selling a scripted coin for a scriptless
+ * one still pays the user's address: that fee is taken from the coin the
+ * node sold from. Scripted to scripted carries no fee.
+ *
  * # One rule, two places
  *
  * This decides what the confirm screen says and whether the address goes in
@@ -56,6 +70,7 @@
  * in each, and `payoutDestination.test.ts` pins the lists and the tables
  * equal.
  */
+import { feeBearingPurchase } from "./licenceFee";
 import { SWAP_TYPE_XMR } from "./offers";
 import { tickerForCoin } from "./types";
 
@@ -115,6 +130,9 @@ export type NodeWalletReason =
   | "protocol"
   /** A coin with no rule above. */
   | "coin"
+  /** A purchase the licence fee is charged on: the coin bought stays in the
+   *  node's wallet so the fee can be taken from it (2026-10-06). */
+  | "fee"
   /** An address form the engine would pay somewhere else, or refuse. */
   | "form"
   /** The node follows this coin through a full node (RPC), which can confirm
@@ -133,6 +151,8 @@ export type PayoutPlan =
 export interface PayoutOffer {
   /** The coin the bid buys: the offer's `coin_from`, as the node names it. */
   receiveCoin: string;
+  /** The coin the bid pays with: the offer's `coin_to` (2026-10-06). */
+  sendCoin: string;
   /** The offer's `swap_type` (5 = the adaptor-signature protocol). */
   swapType: number | null | undefined;
   /**
@@ -144,15 +164,15 @@ export interface PayoutOffer {
 }
 
 /**
- * What each check looks at. A rule that needs more of the swap (the fee rule,
- * if it comes: a taker buying a scripted coin with a scriptless one while the
- * licence fee is live) adds its input to {@link PayoutOffer} and is one more
- * entry in {@link PAYOUT_CHECKS}.
+ * What each check looks at. A rule that needs more of the swap adds its input
+ * to {@link PayoutOffer} and is one more entry in {@link PAYOUT_CHECKS}.
  */
 export interface PayoutCase {
   offer: PayoutOffer;
   /** The coin bought, as an UPPERCASE ticker. */
   ticker: string;
+  /** The coin paid with, as an UPPERCASE ticker. */
+  sold: string;
   /** The reviewed address, trimmed, a bare CashAddr given its prefix. */
   address: string;
 }
@@ -169,6 +189,9 @@ export const PAYOUT_CHECKS: readonly {
 }[] = [
   { name: "protocol", refuse: (c) => (c.offer.swapType === SWAP_TYPE_XMR ? null : "protocol") },
   { name: "coin", refuse: (c) => (PAYOUT_ADDRESS_SHAPES[c.ticker] ? null : "coin") },
+  // Before the form and the connection: for these swaps the fee is THE reason
+  // the coin stays with the node, whatever the address (2026-10-06).
+  { name: "fee", refuse: (c) => (feeBearingPurchase(c.sold, c.ticker) ? "fee" : null) },
   {
     name: "form",
     refuse: (c) => (PAYOUT_ADDRESS_SHAPES[c.ticker]?.test(c.address) ? null : "form"),
@@ -208,13 +231,25 @@ export function planPayout(
     .toUpperCase();
   const address = (reviewedAddress ?? "").trim();
   if (!address) return { to: "node-wallet", ticker, reason: "no-address", address: null };
-  const c: PayoutCase = { offer, ticker, address: normalize(ticker, address) };
+  const sold = (tickerForCoin(offer.sendCoin) ?? offer.sendCoin ?? "").trim().toUpperCase();
+  const c: PayoutCase = { offer, ticker, sold, address: normalize(ticker, address) };
   for (const check of PAYOUT_CHECKS) {
     const reason = check.refuse(c);
     if (reason) return { to: "node-wallet", ticker, reason, address };
   }
   return { to: "address", ticker, address: c.address };
 }
+
+/**
+ * Why a purchase the licence fee is charged on stays in the swap node's
+ * wallet, and how to move it (2026-10-06): one tail for the confirm screen,
+ * the swap's details and EARN, so the three say the same thing. "Sweep back"
+ * is the Settings card that moves coins the node holds into this wallet
+ * (`SweepBackSection`); a coin whose node wallet IS this wallet's (a shared
+ * account) is not offered there, because it is already here.
+ */
+export const FEE_KEPT_TAIL =
+  "so the swap fee can be taken from it. Sweep back (in Settings) moves it to your wallet, unless that wallet is already shared with this one.";
 
 /**
  * One sentence for a plan that leaves the coin in the swap node's wallet:
@@ -230,6 +265,8 @@ export function nodeWalletPayoutNote(plan: PayoutPlan): string | null {
       return `${where}: this offer's swap protocol pays the node's own wallet whatever address is given.`;
     case "coin":
       return `${where}: the wallet has no payout rule for this coin.`;
+    case "fee":
+      return `${where} ${FEE_KEPT_TAIL}`;
     case "connection":
       return `${where}: your swap node follows ${plan.ticker} through a full node, which can confirm a payment only to its own wallet, so this address is not sent.`;
     case "connection-unknown":

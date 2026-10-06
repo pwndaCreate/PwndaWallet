@@ -102,10 +102,10 @@ export function SidecarConfirmModal({
    * are FLIPPED versus the aggregators: this is the DESTINATION-side wallet,
    * and it is a payout target, never a signing address. The engine is told
    * to pay it only in the one form per coin it pays as written
-   * (`payoutDestination.ts`, 2026-10-01), and only for a coin whose payout to
-   * an outside address the node can follow (2026-10-06); otherwise the screen
-   * says the coin lands in the swap node's own wallet, and that is what
-   * happens.
+   * (`payoutDestination.ts`, 2026-10-01), only for a coin whose payout to an
+   * outside address the node can follow, and never on a purchase the licence
+   * fee is charged on (both 2026-10-06); otherwise the screen says the coin
+   * lands in the swap node's own wallet, and why, and that is what happens.
    */
   payoutAddress: string;
   /** Handed the accepted swap so the app-level tracker can adopt it. */

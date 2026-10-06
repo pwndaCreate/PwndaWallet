@@ -965,6 +965,18 @@ describe("where the bought coin was paid (2026-10-01)", () => {
     const html = render(row);
     expect(html).toContain('data-p2p-payout="node-wallet"');
     expect(html).toContain("your swap node&#x27;s LTC wallet");
+    // XMR -> LTC is a purchase the licence fee is charged on (2026-10-06).
+    expect(html).toContain("so the swap fee can be taken from it");
+    expect(html).toContain("Sweep back (in Settings)");
+  });
+
+  it("one the node kept for another reason says so without the fee", async () => {
+    await createP2PHistorySink().placed(
+      handle({ sendCoin: "Bitcoin", payoutAddress: "LUWPbpM43E2p7ZSh8cyTBEkvpHmr3cB8Ez", payoutTo: "node-wallet" }),
+    );
+    const html = render((await rowFor(BID))!);
+    expect(html).toContain("not this wallet&#x27;s LTC address");
+    expect(html).not.toContain("so the swap fee can be taken from it");
   });
 });
 

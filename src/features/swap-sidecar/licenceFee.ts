@@ -69,6 +69,31 @@ export function feeLegFor(
     : { ticker: send, amount: sendAmount };
 }
 
+/**
+ * Scripted coins with a row in the fee schedule, and so a fee address: the
+ * coins a fee is charged in. Mirrors `schedule::FEE_COINS`;
+ * `payoutDestination.test.ts` compares the two source to source.
+ */
+export const FEE_SCHEDULE_TICKERS = ["LTC", "BCH", "BTC"] as const;
+
+/**
+ * Is a taker's purchase of `bought`, paid for with `sold`, charged the licence
+ * fee in the coin bought (operator decision, 2026-10-06)? The schedule's own
+ * test, in its order: exactly one leg scriptless and the coin bought is the
+ * other one ({@link feeLegFor}, `schedule::fee_leg`'s mirror), and the
+ * schedule has a row for it. `swap_bid.rs::fee_bearing_purchase` is the Rust
+ * twin, built on the predicates the fee watcher charges by; both run the same
+ * pairs in their tests. Takes the node's coin names or tickers.
+ */
+export function feeBearingPurchase(sold: string, bought: string): boolean {
+  const leg = feeLegFor(sold, "", bought, "");
+  if (!leg) return false;
+  return (
+    leg.ticker === tickerForCoin(bought) &&
+    (FEE_SCHEDULE_TICKERS as readonly string[]).includes(leg.ticker)
+  );
+}
+
 /** What the quote line shows. `null` while the answer is still in flight. */
 export type LicenceFee =
   | { state: "loading" }
