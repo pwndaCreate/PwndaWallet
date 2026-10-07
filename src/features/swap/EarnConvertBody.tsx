@@ -27,6 +27,7 @@ import {
   CONVERT_SOURCE,
   CONVERT_QUICK_TARGETS,
   projectConversion,
+  P2P_FEE_FRACTION,
 } from "./useConvertPipeline";
 import {
   RouteDiagram,
@@ -196,7 +197,9 @@ export function EarnConvertBody({
   }, [sourceBalance, targetCoin, projection.targetAmount, singleHop, mining.active]);
 
   const legs: RouteLeg[] = useMemo(() => {
-    const p2p: RouteLeg = { label: "p2p · fee ~1%", timing: "30–90 min" };
+    // The licence fee, 0.5% (schedule.rs RATE_BPS). Was "~1%", a canvas
+    // placeholder from 2026-08-28 that never matched the schedule.
+    const p2p: RouteLeg = { label: `p2p · fee ${P2P_FEE_FRACTION * 100}%`, timing: "30–90 min" };
     const near: RouteLeg = { label: "near · fee ~0.3%", timing: "~4 min" };
     return singleHop ? [p2p] : [p2p, near];
   }, [singleHop]);

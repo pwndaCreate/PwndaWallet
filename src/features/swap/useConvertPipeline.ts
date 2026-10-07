@@ -675,13 +675,14 @@ export function useConvertPipeline({
 /**
  * Projected output of the whole pipeline, in target-coin units.
  *
- * Fees are applied as the canvas states them: ~1% on the P2P leg, ~0.3% on
- * the NEAR leg. Both are ADVISORY — the real numbers come from each hop's own
+ * Fees: the P2P leg's licence fee (0.5%, `LICENCE_FEE_FRACTION`, the
+ * schedule's own rate; "~1%" until 2026-10-07, a canvas placeholder) and ~0.3%
+ * on the NEAR leg. Network fees and the maker's price are not in it. ADVISORY — the real numbers come from each hop's own
  * quote, which the user confirms before it fires. This projection exists to
  * answer "roughly what do I end up with", and every surface that renders it
  * labels it with a `≈`.
  */
-export const P2P_FEE_FRACTION = 0.01;
+export const P2P_FEE_FRACTION = LICENCE_FEE_FRACTION;
 export const NEAR_FEE_FRACTION = 0.003;
 
 export function projectConversion(args: {

@@ -43,6 +43,7 @@ import {
   hop1ConversionRecord,
   hop1PaidTo,
   hop2SeedAmount,
+  P2P_FEE_FRACTION,
   isConvertHop1Leg,
   shouldAdoptAsHop1,
   type ConvertPipelineState,
@@ -434,6 +435,24 @@ describe("hop 2's line says where hop 1 paid", () => {
     );
     const bps = Number(/pub const RATE_BPS: u64 = (\d+);/.exec(schedule)?.[1]);
     expect(LICENCE_FEE_FRACTION).toBe(bps / 10_000);
+  });
+
+  it("EARN's P2P leg shows the licence fee, 0.5%, not the old ~1% placeholder", () => {
+    expect(P2P_FEE_FRACTION).toBe(LICENCE_FEE_FRACTION);
+    vi.stubGlobal("window", { localStorage: memoryStorage() });
+    const html = renderToStaticMarkup(
+      createElement(EarnConvertBody, {
+        variant: "landscape",
+        pipeline: pipeline("idle"),
+        sourceBalance: 0.5,
+        pricesByTicker: { XMR: 162.3, LTC: 117, BTC: 62_000 },
+        mining: { active: false },
+        conversions: [],
+      }),
+    );
+    vi.unstubAllGlobals();
+    expect(html).toContain("p2p · fee 0.5%");
+    expect(html).not.toContain("~1%");
   });
 
   it("App passes the verified-shared LTC flag to the pipeline", () => {
