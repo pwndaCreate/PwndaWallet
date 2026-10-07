@@ -195,14 +195,14 @@ export function DexCnWalletCard({
                 ? `Trades from ${copy.walletProcess} — nothing to deposit, nothing to sweep back.`
                 : `Will trade from ${copy.walletProcess} once the swap node next starts — nothing to deposit, nothing to sweep back.`}
           </div>
-          <Btn
-            variant={ack === false ? "ghost" : "accent"}
-            size="sm"
-            disabled={busy}
-            onClick={() => onSetAck(ack === false)}
-          >
-            {busy ? "…" : ack === false ? "Use my wallet" : "Using my wallet"}
-          </Btn>
+          {/* One way only since 2026-10-07: Grove trades only from the
+              user's wallet, so the opt-out is gone (Rust refuses it). A record
+              that opted out earlier is offered the way back. */}
+          {ack === false && (
+            <Btn variant="accent" size="sm" disabled={busy} onClick={() => onSetAck(true)}>
+              {busy ? "…" : "Use my wallet"}
+            </Btn>
+          )}
         </div>
       )}
 

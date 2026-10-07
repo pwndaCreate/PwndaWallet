@@ -3668,6 +3668,11 @@ pub const DEFAULT_ENABLED_COINS: &[&str] = &[
 ///   node, and funding it means a deposit (the C4 bridge);
 /// * a third-party server sees the addresses it is asked about.
 ///
+/// **2026-10-07: `Full` is no longer offered for any coin** (operator: Grove
+/// trades only from the user's own wallet; a local node keeps a wallet of its
+/// own). [`refuse_separate_wallet`] refuses it; the variant stays so a record
+/// or config written earlier still reads. The paragraph below is the history.
+///
 /// So `Lean` is the right DEFAULT — it is P1, light unless the user asks for
 /// more — and `Full` is what a user picks when they want their existing coins
 /// tradeable without moving them. Neither is universally better, which is why
@@ -3716,6 +3721,64 @@ pub const ELECTRUM_CAPABLE: &[(&str, &str)] = &[
 /// True when this coin can be hosted without a local chain at all.
 pub fn can_run_lean(coin: &str) -> bool {
     ELECTRUM_CAPABLE.iter().any(|(c, _)| *c == coin)
+}
+
+/// Coins Grove trades only through the user's OWN wallet (operator decision,
+/// 2026-10-07: "Keep pwnda wallet and bsx integrated pwnda grove as the
+/// default only option"). BTC/LTC/BCH share the wallet's account key (lean,
+/// C8); XMR/ZEPH/ZANO run against the wallet's own wallet process (C9/C-RZ/
+/// C-RX). Nothing else gets a wallet of the engine's own.
+///
+/// DOGE and DASH are absent: they have no light mode, so the engine could only
+/// run them as a local node holding a wallet of its own — a second account,
+/// derived from the BIP-85 swap seed, that this wallet does not show as the
+/// user's. Particl is not a trading coin here; it is the mandatory SMSG
+/// transport ([`MANDATORY_COIN`]) and keeps its engine wallet.
+pub const INTEGRATED_WALLET_COINS: &[&str] =
+    &["bitcoin", "litecoin", "bitcoincash", "monero", "zephyr", "zano"];
+
+/// Refuse anything that would give the swap engine a wallet separate from the
+/// user's own (2026-10-07). One function for the three doors — a coin enable,
+/// a mode change, a sharing withdrawal — so the rule has one wording and one
+/// test. Existing records are left as they are: a record that already has a
+/// separate wallet keeps working (switching it silently could hide funds), and
+/// the only control offered for it is the one that turns sharing back on.
+pub fn refuse_separate_wallet(change: SeparateWalletChange<'_>) -> Result<(), String> {
+    const WHY: &str = "Grove trades only from your own wallet";
+    match change {
+        SeparateWalletChange::Enable { coin, enabled } => {
+            if enabled && coin != MANDATORY_COIN && !INTEGRATED_WALLET_COINS.contains(&coin) {
+                return Err(format!(
+                    "{WHY}, and {coin} has no light mode — the swap node could only run it as a \
+                     local node with a wallet of its own"
+                ));
+            }
+        }
+        SeparateWalletChange::Mode { mode } => {
+            if mode == CoinMode::Full {
+                return Err(format!(
+                    "{WHY}; a local node would keep a wallet of its own, so it is no longer offered"
+                ));
+            }
+        }
+        SeparateWalletChange::Share { share } => {
+            if !share {
+                return Err(format!(
+                    "{WHY}; funding the swap node by deposit into a wallet of its own is no \
+                     longer offered"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What [`refuse_separate_wallet`] is asked about.
+#[derive(Debug, Clone, Copy)]
+pub enum SeparateWalletChange<'a> {
+    Enable { coin: &'a str, enabled: bool },
+    Mode { mode: CoinMode },
+    Share { share: bool },
 }
 
 /// Rough on-disk cost of a coin's chaindata, in GB — **as this engine actually
@@ -4772,6 +4835,7 @@ pub async fn swap_sidecar_set_coin(
                 .to_string(),
         );
     }
+    refuse_separate_wallet(SeparateWalletChange::Enable { coin: key, enabled })?;
     if enabled && key != MANDATORY_COIN && !coin_binaries_present(&bin_dir(&app)?, key) {
         return Err(format!(
             "no daemon binary is seeded for {}, so the swap node cannot run it — the coin would \
@@ -4949,6 +5013,8 @@ pub async fn swap_sidecar_set_coin_mode(
         )
     })?;
 
+    refuse_separate_wallet(SeparateWalletChange::Mode { mode })?;
+
     // Read the CONFIG rather than the record: `connection_type` is the fact
     // that decides whether the node has already baked a mode in.
     let on_disk = datadir(&app).ok().and_then(|dd| {
@@ -5080,6 +5146,7 @@ pub async fn swap_sidecar_set_share_wallet(
     share: bool,
 ) -> Result<OptInRecord, String> {
     let mut rec = read_optin(&app);
+    refuse_separate_wallet(SeparateWalletChange::Share { share })?;
     if !rec.opted_in {
         return Err(
             "the BasicSwap sidecar has not been enabled — accept the setup screen first"
@@ -5148,6 +5215,7 @@ pub async fn swap_sidecar_set_xmr_host_wallet(
     share: bool,
 ) -> Result<OptInRecord, String> {
     let mut rec = read_optin(&app);
+    refuse_separate_wallet(SeparateWalletChange::Share { share })?;
     if !rec.opted_in {
         return Err(
             "the BasicSwap sidecar has not been enabled — accept the setup screen first"
@@ -5215,6 +5283,7 @@ pub async fn swap_sidecar_set_cn_host_wallet(
     share: bool,
 ) -> Result<OptInRecord, String> {
     let mut rec = read_optin(&app);
+    refuse_separate_wallet(SeparateWalletChange::Share { share })?;
     if !rec.opted_in {
         return Err(
             "the BasicSwap sidecar has not been enabled — accept the setup screen first"
@@ -13183,6 +13252,53 @@ fn set_phase(
 
 #[cfg(test)]
 mod tests {
+    /// 2026-10-07, operator: Grove trades only from the user's own wallet. Each
+    /// door that could give the engine a wallet of its own refuses; the
+    /// integrated choices still pass.
+    #[test]
+    fn no_door_opens_a_separate_swap_wallet() {
+        use SeparateWalletChange::*;
+        for coin in ["dogecoin", "dash"] {
+            assert!(refuse_separate_wallet(Enable { coin, enabled: true }).is_err(), "{coin}");
+            // Turning one OFF stays allowed: it never creates a wallet.
+            assert!(refuse_separate_wallet(Enable { coin, enabled: false }).is_ok(), "{coin}");
+        }
+        for coin in INTEGRATED_WALLET_COINS.iter().copied().chain([MANDATORY_COIN]) {
+            assert!(refuse_separate_wallet(Enable { coin, enabled: true }).is_ok(), "{coin}");
+        }
+        assert!(refuse_separate_wallet(Mode { mode: CoinMode::Full }).is_err());
+        assert!(refuse_separate_wallet(Mode { mode: CoinMode::Lean }).is_ok());
+        assert!(refuse_separate_wallet(Share { share: false }).is_err());
+        assert!(refuse_separate_wallet(Share { share: true }).is_ok());
+        // Every coin the engine can run is either integrated, the transport, or refused.
+        for coin in WALLET_SIDECAR_COINS {
+            let integrated = INTEGRATED_WALLET_COINS.contains(coin) || *coin == MANDATORY_COIN;
+            assert_eq!(
+                refuse_separate_wallet(Enable { coin, enabled: true }).is_ok(),
+                integrated,
+                "{coin}"
+            );
+        }
+    }
+
+    /// The commands call the rule — a refusal that no command reaches is a
+    /// check that cannot fail for the reason it exists.
+    #[test]
+    fn every_wallet_door_calls_the_rule() {
+        let src = include_str!("swap_sidecar.rs");
+        for (cmd, call) in [
+            ("pub async fn swap_sidecar_set_coin(", "SeparateWalletChange::Enable"),
+            ("pub async fn swap_sidecar_set_coin_mode(", "SeparateWalletChange::Mode"),
+            ("pub async fn swap_sidecar_set_share_wallet(", "SeparateWalletChange::Share"),
+            ("pub async fn swap_sidecar_set_xmr_host_wallet(", "SeparateWalletChange::Share"),
+            ("pub async fn swap_sidecar_set_cn_host_wallet(", "SeparateWalletChange::Share"),
+        ] {
+            let start = src.find(cmd).unwrap_or_else(|| panic!("{cmd} not found"));
+            let body = &src[start..start + 1500];
+            assert!(body.contains(call), "{cmd} does not call refuse_separate_wallet");
+        }
+    }
+
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::{Arc, Mutex as StdMutex};

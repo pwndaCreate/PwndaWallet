@@ -580,13 +580,16 @@ describe("the CARD's own copy, which the panel walk cannot see", () => {
     expect(controls({ canShareWallet: true, sharesWallet: false })).toMatch(
       /Use my wallet/,
     );
-    expect(controls({ canShareWallet: true, sharesWallet: true })).toMatch(
-      /Using my wallet/,
+    // 2026-10-07 (operator): Grove trades only from the user's own wallet, so a
+    // sharing row has NO opt-out control — the way back is the only direction.
+    expect(controls({ canShareWallet: true, sharesWallet: true })).not.toMatch(
+      /my wallet/i,
     );
 
     // XMR: not electrum-capable, still shareable (C9 shares the wallet-rpc
-    // process instead of account keys). The regression this pins is a row
-    // with no control at all.
+    // process instead of account keys). The regression this pinned was a row
+    // with no control at all for an UNSHARED XMR; since 2026-10-07 that row is
+    // the only one that gets a control, offering the way back.
     expect(
       controls({
         coin: "monero",
@@ -594,9 +597,9 @@ describe("the CARD's own copy, which the panel walk cannot see", () => {
         canRunLean: false,
         configuredMode: "full",
         canShareWallet: true,
-        sharesWallet: true,
+        sharesWallet: false,
       }),
-    ).toMatch(/Using my wallet/);
+    ).toMatch(/Use my wallet/);
 
     // A coin with no sharing mechanism gets no control — a full-mode coin
     // adopts by descriptor import, which has its own gate, so offering this
@@ -607,6 +610,54 @@ describe("the CARD's own copy, which the panel walk cannot see", () => {
     expect(
       controls({ canRunLean: false, configuredMode: "full", canShareWallet: false }),
     ).not.toMatch(/my wallet/i);
+  });
+
+  // 2026-10-07 (operator): "Keep pwnda wallet and bsx integrated pwnda grove as
+  // the default only option." No row offers a local node, and a coin that could
+  // only run with a wallet of the node's own (DOGE, DASH) cannot be enabled.
+  it("offers no way to give the swap node a wallet of its own", () => {
+    const text = (over: Partial<CoinEnableStatus>) => {
+      const found: string[] = [];
+      const visit = (n: unknown): void => {
+        if (n == null || typeof n === "boolean") return;
+        if (Array.isArray(n)) return n.forEach(visit);
+        if (typeof n !== "object") return;
+        const el = n as { type?: unknown; props?: Record<string, unknown> };
+        const props = el.props ?? {};
+        if (typeof props.children === "string") found.push(props.children);
+        if (typeof el.type === "function") {
+          try {
+            visit((el.type as (p: unknown) => unknown)(props));
+            return;
+          } catch {
+            /* hooks-dependent */
+          }
+        }
+        visit(props.children);
+      };
+      visit(
+        DexCoinCard({
+          statuses: [status(over)],
+          onToggle: () => {},
+          onSetMode: () => {},
+          onSetShareWallet: () => {},
+        } as never),
+      );
+      return found.join(" | ");
+    };
+    // A lean coin not yet configured used to offer "Light | Local node".
+    expect(text({ canRunLean: true, configured: false })).not.toMatch(/Local node/);
+    for (const coin of ["dogecoin", "dash"]) {
+      const off = text({ coin, ticker: coin.toUpperCase(), enabled: false, canRunLean: false });
+      expect(off).not.toMatch(/\bEnable\b/);
+      expect(off).toMatch(/not offered/);
+      // One enabled before the rule keeps its Disable.
+      expect(text({ coin, ticker: coin.toUpperCase(), enabled: true, canRunLean: false })).toMatch(
+        /Disable/,
+      );
+    }
+    const ltc = text({ coin: "litecoin", ticker: "LTC", enabled: false });
+    expect(ltc, ltc).toMatch(/\bEnable\b/);
   });
 
   it("never tells one row to deposit and to use your own wallet at once", () => {

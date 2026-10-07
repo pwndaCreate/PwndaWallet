@@ -240,9 +240,6 @@ function CoinRow({
   // this (the mode is baked in at creation), so it can only appear on a record
   // written before that refusal existed — but it must not render as if it took.
   const pending = s.configuredMode != null && s.configuredMode !== s.mode;
-  // Once the coin exists in the config the mode is fixed; offering a control
-  // that the backend will refuse is worse than showing why it is fixed.
-  const modeLocked = s.configured;
   // Enabled, seeded, and STILL absent from the swap node's config. The row
   // said "not configured yet" — true, and with no next step, which is how a
   // user ends up staring at a BasicSwap order book missing the coins they
@@ -253,6 +250,9 @@ function CoinRow({
   // Configured, enabled, and deliberately not running this session — only a
   // host-wallet coin (zephyr/zano) can be in this state; see `active`'s doc.
   const parked = s.enabled && s.configured && s.active === false;
+  // Not offered: it would need a wallet of the swap node's own (2026-10-07).
+  // One already enabled before that keeps its Disable button.
+  const notOffered = !s.enabled && !offersEnable(s.coin);
   return (
     <div
       style={{
@@ -292,7 +292,11 @@ function CoinRow({
           )}
         </div>
         <div style={{ fontSize: 10.5, color: "var(--text-dim)" }}>
-          {unavailable ? unavailableReason(s.coin) : adoptionLine(s, effective)}
+          {notOffered
+            ? "not offered — it has no light mode, so the swap node would need a wallet of its own; Grove trades only from your wallet"
+            : unavailable
+              ? unavailableReason(s.coin)
+              : adoptionLine(s, effective)}
         </div>
         <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
           {diskLabel(s.estDiskGb)}
@@ -368,9 +372,6 @@ function CoinRow({
             {/* No workaround is offered because none exists: disable keeps
                 the chainclient block, and re-enable never re-creates it. The
                 first version of this line promised off/restart/on — false. */}
-            {modeLocked
-              ? " · set when the coin was first enabled; changing it later isn't supported yet"
-              : ""}
             {pending
               ? ` · ${MODE_COPY[s.mode].label} requested but not applied`
               : ""}
@@ -392,24 +393,9 @@ function CoinRow({
           gap: 6,
         }}
       >
-        {/* Only the coins that HAVE a choice get a control. BCH/DOGE/DASH have
-            no light-client support upstream, and particl carries SMSG. */}
-        {!unavailable && s.canRunLean && !modeLocked && (
-          <div style={{ display: "flex", gap: 2 }}>
-            {(["lean", "full"] as const).map((m) => (
-              <Btn
-                key={m}
-                variant={effective === m ? "accent" : "ghost"}
-                size="sm"
-                disabled={busy}
-                onClick={() => onSetMode(s.coin, m)}
-                title={MODE_COPY[m].cost}
-              >
-                {MODE_COPY[m].label}
-              </Btn>
-            ))}
-          </div>
-        )}
+        {/* No Light / Local node choice since 2026-10-07: a local node keeps a
+            wallet of its own, and Grove trades only from the user's wallet.
+            Light is the only mode, and Rust refuses Full. */}
 
         {/* Wallet sharing is ON by default for any capable coin once the DEX
             is opted into (2026-08-20) — opting in IS the decision, and the
@@ -421,23 +407,22 @@ function CoinRow({
             coin (account keys), monero (its wallet-rpc) and, since
             2026-09-04, zephyr/zano (their host wallet process). One control,
             one question; the caller routes to the right command. */}
-        {!unavailable && s.canShareWallet && onSetShareWallet && (
+        {/* One way only since 2026-10-07: the opt-out (fund by deposit into a
+            wallet of the node's own) is gone, and Rust refuses it. A record
+            that opted out earlier keeps working and is offered the way back. */}
+        {!unavailable && s.canShareWallet && onSetShareWallet && !s.sharesWallet && (
           <Btn
-            variant={s.sharesWallet ? "accent" : "ghost"}
+            variant="accent"
             size="sm"
             disabled={busy}
-            onClick={() => onSetShareWallet(s.coin, !s.sharesWallet)}
-            title={
-              s.sharesWallet
-                ? "Stop using your own wallet for this coin — fund the swap node by depositing to it instead."
-                : "Go back to using your own wallet for this coin, so there is nothing to deposit."
-            }
+            onClick={() => onSetShareWallet(s.coin, true)}
+            title="Use your own wallet for this coin, so there is nothing to deposit."
           >
-            {s.sharesWallet ? "Using my wallet" : "Use my wallet"}
+            Use my wallet
           </Btn>
         )}
 
-        {!unavailable && (
+        {!unavailable && !notOffered && (
           <Btn
             variant={s.enabled ? "ghost" : "accent"}
             size="sm"
@@ -480,6 +465,26 @@ function CoinRow({
  * is really blocked, and saying so is the difference between a user waiting for
  * a fix and a user knowing what the fix is.
  */
+/**
+ * Coins Grove trades only through the user's own wallet — mirrors Rust's
+ * `INTEGRATED_WALLET_COINS` (operator decision, 2026-10-07). Any other coin
+ * except the particl transport could only run as a local node with a wallet of
+ * its own, so it is not offered; Rust refuses the enable as well.
+ */
+export const INTEGRATED_WALLET_COINS = [
+  "bitcoin",
+  "litecoin",
+  "bitcoincash",
+  "monero",
+  "zephyr",
+  "zano",
+] as const;
+
+/** Can this row be turned ON? Particl is the mandatory transport. */
+export function offersEnable(coin: string): boolean {
+  return coin === "particl" || (INTEGRATED_WALLET_COINS as readonly string[]).includes(coin);
+}
+
 function unavailableReason(coin: string): string {
   if (coin === "zano") {
     return (

@@ -181,8 +181,10 @@ export function DexXmrWalletCard({
           <Btn
             variant={hostWalletAck ? "accent" : "ghost"}
             size="sm"
-            disabled={hostWalletBusy}
-            onClick={() => onSetHostWalletAck(!hostWalletAck)}
+            // One way only since 2026-10-07 — Grove trades only from the
+            // user's wallet, and Rust refuses a withdrawal.
+            disabled={hostWalletBusy || hostWalletAck}
+            onClick={() => onSetHostWalletAck(true)}
           >
             {hostWalletBusy
               ? "…"
