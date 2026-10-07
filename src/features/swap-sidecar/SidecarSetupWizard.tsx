@@ -477,8 +477,8 @@ export function SidecarSetupWizard({
               <strong>The node uses your existing wallet</strong>, so there is
               nothing to deposit. Light coins query public Electrum servers,
               which can see those addresses, and locking the wallet is refused
-              while a swap is in flight. Turn sharing off per coin in{" "}
-              <strong>Settings ▸ DEX coins</strong>.
+              while a swap is in flight. Swaps always trade from your own
+              wallet; the node never keeps a wallet of its own.
             </li>
             <li style={{ marginBottom: 6 }}>
               <strong>Keep the wallet open until a swap finishes</strong>{" "}
