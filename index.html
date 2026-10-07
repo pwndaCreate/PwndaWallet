@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>PWNDA Wallet — Linux packages</title>
+<style>body{font:15px/1.6 system-ui,sans-serif;max-width:46rem;margin:3rem auto;padding:0 1rem}
+pre{background:#111;color:#eee;padding:1rem;overflow-x:auto;border-radius:6px}code{font-size:.9em}</style>
+<h1>PWNDA Wallet — Linux packages</h1>
+<p>Add the repository once; updates then arrive through your package manager.</p>
+<h2>Debian / Ubuntu</h2>
+<pre><code>curl -fsSL https://pwndacreate.github.io/PwndaWallet/KEY.gpg | sudo tee /usr/share/keyrings/pwnda.gpg > /dev/null
+echo "deb [signed-by=/usr/share/keyrings/pwnda.gpg] https://github.com/pwndaCreate/PwndaWallet/releases/download/linux-repo/ ./" | sudo tee /etc/apt/sources.list.d/pwnda.list
+sudo apt update &amp;&amp; sudo apt install pwnda-wallet</code></pre>
+<h2>Fedora / RHEL</h2>
+<pre><code>sudo curl -fsSL -o /etc/yum.repos.d/pwnda.repo https://pwndacreate.github.io/PwndaWallet/rpm/pwnda.repo
+sudo dnf install pwnda-wallet</code></pre>
+<p>Signing key fingerprint: <code>DAAFAAAF734714DBEB2D72111A0E744E4B57819A</code></p>
