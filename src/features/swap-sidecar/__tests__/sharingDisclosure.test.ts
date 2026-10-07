@@ -87,9 +87,11 @@ describe("the opt-in wizard discloses wallet sharing", () => {
     expect(bullet).toMatch(/refused|refuses/i);
   });
 
-  it("tells the user where to turn it off", () => {
-    // A default-on behaviour with no stated off-ramp is not a disclosure.
-    expect(bullet).toMatch(/Settings/);
-    expect(bullet).toMatch(/DEX coins/i);
+  // 2026-10-07 (operator): Grove trades only from the user's own wallet, so
+  // there is no off-ramp to point at any more. The disclosure says so, and must
+  // not send the user looking for a toggle that no longer exists.
+  it("says the node never keeps a wallet of its own, and offers no opt-out", () => {
+    expect(bullet).toMatch(/never keeps a wallet of its own/);
+    expect(bullet).not.toMatch(/turn sharing off/i);
   });
 });
